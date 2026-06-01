@@ -2357,7 +2357,7 @@ mod tests {
 
             [[rules]]
             tool = "read_file"
-            path = "secrets/**"
+            path = "secrets/api_key.txt"
             "#,
         )
         .expect("permissions toml");
@@ -2366,7 +2366,7 @@ mod tests {
             permissions.rules,
             vec![
                 ToolAskRule::exec_shell("cargo test"),
-                ToolAskRule::file_path("read_file", "secrets/**"),
+                ToolAskRule::file_path("read_file", "secrets/api_key.txt"),
             ]
         );
     }
@@ -2410,7 +2410,7 @@ mod tests {
 
             [[rules]]
             tool = "read_file"
-            path = "secrets/**"
+            path = "secrets/api_key.txt"
             "#,
         )
         .expect("write permissions");
@@ -2422,7 +2422,7 @@ mod tests {
             store.permissions().rules.as_slice(),
             &[
                 ToolAskRule::exec_shell("cargo test"),
-                ToolAskRule::file_path("read_file", "secrets/**"),
+                ToolAskRule::file_path("read_file", "secrets/api_key.txt"),
             ]
         );
         assert_eq!(

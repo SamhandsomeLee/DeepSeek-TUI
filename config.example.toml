@@ -146,7 +146,7 @@ sandbox_mode = "workspace-write" # read-only | workspace-write | danger-full-acc
 #
 # [[rules]]
 # tool = "read_file"
-# path = "secrets/**"
+# path = "secrets/api_key.txt"
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # External Sandbox Backend (pluggable remote execution)
