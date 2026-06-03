@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{expand_path, normalize_model_name};
+use crate::config::{ApiProvider, expand_path, normalize_model_name};
 use crate::localization::normalize_configured_locale;
 use crate::palette::{normalize_hex_rgb_color, normalize_theme_name};
 
@@ -941,6 +941,32 @@ impl Settings {
         self.provider_models
             .get_or_insert_with(std::collections::HashMap::new)
             .insert(provider.to_string(), model.to_string());
+    }
+
+    /// Persist the active provider/model tuple that runtime selection UI and
+    /// slash commands should restore on the next startup.
+    pub fn set_provider_model_selection(
+        &mut self,
+        provider: ApiProvider,
+        model: &str,
+    ) -> Result<()> {
+        let model = model.trim();
+        if model.is_empty() {
+            anyhow::bail!("model cannot be empty");
+        }
+        self.default_provider = Some(provider.as_str().to_string());
+        self.set_model_for_provider(provider.as_str(), model);
+        if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
+            self.set("default_model", model)?;
+        }
+        Ok(())
+    }
+
+    /// Load, update, and save the runtime provider/model selection.
+    pub fn persist_provider_model_selection(provider: ApiProvider, model: &str) -> Result<()> {
+        let mut settings = Self::load()?;
+        settings.set_provider_model_selection(provider, model)?;
+        settings.save()
     }
 
     /// Resolved boolean for whether the renderer should wrap each frame in
