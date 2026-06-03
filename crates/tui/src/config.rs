@@ -7850,6 +7850,19 @@ http_headers = { "X-Model-Provider-Id" = "from-file" }
 
     #[test]
     fn xiaomi_mimo_provider_uses_documented_defaults() -> Result<()> {
+        let _lock = lock_test_env();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-tui-xiaomi-mimo-defaults-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&temp_root)?;
+        let _guard = EnvGuard::new(&temp_root);
+
         let config = Config {
             provider: Some("xiaomi-mimo".to_string()),
             ..Default::default()
