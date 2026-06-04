@@ -221,6 +221,8 @@ Prebuilt binary pairs and platform archives are published for Linux x64, Linux
 ARM64, macOS x64, macOS ARM64, and Windows x64. For other targets, see
 [docs/INSTALL.md](docs/INSTALL.md).
 
+For HarmonyOS PC and OpenHarmony cross-build setup, see [docs/HarmonyOS.md](docs/HarmonyOS.md).
+
 ### China / Mirror-friendly Installation
 
 If GitHub or npm downloads are slow from mainland China, use

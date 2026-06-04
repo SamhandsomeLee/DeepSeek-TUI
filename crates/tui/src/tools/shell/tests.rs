@@ -285,7 +285,7 @@ fn test_write_stdin_streams_output() {
 }
 
 #[test]
-#[cfg(unix)]
+#[cfg(all(unix, not(target_env = "ohos")))]
 fn background_tty_command_has_controlling_terminal() {
     let tmp = tempdir().expect("tempdir");
     let mut manager = ShellManager::new(tmp.path().to_path_buf());

@@ -19,8 +19,9 @@ PR is harvested, superseded, deferred, or closed.
 1. Stabilization and PR harvest: finish #2721 and #2722 before new feature work.
 2. Provider/model/auth correctness: land narrow correctness fixes that match the
    current provider architecture.
-3. HarmonyOS/MatePad Edge intake: keep #2634 active, scoped, and credited while
-   the OHOS/Nix dependency clearance work finishes upstream.
+3. HarmonyOS/MatePad Edge intake: keep #2634 credited while the local harvest
+   clears the OHOS/Nix dependency chain; full target-build success still needs a
+   host with the OpenHarmony native SDK loaded.
 4. File decomposition Phase 1: split safe, test-covered config/provider and TUI
    view surfaces before adding larger workflow UX.
 5. WhaleFlow MVP: typed IR, executor skeleton, replay, and pod monitor before
@@ -42,7 +43,7 @@ harvest/stewardship commits:
 | #2708 Windows sub-agent completion halves TUI render width | Cherry-picked as `e933a11d7`; follow-up fix `72653f8ef` invalidates reused fanout-card rows. | `cargo test -p codewhale-tui --locked subagent`; `cargo test -p codewhale-tui --locked terminal_size`; `cargo clippy -p codewhale-tui --locked -- -D warnings` passed. |
 | #2627 Xiaomi MiMo Token Plan mode | Harvested only the auth-header behavior as `5aa68d986`; did not merge the conflicting mode/env changes. | `cargo test -p codewhale-tui --bin codewhale-tui --locked xiaomi_mimo`; `cargo test -p codewhale-secrets --locked xiaomi_mimo`; `cargo test -p codewhale-config --locked xiaomi_mimo`; `cargo clippy -p codewhale-tui --locked -- -D warnings` passed. |
 | #2636 project-context mtime cache | Defer direct merge; harvest only after cache key/signature is widened. | Must include constitution changes, auto-generated context deletion, canonical path equivalence, and overwrite detection before landing. |
-| #2634 HarmonyOS port | Active HarmonyOS/MatePad Edge lane; do not close. | User-supplied MatePad Edge demo (`https://bilibili.com/video/av116689597368905`) confirms real-device interest. PR remains draft/blocked while the author waits on upstream Nix/dependency clearance and carries local patches; full port needs OHOS target checks plus sandbox, TLS, keyring, clipboard, browser-open, and self-update review before merge. |
+| #2634 HarmonyOS port | Locally harvested with additional Nix-chain clearance; keep credited and do not close until the integration branch is public. | User-supplied MatePad Edge demo (`https://bilibili.com/video/av116689597368905`) confirms real-device interest. Added env-driven OpenHarmony SDK setup, OHOS platform guards/fallbacks, self-update disablement, and OHOS target gating for Starlark execpolicy parsing plus PTY support so published OHOS builds do not pull `nix` 0.28 through `rustyline` or `portable-pty`. `cargo check --workspace --all-features --locked`, focused PTY/clipboard tests, and `cargo tree --locked -p codewhale-tui --target aarch64-unknown-linux-ohos -i nix@0.28.0` passed; full OHOS target check is blocked on this host because `OHOS_NATIVE_SDK`/target CC/sysroot are not configured and `ring` cannot find `assert.h`. |
 | #2687 append-only mode/approval prompt | Defer direct merge; draft has compile failures and Plan-mode prompt correctness risks. | Any future harvest must keep stable `message[0]` genuinely mode-agnostic, preserve mode/approval suffixes after capacity replans, and distinguish external overrides from persisted generated prompts. |
 | #2581 provider fallback chain design doc | Manually harvested as `docs/rfcs/2574-provider-fallback-chain.md` because the current PR head has no net file changes. | Keep issue #2574 open for implementation; close/comment on #2581 after the integration branch is public, crediting @idling11 and reporter @hsdbeebou. |
 | #2530 mention depth-cap hint | Already present in the current v0.9 stack as `a97675824` and `29f57665e`. | `cargo test -p codewhale-tui --locked try_autocomplete_file_mention_no_match` passed. |
@@ -99,7 +100,7 @@ harvest/stewardship commits:
 | #2631 estimated_input_tokens cache | Mergeable | Already harvested into the 22-commit stack. |
 | #2632 tool-catalog JSON cache | Mergeable | Already harvested into the 22-commit stack. |
 | #2633 capacity reverse scans | Mergeable | Already harvested into the 22-commit stack. |
-| #2634 HarmonyOS port | Draft/blocked | Keep as active HarmonyOS/MatePad Edge lane. Do not merge wholesale until upstream Nix/dependency clearance, OHOS target checks, and sandbox/TLS/keyring/clipboard/browser/self-update review are complete. |
+| #2634 HarmonyOS port | Draft / locally harvested | Harvested with credit and extra Nix-chain fixes. Keep the original PR open for now; comment after the integration branch is public and request a real OHOS SDK build confirmation from the contributor before closing. |
 | #2635 output rows cache | Mergeable | Already harvested into the 22-commit stack. |
 | #2636 project-context cache | Conflicting | Defer/harvest only after cache correctness fixes. |
 | #2639 POST /v1/sessions endpoint | Mergeable | Defer; app-server contract needs focused review. |

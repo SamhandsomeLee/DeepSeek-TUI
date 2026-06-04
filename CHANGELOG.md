@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/restore` now shows the 20 most recent snapshots, numeric restore targets can
   reach beyond that default listing up to a bounded index, and list requests
   above the visible cap fail explicitly instead of silently truncating.
+- Added HarmonyOS/OpenHarmony support scaffolding: environment-driven
+  `OHOS_NATIVE_SDK` setup scripts and compiler wrappers, platform docs,
+  explicit Rustls ring-provider installation for the no-provider TLS build, and
+  OHOS fallbacks for unsupported keyring, clipboard, sandbox, browser-open, TTY,
+  execpolicy Starlark parsing, and self-update surfaces.
 
 ### Changed
 
@@ -33,13 +38,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   allowlist approval is merged.
 - Documented the agent and sub-agent stewardship ethos so future automation
   preserves human issue intake, careful PR review, and contributor credit.
+- Moved the TUI Starlark execpolicy parser and PTY support behind non-OHOS
+  target dependencies so published OpenHarmony builds no longer pull `nix` 0.28
+  through `rustyline` or `portable-pty`.
 
 ### Community
 
 Thanks to **@cyq1017** for the restore-listing implementation (#2513) and
 **@wywsoor** for the broader macOS/iTerm rollback UX report (#2494), and
 **@HUQIANTAO** for the `web_run` lock-splitting work (#2502) and turn-metadata
-prefix-cache stability work (#2517).
+prefix-cache stability work (#2517), and **@shenjackyuanjie** for the
+HarmonyOS/OpenHarmony port and MatePad Edge validation trail (#2634).
 
 ## [0.8.53] - 2026-06-03
 
