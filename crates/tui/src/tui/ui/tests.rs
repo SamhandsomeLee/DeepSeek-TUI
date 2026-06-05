@@ -4504,6 +4504,169 @@ fn workspace_context_refresh_respects_ttl_before_requerying_git() {
     assert_ne!(refreshed, initial);
 }
 
+#[test]
+fn completed_exec_tool_refreshes_workspace_context_before_ttl() {
+    let repo = init_git_repo();
+    let checkout = Command::new("git")
+        .args(["checkout", "-b", "feature/old-branch"])
+        .current_dir(repo.path())
+        .output()
+        .expect("git checkout should run");
+    assert!(
+        checkout.status.success(),
+        "git checkout failed: {}",
+        String::from_utf8_lossy(&checkout.stderr)
+    );
+
+    let mut app = create_test_app();
+    app.workspace = repo.path().to_path_buf();
+
+    let start = Instant::now();
+    crate::tui::workspace_context::refresh_if_needed(&mut app, start, true);
+    let initial = app
+        .workspace_context
+        .clone()
+        .expect("initial refresh should populate context");
+    assert!(
+        initial.contains("feature/old-branch"),
+        "expected initial branch in {initial:?}"
+    );
+
+    let checkout = Command::new("git")
+        .args(["checkout", "-b", "feature/new-branch"])
+        .current_dir(repo.path())
+        .output()
+        .expect("git checkout should run");
+    assert!(
+        checkout.status.success(),
+        "git checkout failed: {}",
+        String::from_utf8_lossy(&checkout.stderr)
+    );
+
+    let before_ttl = start + Duration::from_secs(crate::tui::workspace_context::REFRESH_SECS - 1);
+    crate::tui::workspace_context::refresh_if_needed(&mut app, before_ttl, true);
+    assert_eq!(
+        app.workspace_context.as_deref(),
+        Some(initial.as_str()),
+        "normal refresh should still respect the TTL"
+    );
+
+    handle_tool_call_started(
+        &mut app,
+        "shell-branch",
+        "exec_shell",
+        &serde_json::json!({"command": "git checkout -b feature/new-branch"}),
+    );
+    handle_tool_call_complete(
+        &mut app,
+        "shell-branch",
+        "exec_shell",
+        &ok_result("switched"),
+    );
+
+    let refreshed = app
+        .workspace_context
+        .as_deref()
+        .expect("shell completion should refresh context");
+    assert!(
+        refreshed.contains("feature/new-branch"),
+        "expected refreshed branch in {refreshed:?}"
+    );
+}
+
+#[test]
+fn completed_task_shell_wait_refreshes_workspace_context_before_ttl() {
+    let repo = init_git_repo();
+    let checkout = Command::new("git")
+        .args(["checkout", "-b", "feature/task-old"])
+        .current_dir(repo.path())
+        .output()
+        .expect("git checkout should run");
+    assert!(
+        checkout.status.success(),
+        "git checkout failed: {}",
+        String::from_utf8_lossy(&checkout.stderr)
+    );
+
+    let mut app = create_test_app();
+    app.workspace = repo.path().to_path_buf();
+
+    let start = Instant::now();
+    crate::tui::workspace_context::refresh_if_needed(&mut app, start, true);
+    let initial = app
+        .workspace_context
+        .clone()
+        .expect("initial refresh should populate context");
+    assert!(
+        initial.contains("feature/task-old"),
+        "expected initial branch in {initial:?}"
+    );
+
+    let checkout = Command::new("git")
+        .args(["checkout", "-b", "feature/task-new"])
+        .current_dir(repo.path())
+        .output()
+        .expect("git checkout should run");
+    assert!(
+        checkout.status.success(),
+        "git checkout failed: {}",
+        String::from_utf8_lossy(&checkout.stderr)
+    );
+
+    let before_ttl = start + Duration::from_secs(crate::tui::workspace_context::REFRESH_SECS - 1);
+    crate::tui::workspace_context::refresh_if_needed(&mut app, before_ttl, true);
+    assert_eq!(
+        app.workspace_context.as_deref(),
+        Some(initial.as_str()),
+        "normal refresh should still respect the TTL"
+    );
+
+    handle_tool_call_started(
+        &mut app,
+        "task-shell-branch",
+        "task_shell_wait",
+        &serde_json::json!({"task_id": "shell_1"}),
+    );
+    handle_tool_call_complete(
+        &mut app,
+        "task-shell-branch",
+        "task_shell_wait",
+        &ok_result("completed"),
+    );
+
+    let refreshed = app
+        .workspace_context
+        .as_deref()
+        .expect("task shell completion should refresh context");
+    assert!(
+        refreshed.contains("feature/task-new"),
+        "expected refreshed branch in {refreshed:?}"
+    );
+}
+
+#[test]
+fn workspace_context_drain_requests_redraw_when_context_changes() {
+    let mut app = create_test_app();
+    app.workspace_context = Some("feature/old | clean".to_string());
+    app.workspace_context_refreshed_at = Some(Instant::now());
+    app.needs_redraw = false;
+    {
+        let mut cell = app.workspace_context_cell.lock().expect("context cell");
+        *cell = Some("feature/new | clean".to_string());
+    }
+
+    crate::tui::workspace_context::refresh_if_needed(&mut app, Instant::now(), false);
+
+    assert_eq!(
+        app.workspace_context.as_deref(),
+        Some("feature/new | clean")
+    );
+    assert!(
+        app.needs_redraw,
+        "draining a changed async context should redraw the footer"
+    );
+}
+
 #[tokio::test]
 async fn dismissed_plan_prompt_leaves_non_numeric_input_for_normal_send_path() {
     let mut app = create_test_app();

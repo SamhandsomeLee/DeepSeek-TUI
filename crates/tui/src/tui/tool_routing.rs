@@ -15,6 +15,7 @@ use crate::tui::history::{
     WebSearchCell, output_looks_like_diff, summarize_mcp_output, summarize_tool_args,
     summarize_tool_output,
 };
+use crate::tui::workspace_context;
 
 #[allow(clippy::too_many_lines)]
 pub(super) fn handle_tool_call_started(
@@ -647,6 +648,10 @@ pub(super) fn handle_tool_call_complete(
         refresh_active_tool_completion_timestamp(app, cell_index);
     }
 
+    if refreshes_workspace_context_on_completion(name) && status != ToolStatus::Running {
+        workspace_context::refresh_now(app, Instant::now());
+    }
+
     // #455 (observer-only): fire `tool_call_after` hooks once the
     // result has settled. Hooks see tool_name + the result content
     // (or error message) + success flag. Read-only — they cannot
@@ -856,6 +861,19 @@ fn is_exec_tool(name: &str) -> bool {
     matches!(
         name,
         "exec_shell" | "exec_shell_wait" | "exec_shell_interact" | "exec_wait" | "exec_interact"
+    )
+}
+
+fn refreshes_workspace_context_on_completion(name: &str) -> bool {
+    matches!(
+        name,
+        "exec_shell"
+            | "exec_shell_wait"
+            | "exec_shell_interact"
+            | "exec_wait"
+            | "exec_interact"
+            | "task_shell_start"
+            | "task_shell_wait"
     )
 }
 
