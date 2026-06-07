@@ -1129,6 +1129,7 @@ fn is_connection_closed_error_text(err: &str) -> bool {
         || err.contains("connection reset")
         || err.contains("broken pipe")
         || err.contains("unexpected eof")
+        || err.contains("forcibly closed")
 }
 
 fn parse_sse_message_data(body: &str) -> Vec<Vec<u8>> {
@@ -4400,6 +4401,14 @@ mod tests {
         assert!(
             is_mcp_stale_session_error(&err),
             "reset legacy SSE POST should force reconnect before retry"
+        );
+
+        let err = anyhow::anyhow!(
+            "MCP SSE POST send failed (transport=sse endpoint=http://127.0.0.1:123/messages): An existing connection was forcibly closed by the remote host."
+        );
+        assert!(
+            is_mcp_stale_session_error(&err),
+            "Windows reset wording should force reconnect before retry"
         );
     }
 

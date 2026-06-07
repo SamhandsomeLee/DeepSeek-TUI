@@ -3062,6 +3062,17 @@ fn init_git_repo() -> TempDir {
         String::from_utf8_lossy(&init.stderr)
     );
 
+    let autocrlf = Command::new("git")
+        .args(["config", "core.autocrlf", "false"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git config core.autocrlf should run");
+    assert!(
+        autocrlf.status.success(),
+        "git config core.autocrlf failed: {}",
+        String::from_utf8_lossy(&autocrlf.stderr)
+    );
+
     let commit = Command::new("git")
         .args([
             "-c",

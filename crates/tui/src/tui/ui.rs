@@ -4769,7 +4769,7 @@ fn rollback_provider_after_auth_failure(app: &mut App, config: &mut Config) -> O
     app.api_key_env_only = previous_api_key_env_only;
 
     let persistence_error = (|| -> anyhow::Result<()> {
-        commands::persist_root_string_key(
+        crate::config_persistence::persist_root_string_key(
             app.config_path.as_deref(),
             "provider",
             previous_provider.as_str(),
@@ -5348,7 +5348,9 @@ async fn dispatch_user_message(
         auto_selection
             .as_ref()
             .map(|selection| selection.model.clone())
-            .unwrap_or_else(|| commands::auto_model_heuristic(&message.display, &app.model))
+            .unwrap_or_else(|| {
+                crate::model_routing::auto_model_heuristic(&message.display, &app.model)
+            })
     } else {
         app.model.clone()
     };
@@ -5813,7 +5815,11 @@ async fn switch_provider(
         .await;
 
     let persist_warning = (|| -> anyhow::Result<()> {
-        commands::persist_root_string_key(app.config_path.as_deref(), "provider", target.as_str())?;
+        crate::config_persistence::persist_root_string_key(
+            app.config_path.as_deref(),
+            "provider",
+            target.as_str(),
+        )?;
 
         let mut settings = crate::settings::Settings::load()?;
         settings.default_provider = Some(target.as_str().to_string());
@@ -7732,7 +7738,7 @@ async fn handle_view_events(
                 app.status_items = items.clone();
                 app.needs_redraw = true;
                 if final_save {
-                    match commands::persist_status_items(&items) {
+                    match crate::config_persistence::persist_status_items(&items) {
                         Ok(path) => {
                             app.status_message =
                                 Some(format!("Status line saved to {}", path.display()));

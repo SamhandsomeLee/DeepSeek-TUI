@@ -596,7 +596,7 @@ pub fn apply_document(
         app.status_items = new_status_items.clone();
         app.needs_redraw = true;
         if persist {
-            let path = commands::persist_status_items(&new_status_items)?;
+            let path = crate::config_persistence::persist_status_items(&new_status_items)?;
             notes.push(format!("status_items saved to {}", path.display()));
         } else {
             notes.push("status_items updated for this session".to_string());
@@ -685,7 +685,7 @@ fn apply_reasoning_effort(
     app.last_effective_reasoning_effort = None;
     app.update_model_compaction_budget();
     if persist {
-        commands::persist_root_string_key(
+        crate::config_persistence::persist_root_string_key(
             app.config_path.as_deref(),
             "reasoning_effort",
             effort.as_setting(),

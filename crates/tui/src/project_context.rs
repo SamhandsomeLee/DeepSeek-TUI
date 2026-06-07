@@ -683,13 +683,22 @@ fn load_project_context_with_parents_and_home(
     workspace: &Path,
     home_dir: Option<&Path>,
 ) -> ProjectContext {
+    let workspace_canonical = canonicalize_workspace_or_keep(workspace);
     let mut ctx = load_project_context(workspace);
+    let parent_search_stop = project_context_parent_search_stop_dir();
 
     // If no context found in workspace, check parent directories
     if !ctx.has_instructions() {
-        let mut current = workspace.parent();
+        let mut current = workspace_canonical.parent();
 
         while let Some(parent) = current {
+            if parent_search_stop
+                .as_deref()
+                .is_some_and(|stop| parent == stop)
+            {
+                break;
+            }
+
             let parent_ctx = load_project_context(parent);
             ctx.warnings.extend(parent_ctx.warnings.iter().cloned());
             if parent_ctx.has_instructions() {
@@ -768,9 +777,17 @@ pub(crate) fn project_context_cache_candidate_paths(
 ) -> Vec<PathBuf> {
     let workspace = canonicalize_workspace_or_keep(workspace);
     let mut paths = Vec::new();
+    let parent_search_stop = project_context_parent_search_stop_dir();
 
     let mut current = Some(workspace.as_path());
     while let Some(dir) = current {
+        if parent_search_stop
+            .as_deref()
+            .is_some_and(|stop| dir == stop)
+        {
+            break;
+        }
+
         for filename in PROJECT_CONTEXT_FILES {
             paths.push(dir.join(filename));
         }
@@ -834,6 +851,10 @@ fn join_relative_components(base: &Path, relative: &[&str]) -> PathBuf {
 
 fn canonicalize_workspace_or_keep(workspace: &Path) -> PathBuf {
     fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf())
+}
+
+fn project_context_parent_search_stop_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| canonicalize_workspace_or_keep(&home))
 }
 
 /// Combine global user-wide preferences with a project-local

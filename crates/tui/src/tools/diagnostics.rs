@@ -243,6 +243,7 @@ mod tests {
             assert!(status.success(), "git {args:?} failed");
         };
         run(&["init", "-q"]);
+        run(&["config", "core.autocrlf", "false"]);
         run(&["config", "user.email", "test@example.com"]);
         run(&["config", "user.name", "Test User"]);
         fs::write(root.join("README.md"), "init\n").expect("write");

@@ -2506,6 +2506,7 @@ mod tests {
         let repo = tmp.path().join("repo");
         fs::create_dir_all(&repo)?;
         run_test_git(&repo, &["init", "-b", "main"])?;
+        run_test_git(&repo, &["config", "core.autocrlf", "false"])?;
         fs::write(repo.join("tracked.txt"), "clean\n")?;
         run_test_git(&repo, &["add", "tracked.txt"])?;
         run_test_git(
@@ -2987,6 +2988,7 @@ mod tests {
         let repo = tmp.path().join("repo");
         fs::create_dir_all(&repo)?;
         run_test_git(&repo, &["init", "-b", "feature/agent"])?;
+        run_test_git(&repo, &["config", "core.autocrlf", "false"])?;
         fs::write(repo.join("README.md"), "branch visibility\n")?;
         run_test_git(&repo, &["add", "README.md"])?;
         run_test_git(

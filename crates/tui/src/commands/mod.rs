@@ -78,7 +78,6 @@ impl CommandResult {
     }
 
     /// Create a result with both message and action
-    #[allow(dead_code)]
     pub fn with_message_and_action(msg: impl Into<String>, action: AppAction) -> Self {
         Self {
             message: Some(msg.into()),
@@ -710,37 +709,9 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
     config::set_config_value(app, key, value, persist)
 }
 
-/// Persist the user's chosen footer items to `~/.deepseek/config.toml` under
-/// `tui.status_items`. See [`config::persist_status_items`] for details.
-pub fn persist_status_items(
-    items: &[crate::config::StatusItem],
-) -> anyhow::Result<std::path::PathBuf> {
-    config::persist_status_items(items)
-}
-
-/// Persist a root-level string key in `config.toml`.
-pub fn persist_root_string_key(
-    config_path: Option<&std::path::Path>,
-    key: &str,
-    value: &str,
-) -> anyhow::Result<std::path::PathBuf> {
-    config::persist_root_string_key(config_path, key, value)
-}
-
 pub fn switch_mode(app: &mut App, mode: crate::tui::app::AppMode) -> String {
     config::switch_mode(app, mode)
 }
-
-/// Auto-select a model based on request complexity.
-pub fn auto_model_heuristic(input: &str, current_model: &str) -> String {
-    config::auto_model_heuristic(input, current_model)
-}
-
-pub use config::{
-    AutoRouteRecommendation, AutoRouteSelection, normalize_auto_route_effort,
-    parse_auto_route_recommendation, resolve_auto_route_with_flash,
-};
-
 /// Execute a Recursive Language Model (RLM) turn — Algorithm 1 from
 /// Zhang et al. (arXiv:2512.24601).
 ///
@@ -1004,45 +975,6 @@ pub fn get_command_info(name: &str) -> Option<&'static CommandInfo> {
     COMMANDS
         .iter()
         .find(|cmd| cmd.name == name || cmd.aliases.contains(&name))
-}
-
-/// Get all command names matching a prefix, including both built-in
-/// static commands and user-defined commands, formatted as `/name`.
-///
-/// `workspace` is used to also scan workspace-local command directories;
-/// pass `None` when no workspace context is available.
-#[allow(dead_code)]
-pub fn all_command_names_matching(
-    prefix: &str,
-    workspace: Option<&std::path::Path>,
-) -> Vec<String> {
-    let prefix = prefix.strip_prefix('/').unwrap_or(prefix).to_lowercase();
-    let mut result: Vec<String> = COMMANDS
-        .iter()
-        .filter(|cmd| {
-            cmd.name.starts_with(&prefix) || cmd.aliases.iter().any(|a| a.starts_with(&prefix))
-        })
-        .map(|cmd| format!("/{}", cmd.name))
-        .collect();
-
-    // Add user-defined commands
-    result.extend(user_commands::user_commands_matching(&prefix, workspace));
-
-    result.sort();
-    result.dedup();
-    result
-}
-
-/// Get all commands matching a prefix (for autocomplete)
-#[allow(dead_code)]
-pub fn commands_matching(prefix: &str) -> Vec<&'static CommandInfo> {
-    let prefix = prefix.strip_prefix('/').unwrap_or(prefix).to_lowercase();
-    COMMANDS
-        .iter()
-        .filter(|cmd| {
-            cmd.name.starts_with(&prefix) || cmd.aliases.iter().any(|a| a.starts_with(&prefix))
-        })
-        .collect()
 }
 
 fn edit_distance(a: &str, b: &str) -> usize {

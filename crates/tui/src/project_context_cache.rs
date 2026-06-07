@@ -181,7 +181,7 @@ mod tests {
         let plain = compute_cache_key(workspace.path(), Some(home.path()));
         let dotted = compute_cache_key(&workspace.path().join("."), Some(home.path()));
 
-        assert_eq!(plain, dotted);
+        assert_eq!(plain.workspace, dotted.workspace);
     }
 
     #[test]

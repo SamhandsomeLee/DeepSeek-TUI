@@ -27,6 +27,7 @@ mod compaction;
 mod composer_history;
 mod composer_stash;
 mod config;
+mod config_persistence;
 mod config_ui;
 mod core;
 mod cost_status;
@@ -46,6 +47,7 @@ mod lsp;
 mod mcp;
 mod mcp_server;
 mod memory;
+mod model_routing;
 mod models;
 mod network_policy;
 mod palette;
@@ -5505,7 +5507,7 @@ struct CliAutoRoute {
 async fn resolve_cli_auto_route(config: &Config, model: &str, prompt: &str) -> CliAutoRoute {
     if model.trim().eq_ignore_ascii_case("auto") {
         let selection =
-            commands::resolve_auto_route_with_flash(config, prompt, "", "auto", "auto").await;
+            model_routing::resolve_auto_route_with_flash(config, prompt, "", "auto", "auto").await;
         CliAutoRoute {
             model: selection.model,
             reasoning_effort: selection.reasoning_effort,
@@ -6709,6 +6711,12 @@ mod terminal_mode_tests {
             .args(["config", "user.email", "codewhale@example.invalid"])
             .status()
             .expect("git config user.email");
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["config", "core.autocrlf", "false"])
+            .status()
+            .expect("git config core.autocrlf");
         std::fs::write(
             repo.join("math_utils.py"),
             "def add(a, b):\n    return a - b\n",

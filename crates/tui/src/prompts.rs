@@ -2710,12 +2710,12 @@ mod tests {
         // surface (engine.rs builds the system prompt via this fn or
         // its sibling _and_skills variant on every turn).
         let _env_guard = crate::test_support::lock_test_env();
-        let tmp = tempdir().expect("tempdir");
-        let home = tmp.path().join("home");
-        let _home = EnvVarGuard::set("HOME", home.as_os_str());
-        let _userprofile = EnvVarGuard::set("USERPROFILE", home.as_os_str());
+        let workspace_tmp = tempdir().expect("workspace tempdir");
+        let home_tmp = tempdir().expect("home tempdir");
+        let _home = EnvVarGuard::set("HOME", home_tmp.path().as_os_str());
+        let _userprofile = EnvVarGuard::set("USERPROFILE", home_tmp.path().as_os_str());
         let _skills_dir = EnvVarGuard::remove("DEEPSEEK_SKILLS_DIR");
-        let workspace = tmp.path();
+        let workspace = workspace_tmp.path();
 
         for mode in [AppMode::Agent, AppMode::Yolo, AppMode::Plan] {
             let a = match system_prompt_for_mode_with_context(mode, workspace, None) {

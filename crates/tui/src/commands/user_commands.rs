@@ -232,22 +232,6 @@ pub fn try_dispatch_user_command(app: &mut App, input: &str) -> Option<CommandRe
     None
 }
 
-/// Get user command names that match a given prefix (for autocomplete).
-///
-/// The prefix should be the command name portion only (after `/`).
-/// Returns entries formatted as `/name`.
-///
-/// `workspace` is used to also scan workspace-local command directories;
-/// pass `None` when no workspace context is available.
-pub fn user_commands_matching(prefix: &str, workspace: Option<&Path>) -> Vec<String> {
-    let prefix = prefix.to_lowercase();
-    load_user_commands(workspace)
-        .into_iter()
-        .filter(|(name, _)| name.starts_with(&prefix))
-        .map(|(name, _)| format!("/{name}"))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,12 +289,6 @@ mod tests {
         let mut app = App::new(options, &Config::default());
         let result = try_dispatch_user_command(&mut app, "/nonexistent-thing-12345");
         assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_user_commands_matching_with_prefix_no_workspace() {
-        let matches = user_commands_matching("zzzznotfound", None);
-        assert!(matches.is_empty());
     }
 
     // ── Workspace-local commands tests ─────────────────────────────────
@@ -472,23 +450,6 @@ mod tests {
             }
             other => panic!("expected SendMessage action, got: {other:?}"),
         }
-    }
-
-    #[test]
-    fn user_commands_matching_with_workspace() {
-        let tmp = TempDir::new().unwrap();
-        let ws = tmp.path();
-        write_command(
-            &ws.join(".deepseek").join("commands"),
-            "project-cmd",
-            "body",
-        );
-
-        let matches = user_commands_matching("project", Some(ws));
-        assert!(
-            matches.contains(&"/project-cmd".to_string()),
-            "got: {matches:?}"
-        );
     }
 
     #[test]

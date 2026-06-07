@@ -1078,6 +1078,11 @@ mod tests {
             .output()
             .unwrap();
         Command::new("git")
+            .args(["config", "core.autocrlf", "false"])
+            .current_dir(tmpdir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
             .args(["checkout", "-b", "main"])
             .current_dir(tmpdir.path())
             .output()
@@ -1117,6 +1122,11 @@ mod tests {
             .unwrap();
         Command::new("git")
             .args(["config", "user.name", "Test"])
+            .current_dir(tmpdir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "core.autocrlf", "false"])
             .current_dir(tmpdir.path())
             .output()
             .unwrap();
