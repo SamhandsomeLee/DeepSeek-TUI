@@ -5883,6 +5883,41 @@ mode = "token-plan-usa"
     }
 
     #[test]
+    #[test]
+    fn qwen3_6_plus_resolves_to_canonical_on_openrouter() {
+        let _lock = env_lock();
+        let _env = EnvGuard::without_deepseek_runtime_overrides();
+        let config = ConfigToml {
+            provider: ProviderKind::Openrouter,
+            ..ConfigToml::default()
+        };
+
+        let resolved = config.resolve_runtime_options(&CliRuntimeOverrides {
+            model: Some("qwen3.6-plus".to_string()),
+            ..CliRuntimeOverrides::default()
+        });
+
+        assert_eq!(resolved.provider, ProviderKind::Openrouter);
+        assert_eq!(resolved.model, OPENROUTER_QWEN_3_6_PLUS_MODEL);
+    }
+
+    #[test]
+    fn qwen3_6_plus_alias_qwen_dash_resolves() {
+        let _lock = env_lock();
+        let _env = EnvGuard::without_deepseek_runtime_overrides();
+        let config = ConfigToml {
+            provider: ProviderKind::Openrouter,
+            ..ConfigToml::default()
+        };
+
+        let resolved = config.resolve_runtime_options(&CliRuntimeOverrides {
+            model: Some("qwen-3.6-plus".to_string()),
+            ..CliRuntimeOverrides::default()
+        });
+
+        assert_eq!(resolved.model, OPENROUTER_QWEN_3_6_PLUS_MODEL);
+    }
+
     fn openrouter_provider_normalizes_recent_large_model_aliases() {
         let _lock = env_lock();
         let _env = EnvGuard::without_deepseek_runtime_overrides();
