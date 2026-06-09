@@ -1233,8 +1233,9 @@ pub(crate) struct PendingProviderSwitch {
 pub struct App {
     pub mode: AppMode,
     /// Registered hotbar actions available for future slot config/render layers.
-    #[allow(dead_code)]
     pub hotbar_actions: HotbarActionRegistry,
+    /// Resolved 1-8 hotbar slot bindings loaded from config or defaults.
+    pub hotbar_bindings: Vec<codewhale_config::HotbarBinding>,
     /// Composer sub-state (input, cursor, history, menus).
     pub composer: ComposerState,
     /// Viewport sub-state (scroll, cache, selection).
@@ -2060,9 +2061,19 @@ impl App {
             crate::mcp::load_config_with_workspace(&mcp_config_path, &workspace)
                 .map(|cfg| cfg.servers.len())
                 .unwrap_or(0);
+        let hotbar_actions = HotbarActionRegistry::with_builtins();
+        let known_hotbar_action_ids = hotbar_actions
+            .iter()
+            .map(|action| action.id())
+            .collect::<Vec<_>>();
+        let hotbar_bindings = config
+            .resolve_hotbar_bindings(&known_hotbar_action_ids)
+            .bindings;
+
         Self {
             mode: initial_mode,
-            hotbar_actions: HotbarActionRegistry::with_builtins(),
+            hotbar_actions,
+            hotbar_bindings,
             composer: ComposerState {
                 input: initial_input_text,
                 cursor_position: initial_input_cursor,

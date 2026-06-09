@@ -38,6 +38,9 @@ const COST_EQ_TOLERANCE: f64 = 1e-6;
 const RECENT_TOOL_SCAN_LIMIT: usize = 24;
 const ACTIVE_TOOL_COMPLETED_ROW_TTL: Duration = Duration::from_secs(8);
 const ACTIVE_TOOL_STALE_RUNNING_ROW_TTL: Duration = Duration::from_secs(600);
+const HOTBAR_PANEL_HEIGHT: u16 = 5;
+const HOTBAR_MIN_SIDEBAR_HEIGHT: u16 = 13;
+const HOTBAR_SLOTS_PER_ROW: usize = 4;
 
 pub fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
     // Clear hover state at the start of each render
@@ -51,16 +54,40 @@ pub fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    match app.sidebar_focus {
-        SidebarFocus::Auto => render_sidebar_auto(f, area, app),
-        SidebarFocus::Work => render_sidebar_work(f, area, app),
-        SidebarFocus::Tasks => render_sidebar_tasks(f, area, app),
-        SidebarFocus::Agents => render_sidebar_subagents(f, area, app),
-        SidebarFocus::Context => render_context_panel(f, area, app),
-        SidebarFocus::Hidden => Block::default()
+    if app.sidebar_focus == SidebarFocus::Hidden {
+        Block::default()
             .style(Style::default().bg(app.ui_theme.surface_bg))
-            .render(area, f.buffer_mut()),
+            .render(area, f.buffer_mut());
+        return;
     }
+
+    let (panel_area, hotbar_area) = sidebar_layout_with_hotbar(area);
+
+    match app.sidebar_focus {
+        SidebarFocus::Auto => render_sidebar_auto(f, panel_area, app),
+        SidebarFocus::Work => render_sidebar_work(f, panel_area, app),
+        SidebarFocus::Tasks => render_sidebar_tasks(f, panel_area, app),
+        SidebarFocus::Agents => render_sidebar_subagents(f, panel_area, app),
+        SidebarFocus::Context => render_context_panel(f, panel_area, app),
+        SidebarFocus::Hidden => unreachable!("hidden sidebar returned before render"),
+    }
+
+    if let Some(hotbar_area) = hotbar_area {
+        render_sidebar_hotbar(f, hotbar_area, app);
+    }
+}
+
+fn sidebar_layout_with_hotbar(area: Rect) -> (Rect, Option<Rect>) {
+    if area.height < HOTBAR_MIN_SIDEBAR_HEIGHT {
+        return (area, None);
+    }
+
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(HOTBAR_PANEL_HEIGHT)])
+        .split(area);
+
+    (split[0], Some(split[1]))
 }
 
 /// Build the Auto-mode panel stack. Empty panels collapse to zero height so
@@ -2100,6 +2127,119 @@ fn agent_status_marker(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HotbarDisplayCell {
+    slot: u8,
+    action: String,
+    label: String,
+    known: bool,
+    active: bool,
+}
+
+fn hotbar_display_cells(app: &App) -> Vec<HotbarDisplayCell> {
+    app.hotbar_bindings
+        .iter()
+        .map(|binding| {
+            let action = app.hotbar_actions.get(&binding.action);
+            let label = binding
+                .label
+                .clone()
+                .filter(|label| !label.trim().is_empty())
+                .unwrap_or_else(|| {
+                    action
+                        .as_ref()
+                        .map(|action| action.short_label().to_string())
+                        .unwrap_or_else(|| binding.action.clone())
+                });
+            let active = action.as_ref().is_some_and(|action| action.is_active(app));
+
+            HotbarDisplayCell {
+                slot: binding.slot,
+                action: binding.action.clone(),
+                label,
+                known: action.is_some(),
+                active,
+            }
+        })
+        .collect()
+}
+
+fn hotbar_panel_lines(
+    cells: &[HotbarDisplayCell],
+    content_width: usize,
+    theme: &palette::UiTheme,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::with_capacity(2);
+    if cells.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No hotbar slots",
+            Style::default().fg(theme.text_muted),
+        )));
+        return lines;
+    }
+
+    for row in cells.chunks(HOTBAR_SLOTS_PER_ROW) {
+        let separator_width = row.len().saturating_sub(1);
+        let available_cell_width = content_width.saturating_sub(separator_width);
+        let cell_width = (available_cell_width / row.len().max(1))
+            .max(1)
+            .min(content_width.max(1));
+        let mut spans = Vec::with_capacity(row.len() * 2);
+        for (idx, cell) in row.iter().enumerate() {
+            let label_width = cell_width.saturating_sub(2).max(1);
+            let label = truncate_line_to_width(&cell.label, label_width);
+            let text = truncate_line_to_width(&format!("{}:{label}", cell.slot), cell_width);
+            let padded = format!("{text:<cell_width$}");
+            let mut style = if cell.known {
+                Style::default().fg(theme.text_soft)
+            } else {
+                Style::default().fg(theme.error_fg)
+            };
+            if cell.active {
+                style = style.bg(theme.selection_bg).fg(theme.accent_primary).bold();
+            }
+            spans.push(Span::styled(padded, style));
+            if idx + 1 < row.len() {
+                spans.push(Span::raw(" "));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+
+    lines
+}
+
+fn hotbar_panel_hover_texts(cells: &[HotbarDisplayCell]) -> Vec<String> {
+    cells
+        .chunks(HOTBAR_SLOTS_PER_ROW)
+        .map(|row| {
+            row.iter()
+                .map(|cell| {
+                    let status = if cell.known { "" } else { " (unknown)" };
+                    let active = if cell.active { " active" } else { "" };
+                    format!(
+                        "{}: {} -> {}{}{}",
+                        cell.slot, cell.label, cell.action, status, active
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" · ")
+        })
+        .collect()
+}
+
+fn render_sidebar_hotbar(f: &mut Frame, area: Rect, app: &mut App) {
+    if area.height < 3 {
+        return;
+    }
+
+    let content_width = area.width.saturating_sub(4) as usize;
+    let cells = hotbar_display_cells(app);
+    let lines = hotbar_panel_lines(&cells, content_width.max(1), &app.ui_theme);
+    let hover_texts = hotbar_panel_hover_texts(&cells);
+    render_sidebar_section(f, area, "Hotbar", lines, hover_texts, app);
+}
+
 /// Session-context panel (#504) — consolidated session state overview.
 ///
 /// Surfaces at-a-glance: working set, token usage / context %, running
@@ -2351,12 +2491,13 @@ fn sidebar_hover_rows(
 mod tests {
     use super::{
         ACTIVE_TOOL_COMPLETED_ROW_TTL, ACTIVE_TOOL_STALE_RUNNING_ROW_TTL, AutoSidebarPanel,
-        AutoSidebarState, SidebarAgentRow, SidebarHoverRow, SidebarHoverSection, SidebarHoverState,
-        SidebarSubagentSummary, SidebarToolRow, SidebarWorkChecklistItem, SidebarWorkStrategyStep,
-        SidebarWorkSummary, ToolRowOrder, auto_sidebar_panels, editorial_tool_rows,
-        normalize_activity_text, sidebar_hover_rows, sidebar_work_summary,
-        subagent_panel_hover_texts, subagent_panel_lines, task_panel_lines, work_panel_empty_hint,
-        work_panel_hover_texts, work_panel_lines,
+        AutoSidebarState, HOTBAR_PANEL_HEIGHT, SidebarAgentRow, SidebarHoverRow,
+        SidebarHoverSection, SidebarHoverState, SidebarSubagentSummary, SidebarToolRow,
+        SidebarWorkChecklistItem, SidebarWorkStrategyStep, SidebarWorkSummary, ToolRowOrder,
+        auto_sidebar_panels, editorial_tool_rows, hotbar_display_cells, hotbar_panel_lines,
+        normalize_activity_text, render_sidebar, sidebar_hover_rows, sidebar_layout_with_hotbar,
+        sidebar_work_summary, subagent_panel_hover_texts, subagent_panel_lines, task_panel_lines,
+        work_panel_empty_hint, work_panel_hover_texts, work_panel_lines,
     };
     use crate::config::Config;
     use crate::palette;
@@ -2364,16 +2505,20 @@ mod tests {
     use crate::tools::plan::StepStatus;
     use crate::tools::todo::TodoStatus;
     use crate::tui::active_cell::ActiveCell;
-    use crate::tui::app::{App, HuntVerdict, TaskPanelEntry, TuiOptions};
+    use crate::tui::app::{App, AppMode, HuntVerdict, TaskPanelEntry, TuiOptions};
     use crate::tui::history::{
         ExecCell, ExecSource, GenericToolCell, HistoryCell, ToolCell, ToolStatus,
     };
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
     use ratatui::text::Line;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
-    fn create_test_app() -> App {
-        let options = TuiOptions {
+    fn test_options() -> TuiOptions {
+        TuiOptions {
             model: "deepseek-v4-pro".to_string(),
             workspace: PathBuf::from("."),
             config_path: None,
@@ -2393,8 +2538,15 @@ mod tests {
             yolo: false,
             resume_session_id: None,
             initial_input: None,
-        };
-        App::new(options, &Config::default())
+        }
+    }
+
+    fn create_test_app() -> App {
+        App::new(test_options(), &Config::default())
+    }
+
+    fn create_test_app_with_config(config: &Config) -> App {
+        App::new(test_options(), config)
     }
 
     fn sidebar_tool_row(name: &str, status: ToolStatus) -> SidebarToolRow {
@@ -2413,6 +2565,17 @@ mod tests {
                 line.spans
                     .iter()
                     .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn buffer_lines(buffer: &Buffer) -> Vec<String> {
+        let area = buffer.area();
+        (area.y..area.y.saturating_add(area.height))
+            .map(|y| {
+                (area.x..area.x.saturating_add(area.width))
+                    .map(|x| buffer[(x, y)].symbol())
                     .collect::<String>()
             })
             .collect()
@@ -2503,6 +2666,125 @@ mod tests {
         });
 
         assert_eq!(panels, vec![AutoSidebarPanel::Work]);
+    }
+
+    #[test]
+    fn sidebar_reserves_bottom_hotbar_only_when_tall_enough() {
+        let (panel, hotbar) = sidebar_layout_with_hotbar(Rect::new(0, 0, 32, 18));
+        assert_eq!(panel.height, 13);
+        assert_eq!(hotbar.expect("hotbar area").height, 5);
+
+        let (panel, hotbar) = sidebar_layout_with_hotbar(Rect::new(0, 0, 32, 10));
+        assert_eq!(panel.height, 10);
+        assert!(hotbar.is_none());
+    }
+
+    #[test]
+    fn hotbar_defaults_render_as_two_sidebar_rows() {
+        let app = create_test_app();
+        let cells = hotbar_display_cells(&app);
+
+        assert_eq!(cells.len(), 8);
+        assert_eq!(cells[0].label, "voice");
+        assert_eq!(cells[1].label, "compact");
+        assert_eq!(cells[2].label, "plan");
+        assert!(cells.iter().all(|cell| cell.known));
+
+        let text = lines_to_text(&hotbar_panel_lines(&cells, 48, &palette::UI_THEME));
+        assert_eq!(text.len(), 2);
+        assert!(text[0].contains("1:voice"));
+        assert!(text[0].contains("2:compact"));
+        assert!(text[1].contains("8:trust"));
+    }
+
+    #[test]
+    fn hotbar_rows_fit_narrow_sidebar_width() {
+        let app = create_test_app();
+        let cells = hotbar_display_cells(&app);
+        let content_width = 28;
+        let text = lines_to_text(&hotbar_panel_lines(
+            &cells,
+            content_width,
+            &palette::UI_THEME,
+        ));
+
+        assert_eq!(text.len(), 2);
+        assert!(
+            text[0].contains("4:"),
+            "first row should keep slot 4: {text:?}"
+        );
+        assert!(
+            text[1].contains("8:"),
+            "second row should keep slot 8: {text:?}"
+        );
+        for line in &text {
+            let width = unicode_width::UnicodeWidthStr::width(line.as_str());
+            assert!(
+                width <= content_width,
+                "hotbar row width {width} exceeded {content_width}: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hotbar_uses_config_labels_and_marks_unknown_actions() {
+        let config = Config {
+            hotbar: Some(vec![
+                codewhale_config::HotbarBindingToml {
+                    slot: 1,
+                    action: "mode.plan".to_string(),
+                    label: Some("Plan".to_string()),
+                },
+                codewhale_config::HotbarBindingToml {
+                    slot: 2,
+                    action: "plugin.missing".to_string(),
+                    label: Some("Missing".to_string()),
+                },
+            ]),
+            ..Config::default()
+        };
+        let mut app = create_test_app_with_config(&config);
+        app.mode = AppMode::Plan;
+
+        let cells = hotbar_display_cells(&app);
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[0].label, "Plan");
+        assert!(cells[0].known);
+        assert!(cells[0].active);
+        assert_eq!(cells[1].label, "Missing");
+        assert!(!cells[1].known);
+
+        let text = lines_to_text(&hotbar_panel_lines(&cells, 48, &palette::UI_THEME));
+        assert!(text[0].contains("1:Plan"));
+        assert!(text[0].contains("2:Missing"));
+    }
+
+    #[test]
+    fn render_sidebar_paints_hotbar_at_bottom() {
+        let mut app = create_test_app();
+        let backend = TestBackend::new(48, 18);
+        let mut terminal = Terminal::new(backend).expect("create terminal");
+
+        terminal
+            .draw(|frame| render_sidebar(frame, Rect::new(0, 0, 48, 18), &mut app))
+            .expect("draw sidebar");
+
+        let lines = buffer_lines(terminal.backend().buffer());
+        let text = lines.join("\n");
+
+        assert!(
+            text.contains("Hotbar"),
+            "hotbar title should render:\n{text}"
+        );
+        assert!(text.contains("1:voice"), "slot 1 should render:\n{text}");
+        assert!(text.contains("8:trust"), "slot 8 should render:\n{text}");
+        assert!(
+            lines
+                .iter()
+                .skip(lines.len().saturating_sub(HOTBAR_PANEL_HEIGHT as usize))
+                .any(|line| line.contains("Hotbar")),
+            "hotbar should be in the bottom panel:\n{text}"
+        );
     }
 
     #[test]
