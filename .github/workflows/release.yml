@@ -459,6 +459,12 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Checked out into a subdirectory so it cannot clobber the downloaded
+      # artifacts; used for the release-body generator and the CHANGELOG.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+          path: repo
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -494,112 +500,17 @@ jobs:
             printf '%s  %s\n' "${hash}" "${base}" >> "${manifest}"
           done < <(find artifacts -type f ! -path 'artifacts/checksums/*' -print0 | sort -z)
           cat "${manifest}"
+      - name: Generate release body from CHANGELOG
+        shell: bash
+        run: |
+          ./repo/scripts/release/generate-release-body.sh \
+            "${{ needs.resolve.outputs.tag }}" repo/CHANGELOG.md > release-body.md
       - uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ needs.resolve.outputs.tag }}
           files: artifacts/*/*
           prerelease: false
-          body: |
-            > **CodeWhale** is the canonical project, command, npm package, and
-            > release-asset name. The legacy npm package `deepseek-tui` is
-            > deprecated and receives no further releases. Users coming from
-            > v0.8.x legacy `deepseek` / `deepseek-tui` names should migrate
-            > with `docs/REBRAND.md`.
-
-            ## Install
-
-            ### Recommended — npm (one command, both binaries)
-
-            ```bash
-            npm install -g codewhale
-            ```
-
-            The wrapper downloads both binaries from this Release and places them in the same directory.
-
-            ### Docker / GHCR
-
-            ```bash
-            docker run --rm -it \
-              -e DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY" \
-              -v ~/.deepseek:/home/codewhale/.deepseek \
-              ghcr.io/hmbown/codewhale:${{ needs.resolve.outputs.tag }}
-            ```
-
-            The image ships the `codewhale` dispatcher and `codewhale-tui` runtime. The `latest` tag is also updated on release.
-
-            ### Cargo (Linux / macOS)
-
-            ```bash
-            cargo install codewhale-cli codewhale-tui --locked
-            ```
-
-            Both crates are required — `codewhale-cli` produces the `codewhale` dispatcher and `codewhale-tui` produces the interactive runtime that the dispatcher delegates to. Installing only one binary will fail at runtime with a `MISSING_COMPANION_BINARY` error.
-
-            ### Manual download — platform archives (recommended)
-
-            Each archive below contains **both** the `codewhale` dispatcher and `codewhale-tui` runtime, plus an install script:
-
-            | Platform | Archive | Install script |
-            |---|---|---|
-            | Linux x64 | `codewhale-linux-x64.tar.gz` | `install.sh` |
-            | Linux ARM64 | `codewhale-linux-arm64.tar.gz` | `install.sh` |
-            | Linux RISC-V | `codewhale-linux-riscv64.tar.gz` | `install.sh` |
-            | macOS x64 | `codewhale-macos-x64.tar.gz` | `install.sh` |
-            | macOS ARM | `codewhale-macos-arm64.tar.gz` | `install.sh` |
-            | Windows x64 (installer) | `CodeWhaleSetup.exe` | NSIS setup |
-            | Windows x64 | `codewhale-windows-x64.zip` | `install.bat` |
-            | Windows x64 (portable) | `codewhale-windows-x64-portable.zip` | — |
-
-            **Unix (Linux / macOS):**
-            ```bash
-            tar xzf codewhale-<platform>.tar.gz
-            cd codewhale-<platform>
-            ./install.sh
-            ```
-
-            **Windows:**
-            - For the installer path, run `CodeWhaleSetup.exe`; it installs both binaries under `%LOCALAPPDATA%\Programs\CodeWhale\bin` and adds that directory to the current-user PATH.
-            - Extract `codewhale-windows-x64.zip`
-            - Run `install.bat` (copies to `%USERPROFILE%\bin`)
-            - Add `%USERPROFILE%\bin` to your PATH
-
-            The **portable** Windows archive skips the install script — extract and run from any directory. The NSIS installer is currently unsigned and may trigger Windows SmartScreen until a signing certificate is wired into the release pipeline.
-
-            Individual binaries are also attached below for scripting and the npm wrapper. The legacy npm package `deepseek-tui` is deprecated and is not republished. For migration from v0.8.x legacy binary names, see `docs/REBRAND.md`.
-
-            ### Verify (recommended)
-
-            Download the checksum manifests from this Release and verify:
-
-            ```bash
-            # Linux — archive bundles
-            sha256sum -c codewhale-bundles-sha256.txt
-
-            # Linux — individual binaries
-            sha256sum -c codewhale-artifacts-sha256.txt
-
-            # macOS
-            shasum -a 256 -c codewhale-bundles-sha256.txt
-            shasum -a 256 -c codewhale-artifacts-sha256.txt
-            ```
-
-            ## Contributors
-
-            Thanks to @sximelon, @cyq1017, @Artenx, @LHqweasd, @wywsoor,
-            @hsdbeebou, @mserrano11, @Dr3259, @yekern, @lioryx,
-            @puneetdixit200, @HUQIANTAO, @xyuai, @gaord, @shenjackyuanjie,
-            @AdityaVG13, @aboimpinto, @ousamabenyounes, @reidliu41,
-            @ljm3790865, @idling11, @h3c-hexin, @AresNing, @tdccccc,
-            @qiyuanlicn, @bevis-wong, @shuxiangxuebiancheng, @hongqitai,
-            @NASLXTO, @wuxixing, @linzhiqin2003, @merchloubna70-dot,
-            @mvanhorn, @Implementist, @jrcjrcc, @punkcanyang,
-            @yusufgurdogan, @LeoAlex0, @mo-vic, @AiurArtanis, @nasus9527,
-            and @lbcheng888 for reports, PRs, reviews, reproductions,
-            design direction, and harvested work that shaped v0.9.0.
-
-            ## Changelog
-
-            See [CHANGELOG.md](https://github.com/Hmbown/CodeWhale/blob/main/CHANGELOG.md) for the full notes for this release.
+          body_path: release-body.md
 
   homebrew:
     needs: [release, resolve]
