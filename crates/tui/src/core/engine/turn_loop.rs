@@ -153,7 +153,7 @@ impl Engine {
                         // Only update if we got valid messages (never corrupt state)
                         if !result.messages.is_empty() || self.session.messages.is_empty() {
                             let auto_messages_after = result.messages.len();
-                            self.session.messages = result.messages;
+                            self.session.messages = result.messages.into();
                             self.merge_compaction_summary(result.summary_prompt);
                             self.emit_session_updated().await;
                             let removed = auto_messages_before.saturating_sub(auto_messages_after);
@@ -1380,6 +1380,16 @@ impl Engine {
                     )));
                 }
 
+                // #3027: deny wins over allow — check the deny-list first so a
+                // tool present in both lists is still blocked.
+                if blocked_error.is_none()
+                    && command_denies_tool(self.config.disallowed_tools.as_deref(), &tool_name)
+                {
+                    blocked_error = Some(ToolError::permission_denied(format!(
+                        "Tool '{tool_name}' is in the disallowed-tools list"
+                    )));
+                }
+
                 if blocked_error.is_none()
                     && !command_allows_tool(self.config.allowed_tools.as_deref(), &tool_name)
                 {
@@ -2312,7 +2322,7 @@ impl Engine {
         // messages. This preserves the stable prefix through all stored
         // messages while avoiding strict chat templates that only allow
         // system messages at messages[0].
-        let mut messages = self.session.messages.clone();
+        let mut messages: Vec<Message> = self.session.messages.clone().into();
         messages.push(self.runtime_prompt_message());
         messages
     }
@@ -2371,11 +2381,20 @@ mod stream_timeout_tests {
     }
 }
 
-fn command_allows_tool(allowed_tools: Option<&[String]>, tool_name: &str) -> bool {
+pub(super) fn command_allows_tool(allowed_tools: Option<&[String]>, tool_name: &str) -> bool {
     let Some(allowed_tools) = allowed_tools else {
         return true;
     };
     allowed_tools.contains(&tool_name.to_ascii_lowercase())
+}
+
+/// Check whether `tool_name` is explicitly denied (#3027).
+/// Deny always wins over allow.
+pub(super) fn command_denies_tool(disallowed_tools: Option<&[String]>, tool_name: &str) -> bool {
+    let Some(disallowed_tools) = disallowed_tools else {
+        return false;
+    };
+    disallowed_tools.contains(&tool_name.to_ascii_lowercase())
 }
 
 fn resolve_tool_definition<'a>(
@@ -2711,6 +2730,36 @@ mod tests {
     fn review_regression_allowed_tools_gate_blocks_all_tools_when_empty() {
         let allowed = Vec::new();
         assert!(!command_allows_tool(Some(&allowed), "bash"));
+    }
+
+    #[test]
+    fn disallowed_tools_gate_blocks_listed_tool() {
+        let disallowed = vec!["exec_shell".to_string()];
+        assert!(command_denies_tool(Some(&disallowed), "exec_shell"));
+        assert!(!command_denies_tool(Some(&disallowed), "read_file"));
+    }
+
+    #[test]
+    fn disallowed_tools_gate_blocks_case_insensitively() {
+        let disallowed = vec!["exec_shell".to_string()];
+        assert!(command_denies_tool(Some(&disallowed), "Exec_Shell"));
+    }
+
+    #[test]
+    fn disallowed_tools_gate_is_inert_when_not_set() {
+        assert!(!command_denies_tool(None, "exec_shell"));
+        let empty: Vec<String> = Vec::new();
+        assert!(!command_denies_tool(Some(&empty), "exec_shell"));
+    }
+
+    #[test]
+    fn deny_wins_over_allow_for_same_tool() {
+        // The turn-loop gate chain checks the deny-list before the allow-list,
+        // so a tool present in both must still be blocked.
+        let allowed = vec!["exec_shell".to_string()];
+        let disallowed = vec!["exec_shell".to_string()];
+        assert!(command_allows_tool(Some(&allowed), "exec_shell"));
+        assert!(command_denies_tool(Some(&disallowed), "exec_shell"));
     }
 
     #[test]

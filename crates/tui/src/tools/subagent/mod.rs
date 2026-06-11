@@ -1508,8 +1508,19 @@ impl SubAgentManager {
                 .values()
                 .find(|existing| existing.session_name == name)
             {
+                // #3020: Include elapsed time so the parent can distinguish a
+                // live worker from a stale/failed earlier spawn (#2656).
+                let elapsed = existing.started_at.elapsed();
+                let since = if elapsed.as_secs() < 120 {
+                    format!("{}s ago", elapsed.as_secs())
+                } else {
+                    let mins = elapsed.as_secs() / 60;
+                    let secs = elapsed.as_secs() % 60;
+                    format!("{mins}m{secs}s ago")
+                };
                 return Err(anyhow!(
-                    "Sub-agent session name '{name}' is already in use by agent_id '{}' (status: {}). \
+                    "Sub-agent session name '{name}' is already in use by agent_id '{}' \
+                     (status: {}, started {since}). \
                      Reuse that agent_id with agent_eval/agent_close, or open with a different name.",
                     existing.id,
                     subagent_status_name(&existing.status)
@@ -5641,7 +5652,26 @@ fn annotate_child_model_error(err: &str, model: &str) -> String {
             "{err}\n(child model `{model}` may be unavailable under the current access profile — \
              retry agent_open with a different `model`, or remove `model` to inherit the parent's)"
         ),
-        _ => err.to_string(),
+        _ => {
+            // #3020 (#2653): Provider rejections like "Model Not Exist" or
+            // "does not exist or you do not have access" often classify as
+            // `Internal` rather than `Authorization`/`State`.  Catch these
+            // patterns in the raw error text and annotate anyway.
+            let lower = err.to_ascii_lowercase();
+            if lower.contains("model not exist")
+                || lower.contains("model_not_found")
+                || lower.contains("does not exist")
+                || lower.contains("no such model")
+                || lower.contains("invalid model")
+            {
+                format!(
+                    "{err}\n(child model `{model}` may be unavailable under the current access profile — \
+                     retry agent_open with a different `model`, or remove `model` to inherit the parent's)"
+                )
+            } else {
+                err.to_string()
+            }
+        }
     }
 }
 
