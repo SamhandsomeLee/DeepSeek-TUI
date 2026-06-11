@@ -957,11 +957,14 @@ impl ExecCell {
                 ));
             } else if self.status == ToolStatus::Running && self.source == ExecSource::Assistant {
                 lines.extend(wrap_plain_line(
-                    "  Ctrl+B opens shell controls.",
+                    "  Ctrl+B backgrounds this command.",
                     Style::default().fg(palette::TEXT_MUTED),
                     width,
                 ));
-            } else if self.status != ToolStatus::Running {
+            } else if self.status != ToolStatus::Running && mode == RenderMode::Transcript {
+                // #3031: Suppress "(no output)" in compact/Live mode;
+                // the success header is enough signal. Transcript still
+                // records it for exports/clipboard/pager.
                 lines.push(Line::from(Span::styled(
                     "  (no output)",
                     Style::default().fg(palette::TEXT_MUTED).italic(),
@@ -970,13 +973,17 @@ impl ExecCell {
         }
 
         if let Some(duration_ms) = self.duration_ms {
-            let seconds = f64::from(u32::try_from(duration_ms).unwrap_or(u32::MAX)) / 1000.0;
-            lines.extend(render_compact_kv(
-                "time",
-                &format!("{seconds:.2}s"),
-                Style::default().fg(palette::TEXT_DIM),
-                width,
-            ));
+            // #3031: Suppress sub-second timing in compact mode.
+            // Transcript mode always shows exact timing.
+            if mode == RenderMode::Transcript || duration_ms >= 1000 {
+                let seconds = f64::from(u32::try_from(duration_ms).unwrap_or(u32::MAX)) / 1000.0;
+                lines.extend(render_compact_kv(
+                    "time",
+                    &format!("{seconds:.2}s"),
+                    Style::default().fg(palette::TEXT_DIM),
+                    width,
+                ));
+            }
         }
 
         wrap_card_rail(lines)
@@ -2840,10 +2847,15 @@ fn render_preserved_output_mode(
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if output.trim().is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  (no output)",
-            Style::default().fg(palette::TEXT_MUTED).italic(),
-        )));
+        // #3031: In compact/Live mode, suppress "(no output)" — the tool
+        // header already carries the success/failure status.  Transcript
+        // mode still records it for exports/clipboard/pager.
+        if mode == RenderMode::Transcript {
+            lines.push(Line::from(Span::styled(
+                "  (no output)",
+                Style::default().fg(palette::TEXT_MUTED).italic(),
+            )));
+        }
         return lines;
     }
 
@@ -5094,7 +5106,7 @@ mod tests {
 
         assert!(text.contains("running line 1"));
         assert!(text.contains("running line 2"));
-        assert!(!text.contains("Ctrl+B opens shell controls"));
+        assert!(!text.contains("Ctrl+B backgrounds this command"));
     }
 
     #[test]

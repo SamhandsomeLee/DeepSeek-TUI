@@ -387,22 +387,11 @@ pub enum RequestPayloadMode {
 /// in the API payload (after normalization / provider-specific mapping).
 #[must_use]
 pub fn provider_capability(provider: ApiProvider, resolved_model: &str) -> ProviderCapability {
-    if matches!(
-        provider,
-        ApiProvider::Openai | ApiProvider::Atlascloud | ApiProvider::Moonshot
-    ) {
-        return ProviderCapability {
-            provider,
-            resolved_model: resolved_model.to_string(),
-            context_window: crate::models::LEGACY_DEEPSEEK_CONTEXT_WINDOW_TOKENS,
-            max_output: 4096,
-            thinking_supported: false,
-            cache_telemetry_supported: false,
-            request_payload_mode: RequestPayloadMode::ChatCompletions,
-            alias_deprecation: None,
-        };
-    }
-
+    // #3023: Delete the Openai/Atlascloud/Moonshot early-return so these
+    // providers use the generic model-based path below, which correctly
+    // resolves context windows, output limits, and thinking support from
+    // models.rs lookups.  Ollama also falls through to model-based lookups
+    // with 8192 as the last-resort fallback instead of a hardcoded floor.
     if matches!(provider, ApiProvider::XiaomiMimo) {
         return ProviderCapability {
             provider,
@@ -411,19 +400,6 @@ pub fn provider_capability(provider: ApiProvider, resolved_model: &str) -> Provi
                 .unwrap_or(crate::models::LEGACY_DEEPSEEK_CONTEXT_WINDOW_TOKENS),
             max_output: crate::models::max_output_tokens_for_model(resolved_model).unwrap_or(4096),
             thinking_supported: crate::models::model_supports_reasoning(resolved_model),
-            cache_telemetry_supported: false,
-            request_payload_mode: RequestPayloadMode::ChatCompletions,
-            alias_deprecation: None,
-        };
-    }
-
-    if matches!(provider, ApiProvider::Ollama) {
-        return ProviderCapability {
-            provider,
-            resolved_model: resolved_model.to_string(),
-            context_window: 8192,
-            max_output: 4096,
-            thinking_supported: false,
             cache_telemetry_supported: false,
             request_payload_mode: RequestPayloadMode::ChatCompletions,
             alias_deprecation: None,
@@ -459,12 +435,16 @@ pub fn provider_capability(provider: ApiProvider, resolved_model: &str) -> Provi
         && (model_lower.contains("reasoner") || model_lower.contains("r1"));
 
     // Context window: V4-class models get 1M, everything else falls through
-    // to the model's own lookup or a default.
+    // to the model's own lookup or a default.  Ollama defaults to 8192
+    // (conservative for small local models) instead of 128K.
     let context_window = if is_v4_pro || is_v4_flash {
         crate::models::DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS
+    } else if let Some(window) = crate::models::context_window_for_model(resolved_model) {
+        window
+    } else if matches!(provider, ApiProvider::Ollama) {
+        8192
     } else {
-        crate::models::context_window_for_model(resolved_model)
-            .unwrap_or(crate::models::LEGACY_DEEPSEEK_CONTEXT_WINDOW_TOKENS)
+        crate::models::LEGACY_DEEPSEEK_CONTEXT_WINDOW_TOKENS
     };
 
     // Max output tokens: official DeepSeek V4 API metadata lists 384K;
@@ -572,6 +552,19 @@ pub(crate) fn normalize_custom_model_id(model: &str) -> Option<String> {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+/// Validate a user-requested model id against the active provider (#3018).
+///
+/// DeepSeek providers use the strict `normalize_model_name` gate (official
+/// API only accepts DeepSeek IDs).  All other providers pass any non-empty,
+/// non-control-character string through — the provider API is the authority.
+#[must_use]
+pub fn requested_model_for_provider(provider: ApiProvider, model: &str) -> Option<String> {
+    match provider {
+        ApiProvider::Deepseek | ApiProvider::DeepseekCN => normalize_model_name(model),
+        _ => normalize_custom_model_id(model),
     }
 }
 
@@ -7892,6 +7885,25 @@ api_key = "old-openrouter-key"
     }
 
     #[test]
+    fn requested_model_for_provider_is_permissive_off_deepseek() {
+        // #3018: the provider API is the authority for non-DeepSeek routes.
+        assert_eq!(
+            requested_model_for_provider(ApiProvider::Moonshot, "kimi-k2.5").as_deref(),
+            Some("kimi-k2.5")
+        );
+        assert_eq!(
+            requested_model_for_provider(ApiProvider::Ollama, "qwen3:32b").as_deref(),
+            Some("qwen3:32b")
+        );
+        // The official DeepSeek API stays strict.
+        assert!(requested_model_for_provider(ApiProvider::Deepseek, "kimi-k2.5").is_none());
+        assert_eq!(
+            requested_model_for_provider(ApiProvider::Deepseek, "deepseek-v4-pro").as_deref(),
+            Some("deepseek-v4-pro")
+        );
+    }
+
+    #[test]
     fn wire_model_for_provider_matches_active_provider_shape() {
         assert_eq!(
             wire_model_for_provider(ApiProvider::Deepseek, DEFAULT_OPENROUTER_MODEL),
@@ -10776,14 +10788,30 @@ model = "deepseek-ai/deepseek-v4-pro"
     }
 
     #[test]
-    fn provider_capability_atlascloud_custom_model_is_chat_completions_without_thinking() {
+    fn provider_capability_atlascloud_v4_model_resolves_model_metadata() {
+        // #3023: Atlascloud uses the generic model-based path, so its default
+        // DeepSeek V4 model resolves the real V4 metadata instead of the old
+        // hardcoded legacy floor.
         let cap = provider_capability(ApiProvider::Atlascloud, "deepseek-ai/deepseek-v4-flash");
         assert_eq!(
             cap.context_window,
-            crate::models::LEGACY_DEEPSEEK_CONTEXT_WINDOW_TOKENS
+            crate::models::DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS
         );
-        assert_eq!(cap.max_output, 4096);
-        assert!(!cap.thinking_supported);
+        assert_eq!(cap.max_output, 384_000);
+        assert!(cap.thinking_supported);
+        assert!(!cap.cache_telemetry_supported);
+        assert_eq!(
+            cap.request_payload_mode,
+            RequestPayloadMode::ChatCompletions
+        );
+    }
+
+    #[test]
+    fn provider_capability_moonshot_default_model_resolves_kimi_metadata() {
+        let cap = provider_capability(ApiProvider::Moonshot, DEFAULT_MOONSHOT_MODEL);
+        assert_eq!(cap.context_window, 262_144);
+        assert_eq!(cap.max_output, 262_144);
+        assert!(cap.thinking_supported);
         assert!(!cap.cache_telemetry_supported);
         assert_eq!(
             cap.request_payload_mode,
@@ -10808,8 +10836,26 @@ model = "deepseek-ai/deepseek-v4-pro"
     }
 
     #[test]
-    fn provider_capability_ollama_is_openai_compatible_without_thinking() {
+    fn provider_capability_ollama_deepseek_tag_uses_deepseek_heuristic() {
+        // #3023: known model families resolve through models.rs lookups even
+        // on Ollama — a legacy DeepSeek tag gets the 128K heuristic window.
         let cap = provider_capability(ApiProvider::Ollama, "deepseek-v3.1:671b");
+        assert_eq!(
+            cap.context_window,
+            crate::models::LEGACY_DEEPSEEK_CONTEXT_WINDOW_TOKENS
+        );
+        assert_eq!(cap.max_output, 4096);
+        assert!(!cap.thinking_supported);
+        assert!(!cap.cache_telemetry_supported);
+        assert_eq!(
+            cap.request_payload_mode,
+            RequestPayloadMode::ChatCompletions
+        );
+    }
+
+    #[test]
+    fn provider_capability_ollama_unknown_model_falls_back_to_8192() {
+        let cap = provider_capability(ApiProvider::Ollama, "llama3.2:3b");
         assert_eq!(cap.context_window, 8192);
         assert_eq!(cap.max_output, 4096);
         assert!(!cap.thinking_supported);
