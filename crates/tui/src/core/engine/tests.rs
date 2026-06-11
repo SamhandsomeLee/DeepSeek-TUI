@@ -2930,6 +2930,33 @@ async fn pre_request_refresh_skips_compaction_below_normal_threshold() {
     assert_eq!(engine.session.messages.len(), before_len);
 }
 
+#[test]
+fn capacity_observation_uses_bare_kimi_context_window() {
+    // #3023: capacity math reads models::context_window_for_model directly,
+    // so bare Moonshot ids must resolve their real window, not the 128K
+    // legacy fallback.
+    let mut engine = build_engine_with_capacity(CapacityControllerConfig::default());
+    engine.session.model = "kimi-k2.6".to_string();
+    engine.session.messages.push(Message {
+        role: "user".to_string(),
+        content: vec![ContentBlock::Text {
+            text: "x".repeat(40_000),
+            cache_control: None,
+        }],
+    });
+
+    let estimated = engine.estimated_input_tokens() as f64;
+    let turn = TurnContext::new(1);
+    let observation = engine.capacity_observation(&turn);
+
+    let expected = estimated / 262_144.0;
+    assert!(
+        (observation.context_used_ratio - expected).abs() < 1e-9,
+        "context_used_ratio must use kimi-k2.6's 262,144-token window (got {})",
+        observation.context_used_ratio
+    );
+}
+
 #[tokio::test]
 async fn pre_request_refresh_invoked_when_medium_risk() {
     let capacity = CapacityControllerConfig {

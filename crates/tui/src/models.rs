@@ -263,9 +263,13 @@ fn known_context_window_for_model(model_lower: &str) -> Option<u32> {
         | "qwen/qwen3.6-27b"
         | "tencent/hy3-preview"
         | "moonshotai/kimi-k2.6"
-        | "moonshotai/kimi-k2.6:free" => Some(262_144),
-        "z-ai/glm-5.1" | "z-ai/glm-5v-turbo" => Some(202_752),
-        "minimax/minimax-m3" | "qwen/qwen3.6-flash" | "qwen/qwen3.6-plus" => Some(1_000_000),
+        | "moonshotai/kimi-k2.6:free"
+        | "kimi-k2.6"
+        | "kimi-for-coding" => Some(262_144),
+        "z-ai/glm-5.1" | "z-ai/glm-5v-turbo" | "glm-5.1" | "glm-5v-turbo" => Some(202_752),
+        "minimax/minimax-m3" | "minimax-m3" | "qwen/qwen3.6-flash" | "qwen/qwen3.6-plus" => {
+            Some(1_000_000)
+        }
         "xiaomi/mimo-v2.5-pro" | "xiaomi/mimo-v2.5" | "mimo-v2.5-pro" | "mimo-v2.5" => {
             Some(1_000_000)
         }
@@ -285,10 +289,12 @@ pub fn max_output_tokens_for_model(model: &str) -> Option<u32> {
         return Some(384_000);
     }
     match lower.as_str() {
-        "arcee-ai/trinity-large-thinking" | "trinity-large-thinking" | "moonshotai/kimi-k2.6" => {
-            Some(262_144)
-        }
-        "minimax/minimax-m3" => Some(524_288),
+        "arcee-ai/trinity-large-thinking"
+        | "trinity-large-thinking"
+        | "moonshotai/kimi-k2.6"
+        | "kimi-k2.6"
+        | "kimi-for-coding" => Some(262_144),
+        "minimax/minimax-m3" | "minimax-m3" => Some(524_288),
         "qwen/qwen3.6-35b-a3b" | "qwen/qwen3.6-27b" => Some(262_140),
         "qwen/qwen3.6-flash" | "qwen/qwen3.6-max-preview" | "qwen/qwen3.6-plus" => Some(65_536),
         "xiaomi/mimo-v2.5-pro" | "xiaomi/mimo-v2.5" | "mimo-v2.5-pro" | "mimo-v2.5" => {
@@ -328,7 +334,9 @@ pub fn model_supports_reasoning(model: &str) -> bool {
             | "google/gemma-4-26b-a4b-it:free"
             | "moonshotai/kimi-k2.6"
             | "moonshotai/kimi-k2.6:free"
+            | "kimi-k2.6"
             | "minimax/minimax-m3"
+            | "minimax-m3"
             | "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
             | "qwen/qwen3.6-flash"
             | "qwen/qwen3.6-35b-a3b"
@@ -341,6 +349,7 @@ pub fn model_supports_reasoning(model: &str) -> bool {
             | "mimo-v2.5-pro"
             | "mimo-v2.5"
             | "z-ai/glm-5.1"
+            | "glm-5.1"
     )
 }
 
@@ -600,6 +609,31 @@ mod tests {
             max_output_tokens_for_model("minimax/minimax-m3"),
             Some(524_288)
         );
+    }
+
+    #[test]
+    fn bare_provider_model_ids_mirror_vendor_prefixed_rows() {
+        // Direct-provider routes (Moonshot, MiniMax, Z.ai) serve bare model
+        // ids without the OpenRouter vendor prefix; both spellings must
+        // resolve identical metadata (#1310 ride-along on #3023).
+        for (model, expected_window) in [
+            ("kimi-k2.6", 262_144),
+            ("minimax-m3", 1_000_000),
+            ("glm-5.1", 202_752),
+        ] {
+            assert_eq!(context_window_for_model(model), Some(expected_window));
+            assert!(model_supports_reasoning(model));
+        }
+        assert_eq!(context_window_for_model("kimi-for-coding"), Some(262_144));
+        assert!(!model_supports_reasoning("kimi-for-coding"));
+        assert_eq!(context_window_for_model("glm-5v-turbo"), Some(202_752));
+        assert!(!model_supports_reasoning("glm-5v-turbo"));
+        assert_eq!(max_output_tokens_for_model("kimi-k2.6"), Some(262_144));
+        assert_eq!(
+            max_output_tokens_for_model("kimi-for-coding"),
+            Some(262_144)
+        );
+        assert_eq!(max_output_tokens_for_model("minimax-m3"), Some(524_288));
     }
 
     #[test]
