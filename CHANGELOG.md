@@ -28,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   metadata now lives in `commands/registry.rs`, slash parsing in
   `commands/parse.rs`, and handlers under group-owned command areas, preserving
   the existing dispatch surface while reducing future `commands/mod.rs` churn.
+- **Approval-rule source metadata (#1186/#2971).** Runtime API
+  `approval.required` events now include optional `matched_rule` metadata when
+  an execution-policy rule caused the prompt. Thanks @greyfreedom for the PR
+  and @Ram9199 for the audit-semantics discussion.
 
 ### Fixed
 

@@ -407,6 +407,10 @@ Common event names: `thread.started`, `thread.forked`, `turn.started`,
 `item.failed`, `item.interrupted`, `approval.required`, `approval.decided`,
 `approval.timeout`, `sandbox.denied`, `coherence.state`.
 
+`approval.required` events may include a `matched_rule` string when an
+execution-policy rule caused the prompt. This field is explanatory metadata for
+clients and does not grant or persist permissions.
+
 ## Security boundary
 
 - **Localhost by default**. The server binds to `127.0.0.1` by default.

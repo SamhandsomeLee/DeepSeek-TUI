@@ -1156,6 +1156,7 @@ impl Runtime {
             let reason = decision.reason().to_string();
             let maybe_approval_frame = approval_request_frame(
                 &decision.requirement,
+                decision.matched_rule.as_deref(),
                 call_id,
                 approval_id.clone(),
                 response_id.clone(),
@@ -1578,6 +1579,7 @@ fn to_persisted_source(source: &codewhale_protocol::SessionSource) -> SessionSou
 
 fn approval_request_frame(
     requirement: &ExecApprovalRequirement,
+    matched_rule: Option<&str>,
     call_id: String,
     approval_id: String,
     turn_id: String,
@@ -1620,6 +1622,7 @@ fn approval_request_frame(
             command,
             cwd,
             reason: reason.clone(),
+            matched_rule: matched_rule.map(|rule| rule.to_string().into_boxed_str()),
             network_approval_context: None,
             proposed_execpolicy_amendment: proposed_execpolicy_amendment
                 .as_ref()
@@ -1884,6 +1887,36 @@ mod tests {
         };
 
         assert_eq!(permission_path_for_call(&call), None);
+    }
+
+    #[test]
+    fn approval_request_frame_includes_matched_rule() {
+        let requirement = ExecApprovalRequirement::NeedsApproval {
+            reason: "Typed ask rule 'tool=exec_shell command=cargo test' requires approval."
+                .to_string(),
+            proposed_execpolicy_amendment: None,
+            proposed_network_policy_amendments: Vec::new(),
+        };
+
+        let frame = approval_request_frame(
+            &requirement,
+            Some("tool=exec_shell command=cargo test"),
+            "call-1".to_string(),
+            "approval-1".to_string(),
+            "turn-1".to_string(),
+            "cargo test --workspace".to_string(),
+            "/repo".to_string(),
+        )
+        .expect("approval frame");
+
+        let EventFrame::ExecApprovalRequest { request } = frame else {
+            panic!("expected exec approval request frame");
+        };
+        assert_eq!(
+            request.matched_rule.as_deref(),
+            Some("tool=exec_shell command=cargo test")
+        );
+        assert_eq!(request.reason, requirement.reason());
     }
 
     #[test]

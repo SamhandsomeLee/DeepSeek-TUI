@@ -15,6 +15,7 @@ use tokio::io::AsyncWriteExt;
 /// serialised with a `"type"` discriminator using `snake_case` naming (e.g.
 /// `"response_start"`, `"tool_lifecycle"`), making it easy to consume from
 /// JSON-based log files or webhook receivers.
+#[allow(clippy::large_enum_variant)] // Keep the public HookEvent shape stable for 0.8.x.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HookEvent {
