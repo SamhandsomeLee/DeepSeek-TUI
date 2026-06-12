@@ -526,6 +526,53 @@ mod tests {
     }
 
     #[test]
+    fn update_version_from_env_prefers_primary_then_legacy() {
+        {
+            let _env = ReleaseEnvGuard::clear();
+            set_release_env(UPDATE_VERSION_ENV, "  v1.2.3  ");
+
+            assert_eq!(update_version_from_env().as_deref(), Some("1.2.3"));
+        }
+
+        {
+            let _env = ReleaseEnvGuard::clear();
+            set_release_env(LEGACY_UPDATE_VERSION_ENV, "v1.2.4");
+
+            assert_eq!(update_version_from_env().as_deref(), Some("1.2.4"));
+        }
+    }
+
+    #[test]
+    fn update_version_from_env_ignores_missing_or_empty_values() {
+        let _env = ReleaseEnvGuard::clear();
+        assert_eq!(update_version_from_env(), None);
+
+        set_release_env(UPDATE_VERSION_ENV, "   ");
+        set_release_env(LEGACY_UPDATE_VERSION_ENV, "");
+
+        assert_eq!(update_version_from_env(), None);
+    }
+
+    #[test]
+    fn update_network_fallback_hint_mentions_required_mirror_inputs() {
+        let hint = update_network_fallback_hint();
+
+        assert!(hint.contains(CNB_REPO_URL), "hint missing CNB_REPO_URL");
+        assert!(
+            hint.contains(RELEASE_BASE_URL_ENV),
+            "hint missing RELEASE_BASE_URL_ENV"
+        );
+        assert!(
+            hint.contains(UPDATE_VERSION_ENV),
+            "hint missing UPDATE_VERSION_ENV"
+        );
+        assert!(
+            hint.contains(CHECKSUM_MANIFEST_ASSET),
+            "hint missing CHECKSUM_MANIFEST_ASSET"
+        );
+    }
+
+    #[test]
     fn resolve_release_query_uses_github_without_overrides() {
         let _env = ReleaseEnvGuard::clear();
 

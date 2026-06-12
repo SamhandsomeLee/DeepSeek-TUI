@@ -522,6 +522,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tool_result_success_sets_plain_content() {
+        let content = "operation completed successfully";
+        let result = ToolResult::success(content);
+
+        assert!(result.success);
+        assert_eq!(result.content, content);
+        assert!(result.metadata.is_none());
+    }
+
+    #[test]
     fn tool_result_json_round_trips_content() {
         let result = ToolResult::json(&json!({"ok": true})).expect("json");
         assert!(result.success);
@@ -532,12 +542,36 @@ mod tests {
     fn helper_extractors_validate_shape() {
         let input = json!({"name": "demo", "count": 7, "enabled": true});
         assert_eq!(required_str(&input, "name").expect("name"), "demo");
+        assert_eq!(optional_str(&input, "name"), Some("demo"));
+        assert_eq!(optional_str(&input, "missing"), None);
+        assert_eq!(optional_str(&input, "count"), None);
+        assert_eq!(optional_str(&json!({"name": null}), "name"), None);
         assert_eq!(optional_u64(&input, "count", 0), 7);
         assert!(optional_bool(&input, "enabled", false));
         assert!(matches!(
             required_u64(&input, "name"),
             Err(ToolError::MissingField { .. })
         ));
+    }
+
+    #[test]
+    fn required_u64_rejects_missing_or_non_integer_values() {
+        assert!(matches!(
+            required_u64(&json!({}), "count"),
+            Err(ToolError::MissingField { .. })
+        ));
+        assert_eq!(required_u64(&json!({"count": 42}), "count").unwrap(), 42);
+        assert_eq!(
+            required_u64(&json!({"count": u64::MAX}), "count").unwrap(),
+            u64::MAX
+        );
+
+        for value in [json!(-1), json!(3.14), json!("42")] {
+            assert!(matches!(
+                required_u64(&json!({"count": value}), "count"),
+                Err(ToolError::MissingField { .. })
+            ));
+        }
     }
 
     #[test]
@@ -564,6 +598,17 @@ mod tests {
     fn tool_error_missing_field_constructor() {
         let err = ToolError::missing_field("my_field");
         assert!(matches!(err, ToolError::MissingField { field } if field == "my_field"));
+    }
+
+    #[test]
+    fn tool_error_not_available_displays_reason() {
+        let err = ToolError::not_available("custom tool not found");
+
+        assert!(matches!(err, ToolError::NotAvailable { .. }));
+        assert_eq!(
+            err.to_string(),
+            "Failed to locate tool: custom tool not found"
+        );
     }
 
     #[test]
