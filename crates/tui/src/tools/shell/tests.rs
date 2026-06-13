@@ -181,6 +181,23 @@ fn exec_shell_parallel_flags_are_input_aware() {
             "{input:?}"
         );
     }
+
+    assert!(tool.starts_detached_for(&json!({
+        "command": "cargo check --workspace",
+        "background": true
+    })));
+    assert!(tool.starts_detached_for(&json!({
+        "command": "cargo test -p codewhale-tui --bins",
+        "tty": true
+    })));
+    assert!(!tool.starts_detached_for(&json!({
+        "command": "cargo check --workspace"
+    })));
+    assert!(!tool.starts_detached_for(&json!({
+        "command": "cargo check --workspace",
+        "background": true,
+        "interactive": true
+    })));
 }
 
 #[test]

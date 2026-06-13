@@ -47,6 +47,7 @@ pub(super) struct ToolExecutionPlan {
     pub(super) approval_description: String,
     pub(super) supports_parallel: bool,
     pub(super) read_only: bool,
+    pub(super) detached_start: bool,
     pub(super) blocked_error: Option<ToolError>,
     pub(super) guard_result: Option<ToolResult>,
 }
@@ -301,11 +302,17 @@ pub(super) fn parse_parallel_tool_calls(
 
 #[cfg(test)]
 pub(super) fn should_parallelize_tool_batch(plans: &[ToolExecutionPlan]) -> bool {
-    !plans.is_empty() && plans.iter().all(tool_plan_is_parallel_safe)
+    !plans.is_empty() && plans.iter().all(tool_plan_can_join_parallel_batch)
 }
 
 pub(super) fn tool_plan_is_parallel_safe(plan: &ToolExecutionPlan) -> bool {
     plan.read_only && plan.supports_parallel && !plan.approval_required && !plan.interactive
+}
+
+pub(super) fn tool_plan_can_join_parallel_batch(plan: &ToolExecutionPlan) -> bool {
+    plan.blocked_error.is_none()
+        && (tool_plan_is_parallel_safe(plan)
+            || (plan.detached_start && !plan.approval_required && !plan.interactive))
 }
 
 pub(super) fn plan_tool_execution_batches(
@@ -315,7 +322,7 @@ pub(super) fn plan_tool_execution_batches(
     let mut parallel_chunk = Vec::new();
 
     for plan in plans {
-        if tool_plan_is_parallel_safe(&plan) {
+        if tool_plan_can_join_parallel_batch(&plan) {
             parallel_chunk.push(plan);
             continue;
         }

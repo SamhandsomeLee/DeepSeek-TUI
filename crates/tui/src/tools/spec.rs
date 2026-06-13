@@ -677,6 +677,13 @@ pub trait ToolSpec: Send + Sync {
         self.supports_parallel()
     }
 
+    /// Returns whether this input starts durable/detached work and returns
+    /// immediately. Detached starts are not read-only, but in auto-approved
+    /// turns they do not need to block neighboring read-only inspections.
+    fn starts_detached_for(&self, _input: &Value) -> bool {
+        false
+    }
+
     /// Returns whether this tool should be excluded from the model-visible
     /// tool catalog (deferred loading). Tools marked `true` are registered
     /// but not sent to the model until explicitly activated via tool search.

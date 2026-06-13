@@ -1400,6 +1400,7 @@ impl Engine {
                 let mut approval_description = "Tool execution requires approval".to_string();
                 let mut supports_parallel = false;
                 let mut read_only = false;
+                let mut detached_start = false;
                 let mut blocked_error: Option<ToolError> = None;
                 let mut guard_result: Option<ToolResult> = None;
                 // #3026: set by a hook `ask` decision; applied AFTER the
@@ -1530,11 +1531,13 @@ impl Engine {
                 } else if let Some(registry) = tool_registry
                     && let Some(spec) = registry.get(&tool_name)
                 {
-                    approval_required =
-                        spec.approval_requirement_for(&tool_input) != ApprovalRequirement::Auto;
+                    approval_required = spec.approval_requirement_for(&tool_input)
+                        != ApprovalRequirement::Auto
+                        && !registry.context().auto_approve;
                     approval_description = spec.description().to_string();
                     supports_parallel = spec.supports_parallel_for(&tool_input);
                     read_only = spec.is_read_only_for(&tool_input);
+                    detached_start = spec.starts_detached_for(&tool_input);
                 } else if tool_name == CODE_EXECUTION_TOOL_NAME {
                     approval_required = true;
                     approval_description =
@@ -1607,6 +1610,7 @@ impl Engine {
                     approval_description,
                     supports_parallel,
                     read_only,
+                    detached_start,
                     blocked_error,
                     guard_result,
                 });
@@ -1640,11 +1644,25 @@ impl Engine {
                 .collect::<Vec<_>>();
             if !parallel_chunks.is_empty() {
                 let parallel_tool_count: usize = parallel_chunks.iter().sum();
+                let detached_start_count: usize = batches
+                    .iter()
+                    .filter_map(|batch| match batch {
+                        ToolExecutionBatch::Parallel(plans) if plans.len() > 1 => {
+                            Some(plans.iter().filter(|plan| plan.detached_start).count())
+                        }
+                        _ => None,
+                    })
+                    .sum();
+                let tool_kind = if detached_start_count > 0 {
+                    "read-only/background-start tools"
+                } else {
+                    "read-only tools"
+                };
                 let _ = self
                     .tx_event
                     .send(Event::status(format!(
-                        "Executing {parallel_tool_count} read-only tools in {} parallel chunk(s)",
-                        parallel_chunks.len()
+                        "Executing {parallel_tool_count} {tool_kind} in {} parallel chunk(s)",
+                        parallel_chunks.len(),
                     )))
                     .await;
             } else if plan_count > 1 {
@@ -1717,7 +1735,7 @@ impl Engine {
                             };
                             let mut result = Engine::execute_tool_with_lock(
                                 lock,
-                                plan.supports_parallel,
+                                plan.supports_parallel || plan.detached_start,
                                 plan.interactive,
                                 tx_event.clone(),
                                 plan.name.clone(),

@@ -273,6 +273,7 @@ fn make_plan_at(
         approval_description: "desc".to_string(),
         supports_parallel,
         read_only,
+        detached_start: false,
         blocked_error: None,
         guard_result: None,
     }
@@ -435,6 +436,14 @@ fn parallel_batch_requires_read_only_parallel_tools() {
 
     let plans = vec![make_plan(true, true, false, true)];
     assert!(!should_parallelize_tool_batch(&plans));
+
+    let mut background = make_plan(false, false, false, false);
+    background.detached_start = true;
+    assert!(should_parallelize_tool_batch(&[background]));
+
+    let mut gated_background = make_plan(false, false, true, false);
+    gated_background.detached_start = true;
+    assert!(!should_parallelize_tool_batch(&[gated_background]));
 }
 
 #[test]
@@ -527,6 +536,37 @@ fn shell_readonly_plans_batch_around_serial_barrier() {
             );
         }
         ToolExecutionBatch::Serial(_) => panic!("third batch should be parallel"),
+    }
+}
+
+#[test]
+fn background_shell_starts_batch_with_readonly_tools_when_auto_approved() {
+    let mut shell_a = make_plan_at(0, true, true, false, false);
+    shell_a.name = "exec_shell".to_string();
+    shell_a.input = json!({"command": "git status -s"});
+
+    let mut background_cargo = make_plan_at(1, false, false, false, false);
+    background_cargo.name = "exec_shell".to_string();
+    background_cargo.input = json!({"command": "cargo check --workspace", "background": true});
+    background_cargo.detached_start = true;
+
+    let mut shell_b = make_plan_at(2, true, true, false, false);
+    shell_b.name = "exec_shell".to_string();
+    shell_b.input = json!({"command": "rg TODO crates/tui/src/core"});
+
+    let batches = plan_tool_execution_batches(vec![shell_a, background_cargo, shell_b]);
+    assert_eq!(batches.len(), 1);
+
+    match &batches[0] {
+        ToolExecutionBatch::Parallel(plans) => {
+            assert_eq!(
+                plans.iter().map(|plan| plan.index).collect::<Vec<_>>(),
+                vec![0, 1, 2]
+            );
+        }
+        ToolExecutionBatch::Serial(_) => {
+            panic!("background shell start should join parallel batch")
+        }
     }
 }
 

@@ -1935,6 +1935,19 @@ fn exec_shell_input_is_parallel_readonly(input: &serde_json::Value) -> bool {
     is_parallel_readonly_command(command)
 }
 
+fn exec_shell_input_starts_detached(input: &serde_json::Value) -> bool {
+    input
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .is_some()
+        && input
+            .get("interactive")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        && (input.get("background").and_then(serde_json::Value::as_bool) == Some(true)
+            || input.get("tty").and_then(serde_json::Value::as_bool) == Some(true))
+}
+
 async fn execute_foreground_via_background(
     context: &ToolContext,
     command: &str,
@@ -2097,6 +2110,10 @@ impl ToolSpec for ExecShellTool {
 
     fn supports_parallel_for(&self, input: &serde_json::Value) -> bool {
         exec_shell_input_is_parallel_readonly(input)
+    }
+
+    fn starts_detached_for(&self, input: &serde_json::Value) -> bool {
+        exec_shell_input_starts_detached(input)
     }
 
     async fn execute(
