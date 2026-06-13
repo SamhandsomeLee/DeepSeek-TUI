@@ -41,6 +41,10 @@ base_url = "https://api.deepseek.com/beta"
 #   arcee-ai/trinity-large-thinking — OpenRouter Arcee Trinity Large Thinking
 #   xiaomi/mimo-v2.5-pro          — OpenRouter Xiaomi MiMo 2.5 Pro
 #   xiaomi/mimo-v2.5              — OpenRouter Xiaomi MiMo 2.5
+#   z-ai/glm-5.1                  — OpenRouter Z.AI GLM 5.1
+#   z-ai/glm-5.2                  — OpenRouter Z.AI GLM 5.2 (opt-in preview)
+#   GLM-5.1                       — default direct Z.AI Coding Plan model
+#   GLM-5.2                       — direct Z.AI opt-in preview model
 #   kimi-k2.6                       — default Moonshot/Kimi model ID
 #   gpt-4.1                         — default generic OpenAI-compatible model ID
 #   deepseek-ai/deepseek-v4-flash   — default AtlasCloud model ID
@@ -343,7 +347,8 @@ max_subagents = 10 # optional (1-20)
 # Recent large model IDs also accepted here include arcee-ai/trinity-large-thinking,
 # minimax/minimax-m3, minimax/minimax-2.7, xiaomi/mimo-v2.5-pro, qwen/qwen3.6-flash,
 # qwen/qwen3.6-35b-a3b, qwen/qwen3.6-max-preview, qwen/qwen3.6-27b, qwen/qwen3.6-plus,
-# qwen/qwen3.7-max, google/gemma-4-31b-it, z-ai/glm-5.1, moonshotai/kimi-k2.6,
+# qwen/qwen3.7-max, google/gemma-4-31b-it, z-ai/glm-5.1, z-ai/glm-5.2,
+# moonshotai/kimi-k2.6,
 # nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free, and nvidia/nemotron-3-ultra.
 
 # Xiaomi MiMo OpenAI-compatible endpoint (https://platform.xiaomimimo.com)
@@ -401,6 +406,22 @@ max_subagents = 10 # optional (1-20)
 # # base_url = "https://api.kimi.com/coding/v1"
 # # model = "kimi-for-coding"
 # # auth_mode = "kimi_oauth"                   # reads Kimi Code OAuth credentials
+
+# Z.AI GLM Coding Plan endpoint (https://docs.z.ai)
+[providers.zai]
+# api_key = "YOUR_ZAI_API_KEY"                 # or Z_AI_API_KEY
+# base_url = "https://api.z.ai/api/coding/paas/v4"
+# # General API endpoint, if you are not using the Coding Plan:
+# # base_url = "https://api.z.ai/api/paas/v4"
+# model = "GLM-5.1"                             # default; GLM-5.2 is opt-in preview
+
+# MiniMax direct OpenAI-compatible endpoint (https://platform.minimax.io)
+[providers.minimax]
+# api_key = "YOUR_MINIMAX_API_KEY"
+# base_url = "https://api.minimax.io/v1"
+# model = "MiniMax-M3"                          # or MiniMax-M2.7, MiniMax-M2.7-highspeed
+# # MiniMax also publishes Anthropic-compatible endpoints:
+# # global https://api.minimax.io/anthropic, China https://api.minimaxi.com/anthropic.
 
 # Self-hosted SGLang OpenAI-compatible server
 [providers.sglang]

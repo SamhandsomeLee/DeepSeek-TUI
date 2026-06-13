@@ -322,6 +322,13 @@ impl Default for ModelRegistry {
                 supports_reasoning: true,
             },
             ModelInfo {
+                id: "z-ai/glm-5.2".to_string(),
+                provider: ProviderKind::Openrouter,
+                aliases: vec!["glm-5.2".to_string(), "zai-glm-5.2".to_string()],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
                 id: "tencent/hy3-preview".to_string(),
                 provider: ProviderKind::Openrouter,
                 aliases: vec!["hy3-preview".to_string(), "tencent-hy3-preview".to_string()],
@@ -1263,7 +1270,9 @@ mod tests {
             ("qwen3.6-plus", "qwen/qwen3.6-plus"),
             ("gemma-4-31b-it", "google/gemma-4-31b-it"),
             ("glm-5.1", "z-ai/glm-5.1"),
+            ("glm-5.2", "z-ai/glm-5.2"),
             ("minimax-m3", "minimax/minimax-m3"),
+            ("minimax-2.7", "minimax/minimax-2.7"),
             ("openrouter-mimo-v2.5-pro", "xiaomi/mimo-v2.5-pro"),
             ("openrouter-kimi-k2.7-code", "moonshotai/kimi-k2.7-code"),
             ("openrouter-kimi-k2.6", "moonshotai/kimi-k2.6"),

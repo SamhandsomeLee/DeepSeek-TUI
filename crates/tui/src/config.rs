@@ -71,6 +71,7 @@ pub const OPENROUTER_ARCEE_TRINITY_LARGE_THINKING_MODEL: &str = "arcee-ai/trinit
 pub const OPENROUTER_GEMMA_4_31B_MODEL: &str = "google/gemma-4-31b-it";
 pub const OPENROUTER_GEMMA_4_26B_A4B_MODEL: &str = "google/gemma-4-26b-a4b-it";
 pub const OPENROUTER_GLM_5_1_MODEL: &str = "z-ai/glm-5.1";
+pub const OPENROUTER_GLM_5_2_MODEL: &str = "z-ai/glm-5.2";
 pub const OPENROUTER_KIMI_K2_7_CODE_MODEL: &str = "moonshotai/kimi-k2.7-code";
 pub const OPENROUTER_KIMI_K2_6_MODEL: &str = "moonshotai/kimi-k2.6";
 pub const OPENROUTER_MINIMAX_M3_MODEL: &str = "minimax/minimax-m3";
@@ -103,6 +104,7 @@ pub const RECENT_OPENROUTER_LARGE_MODELS: &[&str] = &[
     OPENROUTER_KIMI_K2_7_CODE_MODEL,
     OPENROUTER_KIMI_K2_6_MODEL,
     OPENROUTER_GLM_5_1_MODEL,
+    OPENROUTER_GLM_5_2_MODEL,
     OPENROUTER_TENCENT_HY3_PREVIEW_MODEL,
     OPENROUTER_GEMMA_4_31B_MODEL,
     OPENROUTER_GEMMA_4_26B_A4B_MODEL,
@@ -172,6 +174,7 @@ pub const COMMON_DEEPSEEK_MODELS: &[&str] = &[
 ];
 pub const OFFICIAL_DEEPSEEK_MODELS: &[&str] = &["deepseek-v4-pro", "deepseek-v4-flash"];
 pub const DEFAULT_ZAI_MODEL: &str = "GLM-5.1";
+pub const ZAI_GLM_5_2_MODEL: &str = "GLM-5.2";
 pub const DEFAULT_ZAI_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 pub const DEFAULT_STEPFUN_MODEL: &str = "step-3.7-flash";
 pub const DEFAULT_STEPFUN_BASE_URL: &str = "https://api.stepfun.ai/v1";
@@ -657,6 +660,9 @@ fn canonical_openrouter_recent_model_id(model: &str) -> Option<&'static str> {
         OPENROUTER_GLM_5_1_MODEL | "glm-5.1" | "glm-5-1" | "zai-glm-5.1" | "zai-glm-5-1" => {
             Some(OPENROUTER_GLM_5_1_MODEL)
         }
+        OPENROUTER_GLM_5_2_MODEL | "glm-5.2" | "glm-5-2" | "zai-glm-5.2" | "zai-glm-5-2" => {
+            Some(OPENROUTER_GLM_5_2_MODEL)
+        }
         OPENROUTER_KIMI_K2_7_CODE_MODEL
         | "kimi"
         | "kimi-k2"
@@ -673,6 +679,13 @@ fn canonical_openrouter_recent_model_id(model: &str) -> Option<&'static str> {
         OPENROUTER_MINIMAX_M3_MODEL | "minimax-m3" | "minimax-m-3" => {
             Some(OPENROUTER_MINIMAX_M3_MODEL)
         }
+        OPENROUTER_MINIMAX_2_7_MODEL
+        | "minimax-2.7"
+        | "minimax-2-7"
+        | "minimax-m2.7"
+        | "minimax-m2-7"
+        | "minimax-m-2.7"
+        | "minimax-m-2-7" => Some(OPENROUTER_MINIMAX_2_7_MODEL),
         OPENROUTER_NEMOTRON_3_NANO_OMNI_MODEL
         | "nemotron-3-nano-omni"
         | "nemotron-3-nano-omni-reasoning" => Some(OPENROUTER_NEMOTRON_3_NANO_OMNI_MODEL),
@@ -797,6 +810,16 @@ fn canonical_moonshot_model_id(model: &str) -> Option<&'static str> {
     }
 }
 
+fn canonical_zai_model_id(model: &str) -> Option<&'static str> {
+    let normalized = model.trim().to_ascii_lowercase();
+    let normalized = normalized.replace(['_', ' '], "-");
+    match normalized.as_str() {
+        "glm-5.1" | "glm-5-1" | "zai-glm-5.1" | "zai-glm-5-1" => Some(DEFAULT_ZAI_MODEL),
+        "glm-5.2" | "glm-5-2" | "zai-glm-5.2" | "zai-glm-5-2" => Some(ZAI_GLM_5_2_MODEL),
+        _ => None,
+    }
+}
+
 fn canonical_minimax_model_id(model: &str) -> Option<&'static str> {
     let normalized = model.trim().to_ascii_lowercase();
     let normalized = normalized.replace(['_', ' '], "-");
@@ -862,6 +885,12 @@ pub fn normalize_model_name_for_provider(provider: ApiProvider, model: &str) -> 
 
     if matches!(provider, ApiProvider::Moonshot) {
         return canonical_moonshot_model_id(model)
+            .map(ToString::to_string)
+            .or_else(|| normalize_custom_model_id(model));
+    }
+
+    if matches!(provider, ApiProvider::Zai) {
+        return canonical_zai_model_id(model)
             .map(ToString::to_string)
             .or_else(|| normalize_custom_model_id(model));
     }
@@ -950,7 +979,7 @@ pub fn model_completion_names_for_provider(provider: ApiProvider) -> Vec<&'stati
         ApiProvider::Openai | ApiProvider::Atlascloud => OFFICIAL_DEEPSEEK_MODELS.to_vec(),
         ApiProvider::Together => vec![DEFAULT_TOGETHER_MODEL],
         ApiProvider::OpenaiCodex => vec![DEFAULT_OPENAI_CODEX_MODEL],
-        ApiProvider::Zai => vec![DEFAULT_ZAI_MODEL],
+        ApiProvider::Zai => vec![DEFAULT_ZAI_MODEL, ZAI_GLM_5_2_MODEL],
         ApiProvider::Stepfun => vec![DEFAULT_STEPFUN_MODEL],
         ApiProvider::Anthropic => vec![
             ANTHROPIC_OPUS_MODEL,
@@ -8427,8 +8456,10 @@ api_key = "old-openrouter-key"
             ("kimi", OPENROUTER_KIMI_K2_7_CODE_MODEL),
             ("kimi-k2.6", OPENROUTER_KIMI_K2_6_MODEL),
             ("minimax-m3", OPENROUTER_MINIMAX_M3_MODEL),
+            ("minimax-2.7", OPENROUTER_MINIMAX_2_7_MODEL),
             ("gemma-4-31b-it", OPENROUTER_GEMMA_4_31B_MODEL),
             ("glm-5.1", OPENROUTER_GLM_5_1_MODEL),
+            ("glm-5.2", OPENROUTER_GLM_5_2_MODEL),
         ] {
             assert_eq!(
                 normalize_model_name_for_provider(ApiProvider::Openrouter, alias).as_deref(),
@@ -8565,11 +8596,14 @@ api_key = "old-openrouter-key"
             OPENROUTER_ARCEE_TRINITY_LARGE_THINKING_MODEL,
             OPENROUTER_XIAOMI_MIMO_V2_5_PRO_MODEL,
             OPENROUTER_MINIMAX_M3_MODEL,
+            OPENROUTER_MINIMAX_2_7_MODEL,
             OPENROUTER_QWEN_3_6_FLASH_MODEL,
             OPENROUTER_QWEN_3_6_35B_A3B_MODEL,
             OPENROUTER_QWEN_3_6_MAX_PREVIEW_MODEL,
             OPENROUTER_QWEN_3_6_27B_MODEL,
             OPENROUTER_QWEN_3_6_PLUS_MODEL,
+            OPENROUTER_GLM_5_1_MODEL,
+            OPENROUTER_GLM_5_2_MODEL,
             OPENROUTER_GEMMA_4_31B_MODEL,
         ] {
             assert!(models.contains(&expected), "missing {expected}");
@@ -8581,6 +8615,33 @@ api_key = "old-openrouter-key"
         assert_eq!(
             model_completion_names_for_provider(ApiProvider::Moonshot),
             vec![DEFAULT_MOONSHOT_MODEL]
+        );
+    }
+
+    #[test]
+    fn model_completion_names_for_zai_keep_5_1_default_and_include_5_2() {
+        let models = model_completion_names_for_provider(ApiProvider::Zai);
+
+        assert_eq!(models.first().copied(), Some(DEFAULT_ZAI_MODEL));
+        assert!(models.contains(&ZAI_GLM_5_2_MODEL));
+    }
+
+    #[test]
+    fn normalize_model_name_for_zai_canonicalizes_current_glm_models() {
+        for (alias, expected) in [
+            ("glm-5.1", DEFAULT_ZAI_MODEL),
+            ("glm-5-1", DEFAULT_ZAI_MODEL),
+            ("glm-5.2", ZAI_GLM_5_2_MODEL),
+            ("zai-glm-5-2", ZAI_GLM_5_2_MODEL),
+        ] {
+            assert_eq!(
+                normalize_model_name_for_provider(ApiProvider::Zai, alias).as_deref(),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            normalize_model_name_for_provider(ApiProvider::Zai, "glm-next-preview").as_deref(),
+            Some("glm-next-preview")
         );
     }
 
@@ -11360,6 +11421,9 @@ model = "deepseek-ai/deepseek-v4-pro"
             (OPENROUTER_QWEN_3_6_PLUS_MODEL, 1_000_000, 65_536),
             (OPENROUTER_XIAOMI_MIMO_V2_5_PRO_MODEL, 1_000_000, 131_072),
             (OPENROUTER_MINIMAX_M3_MODEL, 1_000_000, 524_288),
+            (OPENROUTER_MINIMAX_2_7_MODEL, 204_800, 4096),
+            (OPENROUTER_GLM_5_1_MODEL, 202_752, 131_072),
+            (OPENROUTER_GLM_5_2_MODEL, 1_000_000, 131_072),
             (OPENROUTER_NEMOTRON_3_ULTRA_MODEL, 1_000_000, 16_384),
         ] {
             let cap = provider_capability(ApiProvider::Openrouter, model);
@@ -11537,6 +11601,23 @@ model = "deepseek-ai/deepseek-v4-pro"
             cap.request_payload_mode,
             RequestPayloadMode::ChatCompletions
         );
+    }
+
+    #[test]
+    fn provider_capability_zai_keeps_5_1_default_and_tracks_5_2_window() {
+        let default = provider_capability(ApiProvider::Zai, DEFAULT_ZAI_MODEL);
+        assert_eq!(default.resolved_model, DEFAULT_ZAI_MODEL);
+        assert_eq!(default.context_window, 202_752);
+        assert_eq!(default.max_output, 131_072);
+        assert!(default.thinking_supported);
+        assert!(!default.cache_telemetry_supported);
+
+        let preview = provider_capability(ApiProvider::Zai, ZAI_GLM_5_2_MODEL);
+        assert_eq!(preview.resolved_model, ZAI_GLM_5_2_MODEL);
+        assert_eq!(preview.context_window, 1_000_000);
+        assert_eq!(preview.max_output, 131_072);
+        assert!(preview.thinking_supported);
+        assert!(!preview.cache_telemetry_supported);
     }
 
     #[test]

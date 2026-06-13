@@ -43,8 +43,11 @@ const OPENROUTER_ARCEE_TRINITY_LARGE_THINKING_MODEL: &str = "arcee-ai/trinity-la
 const OPENROUTER_GEMMA_4_31B_MODEL: &str = "google/gemma-4-31b-it";
 const OPENROUTER_GEMMA_4_26B_A4B_MODEL: &str = "google/gemma-4-26b-a4b-it";
 const OPENROUTER_GLM_5_1_MODEL: &str = "z-ai/glm-5.1";
+const OPENROUTER_GLM_5_2_MODEL: &str = "z-ai/glm-5.2";
 const OPENROUTER_KIMI_K2_7_CODE_MODEL: &str = "moonshotai/kimi-k2.7-code";
 const OPENROUTER_KIMI_K2_6_MODEL: &str = "moonshotai/kimi-k2.6";
+const OPENROUTER_MINIMAX_M3_MODEL: &str = "minimax/minimax-m3";
+const OPENROUTER_MINIMAX_2_7_MODEL: &str = "minimax/minimax-2.7";
 const OPENROUTER_NEMOTRON_3_NANO_OMNI_MODEL: &str =
     "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free";
 const OPENROUTER_QWEN_3_6_FLASH_MODEL: &str = "qwen/qwen3.6-flash";
@@ -104,6 +107,7 @@ const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
 
 // Z.ai (GLM Coding Plan) defaults
 const DEFAULT_ZAI_MODEL: &str = "GLM-5.1";
+const ZAI_GLM_5_2_MODEL: &str = "GLM-5.2";
 const DEFAULT_ZAI_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 // StepFun / StepFlash defaults
 const DEFAULT_STEPFUN_MODEL: &str = "step-3.7-flash";
@@ -2394,6 +2398,11 @@ fn normalize_model_for_provider(provider: ProviderKind, model: &str) -> String {
     {
         return canonical.to_string();
     }
+    if matches!(provider, ProviderKind::Zai)
+        && let Some(canonical) = canonical_zai_model_id(model)
+    {
+        return canonical.to_string();
+    }
 
     if matches!(
         provider,
@@ -2590,6 +2599,16 @@ fn canonical_minimax_model_id(model: &str) -> Option<&'static str> {
     }
 }
 
+fn canonical_zai_model_id(model: &str) -> Option<&'static str> {
+    let normalized = model.trim().to_ascii_lowercase();
+    let normalized = normalized.replace(['_', ' '], "-");
+    match normalized.as_str() {
+        "glm-5.1" | "glm-5-1" | "zai-glm-5.1" | "zai-glm-5-1" => Some(DEFAULT_ZAI_MODEL),
+        "glm-5.2" | "glm-5-2" | "zai-glm-5.2" | "zai-glm-5-2" => Some(ZAI_GLM_5_2_MODEL),
+        _ => None,
+    }
+}
+
 fn canonical_openrouter_recent_model_id(model: &str) -> Option<&'static str> {
     let normalized = model.trim().to_ascii_lowercase();
     let normalized = normalized.replace(['_', ' '], "-");
@@ -2608,6 +2627,9 @@ fn canonical_openrouter_recent_model_id(model: &str) -> Option<&'static str> {
         OPENROUTER_GLM_5_1_MODEL | "glm-5.1" | "glm-5-1" | "zai-glm-5.1" | "zai-glm-5-1" => {
             Some(OPENROUTER_GLM_5_1_MODEL)
         }
+        OPENROUTER_GLM_5_2_MODEL | "glm-5.2" | "glm-5-2" | "zai-glm-5.2" | "zai-glm-5-2" => {
+            Some(OPENROUTER_GLM_5_2_MODEL)
+        }
         OPENROUTER_KIMI_K2_7_CODE_MODEL
         | "kimi"
         | "kimi-k2"
@@ -2621,6 +2643,16 @@ fn canonical_openrouter_recent_model_id(model: &str) -> Option<&'static str> {
         OPENROUTER_KIMI_K2_6_MODEL | "kimi-k2.6" | "kimi-k2-6" | "moonshot-kimi-k2.6" => {
             Some(OPENROUTER_KIMI_K2_6_MODEL)
         }
+        OPENROUTER_MINIMAX_M3_MODEL | "minimax-m3" | "minimax-m-3" => {
+            Some(OPENROUTER_MINIMAX_M3_MODEL)
+        }
+        OPENROUTER_MINIMAX_2_7_MODEL
+        | "minimax-2.7"
+        | "minimax-2-7"
+        | "minimax-m2.7"
+        | "minimax-m2-7"
+        | "minimax-m-2.7"
+        | "minimax-m-2-7" => Some(OPENROUTER_MINIMAX_2_7_MODEL),
         OPENROUTER_NEMOTRON_3_NANO_OMNI_MODEL
         | "nemotron-3-nano-omni"
         | "nemotron-3-nano-omni-reasoning" => Some(OPENROUTER_NEMOTRON_3_NANO_OMNI_MODEL),
@@ -5754,6 +5786,22 @@ mode = "token-plan-usa"
     }
 
     #[test]
+    fn zai_aliases_resolve_to_canonical_models() {
+        assert_eq!(
+            normalize_model_for_provider(ProviderKind::Zai, "glm-5.1"),
+            DEFAULT_ZAI_MODEL
+        );
+        assert_eq!(
+            normalize_model_for_provider(ProviderKind::Zai, "glm-5-2"),
+            ZAI_GLM_5_2_MODEL
+        );
+        assert_eq!(
+            normalize_model_for_provider(ProviderKind::Zai, "custom-glm-preview"),
+            "custom-glm-preview"
+        );
+    }
+
+    #[test]
     fn novita_provider_defaults_to_canonical_endpoint_and_model() {
         let _lock = env_lock();
         let _env = EnvGuard::without_deepseek_runtime_overrides();
@@ -6738,8 +6786,11 @@ mode = "token-plan-usa"
             ("kimi-k2.7-code", OPENROUTER_KIMI_K2_7_CODE_MODEL),
             ("kimi", OPENROUTER_KIMI_K2_7_CODE_MODEL),
             ("kimi-k2.6", OPENROUTER_KIMI_K2_6_MODEL),
+            ("minimax-m3", OPENROUTER_MINIMAX_M3_MODEL),
+            ("minimax-2.7", OPENROUTER_MINIMAX_2_7_MODEL),
             ("gemma-4-31b-it", OPENROUTER_GEMMA_4_31B_MODEL),
             ("glm-5.1", OPENROUTER_GLM_5_1_MODEL),
+            ("glm-5.2", OPENROUTER_GLM_5_2_MODEL),
         ] {
             let cli = CliRuntimeOverrides {
                 provider: Some(ProviderKind::Openrouter),

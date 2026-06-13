@@ -287,6 +287,7 @@ fn known_context_window_for_model(model_lower: &str) -> Option<u32> {
         | "kimi-k2.6"
         | "kimi-for-coding" => Some(262_144),
         "minimax-m2.7"
+        | "minimax/minimax-2.7"
         | "minimax-m2.7-highspeed"
         | "minimax-m2.5"
         | "minimax-m2.5-highspeed"
@@ -294,6 +295,7 @@ fn known_context_window_for_model(model_lower: &str) -> Option<u32> {
         | "minimax-m2.1-highspeed"
         | "minimax-m2" => Some(204_800),
         "z-ai/glm-5.1" | "z-ai/glm-5v-turbo" | "glm-5.1" | "glm-5v-turbo" => Some(202_752),
+        "z-ai/glm-5.2" | "glm-5.2" => Some(1_000_000),
         "minimax/minimax-m3" | "minimax-m3" | "qwen/qwen3.6-flash" | "qwen/qwen3.6-plus" => {
             Some(1_000_000)
         }
@@ -333,6 +335,7 @@ pub fn max_output_tokens_for_model(model: &str) -> Option<u32> {
         "minimax/minimax-m3" | "minimax-m3" => Some(524_288),
         "qwen/qwen3.6-35b-a3b" | "qwen/qwen3.6-27b" => Some(262_140),
         "qwen/qwen3.6-flash" | "qwen/qwen3.6-max-preview" | "qwen/qwen3.6-plus" => Some(65_536),
+        "z-ai/glm-5.1" | "z-ai/glm-5.2" | "glm-5.1" | "glm-5.2" => Some(131_072),
         "xiaomi/mimo-v2.5-pro" | "xiaomi/mimo-v2.5" | "mimo-v2.5-pro" | "mimo-v2.5" => {
             Some(131_072)
         }
@@ -385,6 +388,7 @@ pub fn model_supports_reasoning(model: &str) -> bool {
             | "kimi-k2.6"
             | "kimi-for-coding"
             | "minimax/minimax-m3"
+            | "minimax/minimax-2.7"
             | "minimax-m3"
             | "minimax-m2.7"
             | "minimax-m2.7-highspeed"
@@ -407,7 +411,9 @@ pub fn model_supports_reasoning(model: &str) -> bool {
             | "mimo-v2.5-pro"
             | "mimo-v2.5"
             | "z-ai/glm-5.1"
+            | "z-ai/glm-5.2"
             | "glm-5.1"
+            | "glm-5.2"
     )
 }
 
@@ -613,10 +619,12 @@ mod tests {
             ("mimo-v2.5-pro", 1_000_000),
             ("mimo-v2.5", 1_000_000),
             ("minimax/minimax-m3", 1_000_000),
+            ("minimax/minimax-2.7", 204_800),
             ("moonshotai/kimi-k2.7-code", 262_144),
             ("moonshotai/kimi-k2.6", 262_144),
             ("google/gemma-4-31b-it", 262_144),
             ("z-ai/glm-5.1", 202_752),
+            ("z-ai/glm-5.2", 1_000_000),
         ] {
             assert_eq!(context_window_for_model(model), Some(expected_window));
             assert!(model_supports_reasoning(model));
@@ -695,6 +703,8 @@ mod tests {
             max_output_tokens_for_model("minimax/minimax-m3"),
             Some(524_288)
         );
+        assert_eq!(max_output_tokens_for_model("z-ai/glm-5.1"), Some(131_072));
+        assert_eq!(max_output_tokens_for_model("z-ai/glm-5.2"), Some(131_072));
     }
 
     #[test]
@@ -710,6 +720,7 @@ mod tests {
             ("minimax-m2.5-highspeed", 204_800),
             ("minimax-m2", 204_800),
             ("glm-5.1", 202_752),
+            ("glm-5.2", 1_000_000),
         ] {
             assert_eq!(context_window_for_model(model), Some(expected_window));
             assert!(model_supports_reasoning(model));
@@ -725,6 +736,8 @@ mod tests {
             Some(262_144)
         );
         assert_eq!(max_output_tokens_for_model("minimax-m3"), Some(524_288));
+        assert_eq!(max_output_tokens_for_model("glm-5.1"), Some(131_072));
+        assert_eq!(max_output_tokens_for_model("glm-5.2"), Some(131_072));
     }
 
     #[test]

@@ -478,6 +478,8 @@ fn picker_model_hint(id: &str) -> &'static str {
         "mimo-v2.5-tts-voicedesign" => "voice design",
         "mimo-v2.5-tts-voiceclone" => "voice clone",
         "minimax/minimax-m3" => "1M multimodal",
+        "z-ai/glm-5.1" | "GLM-5.1" => "default coding",
+        "z-ai/glm-5.2" | "GLM-5.2" => "preview coding",
         _ => "provider model",
     }
 }
@@ -938,6 +940,7 @@ mod tests {
         assert!(model_ids.contains(&"arcee-ai/trinity-large-thinking"));
         assert!(model_ids.contains(&"xiaomi/mimo-v2.5-pro"));
         assert!(model_ids.contains(&"minimax/minimax-m3"));
+        assert!(model_ids.contains(&"z-ai/glm-5.2"));
         assert!(
             model_ids
                 .iter()
