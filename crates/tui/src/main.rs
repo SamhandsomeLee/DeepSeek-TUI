@@ -1123,6 +1123,16 @@ async fn main() -> Result<()> {
                 });
                 let mut config = config.clone();
                 merge_user_workspace_config(&mut config, cli.config.clone(), &workspace);
+                // Honour DEEPSEEK_BASE_URL forwarded by the CLI dispatcher from --base-url.
+                if let Ok(env_url) = std::env::var("DEEPSEEK_BASE_URL") {
+                    let trimmed = env_url.trim();
+                    eprintln!("DEBUG DEEPSEEK_BASE_URL='{trimmed}'");
+                    if !trimmed.is_empty() {
+                        config.base_url = Some(trimmed.to_string());
+                    }
+                } else {
+                    eprintln!("DEBUG DEEPSEEK_BASE_URL not set");
+                }
                 let model = resolve_exec_model(&config, args.model.as_deref());
                 let prompt = join_prompt_parts(&args.prompt);
                 let resume_session_id = resolve_exec_resume_session_id(&args, &workspace)?;
