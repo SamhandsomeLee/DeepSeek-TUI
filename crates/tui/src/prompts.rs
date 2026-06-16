@@ -2,7 +2,7 @@
 //! System prompts for different modes.
 //!
 //! Prompts are assembled from composable layers loaded at compile time:
-//!   base.md + personality overlay → message[0] (byte‑stable).
+//!   constitution.md + personality overlay → message[0] (byte-stable).
 //!   mode delta + tool taxonomy + approval policy → request-time runtime metadata.
 //!
 //! This keeps each concern in its own file and makes prompt tuning
@@ -162,7 +162,7 @@ for the current turn."
 /// The block is appended to the workspace-static portion of the
 /// system prompt (after mode prompt + project context, before
 /// configured instructions / skills) so the `## Language` directive
-/// in `prompts/base.md` can reference it without the model having to
+/// in `prompts/constitution.md` can reference it without the model having to
 /// guess from the user's first message. `locale_tag` is resolved by
 /// the caller from `Settings` so this function stays I/O-free.
 fn render_environment_block(workspace: &Path, locale_tag: &str) -> String {
@@ -482,7 +482,7 @@ fn effective_authority_recap() -> &'static str {
 /// Optional locale-native reinforcement preamble prepended to the system
 /// prompt when the user's UI locale is non-English.
 ///
-/// `base.md` itself stays English (single source of truth, model is
+/// `constitution.md` itself stays English (single source of truth, model is
 /// natively multilingual, prefix-cache stable across users in the same
 /// locale). For non-English locales we prepend a short locale-native
 /// passage so the model's first exposure to the prompt overrides the
@@ -508,7 +508,7 @@ fn effective_authority_recap() -> &'static str {
 /// folk wisdom from Western-LLM commentary doesn't apply here.
 ///
 /// The naïve translation of that argument would be: ship a fully
-/// translated `base.md` per locale. We deliberately stop short of
+/// translated `constitution.md` per locale. We deliberately stop short of
 /// that for v0.8.29. The reasons, ranked:
 ///
 ///   1. **Drift risk.** A 200+ line technical prompt has subtle
@@ -517,11 +517,11 @@ fn effective_authority_recap() -> &'static str {
 ///      of bug that arises (Chinese users see slightly different
 ///      agent behavior than English users) is hard to reproduce and
 ///      hard to triage from bug reports.
-///   2. **Cache stability.** With one English `base.md` and a
+///   2. **Cache stability.** With one English `constitution.md` and a
 ///      per-locale preamble+closer, the largest cacheable chunk
 ///      (mode prompt + project context + environment) stays
 ///      byte-stable within a session and across users in the same
-///      locale. A fully translated per-locale `base.md` keeps cache
+///      locale. A fully translated per-locale `constitution.md` keeps cache
 ///      per-locale but doesn't share with English users.
 ///   3. **Translation QA is expensive.** Each prompt-language pair
 ///      needs a native speaker reviewing tone, register, and rule
@@ -538,7 +538,7 @@ fn effective_authority_recap() -> &'static str {
 /// even as English code accumulates in context turn-over-turn.
 ///
 /// If at some future point the bookend proves insufficient — or if
-/// the maintenance cost of per-locale `base.md` files becomes
+/// the maintenance cost of per-locale `constitution.md` files becomes
 /// preferable to whatever's blocking it — full translation is the
 /// natural next step. The locale tags here, the test invariants,
 /// and the closer position would all carry over unchanged.
@@ -700,7 +700,7 @@ pub const MEMORY_GUIDANCE: &str = include_str!("prompts/memory_guidance.md");
 
 // ── Legacy prompt constants (kept for backwards compatibility) ────────
 
-/// Legacy base prompt (agent.txt — now decomposed into base.md + overlays).
+/// Legacy base prompt (agent.txt — now decomposed into constitution.md + overlays).
 /// Still available for callers that haven't migrated to the layered API.
 pub const AGENT_PROMPT: &str = include_str!("prompts/agent.txt");
 
@@ -742,7 +742,7 @@ impl Personality {
 
 /// Compose the full system prompt in deterministic order:
 ///   1. tool taxonomy  — compact hints generated from the eager core tools
-///   2. base.md        — core identity, toolbox, execution contract
+///   2. constitution.md — core identity, toolbox, execution contract
 ///   3. personality    — voice and tone overlay
 ///   4. mode delta     — mode-specific permissions and workflow
 ///   5. approval policy — tool-approval behavior
@@ -817,7 +817,7 @@ fn apply_model_template(
 }
 
 /// Architecture self-management section injected for DeepSeek V4 model ids
-/// (the original hardcoded base.md section, now model-gated — #3025).
+/// (the original hardcoded constitution.md section, now model-gated — #3025).
 const V4_MODEL_CHARACTERISTICS: &str = "## Your V4 Characteristics
 
 You run on V4 architecture. Understanding the internals helps you self-manage:
@@ -1819,7 +1819,7 @@ mod tests {
     #[test]
     fn locale_reinforcement_preamble_returns_native_script_for_supported_locales() {
         // English (and unknown locales) get None — the existing English
-        // directive in `base.md` is sufficient.
+        // directive in `constitution.md` is sufficient.
         assert!(locale_reinforcement_preamble("en").is_none());
         assert!(locale_reinforcement_preamble("en-US").is_none());
         assert!(locale_reinforcement_preamble("fr-FR").is_none());

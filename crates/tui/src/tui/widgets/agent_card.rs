@@ -229,17 +229,23 @@ impl FanoutCard {
         self
     }
 
-    /// Update or insert a worker by id.
-    pub fn upsert_worker(&mut self, agent_id: &str, status: AgentLifecycle) {
+    /// Update or insert a worker by id. Returns whether the visible state
+    /// changed and the card should be redrawn.
+    pub fn upsert_worker(&mut self, agent_id: &str, status: AgentLifecycle) -> bool {
         if let Some(slot) = self
             .workers
             .iter_mut()
             .find(|s| s.agent_id == agent_id || s.worker_id == agent_id)
         {
+            if slot.agent_id == agent_id && slot.status == status {
+                return false;
+            }
             slot.agent_id = agent_id.to_string();
             slot.status = status;
+            true
         } else {
             self.workers.push(WorkerSlot::new(agent_id, status));
+            true
         }
     }
 
@@ -247,10 +253,13 @@ impl FanoutCard {
     /// cards are seeded from task ids before child agents exist; when a child
     /// starts, this keeps the dot count stable instead of appending a second
     /// circle for the same unit of work.
-    pub fn claim_pending_worker(&mut self, agent_id: &str, status: AgentLifecycle) {
+    pub fn claim_pending_worker(&mut self, agent_id: &str, status: AgentLifecycle) -> bool {
         if let Some(slot) = self.workers.iter_mut().find(|s| s.agent_id == agent_id) {
+            if slot.status == status {
+                return false;
+            }
             slot.status = status;
-            return;
+            return true;
         }
         if let Some(slot) = self
             .workers
@@ -259,9 +268,9 @@ impl FanoutCard {
         {
             slot.agent_id = agent_id.to_string();
             slot.status = status;
-            return;
+            return true;
         }
-        self.upsert_worker(agent_id, status);
+        self.upsert_worker(agent_id, status)
     }
 
     fn counts(&self) -> (usize, usize, usize, usize) {
@@ -428,11 +437,18 @@ pub fn apply_to_delegate(card: &mut DelegateCard, msg: &MailboxMessage) -> bool 
     }
     match msg {
         MailboxMessage::Started { .. } => {
+            if card.status == AgentLifecycle::Running {
+                return false;
+            }
             card.status = AgentLifecycle::Running;
         }
         MailboxMessage::Progress { status, .. } => {
+            let low_signal = is_low_signal_progress(status);
+            if low_signal && card.status == AgentLifecycle::Running {
+                return false;
+            }
             card.status = AgentLifecycle::Running;
-            if !is_low_signal_progress(status) {
+            if !low_signal {
                 card.push_action(status);
             }
         }
@@ -484,34 +500,18 @@ fn is_low_signal_progress(status: &str) -> bool {
 pub fn apply_to_fanout(card: &mut FanoutCard, msg: &MailboxMessage) -> bool {
     let id = msg.agent_id();
     match msg {
-        MailboxMessage::Started { .. } => {
-            card.claim_pending_worker(id, AgentLifecycle::Running);
-            true
-        }
-        MailboxMessage::Progress { .. } | MailboxMessage::ToolCallStarted { .. } => {
-            card.claim_pending_worker(id, AgentLifecycle::Running);
-            true
+        MailboxMessage::Started { .. } => card.claim_pending_worker(id, AgentLifecycle::Running),
+        MailboxMessage::Progress { .. } => card.claim_pending_worker(id, AgentLifecycle::Running),
+        MailboxMessage::ToolCallStarted { .. } => {
+            card.claim_pending_worker(id, AgentLifecycle::Running)
         }
         MailboxMessage::ToolCallCompleted { .. } => true,
-        MailboxMessage::Completed { .. } => {
-            card.upsert_worker(id, AgentLifecycle::Completed);
-            true
-        }
-        MailboxMessage::Failed { .. } => {
-            card.upsert_worker(id, AgentLifecycle::Failed);
-            true
-        }
-        MailboxMessage::Interrupted { .. } => {
-            card.upsert_worker(id, AgentLifecycle::Interrupted);
-            true
-        }
-        MailboxMessage::Cancelled { .. } => {
-            card.upsert_worker(id, AgentLifecycle::Cancelled);
-            true
-        }
+        MailboxMessage::Completed { .. } => card.upsert_worker(id, AgentLifecycle::Completed),
+        MailboxMessage::Failed { .. } => card.upsert_worker(id, AgentLifecycle::Failed),
+        MailboxMessage::Interrupted { .. } => card.upsert_worker(id, AgentLifecycle::Interrupted),
+        MailboxMessage::Cancelled { .. } => card.upsert_worker(id, AgentLifecycle::Cancelled),
         MailboxMessage::ChildSpawned { child_id, .. } => {
-            card.upsert_worker(child_id, AgentLifecycle::Pending);
-            true
+            card.upsert_worker(child_id, AgentLifecycle::Pending)
         }
         MailboxMessage::TokenUsage { .. } => {
             // Cost accumulation happens in handle_subagent_mailbox (ui.rs)
@@ -618,6 +618,10 @@ mod tests {
         assert!(
             !rendered.contains("requesting model response"),
             "{rendered}"
+        );
+        assert!(
+            !apply_to_delegate(&mut card, &msg),
+            "repeated low-signal progress should not redraw the card"
         );
     }
 
@@ -726,6 +730,12 @@ mod tests {
         assert_eq!(card.workers[0].status, AgentLifecycle::Running);
         assert_eq!(card.workers[1].agent_id, "task:b");
         assert_eq!(card.workers[1].status, AgentLifecycle::Pending);
+        let progress =
+            MailboxMessage::progress("agent_live", "step 1/100: requesting model response");
+        assert!(
+            !apply_to_fanout(&mut card, &progress),
+            "repeated progress for a running worker should not redraw"
+        );
     }
 
     #[test]

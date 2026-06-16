@@ -1265,7 +1265,7 @@ pub const DEFAULT_MAX_SPAWN_DEPTH: u32 = codewhale_config::DEFAULT_SPAWN_DEPTH;
 /// Terminal-state notification emitted to the engine's parent turn loop
 /// when one of its direct children finishes (issue #756). Carries the
 /// already-rendered `<codewhale:subagent.done>` sentinel that the model
-/// expects in the transcript per `prompts/base.md`.
+/// expects in the transcript per `prompts/constitution.md`.
 #[derive(Debug, Clone)]
 pub struct SubAgentCompletion {
     /// The completing child's agent id. Held for routing/logging — the

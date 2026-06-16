@@ -2531,11 +2531,24 @@ async fn run_event_loop(
                     EngineEvent::SubAgentMailbox { seq, message } => {
                         let should_refresh_subagents =
                             subagent_message_refreshes_workspace_context(&message);
-                        handle_subagent_mailbox(app, seq, &message);
+                        let updated_transcript = handle_subagent_mailbox(app, seq, &message);
                         if should_refresh_subagents {
                             let _ = engine_handle.send(Op::ListSubAgents).await;
                         }
-                        transcript_batch_updated = true;
+                        if updated_transcript {
+                            transcript_batch_updated = true;
+                        } else if !should_refresh_subagents
+                            && matches!(
+                                message,
+                                crate::tools::subagent::MailboxMessage::Progress { .. }
+                            )
+                        {
+                            // Progress mailbox envelopes mirror AgentProgress.
+                            // When the card state did not visibly change, do
+                            // not let the duplicate envelope bypass the
+                            // AgentProgress redraw throttle.
+                            received_engine_event = redraw_requested_before_event;
+                        }
                     }
                     EngineEvent::ApprovalRequired {
                         id,

@@ -3054,7 +3054,7 @@ fn child_runtime_preserves_step_api_timeout() {
 #[test]
 fn subagent_completion_payload_carries_existing_sentinel_format() {
     // The payload format is the same one already documented in
-    // prompts/base.md: human summary on line 1, `<codewhale:subagent.done>`
+    // prompts/constitution.md: human summary on line 1, `<codewhale:subagent.done>`
     // sentinel on line 2. This test pins the format so future refactors
     // don't silently break the model's parsing contract.
     let mut snap = make_snapshot(SubAgentStatus::Completed);

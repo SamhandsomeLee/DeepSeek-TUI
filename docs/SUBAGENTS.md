@@ -26,8 +26,9 @@ launches detached background work: cancelling the parent turn stops the parent
 wait path, but it does not kill already-opened child runs.
 
 This doc covers the role taxonomy and current compatibility controls. The active
-orchestration surface is `agent`; see `prompts/base.md` "Sub-Agent Strategy"
-and the in-line tool description.
+orchestration surface is `agent`; see
+`crates/tui/src/prompts/constitution.md` "Sub-Agent Strategy" and the in-line
+tool description.
 
 ## Role taxonomy
 

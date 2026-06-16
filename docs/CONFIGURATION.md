@@ -47,7 +47,7 @@ Each repo can carry two distinct, complementary files:
   a legacy `WHALE.md`.
 
   This is the **local-law** layer in CodeWhale's hierarchy: *base myth & global
-  Constitution* (the model prompt in `prompts/base.md`, including the Brother
+  Constitution* (the model prompt in `prompts/constitution.md`, including the Brother
   Whale identity anchor) → *repo constitution* (`.codewhale/constitution.json`,
   this file) → *task packet* (the current objective) → *runtime policy*
   (permissions/sandbox/cost limits enforced in code). The repo constitution
