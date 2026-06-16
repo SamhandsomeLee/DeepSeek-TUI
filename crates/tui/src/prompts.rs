@@ -2794,6 +2794,19 @@ mod tests {
     }
 
     #[test]
+    fn prompt_documents_explicit_subagent_model_strength() {
+        let prompt = AGENT_PROMPT;
+        assert!(prompt.contains("model_strength: \"same\""));
+        assert!(prompt.contains("model_strength: \"faster\""));
+        assert!(prompt.contains("type: \"explore\""));
+        assert!(prompt.contains("overrides `model_strength`"));
+        assert!(prompt.contains("thinking: \"off\""));
+        assert!(prompt.contains("thinking: \"high\""));
+        assert!(prompt.contains("thinking: \"max\""));
+        assert!(prompt.contains("thinking: \"auto\""));
+    }
+
+    #[test]
     fn subagent_done_sentinel_section_present() {
         let prompt = compose_prompt(Personality::Calm);
         assert!(prompt.contains("Internal Sub-agent Completion Events"));

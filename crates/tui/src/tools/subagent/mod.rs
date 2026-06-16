@@ -1071,20 +1071,6 @@ fn worker_profile_from_spec(spec: &AgentWorkerSpec) -> WorkerRuntimeProfile {
     profile
 }
 
-fn worker_model_route_for_spawn(
-    parent_runtime: &SubAgentRuntime,
-    effective_model: &str,
-    explicit_model: bool,
-) -> ModelRoute {
-    if explicit_model {
-        ModelRoute::Fixed(effective_model.to_string())
-    } else if parent_runtime.auto_model {
-        ModelRoute::Auto
-    } else {
-        ModelRoute::Inherit
-    }
-}
-
 fn worker_profile_for_spawn(
     runtime: &SubAgentRuntime,
     agent_type: &SubAgentType,
@@ -1118,12 +1104,11 @@ fn normalize_worker_record(mut record: AgentWorkerRecord) -> AgentWorkerRecord {
     } else if record.follow_up.tool != default_agent_inspect_tool() {
         record.follow_up.tool = default_agent_inspect_tool();
     }
-    if record.takeover.agent_id.is_empty() {
-        record.takeover = takeover_target_for_spec(&record.spec);
-    } else if !record
-        .takeover
-        .instructions
-        .contains(&default_agent_inspect_tool())
+    if record.takeover.agent_id.is_empty()
+        || !record
+            .takeover
+            .instructions
+            .contains(&default_agent_inspect_tool())
     {
         record.takeover = takeover_target_for_spec(&record.spec);
     }
@@ -1176,6 +1161,59 @@ pub(crate) struct SubAgentSpawnOptions {
     pub fork_context: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubAgentModelStrength {
+    Same,
+    Faster,
+}
+
+impl SubAgentModelStrength {
+    fn parse(value: &str) -> Result<Self, ToolError> {
+        let normalized = value.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "same" | "inherit" | "parent" | "current" => Ok(Self::Same),
+            "faster" | "fast" | "smaller" | "small" | "lower" | "cheap" | "flash" => {
+                Ok(Self::Faster)
+            }
+            _ => Err(ToolError::invalid_input(
+                "model_strength must be one of: same, faster".to_string(),
+            )),
+        }
+    }
+
+    fn model_route(self) -> ModelRoute {
+        match self {
+            Self::Same => ModelRoute::Inherit,
+            Self::Faster => ModelRoute::Faster,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubAgentThinking {
+    Inherit,
+    Auto,
+    Effort(ReasoningEffort),
+}
+
+impl SubAgentThinking {
+    fn parse(value: &str) -> Result<Self, ToolError> {
+        let normalized = value.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "inherit" | "parent" | "same" | "current" => Ok(Self::Inherit),
+            "auto" | "automatic" => Ok(Self::Auto),
+            "off" | "disabled" | "none" | "false" => Ok(Self::Effort(ReasoningEffort::Off)),
+            "low" | "minimal" => Ok(Self::Effort(ReasoningEffort::Low)),
+            "medium" | "mid" => Ok(Self::Effort(ReasoningEffort::Medium)),
+            "high" => Ok(Self::Effort(ReasoningEffort::High)),
+            "max" | "maximum" | "xhigh" | "ultracode" => Ok(Self::Effort(ReasoningEffort::Max)),
+            _ => Err(ToolError::invalid_input(
+                "thinking must be one of: inherit, auto, off, low, medium, high, max".to_string(),
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SubAgentInput {
     text: String,
@@ -1190,6 +1228,8 @@ struct SpawnRequest {
     assignment: SubAgentAssignment,
     allowed_tools: Option<Vec<String>>,
     model: Option<String>,
+    model_strength: SubAgentModelStrength,
+    thinking: SubAgentThinking,
     /// Optional working directory for the child. Must canonicalize to a
     /// path inside the parent's workspace. Used to dispatch parallel work
     /// into separate git worktrees: parent runs `git worktree add` first,
@@ -1503,9 +1543,8 @@ impl SubAgentRuntime {
         self
     }
 
-    /// Preserve the parent's thinking configuration. `reasoning_effort_auto`
-    /// stays true even when the parent turn itself was sent with a concrete
-    /// flash-router recommendation, so children can resolve their own tier.
+    /// Preserve the parent's thinking configuration. Child model strength is
+    /// explicit on the `agent` call; this only controls reasoning effort.
     #[must_use]
     pub fn with_reasoning_effort(
         mut self,
@@ -2966,6 +3005,20 @@ impl ToolSpec for AgentTool {
                     "type": "string",
                     "description": SUBAGENT_TYPE_DESCRIPTION
                 },
+                "model_strength": {
+                    "type": "string",
+                    "enum": ["same", "faster"],
+                    "description": "Optional child model strength. Use same (default) when the child should be as capable as the current model. Use faster for type=explore, read-only lookup/search, status, or other low-risk tasks that can run on a smaller/faster same-family sibling; CodeWhale maps known families such as DeepSeek V4 Pro to Flash and GLM-5.2 to GLM-5.1. No hidden auto-downgrade happens."
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Optional exact provider model id for the child. Overrides model_strength. Prefer model_strength unless you know the provider-specific id."
+                },
+                "thinking": {
+                    "type": "string",
+                    "enum": ["inherit", "auto", "off", "low", "medium", "high", "max"],
+                    "description": "Optional child thinking budget. inherit (default) follows the parent thinking mode. auto chooses from the child prompt. off is best for faster explore/lookups. high is for normal reasoning. max is for hard design/debug/release/security work. Explicit thinking overrides the default off used by model_strength=faster."
+                },
                 "cwd": {
                     "type": "string",
                     "description": "Optional working directory for the child; must be inside the parent workspace"
@@ -3078,8 +3131,6 @@ async fn spawn_subagent_from_input(
             &spawn_request.agent_type,
         )?,
     };
-    let configured_model_was_explicit = configured_model.is_some();
-
     let (effective_prompt, _resident_conflict) =
         if let Some(ref file_path) = spawn_request.resident_file {
             let abs_path = if std::path::Path::new(file_path).is_absolute() {
@@ -3115,14 +3166,15 @@ async fn spawn_subagent_from_input(
         configured_model,
         &effective_prompt,
         &spawn_request.agent_type,
+        spawn_request.model_strength.model_route(),
+        spawn_request.thinking,
     )
     .await;
     child_runtime.model = route.model.clone();
     child_runtime.reasoning_effort = route.reasoning_effort.clone();
     child_runtime.reasoning_effort_auto = false;
     let effective_model = route.model;
-    let model_route =
-        worker_model_route_for_spawn(&runtime, &effective_model, configured_model_was_explicit);
+    let model_route = route.model_route;
 
     let mut manager_guard = manager.write().await;
 
@@ -4326,6 +4378,14 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
 
     let cwd = parse_optional_cwd(input)?;
     let model = parse_optional_subagent_model(input, "model")?;
+    let model_strength = optional_input_str(input, &["model_strength", "modelStrength"])
+        .map(SubAgentModelStrength::parse)
+        .transpose()?
+        .unwrap_or(SubAgentModelStrength::Same);
+    let thinking = optional_input_str(input, &["thinking", "reasoning_effort", "reasoningEffort"])
+        .map(SubAgentThinking::parse)
+        .transpose()?
+        .unwrap_or(SubAgentThinking::Inherit);
     let resident_file = input
         .get("resident_file")
         .and_then(|v| v.as_str())
@@ -4364,6 +4424,8 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
         assignment: SubAgentAssignment::new(prompt, role),
         allowed_tools,
         model,
+        model_strength,
+        thinking,
         cwd,
         resident_file,
         fork_context,
@@ -4506,32 +4568,23 @@ pub(crate) async fn resolve_subagent_assignment_route(
     configured_model: Option<String>,
     prompt: &str,
     agent_type: &SubAgentType,
+    requested_model_route: ModelRoute,
+    requested_thinking: SubAgentThinking,
 ) -> SubAgentResolvedRoute {
-    let model_route = assignment_model_route(agent_type, configured_model.as_deref());
-    let explicit_model = matches!(model_route, ModelRoute::Fixed(_));
-    let worker_auto_route = matches!(model_route, ModelRoute::Auto);
-    let mut route =
-        worker_profile_subagent_assignment_route(runtime, &model_route, prompt, agent_type);
-
-    if should_use_subagent_flash_router(runtime)
-        && let Ok(Some(recommendation)) = subagent_flash_router(runtime, prompt).await
-    {
-        if runtime.auto_model && !explicit_model && !worker_auto_route {
-            route.model = recommendation.model;
-        }
-        if runtime.reasoning_effort_auto && !worker_auto_route {
-            route.reasoning_effort = recommendation
-                .reasoning_effort
-                .map(|effort| effort.as_setting().to_string())
-                .or(route.reasoning_effort);
-            route.refresh_tuning();
-        }
-    }
-
-    route
+    let model_route = assignment_model_route(configured_model.as_deref(), requested_model_route);
+    worker_profile_subagent_assignment_route(
+        runtime,
+        &model_route,
+        requested_thinking,
+        prompt,
+        agent_type,
+    )
 }
 
-fn assignment_model_route(agent_type: &SubAgentType, configured_model: Option<&str>) -> ModelRoute {
+fn assignment_model_route(
+    configured_model: Option<&str>,
+    requested_model_route: ModelRoute,
+) -> ModelRoute {
     if let Some(model) = configured_model
         .map(str::trim)
         .filter(|model| !model.is_empty())
@@ -4539,7 +4592,7 @@ fn assignment_model_route(agent_type: &SubAgentType, configured_model: Option<&s
         return ModelRoute::Fixed(model.to_string());
     }
 
-    WorkerRuntimeProfile::for_role(agent_type.clone()).model
+    requested_model_route
 }
 
 fn subagent_request_tuning(reasoning_effort: Option<&str>) -> RequestTuning {
@@ -4549,14 +4602,8 @@ fn subagent_request_tuning(reasoning_effort: Option<&str>) -> RequestTuning {
     }
 }
 
-fn should_use_subagent_flash_router(runtime: &SubAgentRuntime) -> bool {
-    // #3018: providers without a known cheap tier skip the network router
-    // entirely — there is no alternative model worth a round-trip.
-    runtime.auto_model && subagent_router_candidates(runtime).cheap.is_some()
-}
-
-/// Candidate pair for the sub-agent router, derived from the active
-/// provider and the (already provider-resolved) parent model (#3018).
+/// Candidate pair for explicit sub-agent strength routing, derived from the
+/// active provider and the already provider-resolved parent model.
 fn subagent_router_candidates(runtime: &SubAgentRuntime) -> crate::model_routing::RouterCandidates {
     crate::model_routing::provider_router_candidates(runtime.client.api_provider(), &runtime.model)
 }
@@ -4564,208 +4611,88 @@ fn subagent_router_candidates(runtime: &SubAgentRuntime) -> crate::model_routing
 fn fallback_subagent_assignment_route(
     runtime: &SubAgentRuntime,
     configured_model: Option<String>,
+    requested_model_route: ModelRoute,
+    requested_thinking: SubAgentThinking,
     prompt: &str,
 ) -> SubAgentResolvedRoute {
-    let mut model_route = ModelRoute::Inherit;
-    let model = if let Some(model) = configured_model {
-        model_route = ModelRoute::Fixed(model.clone());
-        model
-    } else if runtime.auto_model {
-        model_route = ModelRoute::Auto;
-        // #3018: candidate-aware — on providers without a cheap tier this
-        // always resolves to the parent model instead of a DeepSeek id.
-        crate::model_routing::auto_model_heuristic_for_candidates(
-            prompt,
-            &runtime.model,
-            &subagent_router_candidates(runtime),
-        )
-    } else {
-        runtime.model.clone()
-    };
-
-    let reasoning_effort = if runtime.reasoning_effort_auto {
-        let effort = match crate::auto_reasoning::select(false, prompt) {
-            crate::tui::app::ReasoningEffort::Low | crate::tui::app::ReasoningEffort::Medium => {
-                crate::tui::app::ReasoningEffort::High
-            }
-            other => other,
-        };
-        Some(effort.as_setting().to_string())
-    } else {
-        runtime.reasoning_effort.clone()
-    };
-
-    SubAgentResolvedRoute::new(model_route, model, reasoning_effort)
+    let model_route = assignment_model_route(configured_model.as_deref(), requested_model_route);
+    worker_profile_subagent_assignment_route(
+        runtime,
+        &model_route,
+        requested_thinking,
+        prompt,
+        &SubAgentType::General,
+    )
 }
 
 fn worker_profile_subagent_assignment_route(
     runtime: &SubAgentRuntime,
     model_route: &ModelRoute,
+    requested_thinking: SubAgentThinking,
     prompt: &str,
     _agent_type: &SubAgentType,
 ) -> SubAgentResolvedRoute {
     let candidates = subagent_router_candidates(runtime);
-    let mut used_profile_cheap_lane = false;
+    let mut requested_fast_lane = false;
     let model = match model_route {
         ModelRoute::Fixed(model) => model.clone(),
-        ModelRoute::Auto => {
-            if let Some(cheap) = candidates.cheap.clone() {
-                used_profile_cheap_lane = true;
-                cheap
-            } else {
-                runtime.model.clone()
-            }
+        ModelRoute::Faster | ModelRoute::Auto => {
+            requested_fast_lane = true;
+            candidates
+                .cheap
+                .clone()
+                .unwrap_or_else(|| runtime.model.clone())
         }
-        ModelRoute::Inherit => {
-            if runtime.auto_model {
-                // Preserve the existing session-level auto-model behavior for
-                // synthesis roles that inherit the parent route.
-                crate::model_routing::auto_model_heuristic_for_candidates(
-                    prompt,
-                    &runtime.model,
-                    &candidates,
-                )
-            } else {
-                runtime.model.clone()
-            }
-        }
+        ModelRoute::Inherit => runtime.model.clone(),
     };
 
-    let reasoning_effort = if used_profile_cheap_lane {
-        Some(ReasoningEffort::Off.as_setting().to_string())
-    } else {
-        fallback_subagent_reasoning_effort(runtime, prompt)
-    };
+    let reasoning_effort = subagent_reasoning_effort_for_request(
+        runtime,
+        prompt,
+        requested_fast_lane,
+        requested_thinking,
+    );
 
     SubAgentResolvedRoute::new(model_route.clone(), model, reasoning_effort)
 }
 
+fn subagent_reasoning_effort_for_request(
+    runtime: &SubAgentRuntime,
+    prompt: &str,
+    requested_fast_lane: bool,
+    requested_thinking: SubAgentThinking,
+) -> Option<String> {
+    match requested_thinking {
+        SubAgentThinking::Effort(effort) => Some(effort.as_setting().to_string()),
+        SubAgentThinking::Auto => Some(
+            auto_subagent_reasoning_effort(prompt)
+                .as_setting()
+                .to_string(),
+        ),
+        SubAgentThinking::Inherit if requested_fast_lane => {
+            Some(ReasoningEffort::Off.as_setting().to_string())
+        }
+        SubAgentThinking::Inherit => fallback_subagent_reasoning_effort(runtime, prompt),
+    }
+}
+
 fn fallback_subagent_reasoning_effort(runtime: &SubAgentRuntime, prompt: &str) -> Option<String> {
     if runtime.reasoning_effort_auto {
-        let effort = match crate::auto_reasoning::select(false, prompt) {
-            ReasoningEffort::Low | ReasoningEffort::Medium => ReasoningEffort::High,
-            other => other,
-        };
-        Some(effort.as_setting().to_string())
+        Some(
+            auto_subagent_reasoning_effort(prompt)
+                .as_setting()
+                .to_string(),
+        )
     } else {
         runtime.reasoning_effort.clone()
     }
 }
 
-async fn subagent_flash_router(
-    runtime: &SubAgentRuntime,
-    prompt: &str,
-) -> Result<Option<crate::model_routing::AutoRouteRecommendation>> {
-    if cfg!(test) {
-        return Ok(None);
+fn auto_subagent_reasoning_effort(prompt: &str) -> ReasoningEffort {
+    match crate::auto_reasoning::select(false, prompt) {
+        ReasoningEffort::Low | ReasoningEffort::Medium => ReasoningEffort::High,
+        other => other,
     }
-
-    let candidates = subagent_router_candidates(runtime);
-    let Some(cheap_model) = candidates.cheap.clone() else {
-        // should_use_subagent_flash_router already gates on this; defensive
-        // second gate so the router can never 400 a cheap-tier-less provider.
-        return Ok(None);
-    };
-
-    let request = MessageRequest {
-        model: cheap_model,
-        messages: vec![Message {
-            role: "user".to_string(),
-            content: vec![ContentBlock::Text {
-                text: subagent_router_prompt(runtime, prompt),
-                cache_control: None,
-            }],
-        }],
-        max_tokens: 96,
-        system: Some(SystemPrompt::Text(subagent_router_system_prompt(
-            &candidates,
-        ))),
-        tools: None,
-        tool_choice: None,
-        metadata: None,
-        thinking: None,
-        reasoning_effort: Some("off".to_string()),
-        stream: Some(false),
-        temperature: Some(0.0),
-        top_p: None,
-    };
-
-    let response = tokio::time::timeout(
-        Duration::from_secs(4),
-        runtime.client.create_message(request),
-    )
-    .await??;
-    Ok(
-        crate::model_routing::parse_auto_route_recommendation_for_candidates(
-            &message_response_text(&response.content),
-            &candidates,
-        ),
-    )
-}
-
-/// Render the sub-agent router system prompt from the actual candidate ids
-/// (#3018) so the classifier answers with ids the active provider serves.
-fn subagent_router_system_prompt(candidates: &crate::model_routing::RouterCandidates) -> String {
-    let cheap = candidates.cheap_or_big();
-    let big = &candidates.big;
-    format!(
-        "You are the codewhale sub-agent routing manager. Return only compact JSON: \
-{{\"model\":\"{cheap}|{big}\",\"thinking\":\"off|high|max\"}}. \
-Treat each child assignment like a customer request entering a team queue: decide the least \
-sufficient worker and thinking budget for that assignment. Do not treat being a sub-agent as \
-important by itself. Use {cheap} for trivial, read-only, status, lookup, or single-step work. \
-Use {big} for coding, debugging, release work, multi-file changes, security, architecture, \
-high-risk decisions, ambiguous requests, or work likely to need tool-call judgment. Use thinking \
-off for trivial no-tool work, high for ordinary reasoning, and max only for hard, risky, \
-multi-step, uncertain, or tool-heavy work."
-    )
-}
-
-fn subagent_router_prompt(runtime: &SubAgentRuntime, prompt: &str) -> String {
-    format!(
-        "Parent selected model mode: {}\nParent selected thinking mode: {}\n\nSub-agent assignment:\n{}\n\nReturn JSON only.",
-        if runtime.auto_model { "auto" } else { "fixed" },
-        if runtime.reasoning_effort_auto {
-            "auto"
-        } else {
-            runtime
-                .reasoning_effort
-                .as_deref()
-                .unwrap_or("provider-default")
-        },
-        truncate_subagent_router_prompt(prompt, 4_000)
-    )
-}
-
-fn truncate_subagent_router_prompt(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let mut out = text.chars().take(max_chars).collect::<String>();
-    out.push_str("\n[truncated]");
-    out
-}
-
-fn message_response_text(blocks: &[ContentBlock]) -> String {
-    let mut out = String::new();
-    for block in blocks {
-        match block {
-            ContentBlock::Text { text, .. } => {
-                if !out.is_empty() {
-                    out.push('\n');
-                }
-                out.push_str(text);
-            }
-            ContentBlock::Thinking { thinking, .. } => {
-                if !out.is_empty() {
-                    out.push('\n');
-                }
-                out.push_str(thinking);
-            }
-            _ => {}
-        }
-    }
-    out
 }
 
 fn parse_optional_subagent_model(input: &Value, key: &str) -> Result<Option<String>, ToolError> {
@@ -4952,6 +4879,7 @@ fn emit_agent_progress(
 /// - **Explicit narrow** (`allowed_tools = Some(list)`): legacy / Custom
 ///   path. The registry still builds the full surface, but only the listed
 ///   tool names are visible to the model and callable.
+///
 /// Pure per-role posture check (#3217), independent of any runtime: whether a
 /// role may invoke a tool of the given approval level.
 ///

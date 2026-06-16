@@ -46,14 +46,15 @@ use crate::tools::spec::RuntimeToolServices;
 use crate::tools::spec::{ApprovalRequirement, ToolError, ToolResult};
 use crate::tools::subagent::{
     Mailbox, SharedSubAgentManager, SubAgentCompletion, SubAgentForkContext, SubAgentResult,
-    SubAgentRuntime, SubAgentStatus, SubAgentType, new_shared_subagent_manager_with_timeout,
-    resolve_subagent_assignment_route,
+    SubAgentRuntime, SubAgentStatus, SubAgentThinking, SubAgentType,
+    new_shared_subagent_manager_with_timeout, resolve_subagent_assignment_route,
 };
 use crate::tools::todo::{SharedTodoList, TodoListSnapshot, new_shared_todo_list};
 use crate::tools::user_input::{UserInputRequest, UserInputResponse};
 use crate::tools::{ToolContext, ToolRegistryBuilder};
 use crate::tui::app::AppMode;
 use crate::utils::spawn_supervised;
+use crate::worker_profile::ModelRoute;
 use crate::working_set::WorkingSet;
 
 use super::events::{Event, TurnOutcomeStatus};
@@ -1178,30 +1179,28 @@ impl Engine {
     /// Run the engine event loop
     #[allow(clippy::too_many_lines)]
     pub async fn run(mut self) {
-        while let Some(op) = self.rx_op.recv().await {
-            match op {
-                Op::SendMessage {
-                    content,
-                    mode,
-                    provider,
-                    model,
-                    goal_objective,
-                    goal_token_budget,
-                    goal_status,
-                    reasoning_effort,
-                    reasoning_effort_auto,
-                    auto_model,
-                    allow_shell,
-                    trust_mode,
-                    auto_approve,
-                    approval_mode,
-                    translation_enabled,
-                    show_thinking,
-                    allowed_tools,
-                    hook_executor,
-                    verbosity,
-                } => {
-                    self.handle_send_message(
+        enum EngineRunInput {
+            Operation(Op),
+            SubAgentCompletion(SubAgentCompletion),
+        }
+
+        loop {
+            let input = tokio::select! {
+                op = self.rx_op.recv() => op.map(EngineRunInput::Operation),
+                completion = self.rx_subagent_completion.recv() => {
+                    completion.map(EngineRunInput::SubAgentCompletion)
+                }
+            };
+            let Some(input) = input else {
+                break;
+            };
+
+            match input {
+                EngineRunInput::SubAgentCompletion(completion) => {
+                    self.handle_idle_subagent_completion(completion).await;
+                }
+                EngineRunInput::Operation(op) => match op {
+                    Op::SendMessage {
                         content,
                         mode,
                         provider,
@@ -1221,287 +1220,313 @@ impl Engine {
                         allowed_tools,
                         hook_executor,
                         verbosity,
-                    )
-                    .await;
-                }
-                Op::RunShellCommand {
-                    command,
-                    mode,
-                    trust_mode,
-                    auto_approve,
-                    approval_mode,
-                } => {
-                    self.handle_run_shell_command(
+                    } => {
+                        self.handle_send_message(
+                            content,
+                            mode,
+                            provider,
+                            model,
+                            goal_objective,
+                            goal_token_budget,
+                            goal_status,
+                            reasoning_effort,
+                            reasoning_effort_auto,
+                            auto_model,
+                            allow_shell,
+                            trust_mode,
+                            auto_approve,
+                            approval_mode,
+                            translation_enabled,
+                            show_thinking,
+                            allowed_tools,
+                            hook_executor,
+                            verbosity,
+                        )
+                        .await;
+                    }
+                    Op::RunShellCommand {
                         command,
                         mode,
                         trust_mode,
                         auto_approve,
                         approval_mode,
-                    )
-                    .await;
-                }
-                Op::CancelRequest => {
-                    self.cancel_token.cancel();
-                    self.reset_cancel_token();
-                }
-                Op::ApproveToolCall { id } => {
-                    // Tool approval handling will be implemented in tools module
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!("Approved tool call: {id}")))
+                    } => {
+                        self.handle_run_shell_command(
+                            command,
+                            mode,
+                            trust_mode,
+                            auto_approve,
+                            approval_mode,
+                        )
                         .await;
-                }
-                Op::DenyToolCall { id } => {
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!("Denied tool call: {id}")))
-                        .await;
-                }
-                Op::SpawnSubAgent { prompt } => {
-                    let Some(client) = self.deepseek_client.clone() else {
-                        let message = self
-                            .deepseek_client_error
-                            .as_deref()
-                            .map(|err| format!("Failed to spawn sub-agent: {err}"))
-                            .unwrap_or_else(|| {
-                                "Failed to spawn sub-agent: API client not configured".to_string()
-                            });
+                    }
+                    Op::CancelRequest => {
+                        self.cancel_token.cancel();
+                        self.reset_cancel_token();
+                    }
+                    Op::ApproveToolCall { id } => {
+                        // Tool approval handling will be implemented in tools module
                         let _ = self
                             .tx_event
-                            .send(Event::error(ErrorEnvelope::fatal(message)))
+                            .send(Event::status(format!("Approved tool call: {id}")))
                             .await;
-                        continue;
-                    };
+                    }
+                    Op::DenyToolCall { id } => {
+                        let _ = self
+                            .tx_event
+                            .send(Event::status(format!("Denied tool call: {id}")))
+                            .await;
+                    }
+                    Op::SpawnSubAgent { prompt } => {
+                        let Some(client) = self.deepseek_client.clone() else {
+                            let message = self
+                                .deepseek_client_error
+                                .as_deref()
+                                .map(|err| format!("Failed to spawn sub-agent: {err}"))
+                                .unwrap_or_else(|| {
+                                    "Failed to spawn sub-agent: API client not configured"
+                                        .to_string()
+                                });
+                            let _ = self
+                                .tx_event
+                                .send(Event::error(ErrorEnvelope::fatal(message)))
+                                .await;
+                            continue;
+                        };
 
-                    let mcp_pool = if self.config.features.enabled(Feature::Mcp) {
-                        self.ensure_mcp_pool().await.ok()
-                    } else {
-                        None
-                    };
+                        let mcp_pool = if self.config.features.enabled(Feature::Mcp) {
+                            self.ensure_mcp_pool().await.ok()
+                        } else {
+                            None
+                        };
 
-                    let mut runtime = SubAgentRuntime::new(
-                        client,
-                        self.session.model.clone(),
-                        // Sub-agents don't inherit YOLO mode - use Agent mode defaults
-                        self.build_tool_context(AppMode::Agent, self.session.auto_approve),
-                        self.session.allow_shell,
-                        Some(self.tx_event.clone()),
-                        Arc::clone(&self.subagent_manager),
-                    )
-                    .with_role_models(self.config.subagent_model_overrides.clone())
-                    .with_auto_model(self.session.auto_model)
-                    .with_reasoning_effort(
-                        self.session.reasoning_effort.clone(),
-                        self.session.reasoning_effort_auto,
-                    )
-                    .with_max_spawn_depth(self.config.max_spawn_depth)
-                    .with_step_api_timeout(self.config.subagent_api_timeout)
-                    .with_speech_output_dir(self.config.speech_output_dir.clone())
-                    .with_mcp_pool(mcp_pool)
-                    .background_runtime();
-                    let route = resolve_subagent_assignment_route(
-                        &runtime,
-                        None,
-                        &prompt,
-                        &SubAgentType::General,
-                    )
-                    .await;
-                    runtime.model = route.model;
-                    runtime.reasoning_effort = route.reasoning_effort;
-                    runtime.reasoning_effort_auto = false;
-
-                    let result = {
-                        let mut manager = self.subagent_manager.write().await;
-                        manager.spawn_background(
+                        let mut runtime = SubAgentRuntime::new(
+                            client,
+                            self.session.model.clone(),
+                            // Sub-agents don't inherit YOLO mode - use Agent mode defaults
+                            self.build_tool_context(AppMode::Agent, self.session.auto_approve),
+                            self.session.allow_shell,
+                            Some(self.tx_event.clone()),
                             Arc::clone(&self.subagent_manager),
-                            runtime,
-                            SubAgentType::General,
-                            prompt.clone(),
-                            None,
                         )
-                    };
+                        .with_role_models(self.config.subagent_model_overrides.clone())
+                        .with_auto_model(self.session.auto_model)
+                        .with_reasoning_effort(
+                            self.session.reasoning_effort.clone(),
+                            self.session.reasoning_effort_auto,
+                        )
+                        .with_max_spawn_depth(self.config.max_spawn_depth)
+                        .with_step_api_timeout(self.config.subagent_api_timeout)
+                        .with_speech_output_dir(self.config.speech_output_dir.clone())
+                        .with_mcp_pool(mcp_pool)
+                        .background_runtime();
+                        let route = resolve_subagent_assignment_route(
+                            &runtime,
+                            None,
+                            &prompt,
+                            &SubAgentType::General,
+                            ModelRoute::Inherit,
+                            SubAgentThinking::Inherit,
+                        )
+                        .await;
+                        runtime.model = route.model;
+                        runtime.reasoning_effort = route.reasoning_effort;
+                        runtime.reasoning_effort_auto = false;
 
-                    match result {
-                        Ok(snapshot) => {
-                            let _ = self
-                                .tx_event
-                                .send(Event::status(format!(
-                                    "Spawned sub-agent {}",
-                                    snapshot.agent_id
-                                )))
-                                .await;
-                        }
-                        Err(err) => {
-                            let _ = self
-                                .tx_event
-                                .send(Event::error(ErrorEnvelope::fatal(format!(
-                                    "Failed to spawn sub-agent: {err}"
-                                ))))
-                                .await;
-                        }
-                    }
-                }
-                Op::ListSubAgents => {
-                    let agents = {
-                        let mut manager = self.subagent_manager.write().await;
-                        manager.cleanup(Duration::from_secs(60 * 60));
-                        manager.list()
-                    };
-                    let _ = self.tx_event.send(Event::AgentList { agents }).await;
-                }
-                Op::ChangeMode { mode } => {
-                    self.current_mode = mode;
-                    self.emit_session_updated().await;
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
-                            "Mode changed to: {}",
-                            mode.description()
-                        )))
-                        .await;
-                }
-                Op::SetModel { model, mode: _ } => {
-                    self.session.auto_model = model.trim().eq_ignore_ascii_case("auto");
-                    self.session.model = model;
-                    self.config.model.clone_from(&self.session.model);
-                    self.refresh_system_prompt();
-                    self.emit_session_updated().await;
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
-                            "Model set to: {}",
-                            self.session.model
-                        )))
-                        .await;
-                }
-                Op::SetCompaction { config } => {
-                    let enabled = config.enabled;
-                    self.config.compaction = config;
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
-                            "Auto-compaction {}",
-                            if enabled { "enabled" } else { "disabled" }
-                        )))
-                        .await;
-                }
-                Op::SetStreamChunkTimeout { timeout_secs } => {
-                    self.config.stream_chunk_timeout = Duration::from_secs(timeout_secs);
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
-                            "Stream chunk timeout set to {timeout_secs}s"
-                        )))
-                        .await;
-                }
-                Op::SyncSession {
-                    session_id,
-                    messages,
-                    system_prompt,
-                    system_prompt_override,
-                    model,
-                    workspace,
-                } => {
-                    if let Some(session_id) = session_id {
-                        self.session.id = session_id;
-                    } else if messages.is_empty() && system_prompt.is_none() {
-                        self.session.id = uuid::Uuid::new_v4().to_string();
-                    }
-                    self.session.messages = messages.into();
-                    self.session.compaction_summary_prompt =
-                        extract_compaction_summary_prompt(system_prompt.clone());
-                    self.session.system_prompt = system_prompt;
-                    self.session.last_system_prompt_hash =
-                        Some(system_prompt_hash(self.session.system_prompt.as_ref()));
-                    // Host-supplied prompts are persisted prefixes. Keep them
-                    // byte-stable; mode/runtime state is projected per request.
-                    self.session.system_prompt_override =
-                        system_prompt_override && self.session.system_prompt.is_some();
-                    self.session.auto_model = model.trim().eq_ignore_ascii_case("auto");
-                    self.session.model = model;
-                    self.session.workspace = workspace.clone();
-                    self.config.model.clone_from(&self.session.model);
-                    self.config.workspace = workspace.clone();
-                    let ctx = crate::project_context::load_project_context_with_parents(&workspace);
-                    self.session.project_context = if ctx.has_instructions() {
-                        Some(ctx)
-                    } else {
-                        None
-                    };
-                    self.session.rebuild_working_set();
-                    self.emit_session_updated().await;
-                    let _ = self
-                        .tx_event
-                        .send(Event::status("Session context synced".to_string()))
-                        .await;
-                }
-                Op::CompactContext => {
-                    self.handle_manual_compaction().await;
-                }
-                Op::GetSessionSnapshot { tx } => {
-                    let total_tokens = self.session.total_usage.input_tokens
-                        + self.session.total_usage.output_tokens;
-                    let snapshot = SessionSnapshot {
-                        messages: self.session.messages.to_vec(),
-                        total_tokens,
-                        model: self.session.model.clone(),
-                        workspace: self.session.workspace.clone(),
-                        system_prompt: self.session.system_prompt.clone(),
-                        mode: self.current_mode.as_setting().to_string(),
-                    };
-                    if let Some(tx) = tx.lock().ok().and_then(|mut g| g.take()) {
-                        let _ = tx.send(snapshot);
-                    }
-                }
-                Op::PurgeContext => {
-                    self.handle_purge().await;
-                }
-                Op::EditLastTurn { new_message } => {
-                    // #383: /edit — remove the last user+assistant exchange
-                    // from the session, then re-send with the new content.
-                    // Pop messages from the tail until we've removed the
-                    // most recent user message and everything after it.
-                    // First, find the last user message index.
-                    let mut cut = None;
-                    for (idx, msg) in self.session.messages.iter().enumerate().rev() {
-                        if msg.role == "user" {
-                            cut = Some(idx);
-                            break;
+                        let result = {
+                            let mut manager = self.subagent_manager.write().await;
+                            manager.spawn_background(
+                                Arc::clone(&self.subagent_manager),
+                                runtime,
+                                SubAgentType::General,
+                                prompt.clone(),
+                                None,
+                            )
+                        };
+
+                        match result {
+                            Ok(snapshot) => {
+                                let _ = self
+                                    .tx_event
+                                    .send(Event::status(format!(
+                                        "Spawned sub-agent {}",
+                                        snapshot.agent_id
+                                    )))
+                                    .await;
+                            }
+                            Err(err) => {
+                                let _ = self
+                                    .tx_event
+                                    .send(Event::error(ErrorEnvelope::fatal(format!(
+                                        "Failed to spawn sub-agent: {err}"
+                                    ))))
+                                    .await;
+                            }
                         }
                     }
-                    if let Some(idx) = cut {
-                        self.session.messages.truncate_to(idx);
-                        self.session.bump_messages_revision();
+                    Op::ListSubAgents => {
+                        let agents = {
+                            let mut manager = self.subagent_manager.write().await;
+                            manager.cleanup(Duration::from_secs(60 * 60));
+                            manager.list()
+                        };
+                        let _ = self.tx_event.send(Event::AgentList { agents }).await;
                     }
-                    // Now dispatch the new message as a normal send,
-                    // reusing the engine's stored mode/model config.
-                    let mode = AppMode::Agent; // default fallback
-                    self.handle_send_message(
-                        new_message,
-                        mode,
-                        Some(self.api_provider),
-                        self.session.model.clone(),
-                        self.config.goal_objective.clone(),
-                        self.config.goal_token_budget,
-                        self.config.goal_status,
-                        self.session.reasoning_effort.clone(),
-                        self.session.reasoning_effort_auto,
-                        self.session.auto_model,
-                        self.session.allow_shell,
-                        self.session.trust_mode,
-                        self.session.auto_approve,
-                        self.session.approval_mode,
-                        self.config.translation_enabled,
-                        self.config.show_thinking,
-                        self.config.allowed_tools.clone(),
-                        self.config.hook_executor.clone(),
-                        self.config.verbosity.clone(),
-                    )
-                    .await;
-                }
-                Op::Shutdown => {
-                    break;
-                }
+                    Op::ChangeMode { mode } => {
+                        self.current_mode = mode;
+                        self.emit_session_updated().await;
+                        let _ = self
+                            .tx_event
+                            .send(Event::status(format!(
+                                "Mode changed to: {}",
+                                mode.description()
+                            )))
+                            .await;
+                    }
+                    Op::SetModel { model, mode: _ } => {
+                        self.session.auto_model = model.trim().eq_ignore_ascii_case("auto");
+                        self.session.model = model;
+                        self.config.model.clone_from(&self.session.model);
+                        self.refresh_system_prompt();
+                        self.emit_session_updated().await;
+                        let _ = self
+                            .tx_event
+                            .send(Event::status(format!(
+                                "Model set to: {}",
+                                self.session.model
+                            )))
+                            .await;
+                    }
+                    Op::SetCompaction { config } => {
+                        let enabled = config.enabled;
+                        self.config.compaction = config;
+                        let _ = self
+                            .tx_event
+                            .send(Event::status(format!(
+                                "Auto-compaction {}",
+                                if enabled { "enabled" } else { "disabled" }
+                            )))
+                            .await;
+                    }
+                    Op::SetStreamChunkTimeout { timeout_secs } => {
+                        self.config.stream_chunk_timeout = Duration::from_secs(timeout_secs);
+                        let _ = self
+                            .tx_event
+                            .send(Event::status(format!(
+                                "Stream chunk timeout set to {timeout_secs}s"
+                            )))
+                            .await;
+                    }
+                    Op::SyncSession {
+                        session_id,
+                        messages,
+                        system_prompt,
+                        system_prompt_override,
+                        model,
+                        workspace,
+                    } => {
+                        if let Some(session_id) = session_id {
+                            self.session.id = session_id;
+                        } else if messages.is_empty() && system_prompt.is_none() {
+                            self.session.id = uuid::Uuid::new_v4().to_string();
+                        }
+                        self.session.messages = messages.into();
+                        self.session.compaction_summary_prompt =
+                            extract_compaction_summary_prompt(system_prompt.clone());
+                        self.session.system_prompt = system_prompt;
+                        self.session.last_system_prompt_hash =
+                            Some(system_prompt_hash(self.session.system_prompt.as_ref()));
+                        // Host-supplied prompts are persisted prefixes. Keep them
+                        // byte-stable; mode/runtime state is projected per request.
+                        self.session.system_prompt_override =
+                            system_prompt_override && self.session.system_prompt.is_some();
+                        self.session.auto_model = model.trim().eq_ignore_ascii_case("auto");
+                        self.session.model = model;
+                        self.session.workspace = workspace.clone();
+                        self.config.model.clone_from(&self.session.model);
+                        self.config.workspace = workspace.clone();
+                        let ctx =
+                            crate::project_context::load_project_context_with_parents(&workspace);
+                        self.session.project_context = if ctx.has_instructions() {
+                            Some(ctx)
+                        } else {
+                            None
+                        };
+                        self.session.rebuild_working_set();
+                        self.emit_session_updated().await;
+                        let _ = self
+                            .tx_event
+                            .send(Event::status("Session context synced".to_string()))
+                            .await;
+                    }
+                    Op::CompactContext => {
+                        self.handle_manual_compaction().await;
+                    }
+                    Op::GetSessionSnapshot { tx } => {
+                        let total_tokens = self.session.total_usage.input_tokens
+                            + self.session.total_usage.output_tokens;
+                        let snapshot = SessionSnapshot {
+                            messages: self.session.messages.to_vec(),
+                            total_tokens,
+                            model: self.session.model.clone(),
+                            workspace: self.session.workspace.clone(),
+                            system_prompt: self.session.system_prompt.clone(),
+                            mode: self.current_mode.as_setting().to_string(),
+                        };
+                        if let Some(tx) = tx.lock().ok().and_then(|mut g| g.take()) {
+                            let _ = tx.send(snapshot);
+                        }
+                    }
+                    Op::PurgeContext => {
+                        self.handle_purge().await;
+                    }
+                    Op::EditLastTurn { new_message } => {
+                        // #383: /edit — remove the last user+assistant exchange
+                        // from the session, then re-send with the new content.
+                        // Pop messages from the tail until we've removed the
+                        // most recent user message and everything after it.
+                        // First, find the last user message index.
+                        let mut cut = None;
+                        for (idx, msg) in self.session.messages.iter().enumerate().rev() {
+                            if msg.role == "user" {
+                                cut = Some(idx);
+                                break;
+                            }
+                        }
+                        if let Some(idx) = cut {
+                            self.session.messages.truncate_to(idx);
+                            self.session.bump_messages_revision();
+                        }
+                        // Now dispatch the new message as a normal send,
+                        // reusing the engine's stored mode/model config.
+                        let mode = AppMode::Agent; // default fallback
+                        self.handle_send_message(
+                            new_message,
+                            mode,
+                            Some(self.api_provider),
+                            self.session.model.clone(),
+                            self.config.goal_objective.clone(),
+                            self.config.goal_token_budget,
+                            self.config.goal_status,
+                            self.session.reasoning_effort.clone(),
+                            self.session.reasoning_effort_auto,
+                            self.session.auto_model,
+                            self.session.allow_shell,
+                            self.session.trust_mode,
+                            self.session.auto_approve,
+                            self.session.approval_mode,
+                            self.config.translation_enabled,
+                            self.config.show_thinking,
+                            self.config.allowed_tools.clone(),
+                            self.config.hook_executor.clone(),
+                            self.config.verbosity.clone(),
+                        )
+                        .await;
+                    }
+                    Op::Shutdown => {
+                        break;
+                    }
+                },
             }
         }
 
@@ -1650,6 +1675,50 @@ impl Engine {
                 ),
             ],
         }
+    }
+
+    async fn handle_idle_subagent_completion(&mut self, first: SubAgentCompletion) {
+        let mut completions = vec![first];
+        while let Ok(completion) = self.rx_subagent_completion.try_recv() {
+            completions.push(completion);
+        }
+
+        let count = completions.len();
+        let content = completions
+            .iter()
+            .map(|completion| turn_loop::subagent_completion_runtime_text(&completion.payload))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let _ = self
+            .tx_event
+            .send(Event::status(format!(
+                "Resuming turn with {count} idle sub-agent completion(s)"
+            )))
+            .await;
+
+        self.handle_send_message(
+            content,
+            self.current_mode,
+            Some(self.api_provider),
+            self.session.model.clone(),
+            self.config.goal_objective.clone(),
+            self.config.goal_token_budget,
+            self.config.goal_status,
+            self.session.reasoning_effort.clone(),
+            self.session.reasoning_effort_auto,
+            self.session.auto_model,
+            self.session.allow_shell,
+            self.session.trust_mode,
+            self.session.auto_approve,
+            self.session.approval_mode,
+            self.config.translation_enabled,
+            self.config.show_thinking,
+            self.config.allowed_tools.clone(),
+            self.config.hook_executor.clone(),
+            self.config.verbosity.clone(),
+        )
+        .await;
     }
 
     /// Handle a send message operation

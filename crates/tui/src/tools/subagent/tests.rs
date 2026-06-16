@@ -650,6 +650,81 @@ fn test_parse_spawn_request_accepts_fork_context() {
 }
 
 #[test]
+fn test_parse_spawn_request_accepts_model_strength() {
+    let input = json!({
+        "prompt": "scan parser references",
+        "type": "explore",
+        "model_strength": "faster"
+    });
+    let parsed = parse_spawn_request(&input).expect("spawn request should parse");
+    assert_eq!(parsed.agent_type, SubAgentType::Explore);
+    assert_eq!(parsed.model_strength, SubAgentModelStrength::Faster);
+
+    let input = json!({
+        "prompt": "apply a release fix",
+        "modelStrength": "same"
+    });
+    let parsed = parse_spawn_request(&input).expect("spawn request should parse");
+    assert_eq!(parsed.model_strength, SubAgentModelStrength::Same);
+}
+
+#[test]
+fn test_parse_spawn_request_accepts_child_thinking() {
+    let input = json!({
+        "prompt": "scan parser references",
+        "thinking": "off"
+    });
+    let parsed = parse_spawn_request(&input).expect("spawn request should parse");
+    assert_eq!(
+        parsed.thinking,
+        SubAgentThinking::Effort(ReasoningEffort::Off)
+    );
+
+    let input = json!({
+        "prompt": "design a fix",
+        "reasoning_effort": "max"
+    });
+    let parsed = parse_spawn_request(&input).expect("spawn request should parse");
+    assert_eq!(
+        parsed.thinking,
+        SubAgentThinking::Effort(ReasoningEffort::Max)
+    );
+
+    let input = json!({
+        "prompt": "classify complexity",
+        "reasoningEffort": "auto"
+    });
+    let parsed = parse_spawn_request(&input).expect("spawn request should parse");
+    assert_eq!(parsed.thinking, SubAgentThinking::Auto);
+}
+
+#[test]
+fn test_parse_spawn_request_rejects_invalid_model_strength() {
+    let input = json!({
+        "prompt": "scan parser references",
+        "model_strength": "automatic"
+    });
+    let err = parse_spawn_request(&input).expect_err("invalid model_strength should fail");
+    assert!(
+        err.to_string()
+            .contains("model_strength must be one of: same, faster")
+    );
+}
+
+#[test]
+fn test_parse_spawn_request_rejects_invalid_child_thinking() {
+    let input = json!({
+        "prompt": "scan parser references",
+        "thinking": "forever"
+    });
+    let err = parse_spawn_request(&input).expect_err("invalid thinking should fail");
+    assert!(
+        err.to_string()
+            .contains("thinking must be one of: inherit, auto, off, low, medium, high, max")
+    );
+}
+
+#[test]
 fn test_parse_spawn_request_accepts_session_name_for_agent() {
     let input = json!({
         "name": "review.parser",
@@ -988,6 +1063,17 @@ fn subagent_tool_schemas_advertise_real_type_and_role_vocabulary() {
     }
     assert!(agent_schema["properties"].get("role").is_none());
     assert!(agent_schema["properties"].get("max_depth").is_some());
+    let model_strength = schema_property_description(&agent_schema, "model_strength");
+    assert!(
+        model_strength.contains("type=explore") && model_strength.contains("faster"),
+        "model_strength description should teach explore/faster routing: {model_strength}"
+    );
+    let thinking = schema_property_description(&agent_schema, "thinking");
+    assert!(
+        thinking.contains("inherit") && thinking.contains("model_strength=faster"),
+        "thinking description should teach child thinking control: {thinking}"
+    );
+    assert!(agent_schema["properties"].get("model").is_some());
 }
 
 #[test]
@@ -1120,36 +1206,91 @@ fn test_build_assignment_prompt_includes_metadata() {
 }
 
 #[test]
-fn subagent_auto_model_routes_unconfigured_assignments() {
-    let runtime = stub_runtime().with_auto_model(true);
+fn subagent_model_strength_defaults_to_parent_even_when_parent_auto_model() {
+    let mut runtime = stub_runtime().with_auto_model(true);
+    runtime.model = "deepseek-v4-pro".to_string();
 
-    assert_eq!(
-        fallback_subagent_assignment_route(&runtime, None, "implement the release fix").model,
-        "deepseek-v4-pro"
-    );
-    assert_eq!(
-        fallback_subagent_assignment_route(&runtime, None, "say hello").model,
-        "deepseek-v4-flash"
-    );
+    for prompt in ["implement the release fix", "say hello"] {
+        let route = fallback_subagent_assignment_route(
+            &runtime,
+            None,
+            ModelRoute::Inherit,
+            SubAgentThinking::Inherit,
+            prompt,
+        );
+        assert_eq!(route.model_route, ModelRoute::Inherit);
+        assert_eq!(route.model, "deepseek-v4-pro", "prompt {prompt:?}");
+    }
 }
 
 #[test]
-fn subagent_auto_route_respects_explicit_or_role_model() {
+fn subagent_model_strength_faster_uses_known_family_sibling() {
+    let mut runtime = stub_runtime().with_auto_model(true);
+    runtime.model = "deepseek-v4-pro".to_string();
+
+    let route = fallback_subagent_assignment_route(
+        &runtime,
+        None,
+        ModelRoute::Faster,
+        SubAgentThinking::Inherit,
+        "inspect one file",
+    );
+    assert_eq!(route.model_route, ModelRoute::Faster);
+    assert_eq!(route.model, "deepseek-v4-flash");
+    assert_eq!(route.reasoning_effort.as_deref(), Some("off"));
+}
+
+#[test]
+fn subagent_model_strength_explicit_model_wins_over_faster() {
     let runtime = stub_runtime().with_auto_model(true);
 
-    assert_eq!(
-        fallback_subagent_assignment_route(
-            &runtime,
-            Some("deepseek-v4-flash".to_string()),
-            "implement the release fix"
-        )
-        .model,
-        "deepseek-v4-flash"
+    let route = fallback_subagent_assignment_route(
+        &runtime,
+        Some("deepseek-v4-pro".to_string()),
+        ModelRoute::Faster,
+        SubAgentThinking::Inherit,
+        "inspect one file",
     );
+    assert_eq!(
+        route.model_route,
+        ModelRoute::Fixed("deepseek-v4-pro".to_string())
+    );
+    assert_eq!(route.model, "deepseek-v4-pro");
+}
+
+#[test]
+fn explicit_child_thinking_overrides_faster_default_off() {
+    let mut runtime = stub_runtime().with_reasoning_effort(Some("max".to_string()), false);
+    runtime.model = "deepseek-v4-pro".to_string();
+
+    let route = fallback_subagent_assignment_route(
+        &runtime,
+        None,
+        ModelRoute::Faster,
+        SubAgentThinking::Effort(ReasoningEffort::High),
+        "inspect one file",
+    );
+    assert_eq!(route.model, "deepseek-v4-flash");
+    assert_eq!(route.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(route.tuning.reasoning_effort, Some(ReasoningEffort::High));
+}
+
+#[test]
+fn explicit_child_auto_thinking_resolves_from_child_prompt() {
+    let runtime = stub_runtime().with_reasoning_effort(Some("off".to_string()), false);
+
+    let route = fallback_subagent_assignment_route(
+        &runtime,
+        None,
+        ModelRoute::Inherit,
+        SubAgentThinking::Auto,
+        "debug this release failure",
+    );
+    assert_eq!(route.reasoning_effort.as_deref(), Some("max"));
 }
 
 #[tokio::test]
-async fn route_resolution_matrix_uses_worker_profile_model_routes() {
+async fn route_resolution_matrix_uses_explicit_model_strength_routes() {
     let mut runtime = stub_runtime()
         .with_auto_model(false)
         .with_reasoning_effort(Some("max".to_string()), false);
@@ -1158,6 +1299,7 @@ async fn route_resolution_matrix_uses_worker_profile_model_routes() {
     struct RouteCase {
         agent_type: SubAgentType,
         configured_model: Option<&'static str>,
+        requested_route: ModelRoute,
         prompt: &'static str,
         expected_route: ModelRoute,
         expected_model: &'static str,
@@ -1169,8 +1311,19 @@ async fn route_resolution_matrix_uses_worker_profile_model_routes() {
         RouteCase {
             agent_type: SubAgentType::Explore,
             configured_model: None,
+            requested_route: ModelRoute::Inherit,
             prompt: "inspect the parser and report what changed",
-            expected_route: ModelRoute::Auto,
+            expected_route: ModelRoute::Inherit,
+            expected_model: "deepseek-v4-pro",
+            expected_reasoning: Some("max"),
+            expected_tuning_effort: Some(ReasoningEffort::Max),
+        },
+        RouteCase {
+            agent_type: SubAgentType::Explore,
+            configured_model: None,
+            requested_route: ModelRoute::Faster,
+            prompt: "inspect the parser and report what changed",
+            expected_route: ModelRoute::Faster,
             expected_model: "deepseek-v4-flash",
             expected_reasoning: Some("off"),
             expected_tuning_effort: Some(ReasoningEffort::Off),
@@ -1178,6 +1331,7 @@ async fn route_resolution_matrix_uses_worker_profile_model_routes() {
         RouteCase {
             agent_type: SubAgentType::General,
             configured_model: None,
+            requested_route: ModelRoute::Inherit,
             prompt: "synthesize the release blocker fix",
             expected_route: ModelRoute::Inherit,
             expected_model: "deepseek-v4-pro",
@@ -1187,6 +1341,7 @@ async fn route_resolution_matrix_uses_worker_profile_model_routes() {
         RouteCase {
             agent_type: SubAgentType::Implementer,
             configured_model: Some("deepseek-v4-flash"),
+            requested_route: ModelRoute::Inherit,
             prompt: "apply the narrow code edit",
             expected_route: ModelRoute::Fixed("deepseek-v4-flash".to_string()),
             expected_model: "deepseek-v4-flash",
@@ -1201,6 +1356,8 @@ async fn route_resolution_matrix_uses_worker_profile_model_routes() {
             case.configured_model.map(str::to_string),
             case.prompt,
             &case.agent_type,
+            case.requested_route.clone(),
+            SubAgentThinking::Inherit,
         )
         .await;
         assert_eq!(
@@ -1234,46 +1391,27 @@ fn subagent_auto_reasoning_resolves_to_distinct_v4_tiers() {
     let runtime = stub_runtime().with_reasoning_effort(Some("high".to_string()), true);
 
     assert_eq!(
-        fallback_subagent_assignment_route(&runtime, None, "quick lookup").reasoning_effort,
+        fallback_subagent_assignment_route(
+            &runtime,
+            None,
+            ModelRoute::Inherit,
+            SubAgentThinking::Inherit,
+            "quick lookup",
+        )
+        .reasoning_effort,
         Some("high".to_string())
     );
     assert_eq!(
-        fallback_subagent_assignment_route(&runtime, None, "debug this release failure")
-            .reasoning_effort,
+        fallback_subagent_assignment_route(
+            &runtime,
+            None,
+            ModelRoute::Inherit,
+            SubAgentThinking::Inherit,
+            "debug this release failure"
+        )
+        .reasoning_effort,
         Some("max".to_string())
     );
-}
-
-#[test]
-fn fixed_model_subagent_auto_reasoning_skips_flash_router() {
-    let runtime = stub_runtime().with_reasoning_effort(Some("high".to_string()), true);
-
-    assert!(
-        !should_use_subagent_flash_router(&runtime),
-        "fixed-model auto thinking should resolve locally without a hidden router request"
-    );
-}
-
-#[test]
-fn auto_model_subagent_assignments_still_use_flash_router() {
-    let runtime = stub_runtime().with_auto_model(true);
-
-    assert!(
-        should_use_subagent_flash_router(&runtime),
-        "auto-model sub-agent assignments still need router guidance"
-    );
-}
-
-#[test]
-fn subagent_router_prompt_frames_assignment_as_auto_routing() {
-    let runtime = stub_runtime()
-        .with_auto_model(true)
-        .with_reasoning_effort(Some("high".to_string()), true);
-    let prompt = subagent_router_prompt(&runtime, "inspect one file");
-
-    assert!(prompt.contains("Parent selected model mode: auto"));
-    assert!(prompt.contains("Parent selected thinking mode: auto"));
-    assert!(prompt.contains("inspect one file"));
 }
 
 #[test]
@@ -2686,6 +2824,18 @@ fn stub_client_for_provider(provider: &str) -> DeepSeekClient {
                 ..Default::default()
             };
         }
+        "openrouter" => {
+            providers.openrouter = crate::config::ProviderConfig {
+                api_key: Some("test-key".to_string()),
+                ..Default::default()
+            };
+        }
+        "zai" => {
+            providers.zai = crate::config::ProviderConfig {
+                api_key: Some("test-key".to_string()),
+                ..Default::default()
+            };
+        }
         // Ollama is keyless (local runtime); extend per-provider as needed.
         "ollama" => {}
         other => panic!("extend stub_client_for_provider for provider {other}"),
@@ -3218,15 +3368,23 @@ fn model_catalog_only_advertises_canonical_subagent_tools() {
 // ── #3018: provider-aware auto routing and model validation ─────────────────
 
 #[tokio::test]
-async fn auto_route_on_provider_without_cheap_tier_stays_on_parent_model() {
-    // AC: Ollama + auto-model must never build a request with a DeepSeek id;
-    // the routed model equals the session model for any prompt class.
+async fn faster_route_on_provider_without_known_sibling_stays_on_parent_model() {
+    // AC: Ollama must never build a request with a DeepSeek id; even when the
+    // model explicitly asks for a faster child, an unknown family stays on the
+    // parent model.
     let mut runtime = stub_runtime_for_provider("ollama").with_auto_model(true);
     runtime.model = "qwen3:32b".to_string();
 
     for prompt in ["hi", "please refactor the whole auth module for security"] {
-        let route =
-            resolve_subagent_assignment_route(&runtime, None, prompt, &SubAgentType::General).await;
+        let route = resolve_subagent_assignment_route(
+            &runtime,
+            None,
+            prompt,
+            &SubAgentType::General,
+            ModelRoute::Faster,
+            SubAgentThinking::Inherit,
+        )
+        .await;
         assert_eq!(route.model, "qwen3:32b", "prompt {prompt:?}");
         assert!(
             !route.model.contains("deepseek"),
@@ -3236,19 +3394,39 @@ async fn auto_route_on_provider_without_cheap_tier_stays_on_parent_model() {
 }
 
 #[test]
-fn flash_router_gate_requires_cheap_tier() {
-    let deepseek = stub_runtime().with_auto_model(true);
-    assert!(
-        should_use_subagent_flash_router(&deepseek),
-        "DeepSeek keeps the network router"
+fn faster_route_uses_known_deepseek_and_glm_family_siblings() {
+    let mut deepseek = stub_runtime();
+    deepseek.model = "deepseek-v4-pro".to_string();
+    let route = fallback_subagent_assignment_route(
+        &deepseek,
+        None,
+        ModelRoute::Faster,
+        SubAgentThinking::Inherit,
+        "inspect one file",
     );
+    assert_eq!(route.model, "deepseek-v4-flash");
 
-    let mut moonshot = stub_runtime_for_provider("moonshot").with_auto_model(true);
-    moonshot.model = "kimi-k2.6".to_string();
-    assert!(
-        !should_use_subagent_flash_router(&moonshot),
-        "providers without a cheap tier skip the network router"
+    let mut zai = stub_runtime_for_provider("zai");
+    zai.model = "GLM-5.2".to_string();
+    let route = fallback_subagent_assignment_route(
+        &zai,
+        None,
+        ModelRoute::Faster,
+        SubAgentThinking::Inherit,
+        "inspect docs",
     );
+    assert_eq!(route.model, "GLM-5.1");
+
+    let mut openrouter = stub_runtime_for_provider("openrouter");
+    openrouter.model = "z-ai/glm-5.2".to_string();
+    let route = fallback_subagent_assignment_route(
+        &openrouter,
+        None,
+        ModelRoute::Faster,
+        SubAgentThinking::Inherit,
+        "inspect docs",
+    );
+    assert_eq!(route.model, "z-ai/glm-5.1");
 }
 
 #[test]

@@ -53,6 +53,37 @@ pub(crate) fn provider_router_candidates(
     current_model: &str,
 ) -> RouterCandidates {
     use crate::config::ApiProvider;
+    if provider == ApiProvider::Zai {
+        let normalized = crate::config::normalize_model_name_for_provider(provider, current_model)
+            .unwrap_or_else(|| current_model.to_string());
+        return RouterCandidates {
+            cheap: if normalized == crate::config::ZAI_GLM_5_2_MODEL {
+                Some(crate::config::DEFAULT_ZAI_MODEL.to_string())
+            } else {
+                None
+            },
+            big: normalized,
+        };
+    }
+
+    if provider == ApiProvider::Openrouter
+        && let Some(normalized) =
+            crate::config::normalize_model_name_for_provider(provider, current_model)
+        && matches!(
+            normalized.as_str(),
+            crate::config::OPENROUTER_GLM_5_1_MODEL | crate::config::OPENROUTER_GLM_5_2_MODEL
+        )
+    {
+        return RouterCandidates {
+            cheap: if normalized == crate::config::OPENROUTER_GLM_5_2_MODEL {
+                Some(crate::config::OPENROUTER_GLM_5_1_MODEL.to_string())
+            } else {
+                None
+            },
+            big: normalized,
+        };
+    }
+
     match provider {
         ApiProvider::Deepseek | ApiProvider::DeepseekCN => RouterCandidates::deepseek(),
         ApiProvider::NvidiaNim
@@ -1055,6 +1086,18 @@ mod tests {
             openrouter.cheap.as_deref(),
             Some("deepseek/deepseek-v4-flash")
         );
+
+        let zai = provider_router_candidates(ApiProvider::Zai, "GLM-5.2");
+        assert_eq!(zai.big, "GLM-5.2");
+        assert_eq!(zai.cheap.as_deref(), Some("GLM-5.1"));
+
+        let openrouter_glm = provider_router_candidates(ApiProvider::Openrouter, "z-ai/glm-5.2");
+        assert_eq!(openrouter_glm.big, "z-ai/glm-5.2");
+        assert_eq!(openrouter_glm.cheap.as_deref(), Some("z-ai/glm-5.1"));
+
+        let zai_default = provider_router_candidates(ApiProvider::Zai, "GLM-5.1");
+        assert_eq!(zai_default.big, "GLM-5.1");
+        assert_eq!(zai_default.cheap, None);
 
         // Providers without a known cheap tier: big = session model, no cheap.
         let ollama = provider_router_candidates(ApiProvider::Ollama, "qwen3:32b");

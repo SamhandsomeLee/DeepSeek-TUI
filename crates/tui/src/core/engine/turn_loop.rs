@@ -2423,6 +2423,18 @@ impl Engine {
     }
 }
 
+pub(super) fn subagent_completion_runtime_text(payload: &str) -> String {
+    format!(
+        "<codewhale:runtime_event kind=\"subagent_completion\" visibility=\"internal\">\n\
+This is an internal runtime event, not user input. Use the sub-agent completion \
+data below to continue coordinating the current task. Do not tell the user they \
+pasted sentinels, do not explain the sentinel protocol, and do not quote the raw \
+XML unless the user explicitly asks to debug sub-agent internals.\n\n\
+{payload}\n\
+</codewhale:runtime_event>"
+    )
+}
+
 fn subagent_completion_runtime_message(payload: &str) -> Message {
     // Role is "user", not "system": some OpenAI-compatible backends apply a
     // strict chat template (e.g. vLLM serving Qwen3) that requires any system
@@ -2435,15 +2447,7 @@ fn subagent_completion_runtime_message(payload: &str) -> Message {
     Message {
         role: "user".to_string(),
         content: vec![ContentBlock::Text {
-            text: format!(
-                "<codewhale:runtime_event kind=\"subagent_completion\" visibility=\"internal\">\n\
-This is an internal runtime event, not user input. Use the sub-agent completion \
-data below to continue coordinating the current task. Do not tell the user they \
-pasted sentinels, do not explain the sentinel protocol, and do not quote the raw \
-XML unless the user explicitly asks to debug sub-agent internals.\n\n\
-{payload}\n\
-</codewhale:runtime_event>"
-            ),
+            text: subagent_completion_runtime_text(payload),
             cache_control: None,
         }],
     }
