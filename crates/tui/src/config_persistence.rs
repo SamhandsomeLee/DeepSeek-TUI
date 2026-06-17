@@ -294,7 +294,10 @@ fn save_toml_preserving_comments(
     use anyhow::Context;
     let serialized = toml::to_string_pretty(doc).context("failed to serialize config.toml")?;
     let body = codewhale_config::merge_and_preserve_comments(&serialized, original_raw)
-        .context("failed to merge comments")?;
+        .unwrap_or_else(|e| {
+            tracing::warn!("failed to merge config comments, saving without them: {e:#}");
+            serialized
+        });
     std::fs::write(path, body)
         .with_context(|| format!("failed to write config at {}", path.display()))?;
     Ok(())

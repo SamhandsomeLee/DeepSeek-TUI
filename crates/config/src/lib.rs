@@ -3368,7 +3368,10 @@ impl ConfigStore {
         let body = if let Some(ref original_raw) = self.original_raw {
             let serialized =
                 toml::to_string_pretty(&self.config).context("failed to serialize config")?;
-            merge_and_preserve_comments(&serialized, original_raw)?
+            merge_and_preserve_comments(&serialized, original_raw).unwrap_or_else(|e| {
+                tracing::warn!("failed to merge config comments, saving without them: {e:#}");
+                serialized
+            })
         } else {
             toml::to_string_pretty(&self.config).context("failed to serialize config")?
         };

@@ -152,8 +152,10 @@ impl TuiPrefs {
         let body = if path.exists() {
             let raw = std::fs::read_to_string(&path)
                 .with_context(|| format!("Failed to read tui.toml at {}", path.display()))?;
-            codewhale_config::merge_and_preserve_comments(&serialized, &raw)
-                .context("Failed to merge comments")?
+            codewhale_config::merge_and_preserve_comments(&serialized, &raw).unwrap_or_else(|e| {
+                tracing::warn!("failed to merge tui.toml comments, saving without them: {e:#}");
+                serialized
+            })
         } else {
             serialized
         };
@@ -561,8 +563,10 @@ impl Settings {
         let body = if path.exists() {
             let raw = std::fs::read_to_string(&path)
                 .with_context(|| format!("Failed to read settings at {}", path.display()))?;
-            codewhale_config::merge_and_preserve_comments(&serialized, &raw)
-                .context("Failed to merge comments")?
+            codewhale_config::merge_and_preserve_comments(&serialized, &raw).unwrap_or_else(|e| {
+                tracing::warn!("failed to merge settings comments, saving without them: {e:#}");
+                serialized
+            })
         } else {
             serialized
         };
