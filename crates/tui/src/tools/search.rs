@@ -334,6 +334,11 @@ fn grep_match_to_json(item: &GrepMatch, context_lines: usize) -> Value {
 }
 
 /// Collect files to search based on include/exclude patterns
+struct CollectFilesState {
+    files: Vec<PathBuf>,
+    visited_dirs: HashSet<PathBuf>,
+}
+
 fn collect_files(
     root: &Path,
     include_patterns: &[String],
@@ -341,17 +346,19 @@ fn collect_files(
     cancel_token: Option<&CancellationToken>,
     follow_symlinks: bool,
 ) -> Result<Vec<PathBuf>, ToolError> {
-    let mut files = Vec::new();
-    let mut visited_dirs = HashSet::new();
+    let mut state = CollectFilesState {
+        files: Vec::new(),
+        visited_dirs: HashSet::new(),
+    };
     check_cancelled(cancel_token)?;
 
     if root.is_file() {
-        files.push(root.to_path_buf());
-        return Ok(files);
+        state.files.push(root.to_path_buf());
+        return Ok(state.files);
     }
 
     if follow_symlinks && let Ok(canonical_root) = root.canonicalize() {
-        visited_dirs.insert(canonical_root);
+        state.visited_dirs.insert(canonical_root);
     }
 
     collect_files_recursive(
@@ -360,11 +367,10 @@ fn collect_files(
         include_patterns,
         exclude_patterns,
         cancel_token,
-        &mut files,
+        &mut state,
         follow_symlinks,
-        &mut visited_dirs,
     )?;
-    Ok(files)
+    Ok(state.files)
 }
 
 fn collect_files_recursive(
@@ -373,9 +379,8 @@ fn collect_files_recursive(
     include_patterns: &[String],
     exclude_patterns: &[String],
     cancel_token: Option<&CancellationToken>,
-    files: &mut Vec<PathBuf>,
+    state: &mut CollectFilesState,
     follow_symlinks: bool,
-    visited_dirs: &mut HashSet<PathBuf>,
 ) -> Result<(), ToolError> {
     check_cancelled(cancel_token)?;
 
@@ -430,7 +435,7 @@ fn collect_files_recursive(
                     Ok(canonical) => canonical,
                     Err(_) => continue,
                 };
-                if !visited_dirs.insert(canonical_dir) {
+                if !state.visited_dirs.insert(canonical_dir) {
                     continue;
                 }
             }
@@ -440,14 +445,13 @@ fn collect_files_recursive(
                 include_patterns,
                 exclude_patterns,
                 cancel_token,
-                files,
+                state,
                 follow_symlinks,
-                visited_dirs,
             )?;
         } else if effective_type.is_file() {
             // Check inclusions (if any specified)
             if include_patterns.is_empty() || should_include(&relative_str, include_patterns) {
-                files.push(path);
+                state.files.push(path);
             }
         }
     }

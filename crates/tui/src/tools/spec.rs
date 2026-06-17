@@ -526,12 +526,11 @@ impl ToolContext {
         }
         let canonical = normalize_path(&canonical);
 
-        if self.follow_symlinks {
-            if ancestor_normalized.starts_with(&workspace_plain)
-                || ancestor_normalized.starts_with(&workspace_normalized)
-            {
-                return Ok(canonical);
-            }
+        if self.follow_symlinks
+            && (ancestor_normalized.starts_with(&workspace_plain)
+                || ancestor_normalized.starts_with(&workspace_normalized))
+        {
+            return Ok(canonical);
         }
 
         // Validate it's under workspace, OR is under a user-trusted external
