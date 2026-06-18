@@ -8546,6 +8546,60 @@ fn approval_prompt_uses_event_input_after_message_complete_drain() {
     assert_ne!(content.trim(), "{}");
 }
 
+#[tokio::test]
+async fn approval_decision_persists_ask_rules_to_permissions_file() {
+    let tmp = TempDir::new().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+    let mut app = create_test_app();
+    app.config_path = Some(config_path.clone());
+    let mut config = Config::default();
+    let mut engine = mock_engine_handle();
+    let rule = codewhale_config::ToolAskRule::exec_shell("cargo test");
+
+    apply_approval_decision(
+        &mut app,
+        &mut engine.handle,
+        &mut config,
+        ApprovalDecisionEvent {
+            tool_id: "tool-1".to_string(),
+            tool_name: "exec_shell".to_string(),
+            decision: ReviewDecision::Approved,
+            timed_out: false,
+            approval_key: "approval-key".to_string(),
+            approval_grouping_key: "approval-group".to_string(),
+            persistent_ask_rules: vec![rule.clone()],
+        },
+    )
+    .await;
+
+    assert_eq!(
+        engine.recv_approval_event().await,
+        Some(crate::core::engine::MockApprovalEvent::Approved {
+            id: "tool-1".to_string()
+        })
+    );
+    let store = codewhale_config::ConfigStore::load(Some(config_path)).expect("load config store");
+    assert_eq!(store.permissions().rules, vec![rule]);
+    assert!(
+        app.status_message
+            .as_deref()
+            .is_some_and(|message| message.contains("Saved 1 ask permission rule"))
+    );
+
+    let decision = config
+        .exec_policy_engine
+        .check(codewhale_execpolicy::ExecPolicyContext {
+            command: "cargo test --workspace",
+            cwd: tmp.path().to_string_lossy().as_ref(),
+            tool: Some("exec_shell"),
+            path: None,
+            ask_for_approval: codewhale_execpolicy::AskForApproval::OnFailure,
+            sandbox_mode: None,
+        })
+        .expect("check persisted runtime policy");
+    assert!(decision.requires_approval);
+}
+
 #[test]
 fn second_thinking_block_appends_new_entry_in_same_active_cell() {
     // Real V4 turns can emit Thinking → Tool → Thinking → Tool before any
