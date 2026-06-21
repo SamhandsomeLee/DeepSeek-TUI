@@ -739,6 +739,12 @@ struct ReviewArgs {
     /// Maximum diff characters to include
     #[arg(long, default_value_t = 200_000)]
     max_chars: usize,
+    /// Write a durable pre-push review receipt after a successful review
+    #[arg(long, default_value_t = false)]
+    write_receipt: bool,
+    /// Override where the review receipt is written
+    #[arg(long, requires = "write_receipt")]
+    receipt_path: Option<PathBuf>,
     /// Emit machine-readable JSON output
     #[arg(long, default_value_t = false)]
     json: bool,
@@ -4270,6 +4276,7 @@ async fn run_review(config: &Config, args: ReviewArgs) -> Result<()> {
 
     let model = args
         .model
+        .clone()
         .or_else(|| config.default_text_model.clone())
         .unwrap_or_else(|| config.default_model());
     let route = resolve_cli_auto_route(config, &model, &diff).await?;
@@ -4316,6 +4323,23 @@ Provide findings ordered by severity with file references, then open questions, 
             output.push_str(&text);
         }
     }
+    let receipt = if args.write_receipt {
+        let parsed_output = crate::tools::review::ReviewOutput::from_str(&output);
+        let receipt = crate::tools::review::build_review_receipt(
+            review_target_label(&args),
+            &diff,
+            route.provider.as_str(),
+            &model,
+            &parsed_output,
+            &output,
+            Vec::new(),
+        );
+        let path =
+            crate::tools::review::write_review_receipt(&receipt, args.receipt_path.as_deref())?;
+        Some((path, receipt))
+    } else {
+        None
+    };
     if args.json {
         println!(
             "{}",
@@ -4323,11 +4347,18 @@ Provide findings ordered by severity with file references, then open questions, 
                 "mode": "review",
                 "model": model,
                 "success": true,
-                "content": output
+                "content": output,
+                "receipt_path": receipt
+                    .as_ref()
+                    .map(|(path, _)| path.display().to_string()),
+                "receipt": receipt.as_ref().map(|(_, receipt)| receipt),
             }))?
         );
     } else {
         println!("{output}");
+        if let Some((path, _)) = receipt {
+            eprintln!("Review receipt written: {}", path.display());
+        }
     }
     Ok(())
 }
@@ -4575,6 +4606,26 @@ fn collect_diff(args: &ReviewArgs) -> Result<String> {
         diff = crate::utils::truncate_with_ellipsis(&diff, args.max_chars, "\n...[truncated]\n");
     }
     Ok(diff)
+}
+
+fn review_target_label(args: &ReviewArgs) -> String {
+    let mut label = if args.staged {
+        "staged".to_string()
+    } else if let Some(base) = args
+        .base
+        .as_deref()
+        .map(str::trim)
+        .filter(|base| !base.is_empty())
+    {
+        format!("base:{base}")
+    } else {
+        "working-tree".to_string()
+    };
+    if let Some(path) = &args.path {
+        label.push(' ');
+        label.push_str(path.to_string_lossy().as_ref());
+    }
+    label
 }
 
 fn run_apply(args: ApplyArgs) -> Result<()> {
