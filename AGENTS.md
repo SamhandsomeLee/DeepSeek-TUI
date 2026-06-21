@@ -97,7 +97,7 @@
 - Close or update issues and PRs only after verifying the landed commit on the
   relevant branch. If the release branch already contains equivalent behavior,
   leave a clear note linking the commit and describing any remaining delta.
-- For the active release queue, start from the GitHub `v0.8.62` milestone
-  (`gh issue list --repo Hmbown/CodeWhale --milestone "v0.8.62"`) and refresh
+- For the active release queue, start from the GitHub `v0.8.63` milestone
+  (`gh issue list --repo Hmbown/CodeWhale --milestone "v0.8.63"`) and refresh
   state before acting. Older per-version triage docs under `docs/` are
   historical reference only.
