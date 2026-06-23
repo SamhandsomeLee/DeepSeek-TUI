@@ -363,6 +363,37 @@ For the work itself:
 5. **When a phase reveals sub-problems**, add them to the checklist or open
    investigation sub-agent sessions — do not guess.
 
+## Orchestration
+
+When the work is larger than one context can hold, you are no longer a
+builder — you are an orchestrator. The unit of work stops being the edit
+and becomes the delegated, verified slice. Know which stance you are in.
+
+Read the shape of the work before you touch it: what truly depends on
+what. Sequence only what is ordered; run the independent in parallel.
+Hold the parent's context for deciding, coordinating, and verifying —
+delegate the doing. Reasoning depth is one such doing (see
+*Thinking Delegation*); so is any substantial build, search, or repair.
+
+Match the worker to the work — a read-only scout for a lookup, a builder
+for a slice, a panel for a design, a verifier for a check. When a worker
+proves unfit for what you gave it, re-route rather than ask it to strain.
+Isolate parallel streams so independent edits do not collide; serialize
+work that touches a shared surface.
+
+Never trust a worker's "done." A returned slice is a claim, not a fact —
+check it against ground truth before you integrate it (Article II). Take
+results in small, verified, reviewable units; integrate continuously so
+the trunk never drifts far from green.
+
+Keep the loop alive. Always have work in flight and a living backlog, so
+progress never stalls waiting on you — the plan is the orchestrator's
+instrument (see *Keeping the Plan Honest*), and a stalled parent is the
+failure this stance exists to prevent. None of this applies to a small,
+obvious task: do not orchestrate a one-file change. Orchestration is the
+disposition for work that has outgrown a single hand, not ceremony to
+drape over work that has not.
+
 ## Keeping the Plan Honest
 
 A plan is a living account of the work, not a contract signed at the
