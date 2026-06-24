@@ -2153,6 +2153,54 @@ async fn run_shell_command_op_skips_approval_when_auto_approved() {
 }
 
 #[tokio::test]
+async fn yolo_mode_does_not_prompt_for_typed_ask_rule() {
+    // #3386: a command matching a typed ask-rule (permissions.toml) must not
+    // surface an approval modal in YOLO mode, even though Yolo resolves to
+    // ApprovalMode::Auto which the execpolicy maps to OnFailure (honors
+    // ask-rules). The auto_review safety floor and typed deny rules still
+    // apply; only the ask-rule Prompt is suppressed in YOLO.
+    let (mut engine, handle) = Engine::new(
+        EngineConfig {
+            exec_policy_engine: ask_rule_engine("echo"),
+            ..EngineConfig::default()
+        },
+        &Config::default(),
+    );
+
+    engine
+        .handle_run_shell_command(
+            "echo yolo-ask-rule".to_string(),
+            AppMode::Yolo,
+            true,
+            true,
+            crate::tui::approval::ApprovalMode::Auto,
+        )
+        .await;
+
+    let mut saw_complete = false;
+    let mut rx = handle.rx_event.write().await;
+    while let Some(event) = rx.recv().await {
+        match event {
+            Event::ApprovalRequired { .. } => {
+                panic!("YOLO mode must not prompt for a typed ask-rule");
+            }
+            Event::ToolCallComplete { result, .. } => {
+                saw_complete = true;
+                let result = result.expect("shell result");
+                assert!(result.success, "{result:?}");
+            }
+            Event::TurnComplete { status, .. } => {
+                assert_eq!(status, TurnOutcomeStatus::Completed);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(saw_complete);
+}
+
+#[tokio::test]
 async fn run_shell_command_op_preserves_plan_mode_shell_block() {
     let (mut engine, handle) = Engine::new(EngineConfig::default(), &Config::default());
 
