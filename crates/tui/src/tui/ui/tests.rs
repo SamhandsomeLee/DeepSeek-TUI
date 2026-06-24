@@ -241,6 +241,30 @@ fn recover_terminal_modes_emits_expected_csi_sequences_with_gating() {
     );
 }
 
+#[cfg(not(windows))]
+#[test]
+fn bracketed_paste_mode_helpers_ignore_writer_errors() {
+    struct FailingWriter;
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("terminal mode unsupported"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("terminal mode unsupported"))
+        }
+    }
+
+    let mut writer = FailingWriter;
+
+    assert!(
+        !try_enable_bracketed_paste_mode(&mut writer),
+        "unsupported bracketed paste must be reported without bubbling an error"
+    );
+    disable_bracketed_paste_mode(&mut writer);
+}
+
 #[cfg(windows)]
 #[test]
 fn recover_terminal_modes_runs_without_panic_on_windows() {

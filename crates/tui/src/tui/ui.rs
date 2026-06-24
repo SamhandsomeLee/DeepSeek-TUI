@@ -872,7 +872,7 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
         execute!(terminal.backend_mut(), DisableMouseCapture)?;
     }
     if use_bracketed_paste {
-        execute!(terminal.backend_mut(), DisableBracketedPaste)?;
+        disable_bracketed_paste_mode(terminal.backend_mut());
     }
     terminal.show_cursor()?;
     drop(terminal);
@@ -1061,7 +1061,7 @@ impl Drop for TerminalCleanupGuard {
             let _ = execute!(stdout, DisableMouseCapture);
         }
         if self.use_bracketed_paste {
-            let _ = execute!(stdout, DisableBracketedPaste);
+            disable_bracketed_paste_mode(&mut stdout);
         }
         let _ = execute!(stdout, crossterm::cursor::Show);
     }
@@ -9766,7 +9766,7 @@ fn pause_terminal(
         execute!(terminal.backend_mut(), DisableMouseCapture)?;
     }
     if use_bracketed_paste {
-        execute!(terminal.backend_mut(), DisableBracketedPaste)?;
+        disable_bracketed_paste_mode(terminal.backend_mut());
     }
     Ok(())
 }
@@ -9928,7 +9928,7 @@ pub fn emergency_restore_terminal() {
     pop_keyboard_enhancement_flags(&mut stdout);
     disable_alternate_scroll_mode(&mut stdout);
     let _ = execute!(stdout, DisableFocusChange);
-    let _ = execute!(stdout, DisableBracketedPaste);
+    disable_bracketed_paste_mode(&mut stdout);
     let _ = execute!(stdout, DisableMouseCapture);
     let _ = disable_raw_mode();
     let _ = execute!(stdout, LeaveAlternateScreen);
@@ -9991,11 +9991,27 @@ fn recover_terminal_modes<W: Write>(
     if use_mouse_capture && let Err(err) = execute!(writer, EnableMouseCapture) {
         tracing::debug!(?err, "EnableMouseCapture ignored");
     }
-    if use_bracketed_paste && let Err(err) = execute!(writer, EnableBracketedPaste) {
-        tracing::debug!(?err, "EnableBracketedPaste ignored");
+    if use_bracketed_paste {
+        try_enable_bracketed_paste_mode(writer);
     }
     if let Err(err) = execute!(writer, EnableFocusChange) {
         tracing::debug!(?err, "EnableFocusChange ignored");
+    }
+}
+
+fn try_enable_bracketed_paste_mode<W: Write>(writer: &mut W) -> bool {
+    match execute!(writer, EnableBracketedPaste) {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::debug!(?err, "EnableBracketedPaste ignored");
+            false
+        }
+    }
+}
+
+fn disable_bracketed_paste_mode<W: Write>(writer: &mut W) {
+    if let Err(err) = execute!(writer, DisableBracketedPaste) {
+        tracing::debug!(?err, "DisableBracketedPaste ignored");
     }
 }
 

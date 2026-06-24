@@ -559,6 +559,7 @@ impl Settings {
         if detected_legacy_windows_console_host() {
             self.low_motion = true;
             self.fancy_animations = false;
+            self.bracketed_paste = false;
             if self.synchronized_output.eq_ignore_ascii_case("auto") {
                 self.synchronized_output = "off".to_string();
             }
@@ -2222,6 +2223,10 @@ mod tests {
         settings.apply_env_overrides();
         assert!(settings.low_motion);
         assert!(!settings.fancy_animations);
+        assert!(
+            !settings.bracketed_paste,
+            "legacy Windows console hosts do not support crossterm bracketed paste (#1102)"
+        );
         assert_eq!(settings.synchronized_output, "off");
 
         // SAFETY: cleanup under the guard.
