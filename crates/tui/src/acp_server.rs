@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::client::DeepSeekClient;
-use crate::config::Config;
+use crate::config::{ApiProvider, Config};
 use crate::llm_client::LlmClient;
 use crate::models::{ContentBlock, Message, MessageRequest, SystemPrompt};
 
@@ -130,6 +130,9 @@ impl AcpServer {
                 &self.config,
             ))),
             "session/new" => Ok(AcpDispatch::Response(self.new_session(params)?)),
+            "session/listProviders" => Ok(AcpDispatch::Response(self.list_providers())),
+            "session/currentModel" => Ok(AcpDispatch::Response(self.current_model())),
+            "session/selectModel" => Ok(AcpDispatch::Response(self.select_model(params)?)),
             "session/prompt" => {
                 self.prompt(params, writer).await?;
                 Ok(AcpDispatch::Response(json!({ "stopReason": "end_turn" })))
@@ -155,6 +158,83 @@ impl AcpServer {
             },
         );
         Ok(json!({ "sessionId": session_id }))
+    }
+
+    fn list_providers(&self) -> Value {
+        let mut providers = ApiProvider::sorted_for_display()
+            .into_iter()
+            .map(|provider| {
+                json!({
+                    "id": provider.as_str(),
+                    "displayName": provider.display_name(),
+                    "defaultModel": provider.metadata().map(|metadata| metadata.default_model())
+                })
+            })
+            .collect::<Vec<_>>();
+
+        // Include user-defined `[providers.<name>]` custom entries so ACP
+        // clients can discover and round-trip the provider names that
+        // `session/selectModel` now accepts (#1519).
+        if let Some(custom) = self.config.providers.as_ref().map(|p| &p.custom) {
+            let mut names = custom.keys().collect::<Vec<_>>();
+            names.sort();
+            for name in names {
+                providers.push(json!({
+                    "id": name,
+                    "displayName": name,
+                    "defaultModel": custom.get(name).and_then(|cfg| cfg.model.clone())
+                }));
+            }
+        }
+
+        json!({ "providers": providers })
+    }
+
+    fn current_model(&self) -> Value {
+        // Prefer the raw configured provider key so a custom `[providers.<name>]`
+        // entry round-trips through ACP instead of canonicalizing to "custom".
+        let provider = match self.config.provider.as_deref() {
+            Some(name) if !name.trim().is_empty() => name.to_string(),
+            _ => self.config.api_provider().as_str().to_string(),
+        };
+        json!({
+            "provider": provider,
+            "model": self.model.as_str()
+        })
+    }
+
+    fn select_model(&mut self, params: Value) -> std::result::Result<Value, AcpError> {
+        let model = params
+            .get("model")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AcpError::invalid_params("model is required"))?
+            .to_string();
+
+        if let Some(provider_value) = params.get("provider") {
+            let provider_name = provider_value
+                .as_str()
+                .ok_or_else(|| AcpError::invalid_params("provider must be a string"))?;
+            // Accept either a built-in provider id/alias or a user-defined
+            // custom provider name that has a `[providers.<name>]` table. For
+            // custom providers, preserve the raw key so routing can still find
+            // the configured base URL / auth / model (#1519); canonicalizing to
+            // "custom" would lose that table key.
+            let is_custom = self
+                .config
+                .providers
+                .as_ref()
+                .and_then(|providers| providers.custom_provider_config(provider_name))
+                .is_some();
+            if !is_custom && ApiProvider::parse(provider_name).is_none() {
+                return Err(AcpError::invalid_params(format!(
+                    "unknown provider: {provider_name}"
+                )));
+            }
+            self.config.provider = Some(provider_name.to_string());
+        }
+
+        self.model = model;
+        Ok(self.current_model())
     }
 
     async fn prompt<W>(
@@ -324,6 +404,7 @@ fn initialize_result(client_protocol_version: Option<u64>, config: &Config) -> V
             .unwrap_or(ACP_PROTOCOL_VERSION),
         "agentCapabilities": {
             "loadSession": false,
+            "modelSelection": true,
             "promptCapabilities": {
                 "image": false,
                 "audio": false,
@@ -500,6 +581,92 @@ mod tests {
             result["authMethods"][0]["args"],
             json!(["auth", "set", "--provider", "deepseek"])
         );
+    }
+
+    #[test]
+    fn initialize_advertises_model_selection_capability() {
+        let result = initialize_result(Some(1), &Config::default());
+
+        assert_eq!(result["agentCapabilities"]["modelSelection"], true);
+    }
+
+    #[test]
+    fn list_providers_returns_provider_set() {
+        let server = AcpServer::new(
+            Config::default(),
+            "deepseek-chat".into(),
+            PathBuf::from("/tmp"),
+        );
+        let result = server.list_providers();
+        let providers = result["providers"].as_array().expect("providers array");
+
+        assert!(!providers.is_empty());
+        assert!(
+            providers
+                .iter()
+                .any(|provider| provider["id"] == "deepseek")
+        );
+    }
+
+    #[test]
+    fn current_model_reflects_constructor_default() {
+        let config = Config::default();
+        let expected_provider = config.api_provider().as_str();
+        let server = AcpServer::new(config, "deepseek-reasoner".into(), PathBuf::from("/tmp"));
+        let result = server.current_model();
+
+        assert_eq!(result["provider"], expected_provider);
+        assert_eq!(result["model"], "deepseek-reasoner");
+    }
+
+    #[test]
+    fn select_model_updates_active_selection() {
+        let mut server = AcpServer::new(
+            Config::default(),
+            "deepseek-chat".into(),
+            PathBuf::from("/tmp"),
+        );
+
+        let result = server
+            .select_model(json!({ "provider": "openai", "model": "gpt-4o" }))
+            .expect("select model");
+
+        assert_eq!(result["provider"], "openai");
+        assert_eq!(result["model"], "gpt-4o");
+        assert_eq!(server.current_model()["provider"], "openai");
+        assert_eq!(server.current_model()["model"], "gpt-4o");
+    }
+
+    #[test]
+    fn select_model_rejects_unknown_provider() {
+        let mut server = AcpServer::new(
+            Config::default(),
+            "deepseek-chat".into(),
+            PathBuf::from("/tmp"),
+        );
+        let before = server.current_model();
+
+        let err = server
+            .select_model(json!({ "provider": "unknown-provider", "model": "gpt-4o" }))
+            .expect_err("unknown provider rejected");
+
+        assert_eq!(err.code, -32602);
+        assert_eq!(server.current_model(), before);
+    }
+
+    #[test]
+    fn select_model_rejects_missing_model() {
+        let mut server = AcpServer::new(
+            Config::default(),
+            "deepseek-chat".into(),
+            PathBuf::from("/tmp"),
+        );
+
+        let err = server
+            .select_model(json!({ "provider": "openai" }))
+            .expect_err("missing model rejected");
+
+        assert_eq!(err.code, -32602);
     }
 
     #[test]
