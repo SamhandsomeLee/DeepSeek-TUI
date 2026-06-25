@@ -13,12 +13,24 @@ import {
   parseCommand,
   parseList,
   parseApprovalDecisionArgs,
+  isApprovalResponse,
+  isDenyResponse,
   preservedChatStateFields,
   requiredEnv,
   splitMessage,
   stripGroupPrefix,
   ThreadStore
 } from "./lib.mjs";
+
+/** Map of chatId -> latest pending approval info for natural-language approval. */
+const pendingApprovals = new Map();
+// Clean up stale approvals every 2 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [chatId, approval] of pendingApprovals) {
+    if (now - approval.timestamp > 300_000) pendingApprovals.delete(chatId);
+  }
+}, 120_000);
 
 const config = {
   botId: requiredEnv("WECOM_BOT_ID"),
@@ -35,7 +47,8 @@ const config = {
   allowUnlisted: parseBool(process.env.WECOM_ALLOW_UNLISTED, false),
   threadMapPath: process.env.WECOM_THREAD_MAP_PATH || "/var/lib/codewhale-wecom-bridge/thread-map.json",
   maxReplyChars: Number(process.env.WECOM_MAX_REPLY_CHARS || 3500),
-  turnTimeoutMs: Number(process.env.CODEWHALE_TURN_TIMEOUT_MS || 900000)
+  turnTimeoutMs: Number(process.env.CODEWHALE_TURN_TIMEOUT_MS || 900000),
+  approvalTimeoutMs: Number(process.env.CODEWHALE_APPROVAL_TIMEOUT_MS || 300000)
 };
 
 const threadStore = await ThreadStore.open(config.threadMapPath);
@@ -168,6 +181,24 @@ async function handleCommand(chatId, command, frame) {
       await setChatModel(chatId, action.modelName, frame);
       return;
     case "prompt":
+      // Check if this is a natural-language approval/deny response
+      if (pendingApprovals.has(chatId)) {
+        const pending = pendingApprovals.get(chatId);
+        if (Date.now() - pending.timestamp < config.approvalTimeoutMs) {
+          if (isApprovalResponse(action.prompt)) {
+            const action2 = { kind: "approval", decision: "allow", approvalId: pending.approvalId };
+            await decideApproval(chatId, action2, frame);
+            pendingApprovals.delete(chatId);
+            return;
+          }
+          if (isDenyResponse(action.prompt)) {
+            const action2 = { kind: "approval", decision: "deny", approvalId: pending.approvalId };
+            await decideApproval(chatId, action2, frame);
+            pendingApprovals.delete(chatId);
+            return;
+          }
+        }
+      }
       await runPrompt(chatId, action.prompt, frame);
       return;
     default:
@@ -304,16 +335,27 @@ async function streamTurnEvents(chatId, frame, threadId, turnId, sinceSeq) {
 
       if (record.event === "approval.required") {
         const approval = record.payload || {};
+        const approvalId = approval.approval_id || approval.id;
+        // Track latest pending approval per chat for natural-language responses
+        if (approvalId) {
+          pendingApprovals.set(chatId, {
+            approvalId,
+            toolName: approval.tool_name || "unknown",
+            description: approval.description || "",
+            timestamp: Date.now()
+          });
+        }
         await replyText(
           frame,
           [
             "审批请求",
             `tool=${approval.tool_name || "unknown"}`,
-            `approval_id=${approval.approval_id || approval.id}`,
+            `approval_id=${approvalId}`,
             approval.description || "",
             "",
-            `回复 /allow ${approval.approval_id || approval.id}`,
-            `回复 /deny ${approval.approval_id || approval.id}`
+            `回复 /allow ${approvalId}`,
+            `回复 /deny ${approvalId}`,
+            "也可以直接回复「允许」或「拒绝」"
           ]
             .filter(Boolean)
             .join("\n")
