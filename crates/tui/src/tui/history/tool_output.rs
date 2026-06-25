@@ -73,6 +73,22 @@ fn summarize_inline_value(value: &Value, max_len: usize, count_only: bool) -> St
     }
 }
 
+fn is_noisy_tool_arg_key(key: &str) -> bool {
+    matches!(
+        key,
+        "limit"
+            | "max_count"
+            | "max_output_tokens"
+            | "offset"
+            | "page"
+            | "page_size"
+            | "per_page"
+            | "response_length"
+            | "timeout_ms"
+            | "yield_time_ms"
+    )
+}
+
 #[must_use]
 pub fn summarize_tool_args(input: &Value) -> Option<String> {
     let obj = input.as_object()?;
@@ -162,7 +178,9 @@ pub fn summarize_tool_args(input: &Value) -> Option<String> {
     }
 
     if parts.is_empty()
-        && let Some((key, value)) = obj.iter().next()
+        && let Some((key, value)) = obj
+            .iter()
+            .find(|(key, _)| !is_noisy_tool_arg_key(key.as_str()))
     {
         return Some(format!(
             "{}: {}",

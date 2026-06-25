@@ -79,7 +79,9 @@ pub fn tool_family_for_title(title: &str) -> ToolFamily {
 #[must_use]
 pub fn tool_family_for_name(name: &str) -> ToolFamily {
     match name {
-        "read_file" | "list_dir" | "view_image" => ToolFamily::Read,
+        "read_file" | "list_dir" | "view_image" | "git_log" | "git_show" | "git_blame" => {
+            ToolFamily::Read
+        }
         "edit_file" | "apply_patch" | "write_file" => ToolFamily::Patch,
         "exec_shell"
         | "exec_shell_wait"
@@ -144,12 +146,12 @@ pub fn tool_activity_label_for_name(name: &str, locale: Locale) -> String {
 /// name and the already-sanitized argument summary.
 #[must_use]
 pub fn tool_header_summary_for_name(name: &str, input_summary: Option<&str>) -> Option<String> {
-    let summary = input_summary?.trim();
-    if summary.is_empty() {
-        return None;
-    }
+    let family = tool_family_for_name(name);
+    let summary = input_summary
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty());
 
-    let preferred_keys = match tool_family_for_name(name) {
+    let preferred_keys = match family {
         ToolFamily::Read | ToolFamily::Patch => ["path", "file", "target", "content"].as_slice(),
         ToolFamily::Run => ["command", "cmd", "script"].as_slice(),
         ToolFamily::Find => ["query", "pattern", "path", "scope"].as_slice(),
@@ -162,13 +164,32 @@ pub fn tool_header_summary_for_name(name: &str, input_summary: Option<&str>) -> 
         }
     };
 
-    for key in preferred_keys {
-        if let Some(value) = summary_value(summary, key) {
-            return Some(value);
+    let selected_summary = summary.and_then(|summary| {
+        for key in preferred_keys {
+            if let Some(value) = summary_value(summary, key) {
+                return Some(value);
+            }
         }
+
+        if summary_is_noisy_control_only(summary) {
+            None
+        } else {
+            Some(summary.to_string())
+        }
+    });
+
+    if should_show_tool_name_in_header(name, family) {
+        let tool_name = name.trim();
+        if tool_name.is_empty() {
+            return selected_summary;
+        }
+        return Some(match selected_summary {
+            Some(summary) if summary != tool_name => format!("{tool_name} · {summary}"),
+            _ => tool_name.to_string(),
+        });
     }
 
-    Some(summary.to_string())
+    selected_summary
 }
 
 fn summary_value(summary: &str, key: &str) -> Option<String> {
@@ -184,6 +205,58 @@ fn summary_value(summary: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn should_show_tool_name_in_header(name: &str, family: ToolFamily) -> bool {
+    (matches!(family, ToolFamily::Generic) && !is_known_metadata_tool_name(name))
+        || matches!(name, "git_log" | "git_show" | "git_blame")
+}
+
+fn is_known_metadata_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "update_plan"
+            | "todo_write"
+            | "todo_add"
+            | "todo_update"
+            | "checklist_write"
+            | "checklist_add"
+            | "checklist_update"
+            | "checklist_list"
+    )
+}
+
+fn summary_is_noisy_control_only(summary: &str) -> bool {
+    let mut saw_control = false;
+    for part in summary.split(", ") {
+        let Some((key, value)) = part.split_once(':') else {
+            return false;
+        };
+        if value.trim().is_empty() {
+            continue;
+        }
+        if !is_noisy_summary_key(key.trim()) {
+            return false;
+        }
+        saw_control = true;
+    }
+    saw_control
+}
+
+fn is_noisy_summary_key(key: &str) -> bool {
+    matches!(
+        key,
+        "limit"
+            | "max_count"
+            | "max_output_tokens"
+            | "offset"
+            | "page"
+            | "page_size"
+            | "per_page"
+            | "response_length"
+            | "timeout_ms"
+            | "yield_time_ms"
+    )
 }
 
 /// The verb glyph for a family. Single grapheme so the header layout math
@@ -278,6 +351,7 @@ mod tests {
         assert_eq!(tool_family_for_name("exec_shell"), ToolFamily::Run);
         assert_eq!(tool_family_for_name("task_shell_start"), ToolFamily::Run);
         assert_eq!(tool_family_for_name("grep_files"), ToolFamily::Find);
+        assert_eq!(tool_family_for_name("git_log"), ToolFamily::Read);
         assert_eq!(tool_family_for_name("agent"), ToolFamily::Delegate);
         assert_eq!(tool_family_for_name("rlm_eval"), ToolFamily::Rlm);
         assert_eq!(tool_family_for_name("run_verifiers"), ToolFamily::Verify);
@@ -339,7 +413,23 @@ mod tests {
         );
         assert_eq!(
             tool_header_summary_for_name("unknown", Some("alpha: beta")).as_deref(),
-            Some("alpha: beta")
+            Some("unknown · alpha: beta")
+        );
+        assert_eq!(
+            tool_header_summary_for_name("git_log", Some("max_count: 15")).as_deref(),
+            Some("git_log")
+        );
+        assert_eq!(
+            tool_header_summary_for_name("future_private_tool", Some("max_count: 15")).as_deref(),
+            Some("future_private_tool")
+        );
+        assert_eq!(
+            tool_header_summary_for_name("future_private_tool", None).as_deref(),
+            Some("future_private_tool")
+        );
+        assert_eq!(
+            tool_header_summary_for_name("todo_write", Some("items: <2 items>")).as_deref(),
+            Some("items: <2 items>")
         );
     }
 
