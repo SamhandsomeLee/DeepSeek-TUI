@@ -1613,7 +1613,7 @@ fn english(id: MessageId) -> &'static str {
         MessageId::KbCompleteCycleModes => {
             "Complete /command, queue running-turn follow-up, cycle modes; Shift+Tab cycles reasoning effort"
         }
-        MessageId::KbJumpPlanAgentYolo => "Trigger hotbar slots",
+        MessageId::KbJumpPlanAgentYolo => "Trigger hotbar slots; bare digits stay text",
         MessageId::KbAltJumpPlanAgentYolo => "Alternative jump to Plan / Agent / YOLO mode",
         MessageId::KbFocusSidebar => {
             "Focus Pinned / Tasks / Agents / Context / Auto sidebar; Ctrl+Alt+0 toggles pinned sidebar"

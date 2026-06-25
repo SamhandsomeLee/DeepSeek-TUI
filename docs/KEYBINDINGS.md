@@ -21,6 +21,7 @@ Bindings are not (yet) user-configurable — tracked for a future release (#436,
 | `Alt-V` / `Option-V` (macOS) | Open the details pager for the selected, visible, or most recent tool/sub-agent card; terminals that emit the legacy Option-V glyph are also handled |
 | `Ctrl-Shift-E` / `Cmd-Shift-E` | Toggle the file-tree sidebar                          |
 | `Alt-G`              | Scroll transcript to top when the composer is empty             |
+| `Alt-1`-`Alt-8`      | Dispatch Hotbar slots 1-8 when no modal or inline picker is open |
 | `Alt-!` / `Alt-@` / `Alt-#` / `Alt-$` / `Alt-0` | Focus Pinned / Tasks / Agents / Context / Auto sidebar |
 | `Ctrl-Alt-0`         | Hide/show the pinned sidebar                                    |
 | `Esc`                | Close topmost modal · cancel slash menu · dismiss toast        |
@@ -49,6 +50,18 @@ Editing the message you're about to send.
 | `Tab`                       | Slash-command / `@`-mention completion (popup-aware)    |
 | `Ctrl-O`                    | Open external editor for the composer draft when it has focus |
 | `! command`                 | Run a shell command through normal approval, sandbox, and output surfaces |
+
+### Hotbar
+
+Hotbar trigger semantics are intentionally `Alt-1` through `Alt-8` only. Bare `1`-`8` is normal text input in the composer and remains owned by pickers, onboarding, approval prompts, and modal views.
+
+| Focus state | Hotbar behavior |
+|-------------|-----------------|
+| Composer empty, text, or whitespace | `Alt-1`-`Alt-8` dispatches a configured slot |
+| Sidebar focused, hidden, or auto | `Alt-1`-`Alt-8` still dispatches a configured slot |
+| Slash menu or history search open | Blocked; the inline selector owns the key event |
+| Command palette, help, approval, file picker, session picker, Fleet setup, or any modal stack | Blocked; the modal owns the key event |
+| Onboarding | Blocked; onboarding owns numeric choices |
 
 ### `@` mentions
 

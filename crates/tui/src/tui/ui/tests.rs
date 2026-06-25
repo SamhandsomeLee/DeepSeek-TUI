@@ -3837,17 +3837,61 @@ fn hotbar_bare_digit_inserts_text_even_when_composer_empty() {
 }
 
 #[test]
-fn hotbar_alt_digit_fires_when_composer_has_text() {
+fn hotbar_alt_digit_fires_from_composer_and_sidebar_states() {
     let mut app = create_test_app();
     app.onboarding = OnboardingState::None;
-    app.input = "draft".to_string();
 
     let alt_four = KeyEvent::new(KeyCode::Char('4'), KeyModifiers::ALT);
+
+    assert_eq!(hotbar_slot_from_key(&app, &alt_four), Some(4));
+
+    app.input = "draft".to_string();
+    assert_eq!(hotbar_slot_from_key(&app, &alt_four), Some(4));
+
+    app.input = "   ".to_string();
+    assert_eq!(hotbar_slot_from_key(&app, &alt_four), Some(4));
+
+    app.sidebar_focus = SidebarFocus::Hidden;
+    assert_eq!(hotbar_slot_from_key(&app, &alt_four), Some(4));
+
+    app.sidebar_focus = SidebarFocus::Agents;
     assert_eq!(hotbar_slot_from_key(&app, &alt_four), Some(4));
 }
 
 #[test]
-fn hotbar_digits_are_blocked_while_overlay_is_open() {
+fn hotbar_alt_digit_requires_plain_alt_one_through_eight() {
+    let mut app = create_test_app();
+    app.onboarding = OnboardingState::None;
+
+    assert_eq!(
+        hotbar_slot_from_key(
+            &app,
+            &KeyEvent::new(
+                KeyCode::Char('4'),
+                KeyModifiers::ALT | KeyModifiers::CONTROL
+            )
+        ),
+        None
+    );
+    assert_eq!(
+        hotbar_slot_from_key(
+            &app,
+            &KeyEvent::new(KeyCode::Char('4'), KeyModifiers::ALT | KeyModifiers::SUPER)
+        ),
+        None
+    );
+    assert_eq!(
+        hotbar_slot_from_key(&app, &KeyEvent::new(KeyCode::Char('0'), KeyModifiers::ALT)),
+        None
+    );
+    assert_eq!(
+        hotbar_slot_from_key(&app, &KeyEvent::new(KeyCode::Char('9'), KeyModifiers::ALT)),
+        None
+    );
+}
+
+#[test]
+fn hotbar_digits_are_blocked_while_modal_or_onboarding_is_active() {
     let mut app = create_test_app();
     app.onboarding = OnboardingState::None;
     app.view_stack.push(HelpView::new());
@@ -3856,6 +3900,33 @@ fn hotbar_digits_are_blocked_while_overlay_is_open() {
     let alt_four = KeyEvent::new(KeyCode::Char('4'), KeyModifiers::ALT);
 
     assert_eq!(hotbar_slot_from_key(&app, &bare_four), None);
+    assert_eq!(hotbar_slot_from_key(&app, &alt_four), None);
+
+    let mut app = create_test_app();
+    app.onboarding = OnboardingState::Language;
+    assert_eq!(hotbar_slot_from_key(&app, &bare_four), None);
+    assert_eq!(hotbar_slot_from_key(&app, &alt_four), None);
+}
+
+#[test]
+fn hotbar_alt_digit_is_blocked_while_inline_selectors_are_open() {
+    let mut app = create_test_app();
+    app.onboarding = OnboardingState::None;
+    app.input = "/".to_string();
+    app.cursor_position = app.input.chars().count();
+    app.slash_menu_hidden = false;
+    assert!(
+        !visible_slash_menu_entries(&app, SLASH_MENU_LIMIT).is_empty(),
+        "precondition: slash menu should be visible"
+    );
+
+    let alt_four = KeyEvent::new(KeyCode::Char('4'), KeyModifiers::ALT);
+    assert_eq!(hotbar_slot_from_key(&app, &alt_four), None);
+
+    app.input = "draft".to_string();
+    app.cursor_position = app.input.chars().count();
+    app.start_history_search();
+    assert!(app.is_history_search_active());
     assert_eq!(hotbar_slot_from_key(&app, &alt_four), None);
 }
 

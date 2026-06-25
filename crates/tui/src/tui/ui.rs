@@ -4954,10 +4954,6 @@ async fn run_event_loop(
 }
 
 fn hotbar_slot_from_key(app: &App, key: &event::KeyEvent) -> Option<u8> {
-    if app.onboarding != OnboardingState::None || !app.view_stack.is_empty() {
-        return None;
-    }
-
     let KeyCode::Char(c) = key.code else {
         return None;
     };
@@ -4970,6 +4966,14 @@ fn hotbar_slot_from_key(app: &App, key: &event::KeyEvent) -> Option<u8> {
         && !key.modifiers.contains(KeyModifiers::CONTROL)
         && !key.modifiers.contains(KeyModifiers::SUPER)
     {
+        if app.onboarding != OnboardingState::None
+            || !app.view_stack.is_empty()
+            || app.is_history_search_active()
+            || !visible_slash_menu_entries(app, SLASH_MENU_LIMIT).is_empty()
+        {
+            return None;
+        }
+
         return Some(slot);
     }
 
