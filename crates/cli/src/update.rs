@@ -26,13 +26,9 @@ const UPDATE_HTTP_ATTEMPTS: usize = 3;
 const UPDATE_HTTP_RETRY_DELAY_MS: u64 = 100;
 
 /// Run the self-update workflow.
+///
+/// OpenHarmony (HarmonyOS) won't compile this file, so no need to handle
 pub fn run_update(beta: bool, check_only: bool, proxy_arg: Option<String>) -> Result<()> {
-    #[cfg(target_env = "ohos")]
-    {
-        let _ = (beta, check_only, proxy_arg);
-        bail!("self-update is not supported on HarmonyOS/OpenHarmony yet");
-    }
-
     let current_exe =
         std::env::current_exe().context("failed to determine current executable path")?;
     let legacy_binary = is_legacy_binary(&current_exe);

@@ -70,11 +70,11 @@ executable first:
 chmod +x ./scripts/ohos/ohos-clang.sh ./scripts/ohos/ohos-clangxx.sh
 ```
 
-## Cargo Config
+## Linker And Toolchain Paths
 
-`.cargo/config.toml` intentionally does not set a checked-in linker path.
+The repository does not check in a Cargo linker path or CMake toolchain path.
 Cargo cannot expand environment variables inside `linker` or CMake toolchain
-path values there, so those values are exported by `scripts/ohos-env.ps1` and
+path values, so those values are exported by `scripts/ohos-env.ps1` and
 `scripts/ohos-env.sh` instead.
 
 ## Dependency Guard

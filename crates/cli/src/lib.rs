@@ -1,6 +1,7 @@
 #![allow(clippy::uninlined_format_args)]
 
 mod metrics;
+#[cfg(not(target_env = "ohos"))]
 mod update;
 
 use std::io::{self, Read, Write};
@@ -768,7 +769,17 @@ fn run() -> Result<()> {
             Ok(())
         }
         Some(Commands::Metrics(args)) => run_metrics_command(args),
-        Some(Commands::Update(args)) => update::run_update(args.beta, args.check, args.proxy),
+        Some(Commands::Update(args)) => {
+            #[cfg(not(target_env = "ohos"))]
+            {
+                update::run_update(args.beta, args.check, args.proxy)
+            }
+            #[cfg(target_env = "ohos")]
+            {
+                let _ = args;
+                bail!("self-update is not supported on HarmonyOS/OpenHarmony yet");
+            }
+        }
         None => {
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
             let forwarded = root_tui_passthrough(&cli)?;
