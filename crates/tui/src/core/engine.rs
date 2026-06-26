@@ -40,6 +40,7 @@ use crate::models::{
 };
 use crate::prompts;
 use crate::purge::{emit_purge_completed, emit_purge_failed, emit_purge_started, run_purge};
+use crate::resource_telemetry::ResourceTelemetry;
 use crate::route_runtime::resolve_runtime_route;
 use crate::seam_manager::{SeamConfig, SeamManager};
 use crate::tools::goal::{GoalSnapshot, GoalStatus, SharedGoalState, new_shared_goal_state};
@@ -1769,6 +1770,92 @@ impl Engine {
         }
     }
 
+    fn active_input_tokens_with_current_text(&self, current_text: &str) -> usize {
+        let mut messages: Vec<Message> = self.session.messages.clone().into();
+        if !current_text.trim().is_empty() {
+            messages.push(Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: current_text.to_string(),
+                    cache_control: None,
+                }],
+            });
+        }
+        estimate_input_tokens_conservative(&messages, self.session.system_prompt.as_ref())
+    }
+
+    fn append_resource_metadata_lines(
+        &self,
+        lines: &mut Vec<String>,
+        routed_model: &str,
+        current_text: &str,
+    ) {
+        let input_tokens = self.active_input_tokens_with_current_text(current_text);
+        if let Some(budget) = route_context_budget_for_route(
+            self.api_provider,
+            routed_model,
+            self.active_route_limits,
+            input_tokens,
+        ) {
+            lines.push(format!(
+                "Context pressure: {} ({:.1}% used, {} / {} tokens; {} input tokens available)",
+                budget.pressure.label(),
+                budget.usage_percent(),
+                budget.input_tokens,
+                budget.window_tokens,
+                budget.available_input_tokens,
+            ));
+        }
+
+        if let Some(line) = self.session_token_usage_line() {
+            lines.push(line);
+        }
+        if let Some(line) = self.active_goal_resource_line() {
+            lines.push(line);
+        }
+    }
+
+    fn session_token_usage_line(&self) -> Option<String> {
+        let usage = &self.session.total_usage;
+        let total = usage.input_tokens.saturating_add(usage.output_tokens);
+        if total == 0 {
+            return None;
+        }
+
+        let mut line = format!(
+            "Session token usage: {total} total ({} input, {} output)",
+            usage.input_tokens, usage.output_tokens,
+        );
+        if let Some(hit_tokens) = usage.cache_read_input_tokens {
+            line.push_str(&format!(", cache hits {hit_tokens}"));
+        }
+        if let Some(miss_tokens) = usage.cache_creation_input_tokens {
+            line.push_str(&format!(", cache misses {miss_tokens}"));
+        }
+        Some(line)
+    }
+
+    fn active_goal_resource_line(&self) -> Option<String> {
+        let snapshot = self.config.goal_state.lock().ok()?.snapshot();
+        if !snapshot.is_active() {
+            return None;
+        }
+
+        let mut telemetry =
+            ResourceTelemetry::new(snapshot.tokens_used, snapshot.time_used_seconds);
+        if let Some(token_budget) = snapshot.token_budget {
+            telemetry = telemetry.with_token_budget(u64::from(token_budget));
+        }
+
+        let mut line = format!("Active goal resource usage: {}", telemetry.human_summary());
+        if snapshot.tokens_used > 0 && snapshot.time_used_seconds > 0 {
+            let rate = snapshot.tokens_used as f64 / snapshot.time_used_seconds as f64;
+            line.push_str(&format!("; {rate:.1} tok/s"));
+        }
+        line.push_str(&format!("; {} continuations", snapshot.continuation_count));
+        Some(line)
+    }
+
     async fn add_session_message(&mut self, message: Message) {
         self.session.add_message(message);
         self.emit_session_updated().await;
@@ -1781,6 +1868,7 @@ impl Engine {
         reasoning_effort: Option<&str>,
         reasoning_effort_auto: bool,
         provenance: UserInputProvenance,
+        current_text: &str,
     ) -> ContentBlock {
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let working_set_summary = self
@@ -1813,6 +1901,7 @@ impl Engine {
         if reasoning_effort_auto && let Some(reasoning_effort) = reasoning_effort {
             lines.push(format!("Auto reasoning effort: {reasoning_effort}"));
         }
+        self.append_resource_metadata_lines(&mut lines, routed_model, current_text);
         if let Some(working_set_summary) = working_set_summary {
             lines.push(working_set_summary);
         }
@@ -1884,6 +1973,14 @@ impl Engine {
         // message prefix is invalidated at every date boundary. Moving it
         // to the tail preserves the user-input prefix and limits cache
         // invalidation to the trailing metadata block.
+        let turn_metadata = self.turn_metadata_block(
+            routed_model,
+            auto_model,
+            reasoning_effort,
+            reasoning_effort_auto,
+            provenance,
+            &text,
+        );
         Message {
             role: "user".to_string(),
             content: vec![
@@ -1891,13 +1988,7 @@ impl Engine {
                     text,
                     cache_control: None,
                 },
-                self.turn_metadata_block(
-                    routed_model,
-                    auto_model,
-                    reasoning_effort,
-                    reasoning_effort_auto,
-                    provenance,
-                ),
+                turn_metadata,
             ],
         }
     }
@@ -3689,15 +3780,16 @@ mod approval;
 mod context;
 mod handle;
 pub(crate) use context::compact_tool_result_for_context;
+#[cfg(test)]
+use context::route_context_budget_for_provider;
 use context::{
     MAX_CONTEXT_RECOVERY_ATTEMPTS, MIN_RECENT_MESSAGES_TO_KEEP, context_input_budget_for_route,
-    effective_max_output_tokens_for_route, extract_compaction_summary_prompt,
-    is_context_length_error_message, summarize_text,
+    effective_max_output_tokens_for_route, estimate_input_tokens_conservative,
+    extract_compaction_summary_prompt, is_context_length_error_message,
+    route_context_budget_for_route, summarize_text,
 };
 #[cfg(test)]
 use context::{context_input_budget_for_provider, effective_max_output_tokens};
-#[cfg(test)]
-use context::{route_context_budget_for_provider, route_context_budget_for_route};
 mod dispatch;
 mod lsp_hooks;
 mod streaming;

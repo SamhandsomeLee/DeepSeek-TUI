@@ -3,7 +3,7 @@ use super::*;
 use super::context::{COMPACTION_SUMMARY_MARKER, TURN_MAX_OUTPUT_TOKENS};
 use super::turn_loop::registered_tool_approval_required;
 use crate::config::ApiProvider;
-use crate::models::SystemBlock;
+use crate::models::{SystemBlock, Usage};
 use crate::test_support::{EnvVarGuard, lock_test_env};
 use crate::tools::plan::{PlanItemArg, PlanSnapshot, StepStatus};
 use crate::tools::spec::ToolCapability;
@@ -3791,6 +3791,55 @@ fn turn_metadata_includes_current_local_date_without_working_set() {
     assert!(text.contains("Current model: deepseek-v4-flash"));
     assert!(text.contains("Input provenance: external_user"));
     assert!(text.contains("Input authority: external_current_turn"));
+}
+
+#[test]
+fn turn_metadata_surfaces_context_and_resource_usage() {
+    let tmp = tempdir().expect("tempdir");
+    let config = EngineConfig {
+        model: "deepseek-v4-flash".to_string(),
+        workspace: tmp.path().to_path_buf(),
+        ..Default::default()
+    };
+    let (mut engine, _handle) = Engine::new(config, &Config::default());
+    engine.session.total_usage.add(&Usage {
+        input_tokens: 1_200,
+        output_tokens: 300,
+        prompt_cache_hit_tokens: Some(800),
+        prompt_cache_miss_tokens: Some(400),
+        ..Default::default()
+    });
+    {
+        let mut goal = engine.config.goal_state.lock().expect("goal lock");
+        goal.create("Finish telemetry visibility".to_string(), Some(2_000));
+        goal.record_usage(1_000, 100);
+    }
+
+    let user_msg = engine
+        .user_text_message_with_turn_metadata("continue the long-running release task".to_string());
+    let last_block = user_msg.content.last().expect("turn metadata block");
+    let ContentBlock::Text { text, .. } = last_block else {
+        panic!("expected text metadata block");
+    };
+
+    assert!(text.contains("Context pressure:"), "got: {text}");
+    assert!(text.contains("tokens;"), "got: {text}");
+    assert!(
+        text.contains("input tokens available"),
+        "context headroom should be model-visible: {text}"
+    );
+    assert!(
+        text.contains("Session token usage: 1500 total (1200 input, 300 output"),
+        "session usage should be model-visible: {text}"
+    );
+    assert!(text.contains("cache hits 800"), "got: {text}");
+    assert!(text.contains("cache misses 400"), "got: {text}");
+    assert!(
+        text.contains("Active goal resource usage:"),
+        "active goal resource usage should be model-visible: {text}"
+    );
+    assert!(text.contains("50% budget"), "got: {text}");
+    assert!(text.contains("10.0 tok/s"), "got: {text}");
 }
 
 #[test]
