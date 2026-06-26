@@ -23,6 +23,7 @@ import {
   threadListKeyboard,
   telegramIdentity,
   telegramRetryDelayMs,
+  telegramSendRetryDelayMs,
   looksLikePollingConflict,
   validateBridgeConfig
 } from "../src/lib.mjs";
@@ -247,6 +248,22 @@ test("splitMessage chunks long text without splitting surrogate pairs", () => {
 
 test("telegramRetryDelayMs honors retry_after", () => {
   assert.equal(telegramRetryDelayMs({ parameters: { retry_after: 2 } }), 2000);
+});
+
+test("telegramSendRetryDelayMs retries only safe send failures", () => {
+  assert.equal(
+    telegramSendRetryDelayMs({ errorCode: 429, parameters: { retry_after: 3 } }, 0),
+    3000
+  );
+  assert.equal(
+    telegramSendRetryDelayMs({ errorCode: 429, parameters: { retry_after: 3 } }, 3),
+    null
+  );
+  assert.equal(telegramSendRetryDelayMs(new TypeError("fetch failed"), 0), 1000);
+  assert.equal(telegramSendRetryDelayMs(new TypeError("fetch failed"), 1), 2000);
+  assert.equal(telegramSendRetryDelayMs(new TypeError("fetch failed"), 2), null);
+  assert.equal(telegramSendRetryDelayMs({ name: "AbortError" }, 0), null);
+  assert.equal(telegramSendRetryDelayMs({ errorCode: 500 }, 0), null);
 });
 
 test("looksLikePollingConflict detects Telegram 409 conflicts", () => {

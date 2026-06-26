@@ -179,6 +179,39 @@ export function telegramRetryDelayMs(error, fallbackMs = 3000) {
   return fallbackMs;
 }
 
+export function telegramSendRetryDelayMs(error, attempt = 0) {
+  const retryAfter = Number(error?.parameters?.retry_after || 0);
+  if (error?.errorCode === 429 && attempt < 3) {
+    if (Number.isFinite(retryAfter) && retryAfter > 0) {
+      return Math.min(retryAfter * 1000, 60000);
+    }
+    return 3000;
+  }
+  if (isTransientTelegramSendError(error) && attempt < 2) {
+    return attempt === 0 ? 1000 : 2000;
+  }
+  return null;
+}
+
+function isTransientTelegramSendError(error) {
+  if (!error || error.errorCode) return false;
+  const name = String(error.name || "");
+  if (name === "AbortError" || name === "TimeoutError") return false;
+  if (error instanceof TypeError) return true;
+
+  const code = String(error.code || error.cause?.code || "");
+  if (["ECONNRESET", "ECONNREFUSED", "EAI_AGAIN", "ENOTFOUND", "ETIMEDOUT"].includes(code)) {
+    return true;
+  }
+
+  const message = String(error.message || "").toLowerCase();
+  return (
+    message.includes("fetch failed") ||
+    message.includes("network") ||
+    message.includes("socket hang up")
+  );
+}
+
 export function looksLikePollingConflict(error) {
   const text = String(error?.description || error?.message || "").toLowerCase();
   return error?.errorCode === 409 || text.includes("terminated by other getupdates request");

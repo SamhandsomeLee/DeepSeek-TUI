@@ -72,3 +72,15 @@ test("reattached streams are detached and shutdown preserves active turn state",
   const trackedStream = extractFunction(source, "startTrackedTurnStream");
   assert.match(trackedStream, /if \(!stopping\) {\s*await clearActiveTurn\(chatId\);\s*}/);
 });
+
+test("turn update sends retry without ending the stream", async () => {
+  const source = await readBridgeSource();
+  const streamTurnEvents = extractFunction(source, "streamTurnEvents");
+  const sendTurnText = extractFunction(source, "sendTurnText");
+  const telegramApi = extractFunction(source, "telegramApi");
+
+  assert.doesNotMatch(streamTurnEvents, /await\s+sendText\(/);
+  assert.match(streamTurnEvents, /await\s+sendTurnText\(/);
+  assert.match(sendTurnText, /catch \(error\) {\s*console\.error\("failed to send Telegram turn update"/);
+  assert.match(telegramApi, /method === "sendMessage" \? telegramSendRetryDelayMs\(error, attempt\) : null/);
+});

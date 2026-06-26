@@ -21,7 +21,8 @@ import {
   stripGroupPrefix,
   threadListKeyboard,
   telegramIdentity,
-  telegramRetryDelayMs
+  telegramRetryDelayMs,
+  telegramSendRetryDelayMs
 } from "./lib.mjs";
 import { ThreadStore as CoreThreadStore } from "../../bridge-core/src/lib.mjs";
 
@@ -463,7 +464,7 @@ async function runPrompt(chatId, prompt, options = {}) {
     lastSeq: sinceSeq,
     updatedAt: new Date().toISOString()
   });
-  await sendText(chatId, `Started turn ${turnId || "(unknown)"}`, {
+  await sendTurnText(chatId, `Started turn ${turnId || "(unknown)"}`, {
     replyMarkup: activeTurnKeyboard()
   });
 
@@ -498,7 +499,7 @@ async function reattachActiveTurns() {
       activeTurnId: turnId,
       updatedAt: new Date().toISOString()
     });
-    await sendText(
+    await sendTurnText(
       chatId,
       `Bridge restarted. Reattaching to active turn ${turnId} from seq ${sinceSeq}.`
     );
@@ -548,7 +549,7 @@ async function streamTurnEvents(chatId, threadId, turnId, sinceSeq, options = {}
         responseText += record.payload.delta || "";
         const now = Date.now();
         if (responseText.length > config.maxReplyChars && now - sentProgressAt > 15000) {
-          await sendText(chatId, responseText.slice(0, config.maxReplyChars));
+          await sendTurnText(chatId, responseText.slice(0, config.maxReplyChars));
           responseText = responseText.slice(config.maxReplyChars);
           sentProgressAt = now;
         }
@@ -558,7 +559,7 @@ async function streamTurnEvents(chatId, threadId, turnId, sinceSeq, options = {}
         const approval = record.payload || {};
         const approvalId = approval.approval_id || approval.id;
         if (!approvalId) {
-          await sendText(
+          await sendTurnText(
             chatId,
             [
               "Approval required",
@@ -577,7 +578,7 @@ async function streamTurnEvents(chatId, threadId, turnId, sinceSeq, options = {}
           kind: "approval",
           approvalId
         });
-        await sendText(
+        await sendTurnText(
           chatId,
           [
             "Approval required",
@@ -599,11 +600,11 @@ async function streamTurnEvents(chatId, threadId, turnId, sinceSeq, options = {}
         const status = turn.status || "completed";
         const error = turn.error ? `\n${turn.error}` : "";
         if (status !== "completed") {
-          await sendText(chatId, `Turn ${status}.${error}`.trim(), {
+          await sendTurnText(chatId, `Turn ${status}.${error}`.trim(), {
             replyMarkup: controlKeyboard()
           });
         } else {
-          await sendText(chatId, responseText.trim() || "Turn completed.", {
+          await sendTurnText(chatId, responseText.trim() || "Turn completed.", {
             replyMarkup: controlKeyboard()
           });
         }
@@ -613,7 +614,7 @@ async function streamTurnEvents(chatId, threadId, turnId, sinceSeq, options = {}
       if (record.event === "turn.lifecycle") {
         const status = record.payload?.turn?.status || record.payload?.status;
         if (["failed", "canceled", "interrupted"].includes(status)) {
-          await sendText(chatId, `Turn ${status}.`, { replyMarkup: controlKeyboard() });
+          await sendTurnText(chatId, `Turn ${status}.`, { replyMarkup: controlKeyboard() });
           return;
         }
       }
@@ -621,9 +622,9 @@ async function streamTurnEvents(chatId, threadId, turnId, sinceSeq, options = {}
   } catch (error) {
     if (error.name === "AbortError") {
       if (timedOut) {
-        await sendText(chatId, `Turn timed out after ${Math.round(config.turnTimeoutMs / 1000)}s.`);
+        await sendTurnText(chatId, `Turn timed out after ${Math.round(config.turnTimeoutMs / 1000)}s.`);
       } else if (!stopping) {
-        await sendText(chatId, "Turn stream aborted.");
+        await sendTurnText(chatId, "Turn stream aborted.");
       }
       return;
     }
@@ -789,6 +790,14 @@ async function sendText(chatId, text, options = {}) {
   }
 }
 
+async function sendTurnText(chatId, text, options = {}) {
+  try {
+    await sendText(chatId, text, options);
+  } catch (error) {
+    console.error("failed to send Telegram turn update", error);
+  }
+}
+
 async function answerCallback(callbackQueryId, text = "") {
   await telegramApi("answerCallbackQuery", {
     callback_query_id: callbackQueryId,
@@ -806,6 +815,21 @@ async function editMessageReplyMarkup(chatId, messageId, replyMarkup) {
 }
 
 async function telegramApi(method, body = {}) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await telegramApiOnce(method, body);
+    } catch (error) {
+      const retryMs = method === "sendMessage" ? telegramSendRetryDelayMs(error, attempt) : null;
+      if (retryMs == null) throw error;
+      console.warn(
+        `Telegram ${method} failed: ${error.message}. Retrying in ${Math.round(retryMs / 1000)}s.`
+      );
+      await delay(retryMs);
+    }
+  }
+}
+
+async function telegramApiOnce(method, body = {}) {
   const response = await fetch(`${config.apiBase}/bot${config.botToken}/${method}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
