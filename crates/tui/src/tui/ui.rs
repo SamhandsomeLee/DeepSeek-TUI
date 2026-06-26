@@ -10069,7 +10069,7 @@ fn enable_alternate_scroll_mode<W: Write>(writer: &mut W) {
     set_alternate_scroll_mode(writer, true);
 }
 
-fn disable_alternate_scroll_mode<W: Write>(writer: &mut W) {
+pub(crate) fn disable_alternate_scroll_mode<W: Write>(writer: &mut W) {
     set_alternate_scroll_mode(writer, false);
 }
 
@@ -10134,7 +10134,7 @@ fn enable_windows_ime_console_mode() {
 /// across focus events and are only re-established by `resume_terminal`
 /// after a suspension, which always runs a separate path.
 ///
-fn recover_terminal_modes<W: Write>(
+pub(crate) fn recover_terminal_modes<W: Write>(
     writer: &mut W,
     use_mouse_capture: bool,
     use_bracketed_paste: bool,
@@ -10166,7 +10166,7 @@ fn try_enable_bracketed_paste_mode<W: Write>(writer: &mut W) -> bool {
     }
 }
 
-fn disable_bracketed_paste_mode<W: Write>(writer: &mut W) {
+pub(crate) fn disable_bracketed_paste_mode<W: Write>(writer: &mut W) {
     if let Err(err) = execute!(writer, DisableBracketedPaste) {
         tracing::debug!(?err, "DisableBracketedPaste ignored");
     }
