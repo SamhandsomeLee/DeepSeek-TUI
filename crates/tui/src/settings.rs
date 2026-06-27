@@ -985,7 +985,7 @@ impl Settings {
             ("calm_mode", "Calmer UI defaults: on/off"),
             (
                 "tool_collapse",
-                "Dense tool-run collapse mode: compact, expanded, calm",
+                "Dense tool-run collapse mode: collapsed (alias compact), expanded, calm",
             ),
             (
                 "low_motion",
@@ -1362,7 +1362,7 @@ fn normalize_transcript_spacing(value: &str) -> &str {
 
 fn normalize_tool_collapse_mode(value: &str) -> &str {
     match value.trim().to_ascii_lowercase().as_str() {
-        "compact" | "default" | "on" | "true" => "compact",
+        "compact" | "collapsed" | "collapse" | "default" | "on" | "true" => "compact",
         "expanded" | "expand" | "off" | "none" | "false" => "expanded",
         "calm" | "calm_mode" | "calm-mode" | "calm_only" | "calm-only" => "calm",
         _ => value,
@@ -1829,6 +1829,18 @@ mod tests {
 
         settings.set("collapse", "off").expect("off alias");
         assert_eq!(settings.tool_collapse_mode, "expanded");
+
+        // Issue #3256 proposes `collapsed` as the default verbosity name;
+        // accept it (and the bare verb) as an alias of the canonical `compact`.
+        settings
+            .set("tool_collapse", "collapsed")
+            .expect("collapsed alias");
+        assert_eq!(settings.tool_collapse_mode, "compact");
+        settings.set("tool_collapse", "expanded").expect("reset");
+        settings
+            .set("tool_collapse", "collapse")
+            .expect("collapse alias");
+        assert_eq!(settings.tool_collapse_mode, "compact");
 
         let err = settings
             .set("tool_collapse", "mystery")

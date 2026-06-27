@@ -436,6 +436,8 @@ impl ToolCollapseMode {
         match value.trim().to_ascii_lowercase().as_str() {
             "expanded" | "off" | "none" => Self::Expanded,
             "calm" | "calm-mode" | "calm_only" | "calm-only" => Self::Calm,
+            // `collapsed`/`collapse` are issue #3256's preferred names for the
+            // default; treat them like the canonical `compact`.
             _ => Self::Compact,
         }
     }
