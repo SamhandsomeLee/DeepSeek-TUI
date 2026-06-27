@@ -3,9 +3,13 @@
 **Target branch:** `hunter/0.8.62-glm-subagents`
 **Related EPIC:** [#2870](https://github.com/Hmbown/CodeWhale/issues/2870)
 **Related issue:** [#2791](https://github.com/Hmbown/CodeWhale/issues/2791)
+**EPIC-002 (Command Single Responsibility Extraction):** Layer 4.x (FEAT-005 through FEAT-008)
 
 This document records the command-dispatch ownership model after the
-EPIC-001 replay onto the Hunter branch. It is the public reference for the
+EPIC-001 replay onto the Hunter branch, updated through EPIC-002 (command
+single responsibility extraction). It reflects the final layered ownership:
+top-level group registration, group-owned command registration, and
+command-level ownership of metadata and behavior. It is the public reference for the
 module boundaries, dispatch precedence, and permanent exceptions that remain
 after the command-boundary refactor.
 
@@ -86,7 +90,39 @@ count, allowed tools, pause state, todos, and plan state.
 | `user_commands.rs` lower layer | The registry owns runtime behavior, while this module remains the shared filesystem and parser layer. |
 | `#[cfg(test)]` helpers in `user_commands.rs` | Deferred test migration compatibility while registry-specific tests are added. |
 
-## Replay Status
+## EPIC-002 Completion Status (Draft — Phase 6 In Progress)
+
+EPIC-002 (Command Single Responsibility Extraction) extracted commands for
+all 9 command groups through Layer 4.x sublayers. Layer 4.4 (FEAT-008) is
+currently in Phase 6 validation and is awaiting code review approval for
+final closure evidence.
+
+| Layer | FEAT | Title | Status |
+|---|---|---|---|
+| 4.0 | FEAT-004 | Command Extraction Contract and Baseline | Complete |
+| 4.1 | FEAT-005 | Core and Session Command Extraction | Complete |
+| 4.2 | FEAT-006 | Config and Debug Command Extraction | Complete |
+| 4.3 | FEAT-007 | Project, Memory, Skills, and Utility Extraction | Complete |
+| 4.4 | FEAT-008 | Registry Cleanup, Documentation, and Full Validation | In progress (Phase 6 validation) |
+
+### Current Phase 6 Evidence (Draft — subject to code review)
+
+Phase 6 focused-command-surface and acceptance-runner evidence, collected
+during current validation:
+
+- AT-001: `cargo test -p codewhale-tui --test epic_acceptance_harness` — pass
+- AT-002: `every_registered_command_dispatches_to_a_handler` — pass
+- AT-003: `every_command_alias_dispatches_to_a_handler` — pass
+- AT-004: Help (test), palette (21 tests), slash completion (18 tests) — pass
+- AT-005: `dispatch_prefers_user_command_over_builtin_with_same_name` — pass
+- AT-006: `hidden_user_commands_still_dispatch_directly` — pass
+- AT-007: `unknown_command_suggests_nearest_match` — pass
+- AT-008: `command_registry_has_unique_names_and_aliases` — pass
+- AT-009: `command_ownership_contract_is_enforced` — pass
+- AT-010: Cleanup inventory verified — no undocumented migration paths remain
+- AT-011: Final evidence — draft collected, subject to Phase 8 final gate
+
+## Replay Status (EPIC-001)
 
 FEAT-001's group-owned built-in command direction is represented on Hunter by
 the newer trait-backed registry and nested group tree. FEAT-002 is replayed as

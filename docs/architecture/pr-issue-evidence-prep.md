@@ -1,12 +1,83 @@
-# EPIC-001 Hunter Replay Evidence
+# EPIC Evidence Preparation
+
+## EPIC-002 Closure Evidence (Draft — Phase 6 In Progress)
+
+**Epic:** EPIC-002 — Command Single Responsibility Extraction
+**Related EPIC:** [#2870](https://github.com/Hmbown/CodeWhale/issues/2870)
+**Related issues:** [#2791](https://github.com/Hmbown/CodeWhale/issues/2791),
+[#2851](https://github.com/Hmbown/CodeWhale/pull/2851),
+[#2887](https://github.com/Hmbown/CodeWhale/pull/2887)
+
+This section records draft EPIC-002 closure evidence. Layer 4.4 (FEAT-008) is
+currently in Phase 6 validation awaiting code review. Evidence below is Phase 6
+current-state — final pass/fail markers will replace placeholders after the
+Phase 8 final gate.
+
+### PR References
+
+- Layer 4.0 (FEAT-004): Command extraction contract and baseline
+- Layer 4.1 (FEAT-005): Core and session command extraction
+- Layer 4.2 (FEAT-006): Config and debug command extraction
+- Layer 4.3 (FEAT-007): Project, memory, skills, and utility extraction
+- Layer 4.4 (FEAT-008): Registry cleanup, documentation, and full validation
+
+### Acceptance Evidence
+
+| AT ID | Check | Result |
+|-------|-------|--------|
+| AT-001 | `cargo test -p codewhale-tui --test epic_acceptance_harness` | ⬜ Pass (draft Phase 6 evidence) |
+| AT-002 | `every_registered_command_dispatches_to_a_handler` | ⬜ Pass (draft Phase 6 evidence) |
+| AT-003 | `every_command_alias_dispatches_to_a_handler` | ⬜ Pass (draft Phase 6 evidence) |
+| AT-004 | Help/palette/completion surface tests | ⬜ 18+21+18 pass (draft Phase 6 evidence) |
+| AT-005 | `dispatch_prefers_user_command_over_builtin_with_same_name` | ⬜ Pass (draft Phase 6 evidence) |
+| AT-006 | `hidden_user_commands_still_dispatch_directly` | ⬜ Pass (draft Phase 6 evidence) |
+| AT-007 | `unknown_command_suggests_nearest_match` | ⬜ Pass (draft Phase 6 evidence) |
+| AT-008 | `command_registry_has_unique_names_and_aliases` | ⬜ Pass (draft Phase 6 evidence) |
+| AT-009 | `command_ownership_contract_is_enforced` | ⬜ Pass (draft Phase 6 evidence) |
+| AT-010 | Cleanup inventory — no undocumented migration paths | ⬜ Verified (draft Phase 6 evidence) |
+| AT-011 | Final closure matrix | ⬜ Draft evidence collected (subject to Phase 8 final gate) |
+
+### Permanent Exceptions
+
+| Exception | Rationale |
+|-----------|-----------|
+| Config group-local metadata | Config `mod.rs` keeps 11 `CommandInfo` statics and dispatch — permanent structure, not cleanup scope |
+| Debug group-local metadata | Debug `mod.rs` keeps 11 `CommandInfo` statics and dispatch — permanent structure, not cleanup scope |
+| `/jihua`, `/zidong` | Chinese-language back-compat aliases for `/mode` — predate group-owned registry |
+| `/slop`, `/canzha` | Typed-only aliases for `/debt` — predate group-owned registry |
+| `/set`, `/deepseek` migration hints | Retired commands, direct typed guidance only, excluded from registry/completion |
+| `$skill` prefix | Non-slash compatibility syntax, predates EPIC-002 |
+| Skill-name fallback | Slash commands fall back to skill dispatch after built-ins and user commands |
+| `command_runs_directly()` palette list | UI policy decision, not registry metadata |
+| Public re-export bridge paths | Long-standing public API compatibility |
+| User-command compatibility loaders | `.deepseek`, `.claude`, `.cursor` directories — user-command scope, not built-in cleanup |
+| `#[allow(clippy::module_inception)]` | Intentional structure for same-named group and child modules |
+
+### Validation
+
+- `cargo fmt --all -- --check`
+- `cargo check -p codewhale-tui`
+- `cargo test -p codewhale-tui commands::tests:: -- --test-threads=1` (60 passed)
+- `cargo test -p codewhale-tui command_palette -- --test-threads=1` (21 passed)
+- `cargo test -p codewhale-tui slash_completion -- --test-threads=1` (18 passed)
+- `cargo test -p codewhale-tui user_registry -- --test-threads=1` (18 passed)
+- `cargo test -p codewhale-tui --test epic_acceptance_harness` (1 passed)
+- `cargo test -p codewhale-tui --test command_surfaces_acceptance -- --test-threads=1` (1 passed)
+- `cargo test -p codewhale-tui --test core_session_command_extraction -- --test-threads=1` (1 passed)
+- `cargo test -p codewhale-tui --test plugin_e2e_acceptance -- --test-threads=1` (4 passed)
+- `git diff --check`
+
+---
+
+## EPIC-001 Hunter Replay Evidence
 
 **Target branch:** `hunter/0.8.62-glm-subagents`
 **Replay branch:** `feat/replay-epic-001-on-hunter`
 **Related EPIC:** [#2870](https://github.com/Hmbown/CodeWhale/issues/2870)
 **Related issue:** [#2791](https://github.com/Hmbown/CodeWhale/issues/2791)
 
-This file is the working PR/issue evidence checklist for replaying EPIC-001
-FEAT-001, FEAT-002, and FEAT-003 onto the Hunter branch.
+This section records the working PR/issue evidence checklist for replaying
+EPIC-001 FEAT-001, FEAT-002, and FEAT-003 onto the Hunter branch.
 
 ## Replay Scope
 
