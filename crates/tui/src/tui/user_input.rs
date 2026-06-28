@@ -3,13 +3,13 @@
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Alignment, Rect};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Widget, Wrap};
+use ratatui::widgets::{Block, Borders, Padding, Paragraph, Widget, Wrap};
 
 use crate::palette;
 use crate::tools::user_input::{
     UserInputAnswer, UserInputQuestion, UserInputRequest, UserInputResponse,
 };
-use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
+use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent, render_modal_surface};
 
 fn modal_block(title: &str) -> Block<'static> {
     Block::default()
@@ -19,32 +19,12 @@ fn modal_block(title: &str) -> Block<'static> {
         )]))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(palette::BORDER_COLOR))
+        .style(Style::default().bg(palette::DEEPSEEK_INK))
         .padding(Padding::uniform(1))
 }
 
 fn render_modal_chrome(area: Rect, popup_area: Rect, buf: &mut Buffer) {
-    let shadow_x = popup_area.x.saturating_add(1);
-    let shadow_y = popup_area.y.saturating_add(1);
-    let shadow_right = area.x.saturating_add(area.width);
-    let shadow_bottom = area.y.saturating_add(area.height);
-    let shadow_width = popup_area.width.min(shadow_right.saturating_sub(shadow_x));
-    let shadow_height = popup_area
-        .height
-        .min(shadow_bottom.saturating_sub(shadow_y));
-
-    if shadow_width > 0 && shadow_height > 0 {
-        Block::default().render(
-            Rect {
-                x: shadow_x,
-                y: shadow_y,
-                width: shadow_width,
-                height: shadow_height,
-            },
-            buf,
-        );
-    }
-
-    Clear.render(popup_area, buf);
+    render_modal_surface(area, popup_area, buf);
 }
 
 fn push_option_lines(

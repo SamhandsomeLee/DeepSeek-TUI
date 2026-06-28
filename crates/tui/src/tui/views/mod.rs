@@ -1,5 +1,10 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use ratatui::{buffer::Buffer, layout::Rect};
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    style::Style,
+    widgets::{Block, Clear, Widget},
+};
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::fmt;
@@ -43,6 +48,42 @@ pub enum ModalKind {
     FeedbackPicker,
     ThemePicker,
     ContextMenu,
+}
+
+/// Clear and paint a modal popup with an opaque surface.
+///
+/// Older modals often called `Clear` only, which left reset-background blank
+/// cells that could read as translucent on terminals with a non-default app
+/// background. This helper makes the popup area explicit and keeps the small
+/// shadow from inheriting stale transcript glyphs.
+pub(crate) fn render_modal_surface(area: Rect, popup_area: Rect, buf: &mut Buffer) {
+    let shadow_x = popup_area.x.saturating_add(1);
+    let shadow_y = popup_area.y.saturating_add(1);
+    let shadow_right = area.x.saturating_add(area.width);
+    let shadow_bottom = area.y.saturating_add(area.height);
+    let shadow_width = popup_area.width.min(shadow_right.saturating_sub(shadow_x));
+    let shadow_height = popup_area
+        .height
+        .min(shadow_bottom.saturating_sub(shadow_y));
+
+    if shadow_width > 0 && shadow_height > 0 {
+        Block::default()
+            .style(Style::default().bg(palette::SURFACE_ELEVATED))
+            .render(
+                Rect {
+                    x: shadow_x,
+                    y: shadow_y,
+                    width: shadow_width,
+                    height: shadow_height,
+                },
+                buf,
+            );
+    }
+
+    Clear.render(popup_area, buf);
+    Block::default()
+        .style(Style::default().bg(palette::DEEPSEEK_INK))
+        .render(popup_area, buf);
 }
 
 #[derive(Debug, Clone)]

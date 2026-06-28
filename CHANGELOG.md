@@ -55,6 +55,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fixed Plan/request-input modal surfaces so popup interiors are painted
+  opaquely, and compacted the Plan confirmation footer so action choices stay
+  visible on narrow terminals instead of truncating (#3732).
 - Added a turn-loop Plan-mode guard for file-writing tools and write-capable MCP
   tools so Plan's "no writes" promise is enforced before approval or execution,
   not only by the sandbox/catalog layer (#3734).
