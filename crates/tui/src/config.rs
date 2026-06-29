@@ -3640,11 +3640,26 @@ impl Config {
         self.context.project_pack.unwrap_or(true)
     }
 
-    /// Return whether shell execution is allowed. Defaults to `false`: shell
+    /// Return whether shell execution is allowed for noninteractive and
+    /// durable-task profiles. Defaults to `false`: in headless, app-server, and
+    /// background-task contexts there is no human to approve commands, so shell
     /// access must be opted into explicitly (GHSA-72w5-pf8h-xfp4).
     #[must_use]
     pub fn allow_shell(&self) -> bool {
         self.allow_shell.unwrap_or(false)
+    }
+
+    /// Return whether shell execution is allowed for an *interactive* TUI Agent
+    /// session. Defaults to `true`: the interactive composer always gates each
+    /// shell command behind an approval prompt, so the catalog can expose shell
+    /// by default while still preserving consent (GHSA-72w5-pf8h-xfp4). An
+    /// explicit `allow_shell = false` still hides shell tools. This is the
+    /// single source of truth for the interactive default; both startup
+    /// (`run_interactive`) and the durable Agent permission baseline read it so
+    /// the default cannot drift between them.
+    #[must_use]
+    pub fn interactive_allow_shell(&self) -> bool {
+        self.allow_shell.unwrap_or(true)
     }
 
     /// Whether ghost-text prompt suggestion is enabled (opt-in, default off).

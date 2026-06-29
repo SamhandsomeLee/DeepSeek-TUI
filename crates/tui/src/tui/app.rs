@@ -2490,10 +2490,15 @@ impl App {
         // Durable Agent-era permission baseline (#3386). Plan/Auto/YOLO derive
         // from and restore to this. When the user starts in Auto or YOLO the
         // live shell flag is force-enabled below, so the baseline shell value is
-        // taken from config (the pre-mode surface) rather than the live mirror;
-        // otherwise it mirrors the resolved `allow_shell` option. Trust is
-        // never part of the Agent baseline (it is YOLO-only authority). Approval
-        // mirrors the configured policy.
+        // taken from the interactive default (the pre-mode Agent surface) rather
+        // than the YOLO-forced live mirror; otherwise it mirrors the resolved
+        // `allow_shell` option, which already carries that same interactive
+        // default. Using `interactive_allow_shell()` here keeps the Agent
+        // baseline identical regardless of launch mode, so a YOLO/Auto -> Agent
+        // downshift exposes shell (approval-gated) exactly as documented, while
+        // an explicit `allow_shell = false` still hides it. Trust is never part
+        // of the Agent baseline (it is YOLO-only authority). Approval mirrors the
+        // configured policy.
         let configured_approval_mode = config
             .approval_policy
             .as_deref()
@@ -2501,7 +2506,7 @@ impl App {
             .unwrap_or_default();
         let mode_prefs = ModeSessionPrefs {
             agent_allow_shell: if matches!(initial_mode, AppMode::Auto | AppMode::Yolo) {
-                config.allow_shell()
+                config.interactive_allow_shell()
             } else {
                 allow_shell
             },

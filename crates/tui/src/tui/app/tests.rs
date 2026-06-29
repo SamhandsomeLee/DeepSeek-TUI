@@ -1790,6 +1790,23 @@ fn set_mode_captures_agent_edits_as_the_durable_baseline() {
 }
 
 #[test]
+fn yolo_start_with_default_config_restores_interactive_agent_shell_baseline() {
+    let mut app = App::new(test_options(true), &Config::default());
+    assert_eq!(app.mode, AppMode::Yolo);
+    assert!(app.allow_shell);
+    assert!(app.trust_mode);
+    assert_eq!(app.approval_mode, ApprovalMode::Bypass);
+
+    app.set_mode(AppMode::Agent);
+    assert!(
+        app.allow_shell,
+        "default interactive Agent baseline should expose approval-gated shell after YOLO downshift"
+    );
+    assert!(!app.trust_mode);
+    assert_eq!(app.approval_mode, ApprovalMode::Suggest);
+}
+
+#[test]
 fn leaving_yolo_after_startup_restores_baseline_policies() {
     let config = Config {
         allow_shell: Some(false),

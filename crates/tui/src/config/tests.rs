@@ -156,6 +156,34 @@ fn allow_shell_defaults_to_false_when_unset() {
     );
 }
 
+// The interactive default is shell-on (approval-gated). Both interactive
+// startup and the durable Agent permission baseline (app.rs) read this single
+// method so the default cannot drift between launch modes; an explicit opt-out
+// is still honored.
+#[test]
+fn interactive_allow_shell_defaults_to_true_but_honors_explicit_opt_out() {
+    let default_config = Config::default();
+    assert!(
+        default_config.interactive_allow_shell(),
+        "interactive Agent sessions expose shell by default so approvals can gate commands"
+    );
+
+    let opted_out = Config {
+        allow_shell: Some(false),
+        ..Config::default()
+    };
+    assert!(
+        !opted_out.interactive_allow_shell(),
+        "explicit allow_shell = false still hides shell in interactive sessions"
+    );
+
+    let opted_in = Config {
+        allow_shell: Some(true),
+        ..Config::default()
+    };
+    assert!(opted_in.interactive_allow_shell());
+}
+
 #[test]
 fn prompt_suggestion_defaults_to_false() {
     let config = Config::default();

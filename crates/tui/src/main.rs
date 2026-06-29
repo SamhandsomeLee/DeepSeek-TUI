@@ -6410,7 +6410,7 @@ fn normalize_windows_config_path_str(path: &str) -> String {
 }
 
 fn interactive_tui_allow_shell(yolo: bool, config: &Config) -> bool {
-    yolo || config.allow_shell.unwrap_or(true)
+    yolo || config.interactive_allow_shell()
 }
 
 async fn run_interactive(
