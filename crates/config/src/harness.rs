@@ -158,21 +158,23 @@ impl HarnessProfile {
 }
 
 /// Resolution source for harness profile selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HarnessSource {
     /// Matched a user-configured `[[harness_profiles]]` entry.
     UserProfile,
     /// Matched a built-in seed profile.
     BuiltInSeed,
     /// No match; fell back to the Standard default posture.
+    #[default]
     Default,
 }
 
 /// Deterministic harness resolution for a provider/model route.
 ///
 /// Pure data: constructing it must not mutate provider selection, prompts,
-/// auth, tools, context, or persisted config.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// auth, tools, context, or persisted config. The [`Default`] value is a
+/// no-match Standard resolution, suitable for an initial cached state.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HarnessResolution {
     /// Effective posture (`HarnessPosture::default()` when nothing matched).
     pub posture: HarnessPosture,

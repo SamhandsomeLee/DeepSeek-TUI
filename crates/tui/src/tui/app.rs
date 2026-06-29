@@ -1751,6 +1751,10 @@ pub struct App {
     pub moraine_fallback: bool,
     /// User-configured harness profiles loaded from config.toml (preview display).
     pub harness_profiles: Vec<codewhale_config::HarnessProfile>,
+    /// Cached harness resolution for the active provider/model route (PR3-0
+    /// carry). Single source of truth read by the footer chip, `/harness`, and
+    /// engine construction; refreshed on every route change.
+    pub active_harness_resolution: HarnessResolution,
     pub use_alt_screen: bool,
     pub use_mouse_capture: bool,
     /// When true, plain Up/Down on an empty composer scroll the transcript
@@ -2808,6 +2812,7 @@ impl App {
             use_memory,
             moraine_fallback: config.moraine_fallback(),
             harness_profiles: config.harness_profiles.clone(),
+            active_harness_resolution: HarnessResolution::default(),
             use_alt_screen,
             use_mouse_capture,
             use_bracketed_paste,
@@ -3018,6 +3023,7 @@ impl App {
         if yolo_compat {
             app.notify_yolo_compat_once();
         }
+        app.refresh_active_harness_resolution();
         app
     }
 
@@ -6034,6 +6040,15 @@ impl App {
                 self.active_route_limits,
             );
         }
+        self.refresh_active_harness_resolution();
+    }
+
+    /// Refresh the cached harness resolution for the active provider/model route.
+    ///
+    /// Pure derived state: does not mutate config, persist settings, or change
+    /// runtime behavior until later PR3 slices consume `active_harness_resolution`.
+    pub fn refresh_active_harness_resolution(&mut self) {
+        self.active_harness_resolution = self.harness_resolution();
     }
 
     pub fn set_active_route_limits(&mut self, limits: RouteLimits) {
@@ -6126,7 +6141,7 @@ impl App {
     /// on ordinary routes (Standard is the default and not worth a chip).
     #[must_use]
     pub fn harness_posture_label(&self) -> Option<&'static str> {
-        match self.harness_resolution().posture.kind {
+        match self.active_harness_resolution.posture.kind {
             HarnessPostureKind::CacheHeavy => Some("cache-heavy"),
             HarnessPostureKind::Lean => Some("lean"),
             HarnessPostureKind::Custom => Some("custom"),

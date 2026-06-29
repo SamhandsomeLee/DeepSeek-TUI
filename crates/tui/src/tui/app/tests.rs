@@ -2184,6 +2184,73 @@ fn test_update_model_compaction_budget() {
 }
 
 #[test]
+fn active_harness_posture_tracks_active_route() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.api_provider = ApiProvider::Deepseek;
+    app.model = "deepseek-v4-pro".to_string();
+    app.auto_model = false;
+    app.refresh_active_harness_resolution();
+
+    assert_eq!(
+        app.active_harness_resolution.posture.kind,
+        codewhale_config::HarnessPostureKind::CacheHeavy
+    );
+
+    app.api_provider = ApiProvider::Openai;
+    app.model = "gpt-x".to_string();
+    app.refresh_active_harness_resolution();
+    assert_eq!(
+        app.active_harness_resolution.posture.kind,
+        codewhale_config::HarnessPostureKind::Standard
+    );
+}
+
+#[test]
+fn update_model_compaction_budget_refreshes_harness_posture() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.api_provider = ApiProvider::Deepseek;
+    app.model = "deepseek-v4-pro".to_string();
+    app.auto_model = false;
+    app.active_route_limits = None;
+    app.active_context_window_override = None;
+
+    app.update_model_compaction_budget();
+    assert_eq!(
+        app.active_harness_resolution.posture.kind,
+        codewhale_config::HarnessPostureKind::CacheHeavy
+    );
+}
+
+#[test]
+fn refresh_harness_posture_does_not_mutate_profiles() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.harness_profiles = vec![codewhale_config::HarnessProfile {
+        provider_route: "deepseek".to_string(),
+        model_pattern: "deepseek-v4-*".to_string(),
+        posture: codewhale_config::HarnessPosture::lean(),
+    }];
+    let before = app.harness_profiles.clone();
+
+    app.refresh_active_harness_resolution();
+
+    assert_eq!(app.harness_profiles, before);
+}
+
+#[test]
+fn app_boot_refreshes_active_harness_posture() {
+    let mut options = test_options(false);
+    options.model = "deepseek-v4-pro".to_string();
+    options.skip_onboarding = true;
+    let mut config = Config::default();
+    config.provider = Some("deepseek".to_string());
+    let app = App::new(options, &config);
+    assert_eq!(
+        app.active_harness_resolution.posture.kind,
+        codewhale_config::HarnessPostureKind::CacheHeavy
+    );
+}
+
+#[test]
 fn test_input_history_navigation() {
     let mut app = App::new(test_options(false), &Config::default());
     app.input_history.push("first".to_string());

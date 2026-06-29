@@ -34,7 +34,7 @@ impl RegisterCommand for HarnessCmd {
 }
 
 pub(crate) fn format_harness_status(app: &App) -> String {
-    let resolution = app.harness_resolution();
+    let resolution = &app.active_harness_resolution;
     let posture = &resolution.posture;
     let mut out = String::new();
     let _ = writeln!(
@@ -158,6 +158,7 @@ mod tests {
         app.api_provider = provider;
         app.model = model.to_string();
         app.auto_model = false;
+        app.refresh_active_harness_resolution();
         app
     }
 

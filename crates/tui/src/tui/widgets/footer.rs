@@ -829,6 +829,7 @@ mod tests {
         app.model = "deepseek-v4-flash".to_string();
         app.auto_model = false;
         app.api_provider = crate::config::ApiProvider::Deepseek;
+        app.refresh_active_harness_resolution();
         // Same for theme: tests below assert against the default dark palette,
         // but App::new honors saved settings.toml values on the host machine.
         app.theme_id = crate::palette::ThemeId::Whale;
@@ -896,6 +897,7 @@ mod tests {
         app.api_provider = crate::config::ApiProvider::Openai;
         app.model = "gpt-x".to_string();
         app.auto_model = false;
+        app.refresh_active_harness_resolution();
         let props = idle_props_for(&app);
         assert_eq!(props.posture_label, None);
 

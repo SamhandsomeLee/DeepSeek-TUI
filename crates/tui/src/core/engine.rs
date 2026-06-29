@@ -303,6 +303,10 @@ pub struct EngineConfig {
     pub auto_review_policy: crate::tui::auto_review::AutoReviewPolicy,
     /// Auto-compaction settings for long conversations.
     pub compaction: CompactionConfig,
+    /// Resolved harness posture for the active route; carried for later PR3
+    /// runtime slices. Unused until those slices consume it.
+    #[allow(dead_code)]
+    pub harness_posture: codewhale_config::HarnessPosture,
     /// Shared Todo list state.
     pub todos: SharedTodoList,
     /// Shared Plan state.
@@ -418,6 +422,22 @@ pub struct EngineConfig {
     pub exec_policy_engine: codewhale_execpolicy::ExecPolicyEngine,
 }
 
+impl EngineConfig {
+    /// Resolve the harness posture for a headless engine route.
+    ///
+    /// Single entry point so the headless construction sites (exec agent,
+    /// runtime threads) resolve identically; the interactive TUI reads the
+    /// `App`-cached resolution instead.
+    #[must_use]
+    pub fn resolve_harness_posture(
+        profiles: &[codewhale_config::HarnessProfile],
+        provider_route: &str,
+        model: &str,
+    ) -> codewhale_config::HarnessPosture {
+        codewhale_config::resolve_harness_for_profiles(profiles, provider_route, model).posture
+    }
+}
+
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
@@ -447,6 +467,7 @@ impl Default for EngineConfig {
             features: Features::with_defaults(),
             auto_review_policy: crate::tui::auto_review::AutoReviewPolicy::default(),
             compaction: CompactionConfig::default(),
+            harness_posture: codewhale_config::HarnessPosture::default(),
             todos: new_shared_todo_list(),
             plan_state: new_shared_plan_state(),
             goal_state: new_shared_goal_state(),

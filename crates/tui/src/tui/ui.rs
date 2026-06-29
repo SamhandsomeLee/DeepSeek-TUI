@@ -1495,6 +1495,7 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         features: config.features(),
         auto_review_policy: config.auto_review_policy(),
         compaction: app.compaction_config(),
+        harness_posture: app.active_harness_resolution.posture.clone(),
         todos: app.todos.clone(),
         plan_state: app.plan_state.clone(),
         goal_state: crate::tools::goal::new_shared_goal_state_from_host_status(
@@ -7223,6 +7224,10 @@ async fn dispatch_user_message(
     } else {
         app.last_effective_model = None;
     }
+    // Auto-model may have changed the effective model for this turn, which
+    // feeds harness resolution; keep the cached posture in sync before the
+    // engine config is built.
+    app.refresh_active_harness_resolution();
 
     app.pending_turn_route = Some((effective_provider, effective_model.clone(), app.auto_model));
     if let Err(err) = engine_handle

@@ -2571,6 +2571,11 @@ impl RuntimeThreadManager {
         let max_subagents = cfg
             .max_subagents_for_provider(provider)
             .clamp(1, MAX_SUBAGENTS);
+        let harness_posture = EngineConfig::resolve_harness_posture(
+            &cfg.harness_profiles,
+            provider.as_str(),
+            &thread.model,
+        );
         let engine_cfg = EngineConfig {
             model: thread.model.clone(),
             active_route_limits: None,
@@ -2599,6 +2604,7 @@ impl RuntimeThreadManager {
             features: cfg.features(),
             auto_review_policy: cfg.auto_review_policy(),
             compaction,
+            harness_posture,
             todos: new_shared_todo_list(),
             plan_state: new_shared_plan_state(),
             goal_state: crate::tools::goal::new_shared_goal_state(),

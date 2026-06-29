@@ -7808,6 +7808,11 @@ async fn run_exec_agent(
         features: execution_config.features(),
         auto_review_policy: execution_config.auto_review_policy(),
         compaction,
+        harness_posture: EngineConfig::resolve_harness_posture(
+            &execution_config.harness_profiles,
+            effective_provider.as_str(),
+            &effective_model,
+        ),
         todos: new_shared_todo_list(),
         plan_state: new_shared_plan_state(),
         goal_state: crate::tools::goal::new_shared_goal_state(),
