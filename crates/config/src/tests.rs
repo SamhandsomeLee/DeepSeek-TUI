@@ -5831,6 +5831,145 @@ fn resolving_harness_profile_does_not_change_runtime_options() {
     assert_eq!(resolved.model, "deepseek-v4-pro");
 }
 
+fn harness_order_test_config(flash_first: bool) -> ConfigToml {
+    let exact = HarnessProfile {
+        provider_route: "deepseek".to_string(),
+        model_pattern: "deepseek-v4-flash".to_string(),
+        posture: HarnessPosture::lean(),
+    };
+    let wildcard = HarnessProfile {
+        provider_route: "deepseek".to_string(),
+        model_pattern: "deepseek-v4-*".to_string(),
+        posture: HarnessPosture::cache_heavy(),
+    };
+    let harness_profiles = if flash_first {
+        vec![exact, wildcard]
+    } else {
+        vec![wildcard, exact]
+    };
+    ConfigToml {
+        harness_profiles,
+        ..ConfigToml::default()
+    }
+}
+
+#[test]
+fn resolve_harness_deepseek_v4_is_cache_heavy() {
+    let config = ConfigToml::default();
+    let resolution = config.resolve_harness("deepseek", "deepseek-v4-pro");
+
+    assert_eq!(resolution.posture.kind, HarnessPostureKind::CacheHeavy);
+    assert_eq!(resolution.source, HarnessSource::BuiltInSeed);
+}
+
+#[test]
+fn resolve_harness_mimo_is_cache_heavy_distinct_route() {
+    let config = ConfigToml::default();
+    let resolution = config.resolve_harness("xiaomi-mimo", "mimo-v2.5-pro");
+
+    assert_eq!(resolution.posture.kind, HarnessPostureKind::CacheHeavy);
+    assert_eq!(resolution.source, HarnessSource::BuiltInSeed);
+    let matched = resolution.matched.expect("MiMo seed should match");
+    assert_eq!(matched.provider_route, "xiaomi-mimo");
+    assert_ne!(matched.provider_route, "deepseek");
+}
+
+#[test]
+fn resolve_harness_arcee_direct_not_openrouter_alias() {
+    let config = ConfigToml::default();
+
+    let direct = config.resolve_harness("arcee", "trinity-large-thinking");
+    assert_eq!(direct.posture.kind, HarnessPostureKind::CacheHeavy);
+    assert_eq!(direct.source, HarnessSource::BuiltInSeed);
+    let matched = direct.matched.expect("direct Arcee seed should match");
+    assert_eq!(matched.provider_route, "arcee");
+
+    let openrouter = config.resolve_harness("openrouter", "arcee-ai/trinity-large-thinking");
+    assert_eq!(openrouter.posture.kind, HarnessPostureKind::Standard);
+    assert_eq!(openrouter.source, HarnessSource::Default);
+    assert!(openrouter.matched.is_none());
+}
+
+#[test]
+fn resolve_harness_generic_gateway_falls_back_to_standard() {
+    let config = ConfigToml::default();
+    let resolution = config.resolve_harness("some-openai-gw", "gpt-x");
+
+    assert_eq!(resolution.posture.kind, HarnessPostureKind::Standard);
+    assert_eq!(resolution.source, HarnessSource::Default);
+    assert!(resolution.matched.is_none());
+}
+
+#[test]
+fn resolve_harness_local_route_is_lean() {
+    let config = ConfigToml::default();
+
+    for provider_route in ["vllm", "ollama", "sglang", "huggingface"] {
+        let resolution = config.resolve_harness(provider_route, "any-model");
+        assert_eq!(
+            resolution.posture.kind,
+            HarnessPostureKind::Lean,
+            "expected lean posture for {provider_route}"
+        );
+        assert_eq!(resolution.source, HarnessSource::BuiltInSeed);
+    }
+}
+
+#[test]
+fn resolve_harness_is_order_independent() {
+    for flash_first in [true, false] {
+        let config = harness_order_test_config(flash_first);
+        let resolution = config.resolve_harness("deepseek", "deepseek-v4-flash");
+
+        assert_eq!(resolution.posture.kind, HarnessPostureKind::Lean);
+        assert_eq!(resolution.source, HarnessSource::UserProfile);
+        let matched = resolution.matched.expect("exact user profile should match");
+        assert_eq!(matched.model_pattern, "deepseek-v4-flash");
+    }
+
+    let flash_first = harness_order_test_config(true);
+    let wildcard_first = harness_order_test_config(false);
+    assert_eq!(
+        flash_first.resolve_harness("deepseek", "deepseek-v4-flash"),
+        wildcard_first.resolve_harness("deepseek", "deepseek-v4-flash")
+    );
+}
+
+#[test]
+fn resolve_harness_user_profile_beats_built_in_seed() {
+    let config = ConfigToml {
+        harness_profiles: vec![HarnessProfile {
+            provider_route: "deepseek".to_string(),
+            model_pattern: "deepseek-v4*".to_string(),
+            posture: HarnessPosture::lean(),
+        }],
+        ..ConfigToml::default()
+    };
+
+    let resolution = config.resolve_harness("deepseek", "deepseek-v4-pro");
+    assert_eq!(resolution.posture.kind, HarnessPostureKind::Lean);
+    assert_eq!(resolution.source, HarnessSource::UserProfile);
+}
+
+#[test]
+fn resolve_harness_is_pure_no_mutation() {
+    let config = ConfigToml {
+        harness_profiles: vec![HarnessProfile {
+            provider_route: "deepseek".to_string(),
+            model_pattern: "deepseek-v4-*".to_string(),
+            posture: HarnessPosture::lean(),
+        }],
+        provider: ProviderKind::Deepseek,
+        model: Some("deepseek-v4-pro".to_string()),
+        ..ConfigToml::default()
+    };
+    let before = config.harness_profiles.clone();
+
+    let resolution = config.resolve_harness("deepseek", "deepseek-v4-pro");
+    assert_eq!(resolution.posture.kind, HarnessPostureKind::Lean);
+    assert_eq!(config.harness_profiles, before);
+}
+
 #[test]
 fn harness_posture_kind_rejects_unknown_values() {
     let err = toml::from_str::<ConfigToml>(

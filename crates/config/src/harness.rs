@@ -157,6 +157,147 @@ impl HarnessProfile {
     }
 }
 
+/// Resolution source for harness profile selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HarnessSource {
+    /// Matched a user-configured `[[harness_profiles]]` entry.
+    UserProfile,
+    /// Matched a built-in seed profile.
+    BuiltInSeed,
+    /// No match; fell back to the Standard default posture.
+    Default,
+}
+
+/// Deterministic harness resolution for a provider/model route.
+///
+/// Pure data: constructing it must not mutate provider selection, prompts,
+/// auth, tools, context, or persisted config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessResolution {
+    /// Effective posture (`HarnessPosture::default()` when nothing matched).
+    pub posture: HarnessPosture,
+    /// Where the posture came from.
+    pub source: HarnessSource,
+    /// Matched profile identity for display (`None` when `source` is `Default`).
+    pub matched: Option<MatchedProfile>,
+}
+
+/// Display identity for a matched harness profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchedProfile {
+    pub provider_route: String,
+    pub model_pattern: String,
+}
+
+struct ProfileCandidate<'a> {
+    profile: &'a HarnessProfile,
+    source: HarnessSource,
+    declaration_index: usize,
+}
+
+/// Deterministic `model_pattern` specificity score.
+///
+/// Exact patterns (no `*`/`?`) beat wildcard patterns. Among wildcards, more
+/// non-wildcard literal characters wins. This is a stable heuristic, not a
+/// complete glob semantics engine.
+#[must_use]
+fn model_pattern_specificity_score(pattern: &str) -> (u8, usize) {
+    let has_wildcard = pattern.contains('*') || pattern.contains('?');
+    let literal_count = pattern
+        .chars()
+        .filter(|ch| *ch != '*' && *ch != '?')
+        .count();
+    if has_wildcard {
+        (1, literal_count)
+    } else {
+        (0, literal_count)
+    }
+}
+
+fn source_tier(source: HarnessSource) -> u8 {
+    match source {
+        HarnessSource::UserProfile => 0,
+        HarnessSource::BuiltInSeed => 1,
+        HarnessSource::Default => 2,
+    }
+}
+
+fn compare_profile_candidates(
+    left: &ProfileCandidate<'_>,
+    right: &ProfileCandidate<'_>,
+) -> std::cmp::Ordering {
+    match source_tier(left.source).cmp(&source_tier(right.source)) {
+        std::cmp::Ordering::Equal => {}
+        ordering => return ordering,
+    }
+
+    let left_specificity = model_pattern_specificity_score(&left.profile.model_pattern);
+    let right_specificity = model_pattern_specificity_score(&right.profile.model_pattern);
+    match left_specificity
+        .0
+        .cmp(&right_specificity.0)
+        .then_with(|| right_specificity.1.cmp(&left_specificity.1))
+    {
+        std::cmp::Ordering::Equal => {}
+        ordering => return ordering,
+    }
+
+    left.declaration_index.cmp(&right.declaration_index)
+}
+
+/// Deterministic harness resolution for a provider/model route.
+///
+/// User profiles beat built-in seeds; narrower `model_pattern` beats broader;
+/// declaration order is the stable tiebreak. Returns Standard posture with
+/// [`HarnessSource::Default`] when nothing matches.
+#[must_use]
+pub fn resolve_harness_for_profiles(
+    user_profiles: &[HarnessProfile],
+    provider_route: &str,
+    model: &str,
+) -> HarnessResolution {
+    let mut candidates = Vec::new();
+
+    for (index, profile) in user_profiles.iter().enumerate() {
+        if profile.matches_route(provider_route, model) {
+            candidates.push(ProfileCandidate {
+                profile,
+                source: HarnessSource::UserProfile,
+                declaration_index: index,
+            });
+        }
+    }
+
+    for (index, profile) in built_in_harness_profiles().iter().enumerate() {
+        if profile.matches_route(provider_route, model) {
+            candidates.push(ProfileCandidate {
+                profile,
+                source: HarnessSource::BuiltInSeed,
+                declaration_index: index,
+            });
+        }
+    }
+
+    match candidates
+        .iter()
+        .min_by(|left, right| compare_profile_candidates(left, right))
+    {
+        Some(candidate) => HarnessResolution {
+            posture: candidate.profile.posture.clone(),
+            source: candidate.source,
+            matched: Some(MatchedProfile {
+                provider_route: candidate.profile.provider_route.clone(),
+                model_pattern: candidate.profile.model_pattern.clone(),
+            }),
+        },
+        None => HarnessResolution {
+            posture: HarnessPosture::default(),
+            source: HarnessSource::Default,
+            matched: None,
+        },
+    }
+}
+
 /// Built-in profile seeds for common provider/model families.
 ///
 /// User-configured profiles are always checked first; these seeds only provide

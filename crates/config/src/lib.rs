@@ -13,7 +13,8 @@ pub mod setup_state;
 pub mod user_constitution;
 pub use harness::{
     HarnessCompactionStrategy, HarnessPosture, HarnessPostureKind, HarnessProfile,
-    HarnessSafetyPosture, HarnessToolSurface, built_in_harness_profiles,
+    HarnessResolution, HarnessSafetyPosture, HarnessSource, HarnessToolSurface, MatchedProfile,
+    built_in_harness_profiles, resolve_harness_for_profiles,
 };
 pub use model_reference::{Modality, ModelReferenceCard, ModelReferenceDatabase};
 pub(crate) use provider_defaults::*;
@@ -688,6 +689,16 @@ impl ConfigToml {
             .iter()
             .chain(built_in_harness_profiles().iter())
             .find(|profile| profile.matches_route(provider_route, model))
+    }
+
+    /// Deterministic harness resolution for a provider/model route.
+    ///
+    /// User profiles beat built-in seeds; narrower `model_pattern` beats broader;
+    /// declaration order is the stable tiebreak. Falls back to a Standard posture
+    /// when nothing matches. Pure function: no I/O, no mutation, no side effects.
+    #[must_use]
+    pub fn resolve_harness(&self, provider_route: &str, model: &str) -> HarnessResolution {
+        resolve_harness_for_profiles(&self.harness_profiles, provider_route, model)
     }
 
     /// Resolve durable hotbar config into normalized 1-8 slot bindings.

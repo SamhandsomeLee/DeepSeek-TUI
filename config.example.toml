@@ -851,6 +851,8 @@ fallback_default_prior = 3.8
 # prompt, context, tool, and subagent posture. v0.9 parses, validates, and can
 # resolve profiles for tests/status plumbing, but normal Agent and Workflow
 # runs do not silently promote or mutate behavior from these profiles yet.
+# Resolution is deterministic: user profiles beat built-in seeds, and narrower
+# model_pattern wins regardless of declaration order.
 #
 # [[harness_profiles]]
 # provider_route = "deepseek"
