@@ -4718,6 +4718,10 @@ async fn launch_gate_queues_extra_direct_children() {
     runtime.mailbox = Some(mailbox);
 
     let gate = Arc::new(Semaphore::new(1));
+    let held_launch_permit = Arc::clone(&gate)
+        .acquire_owned()
+        .await
+        .expect("test holds the single launch permit");
     let spawn = |agent_id: &str, gate: Option<Arc<Semaphore>>| {
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let agent = SubAgent::new(
@@ -4750,39 +4754,66 @@ async fn launch_gate_queues_extra_direct_children() {
         (agent, task)
     };
 
-    let (agent_a, task_a) = spawn("agent_gate_a", Some(Arc::clone(&gate)));
     let (agent_b, task_b) = spawn("agent_gate_b", Some(Arc::clone(&gate)));
     {
         let mut mgr = manager.write().await;
-        mgr.agents.insert(agent_a.id.clone(), agent_a);
         mgr.agents.insert(agent_b.id.clone(), agent_b);
     }
 
-    tokio::spawn(run_subagent_task(task_a));
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while gate.available_permits() != 0 {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-    })
-    .await
-    .expect("first child should acquire the launch gate");
+    // Holding the permit models another direct child occupying the launch
+    // gate without relying on wall-clock timing or scheduler fairness.
     tokio::spawn(run_subagent_task(task_b));
 
     let mut messages = Vec::new();
-    let collected = tokio::time::timeout(Duration::from_secs(5), async {
-        let mut completed = 0;
-        while completed < 2 {
+    let queued = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
             let Some(envelope) = mailbox_rx.recv().await else {
                 break;
             };
-            if matches!(envelope.message, MailboxMessage::Completed { .. }) {
-                completed += 1;
+            let message = envelope.message;
+            let queued_b = matches!(
+                &message,
+                MailboxMessage::Progress { agent_id, status }
+                    if agent_id == "agent_gate_b" && status.contains("queued")
+            );
+            let started_b = matches!(
+                &message,
+                MailboxMessage::Started { agent_id, .. } if agent_id == "agent_gate_b"
+            );
+            messages.push(message);
+            assert!(
+                !started_b,
+                "queued child must not start while the launch permit is held: {messages:?}"
+            );
+            if queued_b {
+                break;
             }
-            messages.push(envelope.message);
         }
     })
     .await;
-    assert!(collected.is_ok(), "both gated children should complete");
+    assert!(
+        queued.is_ok(),
+        "second child must publish a visible queued reason: {messages:?}"
+    );
+    drop(held_launch_permit);
+
+    let collected = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let Some(envelope) = mailbox_rx.recv().await else {
+                break;
+            };
+            let completed_b = matches!(
+                &envelope.message,
+                MailboxMessage::Completed { agent_id, .. } if agent_id == "agent_gate_b"
+            );
+            messages.push(envelope.message);
+            if completed_b {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(collected.is_ok(), "queued child should complete");
 
     let queued_b = messages.iter().position(|m| {
         matches!(
@@ -4795,13 +4826,14 @@ async fn launch_gate_queues_extra_direct_children() {
         queued_b.is_some(),
         "second child must publish a visible queued reason: {messages:?}"
     );
+    let queued_b = queued_b.expect("queued progress exists");
 
-    let completed_a = messages
+    let completed_b = messages
         .iter()
         .position(
-            |m| matches!(m, MailboxMessage::Completed { agent_id, .. } if agent_id == "agent_gate_a"),
+            |m| matches!(m, MailboxMessage::Completed { agent_id, .. } if agent_id == "agent_gate_b"),
         )
-        .expect("first child completes");
+        .expect("queued child completes");
     let started_b = messages
         .iter()
         .position(
@@ -4809,8 +4841,8 @@ async fn launch_gate_queues_extra_direct_children() {
         )
         .expect("second child eventually starts");
     assert!(
-        started_b > completed_a,
-        "queued child must not start until a permit frees: {messages:?}"
+        started_b > queued_b && completed_b > started_b,
+        "queued child must start only after queuing, then complete: {messages:?}"
     );
 }
 
