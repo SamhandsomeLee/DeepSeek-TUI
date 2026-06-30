@@ -1136,7 +1136,9 @@ impl ProviderPickerView {
 
     /// Toggle between the configured-only and full-catalog views (#3830),
     /// keeping the current selection if it stays visible and otherwise
-    /// jumping to the nearest visible row.
+    /// jumping to the first visible row (`rows` is sorted alphabetically by
+    /// display name, so this lands on the alphabetically-first match, not
+    /// necessarily the row positionally nearest the old selection).
     fn toggle_view(&mut self) {
         self.view = match self.view {
             ProviderListView::Configured => ProviderListView::Catalog,
