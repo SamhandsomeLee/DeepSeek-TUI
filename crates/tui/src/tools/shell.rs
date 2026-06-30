@@ -2446,7 +2446,7 @@ impl ToolSpec for ExecShellTool {
                     };
                     return Ok(ToolResult {
                         content: format!(
-                            "BLOCKED: This command was blocked for safety reasons.\n\nReasons: {reasons}{suggestions}"
+                            "BLOCKED: This command was blocked for safety reasons.\n\nReasons: {reasons}{suggestions}\n\nNote: allow_shell=true exposes shell tools, but it does not disable built-in shell safety validation."
                         ),
                         success: false,
                         metadata: Some(json!({

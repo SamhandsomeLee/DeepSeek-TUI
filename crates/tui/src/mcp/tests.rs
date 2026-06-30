@@ -357,6 +357,19 @@ fn streamable_http_transport_stores_headers() {
 }
 
 #[test]
+fn mcp_auth_required_error_item_is_model_visible() {
+    let item = McpPool::mcp_auth_required_error_item("nordic-mcp");
+    assert_eq!(item["error"], "authentication_required");
+    assert_eq!(item["server"], "nordic-mcp");
+    assert!(
+        item["message"]
+            .as_str()
+            .expect("message")
+            .contains("codewhale mcp login nordic-mcp")
+    );
+}
+
+#[test]
 fn test_mcp_config_parse_mcp_servers_alias_and_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("mcp.json");

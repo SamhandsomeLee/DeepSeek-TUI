@@ -1664,11 +1664,14 @@ impl McpPool {
             return Ok(resources);
         }
 
+        let mut items = Vec::new();
         let errors = self.connect_all().await;
         for (server, err) in errors {
             tracing::warn!("Failed to connect MCP server '{server}' for resources: {err:#}");
+            if oauth::error_looks_auth_required(&err) {
+                items.push(Self::mcp_auth_required_error_item(&server));
+            }
         }
-        let mut items = Vec::new();
         for (server, conn) in &self.connections {
             for resource in conn.resources() {
                 items.push(serde_json::json!({
@@ -1705,13 +1708,16 @@ impl McpPool {
             return Ok(templates);
         }
 
+        let mut items = Vec::new();
         let errors = self.connect_all().await;
         for (server, err) in errors {
             tracing::warn!(
                 "Failed to connect MCP server '{server}' for resource templates: {err:#}"
             );
+            if oauth::error_looks_auth_required(&err) {
+                items.push(Self::mcp_auth_required_error_item(&server));
+            }
         }
-        let mut items = Vec::new();
         for (server, conn) in &self.connections {
             for template in conn.resource_templates() {
                 items.push(serde_json::json!({
@@ -1724,6 +1730,14 @@ impl McpPool {
             }
         }
         Ok(items)
+    }
+
+    fn mcp_auth_required_error_item(server: &str) -> serde_json::Value {
+        serde_json::json!({
+            "error": "authentication_required",
+            "server": server,
+            "message": oauth::auth_required_login_hint(server),
+        })
     }
 
     /// Get all discovered prompts with server-prefixed names
