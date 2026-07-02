@@ -8,6 +8,7 @@ import { Whale } from "./whale";
 import { LocaleSwitcher } from "./locale-switcher";
 import { MobileMenu } from "./mobile-menu";
 import { NavLinks } from "./nav-links";
+import { ThemeToggle } from "./theme-toggle";
 
 const EN_LINKS = [
   { href: "/en/install", label: "Install", cn: "安装" },
@@ -49,6 +50,7 @@ export async function Nav({ locale = "en" }: { locale?: Locale }) {
             <span className="hidden sm:inline">· {isZh ? new Date().toLocaleDateString("zh-CN", { weekday: "long", month: "long", day: "numeric" }) : new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" })}</span>
           </div>
           <div className="flex items-center gap-4">
+            <ThemeToggle isZh={isZh} />
             <span className="hidden md:inline">codewhale.net</span>
             <span className="tabular">{FACTS.version ? `v${FACTS.version}` : "v0.8.x"}</span>
           </div>
