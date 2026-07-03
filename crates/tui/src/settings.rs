@@ -2837,16 +2837,27 @@ mod tests {
         let explicit_home = tmp.path().join("isolated-codewhale");
         let legacy_dir = tmp.path().join(".deepseek");
         std::fs::create_dir_all(&legacy_dir).expect("legacy dir");
-        std::fs::write(legacy_dir.join("settings.toml"), "low_motion = true\n")
-            .expect("legacy settings");
+        std::fs::write(
+            legacy_dir.join("settings.toml"),
+            "theme = \"dracula\"\ncomposer_density = \"spacious\"\nsidebar_width_percent = 42\n",
+        )
+        .expect("legacy settings");
         let _config_override = EnvVarRestore::remove("DEEPSEEK_CONFIG_PATH");
         let _codewhale_home = EnvVarRestore::set("CODEWHALE_HOME", &explicit_home);
         let _home = EnvVarRestore::set("HOME", tmp.path());
 
         let loaded = Settings::load().expect("load settings");
 
-        assert!(
-            !loaded.low_motion,
+        assert_eq!(
+            loaded.theme, "system",
+            "explicit CODEWHALE_HOME must not inherit ambient legacy settings"
+        );
+        assert_eq!(
+            loaded.composer_density, "comfortable",
+            "explicit CODEWHALE_HOME must not inherit ambient legacy settings"
+        );
+        assert_eq!(
+            loaded.sidebar_width_percent, 28,
             "explicit CODEWHALE_HOME must not inherit ambient legacy settings"
         );
         assert!(
