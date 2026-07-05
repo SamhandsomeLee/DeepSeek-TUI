@@ -427,5 +427,17 @@
     "VoiceErrTooShort": "音声：音声が検出されませんでした。録音が短すぎます",
     "VoiceRecording": "🎙 録音中...お話しください",
     "VoiceProcessing": "🎙 文字起こし中...",
-    "VoiceTranscribed": "🎙 文字起こし完了"
+    "VoiceTranscribed": "🎙 文字起こし完了",
+    "SetupActionFleet": "Fleet 設定",
+    "SetupStepOperateFleetTitle": "Operate と Fleet",
+    "SetupStepOperateFleetWhy": "現在のプロバイダー、実行姿勢、ロスター、並行設定で永続的なマルチワーカー作業を実行できるか確認します。プラン制限の検出は明示的な操作のままです。",
+    "SetupOperateRuntimeLabel": "ワーカーランタイム:",
+    "SetupOperateRosterLabel": "Fleet ロスター:",
+    "SetupOperateConcurrencyLabel": "並行数:",
+    "SetupOperateReadinessLabel": "Operate 準備状態:",
+    "SetupOperateReviewHint": "Enter で現在の Operate/Fleet の事実を記録します。プラン制限の探索、認証情報の書き込み、Fleet 設定変更は行いません。",
+    "SetupOperateReviewed": "Operate/Fleet の準備状態を記録しました。",
+    "SetupOperateNeedsActionSaved": "Operate/Fleet はまだ対応が必要です。セットアップレポートに記録しました。",
+    "SetupReportOperateLabel": "Operate/Fleet:",
+    "SetupReportNextActionOperate": "永続的なマルチワーカー実行の前に Operate/Fleet の準備状態を確認してください。"
 }

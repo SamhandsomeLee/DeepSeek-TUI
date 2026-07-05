@@ -10191,6 +10191,17 @@ async fn handle_view_events(
                         Some("Model route picker opened from /setup readiness.".to_string());
                 }
             }
+            ViewEvent::SetupOpenFleetRequested => {
+                if app.view_stack.top_kind() != Some(ModalKind::FleetSetup) {
+                    let _ = app.next_draft_gen();
+                    app.view_stack
+                        .push(crate::tui::views::fleet_setup::FleetSetupView::new(
+                            app, config,
+                        ));
+                    app.status_message =
+                        Some("Fleet setup opened from /setup Operate/Fleet readiness.".to_string());
+                }
+            }
             ViewEvent::SetupOpenModeRequested => {
                 if app.view_stack.top_kind() != Some(ModalKind::ModePicker) {
                     app.view_stack

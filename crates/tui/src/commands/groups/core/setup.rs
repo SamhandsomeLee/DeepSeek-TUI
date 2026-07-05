@@ -31,6 +31,11 @@ impl RegisterCommand for SetupCmd {
                     step: SetupStep::Verification,
                 })
             }
+            Some("operate" | "fleet" | "operate-fleet" | "operate_fleet") => {
+                CommandResult::action(AppAction::OpenSetupWizardAt {
+                    step: SetupStep::OperateFleet,
+                })
+            }
             Some(other) => CommandResult::error(format!(
                 "Unknown /setup target '{other}'. Try `/setup` to open the setup wizard."
             )),
@@ -100,6 +105,21 @@ mod tests {
             result.action,
             Some(AppAction::OpenSetupWizardAt {
                 step: SetupStep::Verification
+            })
+        );
+        assert!(result.message.is_none());
+    }
+
+    #[test]
+    fn setup_fleet_opens_operate_readiness_step() {
+        let mut app = test_app();
+
+        let result = SetupCmd::execute(&mut app, Some("fleet"));
+
+        assert_eq!(
+            result.action,
+            Some(AppAction::OpenSetupWizardAt {
+                step: SetupStep::OperateFleet
             })
         );
         assert!(result.message.is_none());

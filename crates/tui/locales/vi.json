@@ -425,5 +425,17 @@
     "VoiceErrTooShort": "Giọng nói: không phát hiện giọng nói, bản ghi quá ngắn",
     "VoiceRecording": "🎙 Đang ghi âm... hãy nói",
     "VoiceProcessing": "🎙 Đang chuyển thành văn bản...",
-    "VoiceTranscribed": "🎙 Đã chuyển xong"
+    "VoiceTranscribed": "🎙 Đã chuyển xong",
+    "SetupActionFleet": "thiết lập Fleet",
+    "SetupStepOperateFleetTitle": "Operate và Fleet",
+    "SetupStepOperateFleetWhy": "Xem lại liệu công việc nhiều worker bền vững có thể chạy với nhà cung cấp, tư thế runtime, roster và cấu hình đồng thời hiện tại hay không. Việc phát hiện giới hạn gói vẫn là thao tác rõ ràng.",
+    "SetupOperateRuntimeLabel": "Runtime worker:",
+    "SetupOperateRosterLabel": "Roster Fleet:",
+    "SetupOperateConcurrencyLabel": "Đồng thời:",
+    "SetupOperateReadinessLabel": "Mức sẵn sàng Operate:",
+    "SetupOperateReviewHint": "Enter ghi lại các dữ kiện Operate/Fleet hiện tại. Không dò giới hạn gói, không ghi thông tin xác thực, không đổi cấu hình Fleet.",
+    "SetupOperateReviewed": "Đã ghi mức sẵn sàng Operate/Fleet.",
+    "SetupOperateNeedsActionSaved": "Operate/Fleet vẫn cần hành động; đã ghi vào báo cáo setup.",
+    "SetupReportOperateLabel": "Operate/Fleet:",
+    "SetupReportNextActionOperate": "Xem lại mức sẵn sàng Operate/Fleet trước các lượt chạy nhiều worker bền vững."
 }

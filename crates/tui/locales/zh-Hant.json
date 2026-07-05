@@ -160,5 +160,17 @@
     "VoiceErrTooShort": "語音：未偵測到有效語音，錄製時間過短",
     "VoiceRecording": "🎙 正在錄音...請說話",
     "VoiceProcessing": "🎙 正在轉錄...",
-    "VoiceTranscribed": "🎙 轉錄完成"
+    "VoiceTranscribed": "🎙 轉錄完成",
+    "SetupActionFleet": "Fleet 設定",
+    "SetupStepOperateFleetTitle": "Operate 與 Fleet",
+    "SetupStepOperateFleetWhy": "檢視目前供應商、執行姿態、成員表與並行設定是否能支撐持久多 worker 工作。方案限制偵測仍需明確操作。",
+    "SetupOperateRuntimeLabel": "Worker 執行時：",
+    "SetupOperateRosterLabel": "Fleet 成員表：",
+    "SetupOperateConcurrencyLabel": "並行：",
+    "SetupOperateReadinessLabel": "Operate 就緒：",
+    "SetupOperateReviewHint": "按 Enter 記錄目前 Operate/Fleet 事實。不會偵測方案限制、寫入憑證或更改 Fleet 設定。",
+    "SetupOperateReviewed": "已記錄 Operate/Fleet 就緒狀態。",
+    "SetupOperateNeedsActionSaved": "Operate/Fleet 仍需操作；已記錄到設定報告。",
+    "SetupReportOperateLabel": "Operate/Fleet：",
+    "SetupReportNextActionOperate": "在持久多 worker 執行前檢視 Operate/Fleet 就緒狀態。"
 }

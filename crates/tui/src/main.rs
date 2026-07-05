@@ -3831,12 +3831,18 @@ fn print_doctor_setup_report(
 
     let first_run_ready = state.first_run_ready();
     let update_ready = state.update_ready(crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION);
+    let operate_ready = state.operate_ready();
     let first_run_icon = if first_run_ready {
         "✓".truecolor(ok_rgb.0, ok_rgb.1, ok_rgb.2)
     } else {
         "!".truecolor(warn_rgb.0, warn_rgb.1, warn_rgb.2)
     };
     let update_icon = if update_ready {
+        "✓".truecolor(ok_rgb.0, ok_rgb.1, ok_rgb.2)
+    } else {
+        "!".truecolor(warn_rgb.0, warn_rgb.1, warn_rgb.2)
+    };
+    let operate_icon = if operate_ready {
         "✓".truecolor(ok_rgb.0, ok_rgb.1, ok_rgb.2)
     } else {
         "!".truecolor(warn_rgb.0, warn_rgb.1, warn_rgb.2)
@@ -3853,6 +3859,10 @@ fn print_doctor_setup_report(
         "  {update_icon} update checkpoint {}: {}",
         crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION,
         doctor_ready_label(update_ready)
+    );
+    println!(
+        "  {operate_icon} operate/fleet: {}",
+        doctor_ready_label(operate_ready)
     );
     println!(
         "  · constitution autonomy: {} (guidance only)",
@@ -3881,7 +3891,7 @@ fn print_doctor_setup_report(
         );
     }
     println!(
-        "  · next actions: /constitution (standing law), /setup report (readiness), /provider or /model (route), /config (runtime posture)"
+        "  · next actions: /constitution (standing law), /setup report (readiness), /provider or /model (route), /config (runtime posture), /setup fleet (Operate/Fleet readiness), /fleet setup (explicit profile authoring)"
     );
     for step in codewhale_config::SetupStep::ALL {
         let entry = state.steps.get(&step);
@@ -4035,6 +4045,76 @@ fn doctor_runtime_posture_line(config: &Config, workspace: &Path) -> String {
     )
 }
 
+fn doctor_operate_fleet_report_json(config: &Config, workspace: &Path) -> serde_json::Value {
+    use serde_json::json;
+
+    let provider = config.api_provider();
+    let has_credentials_or_local = crate::config::has_api_key_for(config, provider);
+    let subagents_enabled = config.subagents_enabled_for_provider(provider);
+    let disabled_reason = if subagents_enabled {
+        None
+    } else {
+        Some(
+            config
+                .subagents_disabled_reason()
+                .unwrap_or("disabled for active provider"),
+        )
+    };
+    let max_subagents = config.max_subagents_for_provider(provider);
+    let launch_concurrency = config.launch_concurrency_for_provider(provider);
+    let max_admitted = config.max_admitted_subagents_for_provider(provider);
+    let roster = crate::fleet::roster::FleetRoster::load(&config.fleet_config(), workspace);
+    let mut built_in_members = 0usize;
+    let mut config_members = 0usize;
+    let mut workspace_members = 0usize;
+    for member in roster.members() {
+        match member.origin {
+            crate::fleet::roster::ProfileOrigin::BuiltIn => built_in_members += 1,
+            crate::fleet::roster::ProfileOrigin::Config => config_members += 1,
+            crate::fleet::roster::ProfileOrigin::Workspace => workspace_members += 1,
+        }
+    }
+    let roster_members = roster.members().len();
+    let custom_members = config_members + workspace_members;
+    let roster_ready = roster_members > 0;
+    let runtime_ready = subagents_enabled && max_subagents > 0 && launch_concurrency > 0;
+
+    json!({
+        "ready": has_credentials_or_local && runtime_ready && roster_ready,
+        "provider": {
+            "id": provider.as_str(),
+            "auth": {
+                "present_or_local": has_credentials_or_local,
+                "source": doctor_api_key_source_label(resolve_api_key_source(config)),
+            },
+        },
+        "worker_runtime": {
+            "ready": runtime_ready,
+            "enabled": subagents_enabled,
+            "disabled_reason": disabled_reason,
+            "max_subagents": max_subagents,
+            "launch_concurrency": launch_concurrency,
+            "max_admitted": max_admitted,
+        },
+        "roster": {
+            "ready": roster_ready,
+            "total": roster_members,
+            "built_in": built_in_members,
+            "config": config_members,
+            "workspace": workspace_members,
+            "custom": custom_members,
+            "starter_roster_available": built_in_members > 0,
+            "readiness_rule": "built-in starter roster or custom roster",
+        },
+        "concurrency": {
+            "launch_concurrency": launch_concurrency,
+            "max_subagents": max_subagents,
+            "max_admitted": max_admitted,
+            "plan_limit_probed": false,
+        },
+    })
+}
+
 fn doctor_setup_report_json(config: &Config, workspace: &Path) -> serde_json::Value {
     use serde_json::json;
 
@@ -4089,6 +4169,7 @@ fn doctor_setup_report_json(config: &Config, workspace: &Path) -> serde_json::Va
         "checkpoint_version": crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION,
         "first_run_ready": state.first_run_ready(),
         "update_ready": state.update_ready(crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION),
+        "operate_ready": state.operate_ready(),
         "constitution": {
             "choice": constitution_choice_id(state.constitution_choice),
             "source": constitution_source_id(state.constitution_source),
@@ -4127,12 +4208,14 @@ fn doctor_setup_report_json(config: &Config, workspace: &Path) -> serde_json::Va
                 "source": "workspace",
             },
         },
+        "operate_fleet": doctor_operate_fleet_report_json(config, workspace),
         "consistency": doctor_setup_consistency(&state, source),
         "next_actions": {
             "constitution": "/constitution",
             "setup_report": "/setup report",
             "provider_model": "/provider or /model",
             "runtime_posture": "/config",
+            "operate_fleet": "/setup fleet (readiness), /fleet setup (explicit profile authoring)",
         },
         "steps": steps,
     })
@@ -4147,6 +4230,7 @@ fn setup_step_id(step: codewhale_config::SetupStep) -> &'static str {
         codewhale_config::SetupStep::Hotbar => "hotbar",
         codewhale_config::SetupStep::RemoteRuntime => "remote_runtime",
         codewhale_config::SetupStep::Constitution => "constitution",
+        codewhale_config::SetupStep::OperateFleet => "operate_fleet",
         codewhale_config::SetupStep::Verification => "verification",
     }
 }
@@ -8360,10 +8444,23 @@ mod doctor_setup_state_tests {
         );
         assert_eq!(report["next_actions"]["runtime_posture"], "/config");
         assert_eq!(
+            report["next_actions"]["operate_fleet"],
+            "/setup fleet (readiness), /fleet setup (explicit profile authoring)"
+        );
+        assert_eq!(
             report["checkpoint_version"],
             crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION
         );
         assert_eq!(report["update_ready"], false);
+        assert_eq!(report["operate_ready"], false);
+        assert_eq!(
+            report["operate_fleet"]["concurrency"]["plan_limit_probed"],
+            false
+        );
+        assert_eq!(
+            report["operate_fleet"]["roster"]["readiness_rule"],
+            "built-in starter roster or custom roster"
+        );
         assert_eq!(report["constitution"]["source"], "bundled");
         assert_eq!(report["constitution"]["autonomy_preference"], "unspecified");
         assert_eq!(report["runtime_posture"]["source"], "unset");
@@ -8454,6 +8551,7 @@ mod doctor_setup_state_tests {
         assert_eq!(report["source"], "persisted");
         assert_eq!(report["first_run_ready"], true);
         assert_eq!(report["update_ready"], true);
+        assert_eq!(report["operate_ready"], false);
         assert_eq!(report["constitution"]["choice"], "bundled");
         assert_eq!(
             report["constitution"]["checkpoint_completed_for"],
@@ -8489,6 +8587,75 @@ mod doctor_setup_state_tests {
             "config"
         );
         assert_eq!(provider_step(&report)["result"], "deepseek/deepseek-chat");
+    }
+
+    #[test]
+    fn doctor_setup_report_json_reports_operate_readiness() {
+        let _guard = crate::test_support::lock_test_env();
+        let tmp = TempDir::new().expect("tempdir");
+        let (_home_guard, _codewhale_home) = prepare_env(&tmp);
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let mut state = codewhale_config::SetupState::default();
+        state.set_step(
+            codewhale_config::SetupStep::Language,
+            codewhale_config::StepEntry::new(
+                codewhale_config::StepStatus::Verified,
+                true,
+                crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION,
+            ),
+        );
+        state.set_step(
+            codewhale_config::SetupStep::ProviderModel,
+            codewhale_config::StepEntry::new(
+                codewhale_config::StepStatus::Verified,
+                true,
+                crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION,
+            ),
+        );
+        state.runtime_posture_source = codewhale_config::RuntimePostureSource::Confirmed;
+        state.complete_constitution_checkpoint(
+            crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION,
+            codewhale_config::ConstitutionChoice::Bundled,
+        );
+        state.set_step(
+            codewhale_config::SetupStep::OperateFleet,
+            codewhale_config::StepEntry::new(
+                codewhale_config::StepStatus::Verified,
+                false,
+                crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION,
+            )
+            .with_result(
+                "provider=ready, runtime=ready, roster=ready, concurrency=plan limit not probed",
+            ),
+        );
+        state.save().expect("persist setup state");
+
+        let report = doctor_setup_report_json(&Config::default(), &workspace);
+
+        assert_eq!(report["first_run_ready"], true);
+        assert_eq!(report["operate_ready"], true);
+        assert_eq!(
+            report["operate_fleet"]["concurrency"]["plan_limit_probed"],
+            false
+        );
+        assert!(
+            report["operate_fleet"]["roster"]["built_in"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+        );
+        let operate_step = report["steps"]
+            .as_array()
+            .expect("steps array")
+            .iter()
+            .find(|step| step["step"] == "operate_fleet")
+            .expect("operate/fleet step");
+        assert_eq!(operate_step["status"], "verified");
+        assert!(
+            operate_step["result"]
+                .as_str()
+                .is_some_and(|result| result.contains("plan limit not probed"))
+        );
     }
 }
 

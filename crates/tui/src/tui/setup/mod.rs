@@ -87,7 +87,7 @@ impl SetupWizardStep for StaticSetupStep {
     }
 }
 
-const STEP_SPECS: [StaticSetupStep; 5] = [
+const STEP_SPECS: [StaticSetupStep; 6] = [
     StaticSetupStep {
         id: SetupStep::Language,
         title_id: MessageId::SetupStepLanguageTitle,
@@ -111,6 +111,12 @@ const STEP_SPECS: [StaticSetupStep; 5] = [
         title_id: MessageId::SetupStepConstitutionTitle,
         why_id: MessageId::SetupStepConstitutionWhy,
         required: true,
+    },
+    StaticSetupStep {
+        id: SetupStep::OperateFleet,
+        title_id: MessageId::SetupStepOperateFleetTitle,
+        why_id: MessageId::SetupStepOperateFleetWhy,
+        required: false,
     },
     StaticSetupStep {
         id: SetupStep::Verification,
@@ -164,6 +170,12 @@ struct SetupRuntimeFacts {
     network: String,
     network_default_value: String,
     runtime_result: String,
+    operate_runtime_ready: bool,
+    operate_runtime_result: String,
+    fleet_roster_ready: bool,
+    fleet_roster_result: String,
+    operate_concurrency_result: String,
+    operate_result: String,
     default_mode: String,
     approval_policy_value: String,
     project_override_warning: Option<String>,
@@ -191,6 +203,12 @@ impl Default for SetupRuntimeFacts {
             network: "not configured".to_string(),
             network_default_value: "prompt".to_string(),
             runtime_result: "runtime posture not loaded".to_string(),
+            operate_runtime_ready: false,
+            operate_runtime_result: "worker runtime not loaded".to_string(),
+            fleet_roster_ready: false,
+            fleet_roster_result: "Fleet roster not loaded".to_string(),
+            operate_concurrency_result: "concurrency not loaded".to_string(),
+            operate_result: "operate readiness not loaded".to_string(),
             default_mode: "agent".to_string(),
             approval_policy_value: "on-request".to_string(),
             project_override_warning: None,
@@ -274,6 +292,68 @@ impl SetupRuntimeFacts {
             sandbox,
             network
         );
+        let subagents_enabled = config.subagents_enabled_for_provider(app.api_provider);
+        let max_subagents = config.max_subagents_for_provider(app.api_provider);
+        let launch_concurrency = config.launch_concurrency_for_provider(app.api_provider);
+        let max_admitted = config.max_admitted_subagents_for_provider(app.api_provider);
+        let runtime_disabled_reason = if subagents_enabled {
+            None
+        } else {
+            Some(
+                config
+                    .subagents_disabled_reason()
+                    .unwrap_or("disabled for active provider"),
+            )
+        };
+        let operate_runtime_ready =
+            subagents_enabled && max_subagents > 0 && launch_concurrency > 0;
+        let operate_runtime_result = if let Some(reason) = runtime_disabled_reason {
+            format!("worker runtime disabled ({reason})")
+        } else {
+            format!(
+                "worker runtime enabled for {}; max_subagents={}, launch_concurrency={}, admission={}",
+                app.api_provider.as_str(),
+                max_subagents,
+                launch_concurrency,
+                max_admitted
+            )
+        };
+        let roster =
+            crate::fleet::roster::FleetRoster::load(&config.fleet_config(), &app.workspace);
+        let roster_members = roster.members().len();
+        let custom_roster_members = roster
+            .members()
+            .iter()
+            .filter(|member| !matches!(member.origin, crate::fleet::roster::ProfileOrigin::BuiltIn))
+            .count();
+        let fleet_roster_ready = roster_members > 0;
+        let fleet_roster_result = if custom_roster_members > 0 {
+            format!("{roster_members} Fleet members ({custom_roster_members} config/workspace)")
+        } else {
+            format!("{roster_members} built-in Fleet members; starter roster available")
+        };
+        let operate_concurrency_result = format!(
+            "configured launch_concurrency={launch_concurrency}; max_subagents={max_subagents}; admission={max_admitted}; plan limit not probed"
+        );
+        let operate_result = format!(
+            "provider={}, runtime={}, roster={}, concurrency={}",
+            if provider_ready {
+                "ready"
+            } else {
+                "needs_action"
+            },
+            if operate_runtime_ready {
+                "ready"
+            } else {
+                "needs_action"
+            },
+            if fleet_roster_ready {
+                "ready"
+            } else {
+                "needs_action"
+            },
+            operate_concurrency_result
+        );
         let constitution_autonomy = UserConstitution::load()
             .ok()
             .and_then(|load| {
@@ -302,6 +382,12 @@ impl SetupRuntimeFacts {
             network,
             network_default_value,
             runtime_result,
+            operate_runtime_ready,
+            operate_runtime_result,
+            fleet_roster_ready,
+            fleet_roster_result,
+            operate_concurrency_result,
+            operate_result,
             default_mode: app.mode.as_setting().to_string(),
             approval_policy_value: config
                 .approval_policy
@@ -1242,6 +1328,38 @@ impl SetupWizardView {
         })
     }
 
+    fn operate_fleet_facts_ready(&self) -> bool {
+        self.state.first_run_ready()
+            && self.facts.provider_ready
+            && self.facts.operate_runtime_ready
+            && self.facts.fleet_roster_ready
+    }
+
+    fn commit_operate_fleet_review(&mut self) -> ViewAction {
+        let status = if self.operate_fleet_facts_ready() {
+            StepStatus::Verified
+        } else {
+            StepStatus::NeedsAction
+        };
+        let mut state = self.state.clone();
+        state.set_step(
+            SetupStep::OperateFleet,
+            StepEntry::new(status, false, CONSTITUTION_CHECKPOINT_VERSION)
+                .with_result(self.facts.operate_result.clone()),
+        );
+        self.state = state.clone();
+        self.move_next();
+        let message_id = if status == StepStatus::Verified {
+            MessageId::SetupOperateReviewed
+        } else {
+            MessageId::SetupOperateNeedsActionSaved
+        };
+        ViewAction::Emit(ViewEvent::SetupStateCommitRequested {
+            state,
+            message: tr(self.locale, message_id).to_string(),
+        })
+    }
+
     fn select_runtime_preset(&mut self, key: char) -> ViewAction {
         if let Some(preset) = SetupRuntimePreset::from_key(key)
             && preset != self.runtime_preset
@@ -1608,6 +1726,12 @@ impl ModalView for SetupWizardView {
             KeyCode::Char('m') if self.selected_step() == SetupStep::ProviderModel => {
                 ViewAction::EmitAndClose(ViewEvent::SetupOpenModelRequested)
             }
+            KeyCode::Char('p') if self.selected_step() == SetupStep::OperateFleet => {
+                ViewAction::EmitAndClose(ViewEvent::SetupOpenProviderRequested)
+            }
+            KeyCode::Char('f') if self.selected_step() == SetupStep::OperateFleet => {
+                ViewAction::EmitAndClose(ViewEvent::SetupOpenFleetRequested)
+            }
             KeyCode::Char('m') if self.selected_step() == SetupStep::TrustSandbox => {
                 ViewAction::EmitAndClose(ViewEvent::SetupOpenModeRequested)
             }
@@ -1646,6 +1770,9 @@ impl ModalView for SetupWizardView {
             }
             KeyCode::Enter if self.selected_step() == SetupStep::TrustSandbox => {
                 self.commit_runtime_posture_review()
+            }
+            KeyCode::Enter if self.selected_step() == SetupStep::OperateFleet => {
+                self.commit_operate_fleet_review()
             }
             KeyCode::Enter if self.selected_step() == SetupStep::Verification => {
                 self.commit_setup_report()
@@ -1740,6 +1867,15 @@ impl ModalView for SetupWizardView {
                 "M",
                 tr(self.locale, MessageId::SetupActionModel).to_string(),
             ));
+        } else if self.selected_step() == SetupStep::OperateFleet {
+            hints.push(ActionHint::new(
+                "P",
+                tr(self.locale, MessageId::SetupActionProvider).to_string(),
+            ));
+            hints.push(ActionHint::new(
+                "F",
+                tr(self.locale, MessageId::SetupActionFleet).to_string(),
+            ));
         } else if self.selected_step() == SetupStep::TrustSandbox {
             hints.push(ActionHint::new(
                 "1-3",
@@ -1832,6 +1968,7 @@ impl SetupWizardView {
             SetupStep::ProviderModel => self.provider_model_detail_lines(),
             SetupStep::TrustSandbox => self.runtime_posture_detail_lines(),
             SetupStep::Constitution => self.constitution_detail_lines(),
+            SetupStep::OperateFleet => self.operate_fleet_detail_lines(),
             SetupStep::Verification => self.verification_detail_lines(),
             _ => Vec::new(),
         }
@@ -2017,6 +2154,32 @@ impl SetupWizardView {
         lines
     }
 
+    fn operate_fleet_detail_lines(&self) -> Vec<Line<'static>> {
+        let route = format!("{} / {}", self.facts.provider, self.facts.model);
+        let readiness = self.ready_label(self.operate_fleet_facts_ready());
+        vec![
+            self.detail_row(MessageId::SetupCardRouteLabel, &route),
+            self.detail_row(MessageId::SetupCardAuthLabel, &self.facts.auth),
+            self.detail_row(
+                MessageId::SetupOperateRuntimeLabel,
+                &self.facts.operate_runtime_result,
+            ),
+            self.detail_row(
+                MessageId::SetupOperateRosterLabel,
+                &self.facts.fleet_roster_result,
+            ),
+            self.detail_row(
+                MessageId::SetupOperateConcurrencyLabel,
+                &self.facts.operate_concurrency_result,
+            ),
+            self.detail_row(MessageId::SetupOperateReadinessLabel, &readiness),
+            Line::from(Span::styled(
+                tr(self.locale, MessageId::SetupOperateReviewHint).to_string(),
+                Style::default().fg(palette::TEXT_MUTED),
+            )),
+        ]
+    }
+
     fn verification_detail_lines(&self) -> Vec<Line<'static>> {
         let mut lines = vec![
             self.detail_row(
@@ -2026,6 +2189,10 @@ impl SetupWizardView {
             self.detail_row(
                 MessageId::SetupReportUpdateLabel,
                 &self.ready_label(self.state.update_ready(CONSTITUTION_CHECKPOINT_VERSION)),
+            ),
+            self.detail_row(
+                MessageId::SetupReportOperateLabel,
+                &self.ready_label(self.state.operate_ready()),
             ),
             self.detail_row(
                 MessageId::SetupReportSourceLabel,
@@ -2108,6 +2275,9 @@ impl SetupWizardView {
         }
         if !self.state.first_run_ready() {
             return MessageId::SetupReportNextActionRequired;
+        }
+        if !self.state.operate_ready() {
+            return MessageId::SetupReportNextActionOperate;
         }
         MessageId::SetupReportNextActionNone
     }
@@ -2264,7 +2434,7 @@ fn project_runtime_override_warning(workspace: &Path, locale: Locale) -> Option<
 
 fn setup_report_result(state: &SetupState, facts: &SetupRuntimeFacts) -> String {
     format!(
-        "first_run={}, update={}, constitution={:?}, autonomy={}, posture={:?}, runtime={}",
+        "first_run={}, update={}, operate={}, constitution={:?}, autonomy={}, posture={:?}, runtime={}, operate_fleet={}",
         if state.first_run_ready() {
             "ready"
         } else {
@@ -2275,10 +2445,16 @@ fn setup_report_result(state: &SetupState, facts: &SetupRuntimeFacts) -> String 
         } else {
             "needs_action"
         },
+        if state.operate_ready() {
+            "ready"
+        } else {
+            "needs_action"
+        },
         state.constitution_choice,
         facts.constitution_autonomy,
         state.runtime_posture_source,
-        facts.runtime_result
+        facts.runtime_result,
+        facts.operate_result
     )
 }
 
@@ -2644,6 +2820,7 @@ mod tests {
                 SetupStep::ProviderModel,
                 SetupStep::TrustSandbox,
                 SetupStep::Constitution,
+                SetupStep::OperateFleet,
                 SetupStep::Verification,
             ]
         );
@@ -2695,7 +2872,7 @@ mod tests {
 
         let action = view.handle_key(key(KeyCode::Right));
         assert!(matches!(action, ViewAction::None));
-        assert_eq!(view.selected_step(), SetupStep::Verification);
+        assert_eq!(view.selected_step(), SetupStep::OperateFleet);
 
         let action = view.handle_key(key(KeyCode::Char('b')));
         assert!(matches!(action, ViewAction::None));
@@ -2728,7 +2905,7 @@ mod tests {
         };
         assert_eq!(state.status(SetupStep::Constitution), StepStatus::Skipped);
         assert!(message.contains("skipped"));
-        assert_eq!(view.selected_step(), SetupStep::Verification);
+        assert_eq!(view.selected_step(), SetupStep::OperateFleet);
 
         let action = view.handle_key(key(KeyCode::Char('r')));
 
@@ -2737,7 +2914,7 @@ mod tests {
             panic!("expected retry setup-state commit event");
         };
         assert_eq!(
-            state.status(SetupStep::Verification),
+            state.status(SetupStep::OperateFleet),
             StepStatus::NeedsAction
         );
         assert!(message.contains("retry"));
@@ -2866,6 +3043,28 @@ mod tests {
         assert!(matches!(
             config_action,
             ViewAction::EmitAndClose(ViewEvent::SetupOpenConfigRequested)
+        ));
+    }
+
+    #[test]
+    fn operate_fleet_step_hands_off_to_provider_and_fleet_surfaces() {
+        let mut view = SetupWizardView::new_at_with_facts(
+            SetupState::default(),
+            Locale::En,
+            SetupStep::OperateFleet,
+            SetupRuntimeFacts::default(),
+        );
+
+        let provider_action = view.handle_key(key(KeyCode::Char('p')));
+        assert!(matches!(
+            provider_action,
+            ViewAction::EmitAndClose(ViewEvent::SetupOpenProviderRequested)
+        ));
+
+        let fleet_action = view.handle_key(key(KeyCode::Char('f')));
+        assert!(matches!(
+            fleet_action,
+            ViewAction::EmitAndClose(ViewEvent::SetupOpenFleetRequested)
         ));
     }
 
@@ -3004,6 +3203,28 @@ mod tests {
             model: model.to_string(),
             ..SetupRuntimeFacts::default()
         }
+    }
+
+    fn first_run_ready_state() -> SetupState {
+        let mut state = SetupState::default();
+        state.set_step(
+            SetupStep::Language,
+            StepEntry::new(StepStatus::Verified, true, CONSTITUTION_CHECKPOINT_VERSION),
+        );
+        state.set_step(
+            SetupStep::ProviderModel,
+            StepEntry::new(StepStatus::Verified, true, CONSTITUTION_CHECKPOINT_VERSION),
+        );
+        state.runtime_posture_source = RuntimePostureSource::Confirmed;
+        state.complete_constitution_checkpoint(
+            CONSTITUTION_CHECKPOINT_VERSION,
+            ConstitutionChoice::Bundled,
+        );
+        state.set_step(
+            SetupStep::Constitution,
+            StepEntry::new(StepStatus::Verified, true, CONSTITUTION_CHECKPOINT_VERSION),
+        );
+        state
     }
 
     fn sample_model_draft() -> Box<UserConstitution> {
@@ -3886,6 +4107,107 @@ mod tests {
     }
 
     #[test]
+    fn operate_fleet_detail_lines_show_read_only_facts() {
+        let facts = SetupRuntimeFacts {
+            provider: "DeepSeek".to_string(),
+            model: "deepseek-v4-pro".to_string(),
+            auth: "present".to_string(),
+            provider_ready: true,
+            operate_runtime_ready: true,
+            operate_runtime_result: "worker runtime enabled for deepseek; max_subagents=4, launch_concurrency=2, admission=6".to_string(),
+            fleet_roster_ready: true,
+            fleet_roster_result: "3 Fleet members (1 config/workspace)".to_string(),
+            operate_concurrency_result:
+                "configured launch_concurrency=2; max_subagents=4; admission=6; plan limit not probed"
+                    .to_string(),
+            ..SetupRuntimeFacts::default()
+        };
+        let view = SetupWizardView::new_at_with_facts(
+            first_run_ready_state(),
+            Locale::En,
+            SetupStep::OperateFleet,
+            facts,
+        );
+
+        let text = lines_to_text(view.operate_fleet_detail_lines());
+
+        assert!(text.contains("Worker runtime:"));
+        assert!(text.contains("worker runtime enabled for deepseek"));
+        assert!(text.contains("Fleet roster:"));
+        assert!(text.contains("3 Fleet members"));
+        assert!(text.contains("plan limit not probed"));
+        assert!(text.contains("It does not probe plan limits"));
+    }
+
+    #[test]
+    fn operate_fleet_review_records_ready_without_plan_probe() {
+        let facts = SetupRuntimeFacts {
+            provider_ready: true,
+            operate_runtime_ready: true,
+            fleet_roster_ready: true,
+            operate_result:
+                "provider=ready, runtime=ready, roster=ready, concurrency=configured launch_concurrency=2; max_subagents=4; admission=6; plan limit not probed"
+                    .to_string(),
+            ..SetupRuntimeFacts::default()
+        };
+        let mut view = SetupWizardView::new_at_with_facts(
+            first_run_ready_state(),
+            Locale::En,
+            SetupStep::OperateFleet,
+            facts,
+        );
+
+        let action = view.handle_key(key(KeyCode::Enter));
+
+        let ViewAction::Emit(ViewEvent::SetupStateCommitRequested { state, message }) = action
+        else {
+            panic!("expected setup-state commit event");
+        };
+        assert_eq!(state.status(SetupStep::OperateFleet), StepStatus::Verified);
+        assert!(state.operate_ready());
+        let result = state
+            .steps
+            .get(&SetupStep::OperateFleet)
+            .and_then(|entry| entry.result.as_deref())
+            .expect("operate result");
+        assert!(result.contains("plan limit not probed"), "{result}");
+        assert!(message.contains("Operate/Fleet readiness recorded"));
+        assert_eq!(view.selected_step(), SetupStep::Verification);
+    }
+
+    #[test]
+    fn operate_fleet_review_records_needs_action_until_first_run_ready() {
+        let facts = SetupRuntimeFacts {
+            provider_ready: true,
+            operate_runtime_ready: true,
+            fleet_roster_ready: true,
+            operate_result:
+                "provider=ready, runtime=ready, roster=ready, concurrency=plan limit not probed"
+                    .to_string(),
+            ..SetupRuntimeFacts::default()
+        };
+        let mut view = SetupWizardView::new_at_with_facts(
+            SetupState::default(),
+            Locale::En,
+            SetupStep::OperateFleet,
+            facts,
+        );
+
+        let action = view.handle_key(key(KeyCode::Enter));
+
+        let ViewAction::Emit(ViewEvent::SetupStateCommitRequested { state, message }) = action
+        else {
+            panic!("expected setup-state commit event");
+        };
+        assert_eq!(
+            state.status(SetupStep::OperateFleet),
+            StepStatus::NeedsAction
+        );
+        assert!(!state.operate_ready());
+        assert!(message.contains("needs action"));
+    }
+
+    #[test]
     fn runtime_posture_preset_requires_preview_before_apply() {
         let facts = SetupRuntimeFacts {
             default_mode: "agent".to_string(),
@@ -3979,6 +4301,7 @@ mod tests {
                 .and_then(|entry| entry.result.as_deref())
                 .is_some_and(|result| {
                     result.contains("update=needs_action")
+                        && result.contains("operate=needs_action")
                         && result.contains("autonomy=balanced")
                         && result.contains("runtime=intent=agent, approval=suggest")
                 })
@@ -4011,7 +4334,9 @@ mod tests {
                 .steps
                 .get(&SetupStep::Verification)
                 .and_then(|entry| entry.result.as_deref())
-                .is_some_and(|result| result.contains("update=ready"))
+                .is_some_and(|result| {
+                    result.contains("update=ready") && result.contains("operate=needs_action")
+                })
         );
     }
 
@@ -4033,6 +4358,7 @@ mod tests {
 
         assert!(text.contains("First-run:"));
         assert!(text.contains("Update checkpoint:"));
+        assert!(text.contains("Operate/Fleet:"));
         assert!(text.contains("Constitution autonomy:"));
         assert!(text.contains("balanced"));
         assert!(text.contains("Runtime posture:"));

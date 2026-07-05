@@ -426,5 +426,17 @@
     "VoiceErrTooShort": "Voz: no se detectó voz, grabación demasiado corta",
     "VoiceRecording": "🎙 Grabando... habla ahora",
     "VoiceProcessing": "🎙 Transcribiendo...",
-    "VoiceTranscribed": "🎙 Transcrito"
+    "VoiceTranscribed": "🎙 Transcrito",
+    "SetupActionFleet": "configuración de Fleet",
+    "SetupStepOperateFleetTitle": "Operate y Fleet",
+    "SetupStepOperateFleetWhy": "Revisa si el trabajo multi-worker durable puede ejecutarse con el proveedor, la postura de ejecución, el roster y la concurrencia actuales. El descubrimiento de límites del plan sigue siendo explícito.",
+    "SetupOperateRuntimeLabel": "Runtime de workers:",
+    "SetupOperateRosterLabel": "Roster de Fleet:",
+    "SetupOperateConcurrencyLabel": "Concurrencia:",
+    "SetupOperateReadinessLabel": "Preparación de Operate:",
+    "SetupOperateReviewHint": "Enter registra los hechos actuales de Operate/Fleet. No prueba límites del plan, no escribe credenciales ni cambia la configuración de Fleet.",
+    "SetupOperateReviewed": "Preparación de Operate/Fleet registrada.",
+    "SetupOperateNeedsActionSaved": "Operate/Fleet aún necesita acción; registrado en el reporte de setup.",
+    "SetupReportOperateLabel": "Operate/Fleet:",
+    "SetupReportNextActionOperate": "Revisa la preparación de Operate/Fleet antes de ejecuciones durables multi-worker."
 }

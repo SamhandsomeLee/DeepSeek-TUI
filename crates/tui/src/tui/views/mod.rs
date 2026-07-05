@@ -688,6 +688,9 @@ pub enum ViewEvent {
     /// Emitted by the setup Provider/Model readiness card to hand off to the
     /// existing provider-qualified model route picker.
     SetupOpenModelRequested,
+    /// Emitted by the setup Operate/Fleet readiness card to hand off to the
+    /// existing Fleet setup wizard without writing Fleet config itself.
+    SetupOpenFleetRequested,
     /// Emitted by the setup Runtime Posture card to hand off to the existing
     /// work-mode picker.
     SetupOpenModeRequested,
