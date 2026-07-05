@@ -15,7 +15,8 @@
 
 use anyhow::{Result, bail};
 use codewhale_protocol::fleet::{
-    FleetResolvedRoute, FleetTaskSpec, FleetTaskWorkerProfile, FleetWorkerSpec,
+    FleetEffectivePermissions, FleetResolvedRoute, FleetTaskSpec, FleetTaskWorkerProfile,
+    FleetWorkerSpec,
 };
 
 use super::profile::AgentProfile;
@@ -587,6 +588,68 @@ pub fn apply_exec_hardening(
     spec
 }
 
+pub(crate) fn fleet_effective_permissions_from_worker_spec(
+    spec: &AgentWorkerSpec,
+) -> FleetEffectivePermissions {
+    fleet_effective_permissions_from_runtime_profile(&spec.runtime_profile, None)
+}
+
+pub(crate) fn fleet_effective_permissions_for_task(
+    task_spec: &FleetTaskSpec,
+    agent_profiles: &[AgentProfile],
+    spec: &AgentWorkerSpec,
+) -> FleetEffectivePermissions {
+    let agent_profile = resolve_task_agent_profile(task_spec, agent_profiles)
+        .ok()
+        .flatten();
+    fleet_effective_permissions_from_runtime_profile(&spec.runtime_profile, agent_profile)
+}
+
+fn fleet_effective_permissions_from_runtime_profile(
+    profile: &WorkerRuntimeProfile,
+    agent_profile: Option<&AgentProfile>,
+) -> FleetEffectivePermissions {
+    FleetEffectivePermissions {
+        write: profile.permissions.write,
+        network: profile.permissions.network,
+        shell: shell_policy_label(profile.shell).to_string(),
+        tool_scope: tool_scope_label(&profile.tools).to_string(),
+        tools: match &profile.tools {
+            ToolScope::Inherit => Vec::new(),
+            ToolScope::Explicit(tools) => tools.clone(),
+        },
+        background: profile.background,
+        max_spawn_depth: profile.max_spawn_depth,
+        profile_id: agent_profile.map(|profile| profile.id.clone()),
+        profile_origin: agent_profile
+            .map(|profile| profile_origin_label(profile.origin).to_string()),
+        source: "worker_runtime_profile".to_string(),
+    }
+}
+
+fn profile_origin_label(origin: crate::fleet::roster::ProfileOrigin) -> &'static str {
+    match origin {
+        crate::fleet::roster::ProfileOrigin::BuiltIn => "built_in",
+        crate::fleet::roster::ProfileOrigin::Config => "config",
+        crate::fleet::roster::ProfileOrigin::Workspace => "workspace",
+    }
+}
+
+fn shell_policy_label(shell: crate::worker_profile::ShellPolicy) -> &'static str {
+    match shell {
+        crate::worker_profile::ShellPolicy::None => "none",
+        crate::worker_profile::ShellPolicy::ReadOnly => "read_only",
+        crate::worker_profile::ShellPolicy::Full => "full",
+    }
+}
+
+fn tool_scope_label(tools: &ToolScope) -> &'static str {
+    match tools {
+        ToolScope::Inherit => "inherit",
+        ToolScope::Explicit(_) => "explicit",
+    }
+}
+
 /// Filter a tool profile against allowed/disallowed lists.
 fn filter_tool_profile(
     profile: &AgentWorkerToolProfile,
@@ -999,6 +1062,7 @@ mod tests {
             max_concurrent_tasks: None,
         };
 
+        let profiles = vec![profile];
         let spec = fleet_task_to_worker_spec_with_profiles(
             "worker-1",
             "run-1",
@@ -1006,7 +1070,7 @@ mod tests {
             &worker,
             "auto",
             std::path::Path::new("/tmp"),
-            &[profile],
+            &profiles,
             None,
         )
         .unwrap();
@@ -1024,6 +1088,11 @@ mod tests {
         );
         assert_eq!(spec.runtime_profile.role, SubAgentType::Review);
         assert_eq!(spec.runtime_profile.model, ModelRoute::Auto);
+
+        let permissions = fleet_effective_permissions_for_task(&task, &profiles, &spec);
+        assert_eq!(permissions.profile_id.as_deref(), Some("reviewer"));
+        assert_eq!(permissions.profile_origin.as_deref(), Some("workspace"));
+        assert_eq!(permissions.source, "worker_runtime_profile");
     }
 
     #[test]
@@ -1176,6 +1245,16 @@ mod tests {
         );
         assert_eq!(spec.runtime_profile.model, ModelRoute::Faster);
         assert_eq!(spec.max_spawn_depth, 1);
+
+        let permissions = fleet_effective_permissions_from_worker_spec(&spec);
+        assert!(!permissions.write);
+        assert!(!permissions.network);
+        assert_eq!(permissions.shell, "read_only");
+        assert_eq!(permissions.tool_scope, "explicit");
+        assert_eq!(permissions.tools, vec!["read_file".to_string()]);
+        assert!(permissions.background);
+        assert_eq!(permissions.max_spawn_depth, 1);
+        assert_eq!(permissions.source, "worker_runtime_profile");
     }
 
     #[test]

@@ -896,6 +896,38 @@ pub struct FleetResolvedRoute {
     pub source: String,
 }
 
+/// Effective worker authority persisted on a [`FleetReceipt`] (#3211).
+///
+/// This is a non-secret snapshot of the already-computed runtime profile. It
+/// records what the worker was allowed to do; it does not grant permissions and
+/// does not carry credentials, sandbox paths, or provider endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FleetEffectivePermissions {
+    /// Whether the worker profile may modify workspace files.
+    pub write: bool,
+    /// Whether the worker profile may use network-capable tools.
+    pub network: bool,
+    /// Shell posture (`none`, `read_only`, or `full`).
+    pub shell: String,
+    /// Tool-surface posture (`inherit` or `explicit`).
+    pub tool_scope: String,
+    /// Explicit tool names when `tool_scope` is `explicit`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+    /// Whether the worker is intended to run detached/background.
+    pub background: bool,
+    /// Remaining nested-delegation budget after parent intersection/hardening.
+    pub max_spawn_depth: u32,
+    /// Roster profile id that contributed to this worker, when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    /// Roster layer for `profile_id` (`built_in`, `config`, or `workspace`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_origin: Option<String>,
+    /// How this snapshot was produced (e.g. `"worker_runtime_profile"`).
+    pub source: String,
+}
+
 /// Receipt produced when a task completes verification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FleetReceipt {
@@ -916,6 +948,9 @@ pub struct FleetReceipt {
     /// existed) deserializable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_route: Option<FleetResolvedRoute>,
+    /// Effective worker authority for this task (#3211).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_permissions: Option<FleetEffectivePermissions>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1232,6 +1267,7 @@ mod tests {
                 notes: None,
             }),
             resolved_route: None,
+            effective_permissions: None,
         };
         let json = serde_json::to_string(&receipt).unwrap();
         let back: FleetReceipt = serde_json::from_str(&json).unwrap();
@@ -1255,6 +1291,7 @@ mod tests {
                 notes: Some("manual verification required".to_string()),
             }),
             resolved_route: None,
+            effective_permissions: None,
         };
 
         let json = serde_json::to_string(&receipt).unwrap();
@@ -1419,6 +1456,18 @@ mod tests {
                 model_source: Some("task.model".to_string()),
                 source: "resolver".to_string(),
             }),
+            effective_permissions: Some(FleetEffectivePermissions {
+                write: true,
+                network: true,
+                shell: "full".to_string(),
+                tool_scope: "explicit".to_string(),
+                tools: vec!["read_file".to_string(), "apply_patch".to_string()],
+                background: true,
+                max_spawn_depth: 2,
+                profile_id: Some("builder".to_string()),
+                profile_origin: Some("built_in".to_string()),
+                source: "worker_runtime_profile".to_string(),
+            }),
         }
     }
 
@@ -1428,6 +1477,7 @@ mod tests {
         let json = serde_json::to_string(&receipt).unwrap();
         let back: FleetReceipt = serde_json::from_str(&json).unwrap();
         assert_eq!(back.resolved_route, receipt.resolved_route);
+        assert_eq!(back.effective_permissions, receipt.effective_permissions);
         let route = back.resolved_route.unwrap();
         assert_eq!(route.provider_id, "deepseek");
         assert_eq!(route.wire_model_id, "deepseek-v4-pro");
@@ -1445,6 +1495,23 @@ mod tests {
         );
         assert_eq!(route.model_source.as_deref(), Some("task.model"));
         assert_eq!(route.source, "resolver");
+
+        let permissions = back
+            .effective_permissions
+            .expect("effective permissions should round-trip");
+        assert!(permissions.write);
+        assert!(permissions.network);
+        assert_eq!(permissions.shell, "full");
+        assert_eq!(permissions.tool_scope, "explicit");
+        assert_eq!(
+            permissions.tools,
+            vec!["read_file".to_string(), "apply_patch".to_string()]
+        );
+        assert!(permissions.background);
+        assert_eq!(permissions.max_spawn_depth, 2);
+        assert_eq!(permissions.profile_id.as_deref(), Some("builder"));
+        assert_eq!(permissions.profile_origin.as_deref(), Some("built_in"));
+        assert_eq!(permissions.source, "worker_runtime_profile");
     }
 
     #[test]

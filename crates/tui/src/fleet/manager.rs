@@ -915,6 +915,7 @@ impl FleetManager {
         // verification and the simulated/transport fallback below — persists the
         // same honest, secret-free route detail.
         let resolved_route = self.resolve_task_route(&task.task_spec);
+        let effective_permissions = self.resolve_task_effective_permissions(task);
         let verification_input = FleetTaskVerificationInput {
             run_id: task.entry.run_id.clone(),
             task_id: task.entry.task_id.clone(),
@@ -922,6 +923,7 @@ impl FleetManager {
             exit_code,
             artifacts,
             resolved_route,
+            effective_permissions,
         };
         if task.task_spec.scorer.is_some() {
             let verification =
@@ -967,6 +969,7 @@ impl FleetManager {
             artifacts: verification_input.artifacts,
             score: None,
             resolved_route: verification_input.resolved_route,
+            effective_permissions: verification_input.effective_permissions,
         })?;
         Ok(true)
     }
@@ -980,6 +983,42 @@ impl FleetManager {
     fn resolve_task_route(&self, task_spec: &FleetTaskSpec) -> Option<FleetResolvedRoute> {
         let roster = self.agent_roster();
         worker_runtime::resolve_fleet_route(task_spec, roster.members())
+    }
+
+    /// Resolve the effective worker authority to persist on a task's receipt
+    /// (#3211). This mirrors Fleet worker registration and applies exec
+    /// hardening before snapshotting the runtime profile. Failures degrade to
+    /// `None` so receipt writing never widens or fabricates authority.
+    fn resolve_task_effective_permissions(
+        &self,
+        task: &FleetExecutorTaskContext,
+    ) -> Option<FleetEffectivePermissions> {
+        let state = self.ledger.rebuild_state().ok()?;
+        let run = state.runs.get(&task.entry.run_id.0)?;
+        let worker_spec = run
+            .worker_specs
+            .iter()
+            .find(|worker| worker.id == task.worker_id)
+            .cloned()
+            .unwrap_or_else(|| default_local_worker(&task.worker_id));
+        let roster = self.agent_roster();
+        let worker = worker_runtime::fleet_task_to_worker_spec_with_profiles(
+            &task.worker_id,
+            &task.entry.run_id.0,
+            &task.task_spec,
+            &worker_spec,
+            "auto",
+            &self.workspace,
+            roster.members(),
+            None,
+        )
+        .ok()?;
+        let worker = worker_runtime::apply_exec_hardening(worker, &self.exec_config);
+        Some(worker_runtime::fleet_effective_permissions_for_task(
+            &task.task_spec,
+            roster.members(),
+            &worker,
+        ))
     }
 
     fn task_artifacts_for_receipt(
@@ -1693,6 +1732,7 @@ mod tests {
                     artifacts: Vec::new(),
                     score: None,
                     resolved_route: None,
+                    effective_permissions: None,
                 })
                 .unwrap();
         }
@@ -2415,6 +2455,47 @@ esac
                     .is_some_and(|source| !source.is_empty()),
                 "receipt {key} resolved-route should record model source"
             );
+            let permissions = receipt
+                .effective_permissions
+                .as_ref()
+                .unwrap_or_else(|| panic!("receipt {key} should carry effective permissions"));
+            assert_eq!(
+                permissions.source, "worker_runtime_profile",
+                "receipt {key} permissions source must be the worker runtime profile"
+            );
+            assert!(
+                permissions.background,
+                "receipt {key} should record background worker execution"
+            );
+            assert_eq!(
+                permissions.tool_scope, "explicit",
+                "receipt {key} should preserve explicit tool scope"
+            );
+            assert!(
+                !permissions.tools.is_empty(),
+                "receipt {key} should record explicit tool names"
+            );
+            match route.role.as_deref() {
+                Some("builder") => {
+                    assert!(permissions.write, "builder receipt {key} should write");
+                    assert_eq!(permissions.shell, "full");
+                }
+                Some("scout") => {
+                    assert!(
+                        !permissions.write,
+                        "scout receipt {key} must stay read-only"
+                    );
+                    assert_eq!(permissions.shell, "read_only");
+                }
+                Some("verifier") => {
+                    assert!(
+                        !permissions.write,
+                        "verifier receipt {key} must stay read-only"
+                    );
+                    assert_eq!(permissions.shell, "full");
+                }
+                role => panic!("unexpected receipt role for {key}: {role:?}"),
+            }
 
             let receipt_json = serde_json::to_string(receipt).unwrap();
             let haystack = receipt_json.to_ascii_lowercase();

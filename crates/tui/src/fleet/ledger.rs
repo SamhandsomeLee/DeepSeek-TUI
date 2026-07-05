@@ -920,6 +920,7 @@ mod tests {
                 artifacts: vec![],
                 score: None,
                 resolved_route: None,
+                effective_permissions: None,
             })
             .unwrap();
 
@@ -953,6 +954,7 @@ mod tests {
             artifacts: vec![],
             score: None,
             resolved_route: None,
+            effective_permissions: None,
         };
         ledger.record_receipt(receipt.clone()).unwrap();
         let state = ledger.rebuild_state().unwrap();
