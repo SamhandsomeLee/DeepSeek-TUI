@@ -3,9 +3,9 @@
 //! Replaces the old six-column config matrix (#3791). Fleet is presented as an
 //! agent team: the user makes one focused choice at a time (a role, then a model
 //! class) and then reviews the full posture — model/route, permissions, tools,
-//! workspace/org scope, and review policy — before starting. "Start" inserts a
-//! safe profile-authoring prompt into the composer; nothing is written to disk,
-//! preserving the existing InsertText-to-compose commit path.
+//! workspace/org scope, and review policy — before starting. "Start" previews a
+//! deterministic starter TOML profile; nothing is written until the user
+//! explicitly ratifies the exact rendered bytes.
 //!
 //! NOTE (audit #7 / #3167): the role/model taxonomy and copy below are
 //! intentionally English for now; #3167 reworks this into an interactive
@@ -27,8 +27,8 @@ use crate::config::Config;
 use crate::palette;
 use crate::tui::app::App;
 use crate::tui::views::{
-    ActionHint, CommandPaletteAction, ModalKind, ModalView, ViewAction, ViewEvent,
-    centered_modal_area, render_modal_footer, render_modal_surface, truncate_view_text,
+    ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, centered_modal_area,
+    render_modal_footer, render_modal_surface, truncate_view_text,
 };
 
 const PROFILE_DIR: &str = ".codewhale/agents";
@@ -335,8 +335,8 @@ impl FleetSetupView {
         }
     }
 
-    /// Advance to the next step, or — on the review step — commit by inserting
-    /// the profile-authoring prompt into the composer.
+    /// Advance to the next step, or — on the review step — preview the exact
+    /// starter profile TOML the next ratify keypress would persist.
     fn advance(&mut self) -> ViewAction {
         match self.step {
             Step::Role => {
@@ -348,7 +348,7 @@ impl FleetSetupView {
                 self.review_scroll = 0;
                 ViewAction::None
             }
-            Step::Review => self.insert_profile_prompt_action(),
+            Step::Review => self.preview_starter_profile_action(),
         }
     }
 
@@ -368,21 +368,48 @@ impl FleetSetupView {
         }
     }
 
-    fn insert_profile_prompt_action(&self) -> ViewAction {
-        ViewAction::EmitAndClose(ViewEvent::CommandPaletteSelected {
-            action: CommandPaletteAction::InsertText {
-                text: self.profile_prompt(),
-            },
-        })
+    fn preview_starter_profile_action(&mut self) -> ViewAction {
+        let draft = self.starter_profile_draft();
+        let (title, header) = match self.snapshot.locale {
+            crate::localization::Locale::ZhHans => (
+                "Fleet 配置 — 起始草案（Enter/g 批准）".to_string(),
+                format!(
+                    "# .codewhale/agents/{}\n# CodeWhale 根据当前角色和模型选择确定性渲染。\n# 权限保持在 Fleet 底线：无 shell、无 trust、需审批。\n# 在向导中按 Enter 或 g 之前不会保存任何内容。\n\n",
+                    draft.file_name()
+                ),
+            ),
+            _ => (
+                "Fleet profile — starter draft (Enter/g ratifies)".to_string(),
+                format!(
+                    "# .codewhale/agents/{}\n# Deterministic starter profile rendered by CodeWhale from your role/model choices.\n# Permissions stay at the fleet floor: no shell, no trust, approval required.\n# Nothing is saved until you press Enter or g in the wizard.\n\n",
+                    draft.file_name()
+                ),
+            ),
+        };
+        let content = format!("{header}{}", draft.render_toml());
+        self.model_draft = Some(draft);
+        self.model_draft_label = Some("CodeWhale starter".to_string());
+        ViewAction::Emit(ViewEvent::OpenTextPager { title, content })
     }
 
-    /// Build the profile authoring prompt for the current role/model selection.
-    fn profile_prompt(&self) -> String {
-        profile_authoring_prompt(
-            &self.snapshot,
-            self.selected_role(),
-            self.selected_model_class(),
-        )
+    /// Build a deterministic starter profile for the current role/model
+    /// selection. The same ratify event persists this as model-drafted profiles,
+    /// so duplicate-id checks and atomic writes stay in one host path.
+    fn starter_profile_draft(&self) -> Box<crate::fleet::profile::FleetProfileDraft> {
+        let role = &ROLES[self.role_idx.min(ROLES.len() - 1)];
+        let model_class = self.selected_model_class();
+        Box::new(crate::fleet::profile::FleetProfileDraft {
+            id: profile_file_stem(role.label),
+            display_name: Some(role.label.to_string()),
+            description: Some(format!("{} - {}", role.summary, role.description)),
+            role_hint: role.label.to_string(),
+            model_class_hint: Some(model_class.to_string()),
+            model: None,
+            instructions: Some(format!(
+                "Role: {}. Work only within the assigned Fleet slice. Report concise evidence and stop when the assignment is complete. Do not widen permissions, trust, route configuration, or topology.",
+                role.label
+            )),
+        })
     }
 
     /// The action hints for the current step's footer (wrapped by the shared
@@ -401,12 +428,15 @@ impl FleetSetupView {
             }
             Step::Review => {
                 hints.push(ActionHint::new("↑/↓", "scroll"));
-                hints.push(ActionHint::new("Enter", "start"));
                 if self.model_draft.is_some() {
+                    hints.push(ActionHint::new("Enter", "ratify"));
                     hints.push(ActionHint::new("g", "ratify draft"));
                     hints.push(ActionHint::new("m", "redraft"));
                 } else if self.snapshot.provider_ready {
+                    hints.push(ActionHint::new("Enter", "preview"));
                     hints.push(ActionHint::new("m", "model draft"));
+                } else {
+                    hints.push(ActionHint::new("Enter", "preview"));
                 }
                 hints.push(ActionHint::new("←", "back"));
             }
@@ -568,7 +598,7 @@ impl FleetSetupView {
             ),
             Step::Review => (
                 "Review & start",
-                "Confirm the posture below, then start to author the profile.",
+                "Confirm the posture below, preview exact TOML, then ratify to save.",
             ),
         };
         let lines = vec![
@@ -671,7 +701,7 @@ impl FleetSetupView {
             &mut lines,
             "Profile",
             format!(
-                "{PROFILE_DIR}/{file_stem}.toml  ·  {profile_value} present. Start inserts a safe authoring prompt into the composer — nothing is written to disk.",
+                "{PROFILE_DIR}/{file_stem}.toml  ·  {profile_value} present. Start previews a deterministic starter profile; nothing is written to disk until ratification.",
             ),
         );
 
@@ -830,43 +860,6 @@ fn profile_file_stem(role: &str) -> String {
     }
 }
 
-fn profile_authoring_prompt(
-    snapshot: &FleetSetupSnapshot,
-    role: &str,
-    model_class: &str,
-) -> String {
-    let file_stem = profile_file_stem(role);
-    format!(
-        "Create a safe CodeWhale Fleet agent profile file for this workspace.\n\n\
-         Selected planner role: {role}. Selected model class: {model_class}.\n\
-         Target path: {PROFILE_DIR}/{file_stem}.toml\n\
-         Current route context only: provider = {provider}, model = {model}, reasoning = {reasoning}\n\n\
-         Write TOML using only this schema:\n\
-         - name\n\
-         - display_name\n\
-         - description\n\
-         - role_hint (set to \"{role}\")\n\
-         - model_class_hint (set to \"{model_class}\"; one of inherit, fast, balanced, deep-reasoning, code, review, or tool-heavy)\n\
-         - model (optional explicit model id on the active/resolved route; omit to inherit the current route)\n\
-         - [instructions].text\n\
-         - [tools].posture = \"read-only\"\n\n\
-         Do not include provider, base_url, api_key, auth, secrets, trust, allow_shell, or approval_required=false.\n\
-         If model is present, keep it to a visible model id such as deepseek-v4-pro or glm-5.2.\n\
-         Fleet product shape:\n\
-         - Fleet is the durable sub-agent config surface: slots, profiles, models, tools, and ledger\n\
-         - one main orchestrator profile coordinates the Fleet run and verifies returned claims\n\
-         - workers are summoned as focused Fleet members with only their assigned slice\n\
-         - default model behavior is same-route inheritance; choose fast/strong/code/review only when the role needs it\n\
-         - DeepSeek-style model tiers are recommendations, not hierarchy rules; every slot may override model\n\
-         - Workflow plans may select and monitor Fleet slots, but Fleet owns the worker config\n\
-         - do not encode a recursive worker tree in [instructions].text; topology belongs to the orchestrator, not each worker\n\n\
-         Keep the profile permission-narrowing and compatible with recursive Fleet role workers.",
-        provider = snapshot.provider,
-        model = snapshot.model,
-        reasoning = snapshot.reasoning
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1021,7 +1014,7 @@ mod tests {
     }
 
     #[test]
-    fn start_on_review_inserts_profile_prompt_for_selection() {
+    fn start_on_review_previews_and_ratifies_starter_profile_for_selection() {
         let mut view = FleetSetupView::from_snapshot(snapshot());
         // Role: manager(0) main(1) scout(2) builder(3) -> builder.
         view.handle_key(key(KeyCode::Down));
@@ -1034,19 +1027,33 @@ mod tests {
 
         let action = view.handle_key(key(KeyCode::Enter)); // Start
         match action {
-            ViewAction::EmitAndClose(ViewEvent::CommandPaletteSelected {
-                action: CommandPaletteAction::InsertText { text },
-            }) => {
-                assert!(text.contains("Target path: .codewhale/agents/builder.toml"));
-                assert!(text.contains("role_hint (set to \"builder\")"));
-                assert!(text.contains("model_class_hint (set to \"fast\""));
-                assert!(text.contains("provider = DeepSeek"));
-                assert!(text.contains("Do not include provider, base_url"));
-                assert!(text.contains("Fleet is the durable sub-agent config surface"));
-                assert!(text.contains("topology belongs to the orchestrator"));
+            ViewAction::Emit(ViewEvent::OpenTextPager { title, content }) => {
+                assert!(title.contains("starter draft"));
+                assert!(content.contains("# .codewhale/agents/builder.toml"));
+                assert!(content.contains("id = \"builder\""));
+                assert!(content.contains("role_hint = \"builder\""));
+                assert!(content.contains("model_class_hint = \"fast\""));
+                assert!(content.contains("Nothing is saved until"));
+                for forbidden in ["provider", "base_url", "api_key"] {
+                    assert!(
+                        !content.contains(forbidden),
+                        "starter profile must not carry {forbidden}: {content}"
+                    );
+                }
             }
-            other => panic!("expected profile prompt insertion, got {other:?}"),
+            other => panic!("expected starter profile preview, got {other:?}"),
         }
+        assert!(view.model_draft.is_some());
+
+        let action = view.handle_key(key(KeyCode::Enter)); // ratify previewed draft
+        let ViewAction::EmitAndClose(ViewEvent::FleetProfileDraftCommitRequested { draft }) =
+            action
+        else {
+            panic!("expected ratified starter draft");
+        };
+        assert_eq!(draft.id, "builder");
+        assert_eq!(draft.role_hint, "builder");
+        assert_eq!(draft.model_class_hint.as_deref(), Some("fast"));
     }
 
     #[test]
@@ -1108,11 +1115,16 @@ mod tests {
     #[test]
     fn default_selection_targets_manager_inherit() {
         let view = FleetSetupView::from_snapshot(snapshot());
-        let prompt = view.profile_prompt();
-        assert!(prompt.contains("Target path: .codewhale/agents/manager.toml"));
-        assert!(prompt.contains("model_class_hint (set to \"inherit\""));
-        assert!(prompt.contains("Current route context only"));
-        assert!(prompt.contains("permission-narrowing"));
+        let draft = view.starter_profile_draft();
+        assert_eq!(draft.file_name(), "manager.toml");
+        assert_eq!(draft.role_hint, "manager");
+        assert_eq!(draft.model_class_hint.as_deref(), Some("inherit"));
+        assert!(
+            draft
+                .instructions
+                .as_deref()
+                .is_some_and(|text| text.contains("assigned Fleet slice"))
+        );
     }
 
     #[test]
@@ -1243,7 +1255,7 @@ mod tests {
         }
 
         // The review is intentionally scrollable; scrolling to the bottom reveals
-        // the workspace/org scope, review policy, and the honest "no disk write"
+        // the workspace/org scope, review policy, and the honest ratification
         // note on the Start action.
         let bottom = render_through_stack(
             || {
@@ -1256,7 +1268,7 @@ mod tests {
             40,
         )
         .join("\n");
-        for needle in ["Workspace", "Review policy", "nothing is written to disk"] {
+        for needle in ["Workspace", "Review policy", "until ratification"] {
             assert!(bottom.contains(needle), "scrolled review missing: {needle}");
         }
     }
