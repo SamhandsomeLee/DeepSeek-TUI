@@ -25,7 +25,7 @@ body:
       description: "What problem does this fix, and why now? (2-4 sentences)"
       placeholder: |
         e.g. "The TUI freezes when 4+ sub-agents run concurrently because
-        AgentProgress events trigger a full redraw each.  This blocks v0.8.58's
+        AgentProgress events trigger a full redraw each.  This blocks
         recommended sub-agent fanout."
     validations:
       required: true
