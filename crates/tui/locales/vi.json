@@ -514,6 +514,7 @@
     "SetupCheckpointDeferred": "Checkpoint constitution đã hoãn: luật tích hợp/mặc định áp dụng cho đến khi bạn quay lại /setup.",
     "SetupStepSkipped": "Bước setup đã bỏ qua và lưu.",
     "SetupStepRetryRecorded": "Bước setup đã được đánh dấu để thử lại.",
+    "SetupLanguageReviewed": "Đã ghi ngôn ngữ setup.",
     "SetupConstitutionChoiceLabel": "Lựa chọn:",
     "SetupConstitutionSourceLabel": "Nguồn:",
     "SetupConstitutionValidityLabel": "Hiệu lực:",

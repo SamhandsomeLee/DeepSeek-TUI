@@ -516,6 +516,7 @@
     "SetupCheckpointDeferred": "Constitution チェックポイントを延期しました。/setup に戻るまで同梱/既定のルールが適用されます。",
     "SetupStepSkipped": "セットアップステップをスキップして保存しました。",
     "SetupStepRetryRecorded": "セットアップステップを再試行対象として記録しました。",
+    "SetupLanguageReviewed": "セットアップ言語を記録しました。",
     "SetupConstitutionChoiceLabel": "選択:",
     "SetupConstitutionSourceLabel": "ソース:",
     "SetupConstitutionValidityLabel": "妥当性:",

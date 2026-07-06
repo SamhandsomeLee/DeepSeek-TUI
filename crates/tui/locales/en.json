@@ -354,6 +354,7 @@
     "SetupCheckpointDeferred": "Constitution checkpoint deferred: bundled/default law applies until you return to /setup.",
     "SetupStepSkipped": "Setup step skipped and saved.",
     "SetupStepRetryRecorded": "Setup step marked for retry.",
+    "SetupLanguageReviewed": "Setup language recorded.",
     "SetupConstitutionChoiceLabel": "Choice:",
     "SetupConstitutionSourceLabel": "Source:",
     "SetupConstitutionValidityLabel": "Validity:",

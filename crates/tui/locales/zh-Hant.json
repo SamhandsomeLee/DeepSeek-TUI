@@ -249,6 +249,7 @@
     "SetupCheckpointDeferred": "Constitution checkpoint 已延後：返回 /setup 前會套用內建/預設規則。",
     "SetupStepSkipped": "設定步驟已略過並儲存。",
     "SetupStepRetryRecorded": "設定步驟已標記為重試。",
+    "SetupLanguageReviewed": "已記錄設定語言。",
     "SetupConstitutionChoiceLabel": "選擇：",
     "SetupConstitutionSourceLabel": "來源：",
     "SetupConstitutionValidityLabel": "有效性：",

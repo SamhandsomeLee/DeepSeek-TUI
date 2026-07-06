@@ -515,6 +515,7 @@
     "SetupCheckpointDeferred": "Checkpoint de constitution pospuesto: se aplica la ley incluida/predeterminada hasta que vuelvas a /setup.",
     "SetupStepSkipped": "Paso de setup saltado y guardado.",
     "SetupStepRetryRecorded": "Paso de setup marcado para reintento.",
+    "SetupLanguageReviewed": "Idioma del setup registrado.",
     "SetupConstitutionChoiceLabel": "Elección:",
     "SetupConstitutionSourceLabel": "Fuente:",
     "SetupConstitutionValidityLabel": "Validez:",

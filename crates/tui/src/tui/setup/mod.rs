@@ -290,13 +290,14 @@ impl SetupRuntimeFacts {
             "missing for active provider".to_string()
         };
         let health = if provider_ready {
-            "ready for first turn; live validation remains with /provider"
+            "ready for first turn; live validation remains with /provider".to_string()
         } else if app.api_provider == crate::config::ApiProvider::OpenaiCodex {
-            "run codex login or set OPENAI_CODEX_ACCESS_TOKEN before first turn"
+            "run codex login or set OPENAI_CODEX_ACCESS_TOKEN before first turn".to_string()
+        } else if let Some(url) = app.api_provider.credential_url() {
+            format!("needs key or local runtime before first turn; credentials: {url}")
         } else {
-            "needs key or local runtime before first turn"
-        }
-        .to_string();
+            "needs key or local runtime before first turn".to_string()
+        };
         let provider_result = format!(
             "provider={}, model={}, auth={}, health={}",
             app.api_provider.as_str(),
@@ -2258,6 +2259,22 @@ impl SetupWizardView {
         })
     }
 
+    fn commit_language_review(&mut self) -> ViewAction {
+        let mut state = self.state.clone();
+        state.constitution_language = Some(self.locale.tag().to_string());
+        state.set_step(
+            SetupStep::Language,
+            StepEntry::new(StepStatus::Verified, true, CONSTITUTION_CHECKPOINT_VERSION)
+                .with_result(format!("setup locale {}", self.locale.tag())),
+        );
+        self.state = state.clone();
+        self.move_next();
+        ViewAction::Emit(ViewEvent::SetupStateCommitRequested {
+            state,
+            message: tr(self.locale, MessageId::SetupLanguageReviewed).to_string(),
+        })
+    }
+
     fn commit_provider_model_review(&mut self) -> ViewAction {
         let status = provider::step_status(self.facts.provider_ready);
         let mut state = self.state.clone();
@@ -2807,6 +2824,9 @@ impl ModalView for SetupWizardView {
             KeyCode::Char('d') => self.commit_constitution(SetupCommitKind::DeferredConstitution),
             KeyCode::Enter if self.selected_step() == SetupStep::Constitution => {
                 self.commit_constitution(SetupCommitKind::BundledConstitution)
+            }
+            KeyCode::Enter if self.selected_step() == SetupStep::Language => {
+                self.commit_language_review()
             }
             KeyCode::Enter if self.selected_step() == SetupStep::ProviderModel => {
                 self.commit_provider_model_review()
@@ -4426,6 +4446,38 @@ mod tests {
     }
 
     #[test]
+    fn language_step_records_locale_and_unblocks_first_run_ready() {
+        let mut state = SetupState::default();
+        state.set_step(
+            SetupStep::ProviderModel,
+            StepEntry::new(StepStatus::Verified, true, CONSTITUTION_CHECKPOINT_VERSION),
+        );
+        state.runtime_posture_source = RuntimePostureSource::Confirmed;
+        state.complete_constitution_checkpoint(
+            CONSTITUTION_CHECKPOINT_VERSION,
+            ConstitutionChoice::Bundled,
+        );
+        state.set_step(
+            SetupStep::Constitution,
+            StepEntry::new(StepStatus::Verified, true, CONSTITUTION_CHECKPOINT_VERSION),
+        );
+        let mut view = SetupWizardView::new(state, Locale::En);
+        assert_eq!(view.selected_step(), SetupStep::Language);
+
+        let action = view.handle_key(key(KeyCode::Enter));
+
+        let ViewAction::Emit(ViewEvent::SetupStateCommitRequested { state, message }) = action
+        else {
+            panic!("expected language setup-state commit event");
+        };
+        assert_eq!(state.status(SetupStep::Language), StepStatus::Verified);
+        assert_eq!(state.constitution_language.as_deref(), Some("en"));
+        assert!(state.first_run_ready());
+        assert!(message.contains("Setup language recorded"));
+        assert_eq!(view.selected_step(), SetupStep::ProviderModel);
+    }
+
+    #[test]
     fn zh_hans_checkpoint_copy_is_localized() {
         assert_ne!(
             tr(Locale::ZhHans, MessageId::SetupWizardTitle),
@@ -4585,6 +4637,72 @@ mod tests {
             model_action,
             ViewAction::EmitAndClose(ViewEvent::SetupOpenModelRequested)
         ));
+    }
+
+    #[test]
+    fn provider_model_detail_lines_show_credential_url_for_missing_hosted_provider() {
+        let _guard = crate::test_support::lock_test_env();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        let codewhale_home = tmp.path().join(".codewhale");
+        let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
+        let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path());
+        let _codewhale_home =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home);
+        let _deepseek_key = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
+        let _nim_key = crate::test_support::EnvVarGuard::remove("NVIDIA_API_KEY");
+        let _nim_alt_key = crate::test_support::EnvVarGuard::remove("NVIDIA_NIM_API_KEY");
+        let config = Config {
+            provider: Some("nvidia-nim".to_string()),
+            ..Config::default()
+        };
+        let app = App::new(setup_test_options(workspace), &config);
+        let facts = SetupRuntimeFacts::from_app_config(&app, &config);
+        let view = SetupWizardView::new_at_with_facts(
+            SetupState::default(),
+            Locale::En,
+            SetupStep::ProviderModel,
+            facts,
+        );
+
+        let text = lines_to_text(view.provider_model_detail_lines());
+
+        assert!(text.contains("NVIDIA NIM"), "{text}");
+        assert!(text.contains("credentials: https://build.nvidia.com/settings/api-keys"));
+    }
+
+    #[test]
+    fn provider_model_detail_lines_keep_codex_oauth_url_free() {
+        let _guard = crate::test_support::lock_test_env();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        let codewhale_home = tmp.path().join(".codewhale");
+        let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
+        let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path());
+        let _codewhale_home =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home);
+        let _openai_codex_key =
+            crate::test_support::EnvVarGuard::remove("OPENAI_CODEX_ACCESS_TOKEN");
+        let _codex_key = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
+        let config = Config {
+            provider: Some("openai-codex".to_string()),
+            ..Config::default()
+        };
+        let app = App::new(setup_test_options(workspace), &config);
+        let facts = SetupRuntimeFacts::from_app_config(&app, &config);
+        let view = SetupWizardView::new_at_with_facts(
+            SetupState::default(),
+            Locale::En,
+            SetupStep::ProviderModel,
+            facts,
+        );
+
+        let text = lines_to_text(view.provider_model_detail_lines());
+
+        assert!(text.contains("codex login"), "{text}");
+        assert!(!text.contains("credentials:"), "{text}");
     }
 
     #[test]

@@ -344,6 +344,7 @@
   "SetupCheckpointDeferred": "宪法检查点已稍后处理：在返回 /setup 前使用内置/默认准则。",
   "SetupStepSkipped": "已保存跳过此设置步骤。",
   "SetupStepRetryRecorded": "已标记此设置步骤待重试。",
+  "SetupLanguageReviewed": "已记录设置语言。",
   "SetupConstitutionChoiceLabel": "选择：",
   "SetupConstitutionSourceLabel": "来源：",
   "SetupConstitutionValidityLabel": "有效性：",

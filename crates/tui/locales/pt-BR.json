@@ -503,6 +503,7 @@
     "SetupCheckpointDeferred": "Checkpoint da constitution adiado: a lei embutida/padrão vale até você voltar ao /setup.",
     "SetupStepSkipped": "Etapa de setup pulada e salva.",
     "SetupStepRetryRecorded": "Etapa de setup marcada para tentar novamente.",
+    "SetupLanguageReviewed": "Idioma do setup registrado.",
     "SetupConstitutionChoiceLabel": "Escolha:",
     "SetupConstitutionSourceLabel": "Fonte:",
     "SetupConstitutionValidityLabel": "Validade:",
