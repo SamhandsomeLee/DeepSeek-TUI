@@ -3317,6 +3317,7 @@ mod tests {
                 "MCP",
                 "Fleet",
                 "Experimental",
+                "Fleet",
             ]
         );
     }
@@ -3462,7 +3463,7 @@ max_spawn_depth = 2
 
         view.update_filter(|filter| filter.push_str("experimental"));
         assert_eq!(visible_section_labels(&view), vec!["Experimental"]);
-        assert!(visible_row_keys(&view).contains(&"features.subagents"));
+        assert_eq!(visible_row_keys(&view), vec!["features.vision_model"]);
 
         view.clear_filter();
         type_filter(&mut view, "feature vision");
@@ -3471,12 +3472,12 @@ max_spawn_depth = 2
 
         view.clear_filter();
         type_filter(&mut view, "goal");
-        assert_eq!(visible_section_labels(&view), vec!["Experimental"]);
+        assert_eq!(visible_section_labels(&view), vec!["Fleet"]);
         assert_eq!(visible_row_keys(&view), vec!["goal_command"]);
 
         view.clear_filter();
         type_filter(&mut view, "workflow");
-        assert_eq!(visible_section_labels(&view), vec!["Experimental"]);
+        assert_eq!(visible_section_labels(&view), vec!["Fleet"]);
         assert_eq!(visible_row_keys(&view), vec!["workflow"]);
 
         view.clear_filter();
