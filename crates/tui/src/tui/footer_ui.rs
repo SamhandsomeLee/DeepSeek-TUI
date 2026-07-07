@@ -1184,27 +1184,6 @@ pub(crate) fn footer_state_label(app: &App) -> (&'static str, ratatui::style::Co
     ("idle", app.ui_theme.status_ready)
 }
 
-#[cfg(test)]
-pub(crate) fn footer_mode_style(app: &App) -> (&'static str, ratatui::style::Color) {
-    let label = match app.mode {
-        crate::tui::app::AppMode::Agent => "act",
-        crate::tui::app::AppMode::Auto => "act",
-        crate::tui::app::AppMode::Yolo => "yolo",
-        crate::tui::app::AppMode::Plan => "plan",
-        crate::tui::app::AppMode::Multitask => "multitask",
-        crate::tui::app::AppMode::Operate => "operate",
-    };
-    let color = match app.mode {
-        crate::tui::app::AppMode::Agent => app.ui_theme.mode_agent,
-        crate::tui::app::AppMode::Auto => app.ui_theme.mode_agent,
-        crate::tui::app::AppMode::Yolo => app.ui_theme.mode_yolo,
-        crate::tui::app::AppMode::Plan => app.ui_theme.mode_plan,
-        crate::tui::app::AppMode::Multitask => app.ui_theme.mode_agent,
-        crate::tui::app::AppMode::Operate => app.ui_theme.mode_yolo,
-    };
-    (label, color)
-}
-
 pub(crate) fn format_token_count_compact(tokens: u64) -> String {
     if tokens >= 1_000_000 {
         format!("{:.1}M", tokens as f64 / 1_000_000.0)
