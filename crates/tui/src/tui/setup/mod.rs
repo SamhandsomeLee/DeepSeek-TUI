@@ -180,6 +180,7 @@ pub struct SetupWizardView {
     model_draft_label: Option<String>,
     runtime_preset: SetupRuntimePreset,
     runtime_preset_preview_seen: bool,
+    body_scroll: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2087,6 +2088,7 @@ impl SetupWizardView {
             model_draft_label: None,
             runtime_preset: SetupRuntimePreset::default(),
             runtime_preset_preview_seen: false,
+            body_scroll: 0,
         }
     }
 
@@ -2140,6 +2142,7 @@ impl SetupWizardView {
             model_draft_label: None,
             runtime_preset: SetupRuntimePreset::default(),
             runtime_preset_preview_seen: false,
+            body_scroll: 0,
         }
     }
 
@@ -2163,15 +2166,18 @@ impl SetupWizardView {
             model_draft_label: None,
             runtime_preset: SetupRuntimePreset::default(),
             runtime_preset_preview_seen: false,
+            body_scroll: 0,
         }
     }
 
     fn move_next(&mut self) {
         self.selected = (self.selected + 1).min(STEP_SPECS.len().saturating_sub(1));
+        self.body_scroll = 0;
     }
 
     fn move_back(&mut self) {
         self.selected = self.selected.saturating_sub(1);
+        self.body_scroll = 0;
     }
 
     fn commit_selected_status(
@@ -2698,6 +2704,14 @@ impl ModalView for SetupWizardView {
                 self.move_next();
                 ViewAction::None
             }
+            KeyCode::PageUp => {
+                self.body_scroll = self.body_scroll.saturating_sub(8);
+                ViewAction::None
+            }
+            KeyCode::PageDown => {
+                self.body_scroll = self.body_scroll.saturating_add(8);
+                ViewAction::None
+            }
             KeyCode::Up => {
                 self.move_back();
                 ViewAction::None
@@ -2850,6 +2864,10 @@ impl ModalView for SetupWizardView {
                 "R",
                 tr(self.locale, MessageId::SetupActionRetry).to_string(),
             ),
+            ActionHint::new(
+                "PgUp/Dn",
+                tr(self.locale, MessageId::SetupActionScrollBody).to_string(),
+            ),
         ];
         if self.selected_step() == SetupStep::Constitution {
             hints.push(ActionHint::new(
@@ -2980,8 +2998,17 @@ impl ModalView for SetupWizardView {
         lines.push(Line::from(Span::raw(
             tr(self.locale, MessageId::SetupCheckpointLayerOrder).to_string(),
         )));
+        let wrap_width = usize::from(content_area.width).max(1);
+        let visual_rows: usize = lines
+            .iter()
+            .map(|line| line.width().div_ceil(wrap_width).max(1))
+            .sum();
+        let visible_rows = usize::from(content_area.height).max(1);
+        let max_scroll = visual_rows.saturating_sub(visible_rows);
+        let scroll = self.body_scroll.min(max_scroll);
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
+            .scroll((scroll as u16, 0))
             .render(content_area, buf);
     }
 
@@ -6546,6 +6573,19 @@ mod tests {
         assert!(text.contains("Runtime posture:"));
         assert!(text.contains("intent=agent, approval=suggest"));
         assert!(text.contains("Complete the constitution checkpoint"));
+    }
+
+    #[test]
+    fn setup_wizard_body_scroll_resets_on_step_change() {
+        let mut view = SetupWizardView::new(SetupState::default(), Locale::En);
+        view.body_scroll = 12;
+        view.move_next();
+        assert_eq!(view.body_scroll, 0, "step change should reset body scroll");
+        view.body_scroll = 5;
+        view.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert!(view.body_scroll >= 5);
+        view.move_back();
+        assert_eq!(view.body_scroll, 0);
     }
 
     fn lines_to_text(lines: Vec<Line<'static>>) -> String {
