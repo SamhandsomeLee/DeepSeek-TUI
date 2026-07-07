@@ -4233,7 +4233,9 @@ async fn run_subagent_task(task: SubAgentTask) {
             let raw = summarize_subagent_result(res);
             let (summary, truncated) = stamp_subagent_summary(&raw);
             let sentinel = match &res.status {
-                SubAgentStatus::Failed(error) => subagent_failed_sentinel(&task.agent_id, error),
+                SubAgentStatus::Failed(error) => {
+                    subagent_failed_sentinel(&task.agent_id, error)
+                }
                 _ => subagent_done_sentinel(&task.agent_id, res, truncated),
             };
             (summary, sentinel)
@@ -7298,7 +7300,9 @@ fn summarize_subagent_result(result: &SubAgentResult) -> String {
     }
     match (&result.status, result.result.as_ref()) {
         (SubAgentStatus::Completed, Some(text)) => text.clone(),
-        (SubAgentStatus::Completed, None) => "Completed (no final summary returned)".to_string(),
+        (SubAgentStatus::Completed, None) => {
+            "Completed (no final summary returned)".to_string()
+        }
         (SubAgentStatus::Interrupted(error), _) => format!("Interrupted: {error}"),
         (SubAgentStatus::Cancelled, _) => "Cancelled".to_string(),
         (SubAgentStatus::BudgetExhausted, _) => "Token budget exhausted".to_string(),
