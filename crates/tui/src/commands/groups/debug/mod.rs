@@ -2,12 +2,13 @@
 //! and the change log.
 
 mod balance;
+mod cache;
 mod change;
-// This group dir intentionally has a `debug.rs` child module with the same
-// name. The module_inception allow is a permanent structure rationale, not
-// migration scaffolding; see docs/architecture/command-dispatch.md.
-#[allow(clippy::module_inception)]
-mod debug;
+mod tokens;
+mod undo;
+
+#[cfg(test)]
+mod tests;
 
 use crate::commands::CommandResult;
 use crate::commands::traits::{Command, CommandGroup, CommandInfo, FunctionCommand};
@@ -145,31 +146,31 @@ pub(in crate::commands) fn dispatch(
     arg: Option<&str>,
 ) -> Option<CommandResult> {
     let result = match command {
-        "tokens" => debug::tokens(app),
-        "cost" => debug::cost(app),
+        "tokens" => tokens::tokens(app),
+        "cost" => tokens::cost(app),
         "balance" => balance::balance(app),
-        "cache" => debug::cache(app, arg),
+        "cache" => cache::cache(app, arg),
         "change" => change::change(app, arg),
-        "system" | "xitong" => debug::system_prompt(app),
-        "context" | "ctx" => debug::context(app, arg),
-        "edit" => debug::edit(app),
-        "diff" => debug::diff(app),
+        "system" | "xitong" => tokens::system_prompt(app),
+        "context" | "ctx" => tokens::context(app, arg),
+        "edit" => undo::edit(app),
+        "diff" => undo::diff(app),
         "undo" => {
             // Try surgical patch-undo first; fall back to conversation undo
             // if no snapshots are available or if the snapshot undo couldn't
             // find anything useful.
-            let result = debug::patch_undo(app);
+            let result = undo::patch_undo(app);
             if result.message.as_deref().is_none_or(|m| {
                 m.starts_with("No snapshots found")
                     || m.starts_with("No older tool or pre-turn")
                     || m.starts_with("Snapshot repo")
             }) {
-                debug::undo_conversation(app)
+                undo::undo_conversation(app)
             } else {
                 result
             }
         }
-        "retry" | "chongshi" => debug::retry(app),
+        "retry" | "chongshi" => undo::retry(app),
         _ => return None,
     };
     Some(result)
