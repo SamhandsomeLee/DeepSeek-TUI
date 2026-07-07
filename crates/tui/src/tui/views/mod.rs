@@ -1729,7 +1729,7 @@ fn experimental_config_rows(config: &Config) -> Vec<ConfigRow> {
 
     for spec in FEATURES
         .iter()
-        .filter(|spec| spec.stage == Stage::Experimental)
+        .filter(|spec| matches!(spec.stage, Stage::Experimental | Stage::Beta))
     {
         let effective = features.enabled(spec.id);
         let configured_value = configured
@@ -1749,16 +1749,20 @@ fn experimental_config_rows(config: &Config) -> Vec<ConfigRow> {
     }
 
     rows.push(ConfigRow {
-        section: ConfigSection::Experimental,
+        section: ConfigSection::Fleet,
         key: "goal_command".to_string(),
-        value: "preview placeholder (not stable)".to_string(),
+        value:
+            "/goal sets session objectives with optional token budgets; state shows in Work context"
+                .to_string(),
         editable: false,
         scope: ConfigScope::Saved,
     });
     rows.push(ConfigRow {
-        section: ConfigSection::Experimental,
+        section: ConfigSection::Fleet,
         key: "workflow".to_string(),
-        value: "preview overlay for workflow/fleet runs (not stable)".to_string(),
+        value:
+            "/workflow runs scripted fan-out/fan-in operations with run cards and cancel support"
+                .to_string(),
         editable: false,
         scope: ConfigScope::Saved,
     });
@@ -1888,14 +1892,16 @@ fn config_hint_for_key(key: &str) -> &'static str {
         "fleet.exec.max_spawn_depth" => {
             "0 blocks child agents; 3 default (same axis as sub-agents); capped at 8"
         }
-        "features.subagents" => "read-only feature flag state; Fleet setup is the user-facing path",
+        "features.subagents" => {
+            "read-only feature flag state; /fleet setup is the user-facing path"
+        }
         "features.web_search" => "read-only feature flag state for web search tools",
         "features.apply_patch" => "read-only feature flag state for patch editing tools",
         "features.mcp" => "read-only feature flag state for MCP tools",
         "features.exec_policy" => "read-only feature flag state for execution policy tools",
-        "features.vision_model" => "read-only feature flag state for vision/model image support",
-        "goal_command" => "preview-only; not a stable command surface yet",
-        "workflow" => "preview-only workflow/fleet overlay; not a stable command surface yet",
+        "features.vision_model" => "beta feature flag for vision/model image support",
+        "goal_command" => "/goal sets objectives, budgets, and Work-context status",
+        "workflow" => "/workflow runs scripted operations with fan-out/fan-in run cards",
         _ => "",
     }
 }
@@ -3347,14 +3353,14 @@ mod tests {
         assert!(keys.contains(&"prefer_external_pdftotext"));
         assert!(keys.contains(&"mcp_config_path"));
         assert!(keys.contains(&"fleet.exec.max_spawn_depth"));
-        assert!(keys.contains(&"features.subagents"));
-        assert!(keys.contains(&"features.web_search"));
-        assert!(keys.contains(&"features.apply_patch"));
-        assert!(keys.contains(&"features.mcp"));
-        assert!(keys.contains(&"features.exec_policy"));
         assert!(keys.contains(&"features.vision_model"));
         assert!(keys.contains(&"goal_command"));
         assert!(keys.contains(&"workflow"));
+        assert!(!keys.contains(&"features.subagents"));
+        assert!(!keys.contains(&"features.web_search"));
+        assert!(!keys.contains(&"features.apply_patch"));
+        assert!(!keys.contains(&"features.mcp"));
+        assert!(!keys.contains(&"features.exec_policy"));
         assert!(!keys.contains(&"whaleflow"));
         assert!(
             view.rows
@@ -3405,10 +3411,8 @@ vision_model = true
         let web_search = view
             .rows
             .iter()
-            .find(|row| row.key == "features.web_search")
-            .expect("web_search feature row");
-        assert_eq!(web_search.value, "disabled (configured; default enabled)");
-        assert!(!web_search.editable);
+            .find(|row| row.key == "features.web_search");
+        assert!(web_search.is_none());
 
         let vision = view
             .rows
@@ -3418,12 +3422,8 @@ vision_model = true
         assert_eq!(vision.value, "enabled (configured; default disabled)");
         assert!(!vision.editable);
 
-        let subagents = view
-            .rows
-            .iter()
-            .find(|row| row.key == "features.subagents")
-            .expect("subagents feature row");
-        assert_eq!(subagents.value, "enabled (default enabled)");
+        let subagents = view.rows.iter().find(|row| row.key == "features.subagents");
+        assert!(subagents.is_none());
     }
 
     #[test]
@@ -3712,8 +3712,8 @@ base_url = "https://api.xiaomimimo.com/v1"
         assert_eq!(visible_row_keys(&view), vec!["reasoning_effort"]);
 
         view.clear_filter();
-        type_filter(&mut view, "fleet setup user-facing");
-        assert_eq!(visible_row_keys(&view), vec!["features.subagents"]);
+        type_filter(&mut view, "fan-out/fan-in");
+        assert_eq!(visible_row_keys(&view), vec!["workflow"]);
     }
 
     #[test]
