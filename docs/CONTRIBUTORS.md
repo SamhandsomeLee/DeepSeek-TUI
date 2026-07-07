@@ -28,6 +28,27 @@ notes, and relevant issue/PR comments.
 ## Contributors by time
 
 <details open>
+<summary><strong>v0.8.68 — maintenance sweep, runtime persistence &amp; release evidence</strong></summary>
+
+The v0.8.68 maintenance lane started with post-release cleanup on `main`: runtime
+thread persistence, terminal selection, UTF-8 edit handling, README discovery,
+and dead-code removal landed alongside Cursor dogfood evidence for v0.8.67.
+
+- **[MXAntian](https://github.com/MXAntian)** — persist compaction summaries
+  into thread records so `/v1` engine reloads keep compacted context (#4091)
+- **[nightt5879](https://github.com/nightt5879)** — keep native terminal
+  selection usable when mouse capture is disabled, and advance fuzzy edit
+  matches on UTF-8 character boundaries (#4088, #4045)
+- **[gaord](https://github.com/gaord)** — add the community-maintained
+  CodeWhale for VS Code GUI frontend to the English and Chinese READMEs (#4035)
+- **[Darrell Thomas](https://github.com/DarrellThomas)** — remove the unused
+  whale route taxonomy module and its dead tests (#4041)
+- **[Taixin Guo](https://github.com/taixinguo)** — CJK fuzzy-edit panic report
+  and fix direction credited in the UTF-8 boundary patch (#3971, #4045)
+
+</details>
+
+<details>
 <summary><strong>v0.8.66 — release readiness, provider intake &amp; UI hardening</strong></summary>
 
 The v0.8.66 release prepared the 0.8.66 package lane, hardened provider/model

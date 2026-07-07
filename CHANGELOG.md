@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added Cursor-integrated-terminal dogfood evidence for the published v0.8.67
+  release, covering installed binary provenance, release/publication checks,
+  headless runtime smoke, setup QA, and remaining manual visual TUI checks.
+- README and README.zh-CN now point users to the community-maintained
+  CodeWhale for VS Code GUI frontend while clarifying that this repository's
+  `extensions/vscode/` scaffold remains the read-only Phase 0 viewer (#4035).
+
+### Fixed
+
+- Runtime compaction summaries are now persisted into `/v1` thread records so
+  engine reloads and restarts preserve compacted context. Contributed by
+  MXAntian (@MXAntian) (#4091).
+- The TUI leaves xterm alternate-scroll mode off when mouse capture is disabled,
+  preserving native terminal text selection in light-theme/no-mouse-capture
+  sessions. Contributed by Nightt (@nightt5879) (#4088, #4026).
+
+### Changed
+
+- Removed the unused `tui::whale_routes` taxonomy module and its tests.
+  Contributed by Darrell Thomas (@DarrellThomas) (#4041, #3852).
+
 ## [0.8.67] - 2026-07-06
 
 ### Added
