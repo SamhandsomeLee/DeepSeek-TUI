@@ -124,18 +124,16 @@ def ensure_models_dev_shape(data: Any, source: str) -> dict[str, Any]:
         die(f"{source}: 'models' must be an object")
     if providers is not None and not isinstance(providers, dict):
         die(f"{source}: 'providers' must be an object")
-    # Strip any accidental credential-shaped keys if a hand-edited file had them.
-    scrubbed = scrub_secrets(data)
-    return scrubbed
+    # Rebuild a public document from allowlisted top-level keys only so we never
+    # persist credential-shaped fields even if a future Models.dev field adds them.
+    return public_models_dev_document(data)
 
 
-def scrub_secrets(node: Any) -> Any:
-    """Drop keys that look like credentials; never persist auth material."""
+def is_credential_key(key: str) -> bool:
     banned_exact = {
         "api_key",
-        "apiKey",
+        "apikey",
         "authorization",
-        "Authorization",
         "token",
         "access_token",
         "refresh_token",
@@ -143,16 +141,37 @@ def scrub_secrets(node: Any) -> Any:
         "password",
         "client_secret",
     }
+    lowered = key.lower()
+    return lowered in banned_exact or lowered.endswith("_api_key") or lowered.endswith("_secret")
+
+
+def scrub_secrets(node: Any) -> Any:
+    """Drop keys that look like credentials; never persist auth material."""
     if isinstance(node, dict):
         out: dict[str, Any] = {}
         for key, value in node.items():
-            if key in banned_exact or key.lower().endswith("_api_key"):
+            if not isinstance(key, str) or is_credential_key(key):
                 continue
             out[key] = scrub_secrets(value)
         return out
     if isinstance(node, list):
         return [scrub_secrets(item) for item in node]
-    return node
+    if isinstance(node, (str, int, float, bool)) or node is None:
+        return node
+    # Drop non-JSON-scalar oddities rather than serializing them.
+    return None
+
+
+def public_models_dev_document(data: dict[str, Any]) -> dict[str, Any]:
+    """Construct a write-safe Models.dev-shaped document (public metadata only)."""
+    out: dict[str, Any] = {}
+    if isinstance(data.get("_meta"), dict):
+        out["_meta"] = scrub_secrets(data["_meta"])
+    if isinstance(data.get("models"), dict):
+        out["models"] = scrub_secrets(data["models"])
+    if isinstance(data.get("providers"), dict):
+        out["providers"] = scrub_secrets(data["providers"])
+    return out
 
 
 def catalog_stats(data: dict[str, Any]) -> str:
@@ -231,15 +250,39 @@ def refresh_openrouter(args: argparse.Namespace) -> None:
     if args.limit is not None and args.limit > 0:
         rows = rows[: args.limit]
 
+    # Project only public catalog fields — never the raw response object —
+    # so credential-shaped keys cannot reach disk even if OpenRouter adds them.
+    public_rows: list[dict[str, Any]] = []
+    allowed = {
+        "id",
+        "name",
+        "created",
+        "description",
+        "context_length",
+        "architecture",
+        "pricing",
+        "top_provider",
+        "per_request_limits",
+        "supported_parameters",
+    }
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        projected: dict[str, Any] = {}
+        for key in allowed:
+            if key in row and not is_credential_key(key):
+                projected[key] = scrub_secrets(row[key])
+        if projected.get("id"):
+            public_rows.append(projected)
     payload = {
         "_meta": {
             "source": "openrouter.ai/api/v1/models",
             "note": "Public model listing for cache dogfood; not the Models.dev SoT.",
-            "count": len(rows),
+            "count": len(public_rows),
             "sort": args.sort,
             "limit": args.limit,
         },
-        "data": scrub_secrets(rows),
+        "data": public_rows,
     }
     print(f"loaded OpenRouter models: {len(rows)} rows (sort={args.sort}, limit={args.limit})")
     if args.write_cache:
