@@ -218,6 +218,73 @@ mod tests {
         );
     }
 
+    /// #4116 CRITICAL (no-narrowing guarantee for the migrated consumer): the
+    /// catalog-backed facade must return a NON-EMPTY enumeration for every
+    /// provider that has a non-empty legacy `model_completion_names_for_provider`
+    /// table. `all_catalog_models_for_provider` falls back to that legacy table
+    /// whenever the merged catalog has no rows for the provider, so this holds by
+    /// construction — and it proves that the raw-legacy tail removed from the
+    /// subagent `operator_model_for_subagent` consumer (which only ran when the
+    /// facade was empty) was unreachable whenever legacy was non-empty. The
+    /// migrated consumer is therefore behavior-preserving: it always has a
+    /// catalog-sourced model to pick and never narrows to fewer choices than the
+    /// legacy path offered.
+    ///
+    /// Note: the facade is intentionally *catalog-authoritative*, so for some
+    /// providers whose bundled catalog supersedes stale entries in the legacy
+    /// placeholder table (e.g. curated OpenRouter/MiniMax revisions), the facade
+    /// is not a strict superset of every legacy id. That divergence predates this
+    /// migration and does not affect subagent model *acceptance*, which is gated
+    /// by `validate_route`/`requested_model_for_provider`, not by this list.
+    #[test]
+    fn catalog_facade_covers_every_provider_with_a_legacy_table() {
+        clear_live_snapshot();
+        for &provider in ApiProvider::all() {
+            let legacy_len = model_completion_names_for_provider(provider).len();
+            if legacy_len == 0 {
+                continue;
+            }
+            assert!(
+                !all_catalog_models_for_provider(provider).is_empty(),
+                "catalog facade returned no models for {provider:?} despite a \
+                 non-empty legacy table ({legacy_len} entries): the operator-route \
+                 consumer would have nothing to enumerate"
+            );
+        }
+    }
+
+    /// #4116 (AC b): a provider with no bundled/live catalog coverage must fall
+    /// back to the legacy table verbatim, so routing surfaces stay usable until
+    /// the asset catches up. We assert this for every currently-unbundled
+    /// provider that still carries a non-empty legacy list, and require at least
+    /// one such provider to exist so the fallback path is actually exercised.
+    #[test]
+    fn unbundled_provider_falls_back_to_legacy_table() {
+        clear_live_snapshot();
+        let merged = merged_snapshot();
+        let mut exercised = 0usize;
+        for &provider in ApiProvider::all() {
+            let catalog_id = catalog_provider_id(provider);
+            let has_catalog_rows = !merged.offerings_for_provider(catalog_id).is_empty();
+            let legacy = model_completion_names_for_provider(provider);
+            if has_catalog_rows || legacy.is_empty() {
+                continue;
+            }
+            // Unbundled + non-empty legacy: the facade must echo the legacy list.
+            let facade = all_catalog_models_for_provider(provider);
+            let expected: Vec<String> = legacy.iter().map(|m| m.to_string()).collect();
+            assert_eq!(
+                facade, expected,
+                "unbundled provider {provider:?} did not fall back to the legacy table"
+            );
+            exercised += 1;
+        }
+        assert!(
+            exercised > 0,
+            "expected at least one unbundled provider to exercise the legacy fallback path"
+        );
+    }
+
     #[test]
     fn live_snapshot_merges_over_bundled() {
         clear_live_snapshot();

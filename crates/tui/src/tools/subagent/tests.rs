@@ -5889,6 +5889,51 @@ fn role_model_validation_stays_strict_on_official_deepseek() {
 }
 
 #[test]
+fn operator_model_for_subagent_enumerates_from_catalog_facade() {
+    // #4116: the operator-route fallback must source its model from the
+    // catalog-backed ProviderLake facade, not the raw legacy table. On the
+    // strict official DeepSeek API an invalid id is rejected, forcing the
+    // enumeration branch; the chosen model must be exactly the facade's first
+    // entry (proving the consumer was migrated off the raw legacy path), never
+    // an invented id.
+    crate::provider_lake::clear_live_snapshot();
+    let mut runtime = stub_runtime(); // official DeepSeek API (strict validation)
+    runtime.model = "definitely-not-a-real-model".to_string();
+
+    let provider = runtime.client.api_provider();
+    assert_eq!(provider, crate::config::ApiProvider::Deepseek);
+    // Sanity: the strict provider really does reject the invalid id, so
+    // operator_model_for_subagent must take the enumeration branch.
+    assert!(crate::config::validate_route(provider, &runtime.model).is_err());
+
+    let facade = crate::provider_lake::all_catalog_models_for_provider(provider);
+    assert!(
+        !facade.is_empty(),
+        "expected the catalog facade to enumerate DeepSeek models"
+    );
+
+    let chosen = operator_model_for_subagent(&runtime);
+    assert_eq!(
+        chosen, facade[0],
+        "operator model must come from the catalog-backed facade"
+    );
+    assert_ne!(
+        chosen, "definitely-not-a-real-model",
+        "operator model must not echo an invalid id"
+    );
+    // No-regression guard: DeepSeek's catalog view still enumerates every legacy
+    // id it accepted before the migration (facade ⊇ legacy for this provider).
+    let facade_lower: std::collections::BTreeSet<String> =
+        facade.iter().map(|m| m.to_ascii_lowercase()).collect();
+    for legacy in crate::config::model_completion_names_for_provider(provider) {
+        assert!(
+            facade_lower.contains(&legacy.to_ascii_lowercase()),
+            "catalog facade dropped legacy model {legacy:?} for {provider:?}"
+        );
+    }
+}
+
+#[test]
 fn normalize_requested_subagent_model_is_provider_aware() {
     assert_eq!(
         normalize_requested_subagent_model(

@@ -6411,20 +6411,24 @@ fn fallback_subagent_assignment_route(
 
 /// Operator-visible model for the active provider when inherit/faster routing
 /// must not cross namespaces (#3227, subagent route validation 2026-07-07).
+///
+/// Enumerates through the catalog-backed [`crate::provider_lake`] facade rather
+/// than the raw legacy `model_completion_names_for_provider` table (#4116). The
+/// facade returns bundled+live catalog rows for the provider and, for providers
+/// with no catalog coverage, falls back to that same legacy table internally.
+/// This consumer only reads the first entry, and it already preferred the
+/// catalog facade before the migration — the removed raw-legacy tail only ran
+/// when the facade was empty, which never happens while the legacy table is
+/// non-empty. Dropping it is therefore behavior-preserving and never narrows
+/// the operator model chosen here.
 fn operator_model_for_subagent(runtime: &SubAgentRuntime) -> String {
     let provider = runtime.client.api_provider();
     if crate::config::validate_route(provider, &runtime.model).is_ok() {
         return runtime.model.clone();
     }
-    if let Some(model) = crate::provider_lake::all_catalog_models_for_provider(provider)
+    crate::provider_lake::all_catalog_models_for_provider(provider)
         .into_iter()
         .next()
-    {
-        return model;
-    }
-    crate::config::model_completion_names_for_provider(provider)
-        .first()
-        .map(|model| (*model).to_string())
         .unwrap_or_else(|| runtime.model.clone())
 }
 
