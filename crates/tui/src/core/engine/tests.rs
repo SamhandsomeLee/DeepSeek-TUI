@@ -2354,7 +2354,10 @@ fn deferred_tool_preflight_guides_rlm_open_misnamed_source_fields() {
 }
 
 #[test]
-fn deferred_tool_preflight_guides_checklist_update_list_replacement() {
+fn model_catalog_exposes_work_update_as_sole_progress_surface() {
+    // #4132: ordinary progress is one model-visible tool. Legacy checklist_* /
+    // todo_* spellings stay registry-callable for replay but must not appear in
+    // the deferred model catalog (so there is no deferred-preflight path for them).
     let (engine, _handle) = Engine::new(EngineConfig::default(), &Config::default());
     let registry = engine
         .build_turn_tool_registry_builder(
@@ -2370,35 +2373,54 @@ fn deferred_tool_preflight_guides_checklist_update_list_replacement() {
         AppMode::Agent,
         &always_load,
     );
-    let mut active = initial_active_tools(&catalog);
-    assert!(!active.contains("checklist_update"));
+    let active = initial_active_tools(&catalog);
+    let catalog_names: HashSet<&str> = catalog.iter().map(|tool| tool.name.as_str()).collect();
 
-    let result = preflight_requested_deferred_tool(
-        "checklist_update",
-        &json!({
-            "todos": [
-                { "content": "wire preflight", "status": "completed" }
-            ]
-        }),
-        &catalog,
-        &mut active,
-    )
-    .expect("deferred checklist_update should preflight");
-
-    assert!(active.contains("checklist_update"));
-    assert!(result.success);
     assert!(
-        result
-            .content
-            .contains("Tool `checklist_update` was deferred")
+        catalog_names.contains("work_update"),
+        "work_update must be model-visible"
     );
-    assert!(result.content.contains("id: integer required"));
-    assert!(result.content.contains("status: string"));
-    assert!(result.content.contains("Missing required fields:"));
-    assert!(result.content.contains("id, status"));
-    assert!(result.content.contains("Unexpected fields:"));
-    assert!(result.content.contains("todos"));
-    assert!(result.content.contains("Use work_update"));
+    assert!(
+        active.contains("work_update"),
+        "work_update should load with the default active native set"
+    );
+    assert!(
+        catalog_names.contains("update_plan"),
+        "update_plan remains Strategy metadata, not a second checklist"
+    );
+    for hidden in [
+        "checklist_write",
+        "checklist_add",
+        "checklist_update",
+        "checklist_list",
+        "todo_write",
+        "todo_add",
+        "todo_update",
+        "todo_list",
+    ] {
+        assert!(
+            registry.contains(hidden),
+            "{hidden} must remain callable for transcript replay"
+        );
+        assert!(
+            !catalog_names.contains(hidden),
+            "{hidden} must stay hidden from the model catalog"
+        );
+        assert!(
+            preflight_requested_deferred_tool(
+                hidden,
+                &json!({
+                    "todos": [
+                        { "content": "should not hydrate hidden alias", "status": "completed" }
+                    ]
+                }),
+                &catalog,
+                &mut active.clone(),
+            )
+            .is_none(),
+            "{hidden} must not have a deferred catalog preflight path"
+        );
+    }
 }
 
 #[tokio::test]

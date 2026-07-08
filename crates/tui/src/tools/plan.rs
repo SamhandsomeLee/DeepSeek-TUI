@@ -646,7 +646,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn update_plan_description_keeps_checklist_as_primary_work_progress() {
+    fn update_plan_description_keeps_work_update_as_primary_progress() {
         let tool = UpdatePlanTool::new(new_shared_plan_state());
         let description = tool.description();
 
