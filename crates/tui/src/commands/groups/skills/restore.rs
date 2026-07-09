@@ -212,6 +212,7 @@ mod tests {
             use_mouse_capture: false,
             use_bracketed_paste: true,
             max_subagents: 1,
+            max_subagents_cli_override: false,
             skills_dir: tmp.path().join("skills"),
             memory_path: tmp.path().join("memory.md"),
             notes_path: tmp.path().join("notes.txt"),

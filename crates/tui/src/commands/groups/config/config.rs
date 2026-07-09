@@ -1282,7 +1282,10 @@ fn set_subagents_config_value(
     };
 
     if key == "max_concurrent" {
-        app.max_subagents = config.max_subagents_for_provider(app.api_provider);
+        // Explicit `/config` change supersedes a prior CLI pin for this session,
+        // then re-applies posture so cache-heavy routes stay capped.
+        app.max_subagents_cli_override = false;
+        app.apply_harness_max_subagents(config.max_subagents_for_provider(app.api_provider));
     }
     let display_value = subagents_config_display_value(&config, key);
     let note = note.map(|note| format!("; {note}")).unwrap_or_default();
@@ -1345,12 +1348,11 @@ fn subagents_config_display_value(config: &Config, key: &str) -> String {
 
 fn subagents_runtime_action(app: &App, config: &Config) -> AppAction {
     let provider = app.api_provider;
-    let max_subagents = config
-        .max_subagents_for_provider(provider)
-        .clamp(1, MAX_SUBAGENTS);
+    // Prefer the App's already-resolved cap (CLI pin or posture-applied) so
+    // engine sync cannot diverge from `app.max_subagents` / `build_engine_config`.
     AppAction::UpdateSubagentRuntimeConfig {
         enabled: config.subagents_enabled_for_provider(provider),
-        max_subagents,
+        max_subagents: app.max_subagents,
         launch_concurrency: config.launch_concurrency_for_provider(provider),
         max_spawn_depth: config.subagent_max_spawn_depth_for_provider(provider),
         api_timeout_secs: config.subagent_api_timeout_secs_for_provider(provider),
@@ -1373,6 +1375,11 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
                 app.reasoning_effort = ReasoningEffort::Auto;
                 app.last_effective_reasoning_effort = None;
                 app.update_model_compaction_budget();
+                if let Ok(config) = load_command_config(app) {
+                    app.apply_harness_max_subagents(
+                        config.max_subagents_for_provider(app.api_provider),
+                    );
+                }
                 app.session.last_prompt_tokens = None;
                 app.session.last_completion_tokens = None;
                 app.session.last_output_throughput = None;
@@ -1390,6 +1397,11 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
             };
             app.set_model_selection(model.clone());
             app.update_model_compaction_budget();
+            if let Ok(config) = load_command_config(app) {
+                app.apply_harness_max_subagents(
+                    config.max_subagents_for_provider(app.api_provider),
+                );
+            }
             app.session.last_prompt_tokens = None;
             app.session.last_completion_tokens = None;
             app.session.last_output_throughput = None;
@@ -2204,6 +2216,7 @@ mod tests {
             use_mouse_capture: false,
             use_bracketed_paste: true,
             max_subagents: 1,
+            max_subagents_cli_override: false,
             skills_dir: PathBuf::from("."),
             memory_path: PathBuf::from("memory.md"),
             notes_path: PathBuf::from("notes.txt"),

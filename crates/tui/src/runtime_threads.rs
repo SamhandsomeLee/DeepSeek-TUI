@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::compaction::CompactionConfig;
-use crate::config::{Config, DEFAULT_TEXT_MODEL, MAX_SUBAGENTS};
+use crate::config::{Config, DEFAULT_TEXT_MODEL};
 use crate::core::engine::{EngineConfig, EngineHandle, spawn_engine};
 use crate::core::events::{Event as EngineEvent, TurnOutcomeStatus};
 use crate::core::ops::Op;
@@ -973,8 +973,10 @@ impl RuntimeThreadManager {
             };
             let subagent = (
                 cfg.subagents_enabled_for_provider(provider),
-                cfg.max_subagents_for_provider(provider)
-                    .clamp(1, crate::config::MAX_SUBAGENTS),
+                crate::route_budget::max_subagents_for_posture(
+                    harness_posture.max_subagents,
+                    cfg.max_subagents_for_provider(provider),
+                ),
                 cfg.launch_concurrency_for_provider(provider),
                 cfg.subagent_max_spawn_depth_for_provider(provider),
                 cfg.subagent_api_timeout_secs_for_provider(provider),
@@ -2593,9 +2595,10 @@ impl RuntimeThreadManager {
             .lsp
             .clone()
             .map(crate::config::LspConfigToml::into_runtime);
-        let max_subagents = cfg
-            .max_subagents_for_provider(provider)
-            .clamp(1, MAX_SUBAGENTS);
+        let max_subagents = crate::route_budget::max_subagents_for_posture(
+            harness_posture.max_subagents,
+            cfg.max_subagents_for_provider(provider),
+        );
         let engine_cfg = EngineConfig {
             model: thread.model.clone(),
             active_route_limits: None,

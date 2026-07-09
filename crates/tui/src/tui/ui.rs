@@ -7397,6 +7397,25 @@ async fn apply_model_and_compaction_update(
         .await;
 }
 
+/// Push the App's current sub-agent concurrency controls into the running engine.
+///
+/// Call after `apply_harness_max_subagents` (or any path that mutates
+/// `app.max_subagents`) so the live engine does not keep a stale cap while
+/// `/harness` already shows the posture value as live.
+async fn sync_subagent_runtime_config(engine_handle: &EngineHandle, app: &App, config: &Config) {
+    let provider = app.api_provider;
+    let _ = engine_handle
+        .send(Op::SetSubagentRuntimeConfig {
+            enabled: config.subagents_enabled_for_provider(provider),
+            max_subagents: app.max_subagents,
+            launch_concurrency: config.launch_concurrency_for_provider(provider),
+            max_spawn_depth: config.subagent_max_spawn_depth_for_provider(provider),
+            api_timeout_secs: config.subagent_api_timeout_secs_for_provider(provider),
+            heartbeat_timeout_secs: config.subagent_heartbeat_timeout_secs_for_provider(provider),
+        })
+        .await;
+}
+
 async fn drain_web_config_events(
     web_config_session: &mut Option<WebConfigSession>,
     app: &mut App,
@@ -7421,6 +7440,7 @@ async fn drain_web_config_events(
                                 app.active_route_limits,
                             )
                             .await;
+                            sync_subagent_runtime_config(engine_handle, app, config).await;
                         }
                         app.status_message = Some(format!(
                             "Web config draft applied: {}",
@@ -7447,6 +7467,7 @@ async fn drain_web_config_events(
                                 app.active_route_limits,
                             )
                             .await;
+                            sync_subagent_runtime_config(engine_handle, app, config).await;
                         }
                         app.add_message(HistoryCell::System {
                             content: outcome.final_message.clone(),
@@ -7572,6 +7593,9 @@ async fn apply_model_picker_choice(
     if model_changed || effort_changed {
         app.update_model_compaction_budget();
     }
+    if model_changed {
+        app.apply_harness_max_subagents(config.max_subagents_for_provider(app.api_provider));
+    }
 
     // Best-effort persist; surface a status warning if the settings file
     // can't be written rather than aborting the in-memory change.
@@ -7607,6 +7631,9 @@ async fn apply_model_picker_choice(
             app.active_route_limits,
         )
         .await;
+        // Same-provider model switches do not respawn the engine; push the
+        // posture-derived (or CLI-pinned) cap so the live manager stays in sync.
+        sync_subagent_runtime_config(engine_handle, app, config).await;
     }
 
     let model_summary = if model_is_auto {
@@ -7783,9 +7810,6 @@ async fn switch_provider(
     let new_endpoint = display_base_url_host(&new_base_url);
     let cache_scope_changed = previous_provider != target || previous_model != new_model;
     app.api_provider = target;
-    app.max_subagents = config
-        .max_subagents_for_provider(target)
-        .clamp(1, crate::config::MAX_SUBAGENTS);
     app.provider_chain = target
         .kind()
         .map(|kind| codewhale_config::ProviderChain::new(kind, &config.fallback_providers))
@@ -7801,6 +7825,7 @@ async fn switch_provider(
             .insert(target.as_str().to_string(), new_model.clone());
     }
     app.update_model_compaction_budget();
+    app.apply_harness_max_subagents(config.max_subagents_for_provider(target));
     if cache_scope_changed {
         app.clear_model_scoped_telemetry();
     } else {
@@ -7953,6 +7978,7 @@ async fn apply_provider_fallback_switch(
     app.set_active_context_window_override(config.context_window_for_provider_config(target));
     app.set_active_route_limits(resolved_route.candidate.limits);
     app.update_model_compaction_budget();
+    app.apply_harness_max_subagents(config.max_subagents_for_provider(target));
     if cache_scope_changed {
         app.clear_model_scoped_telemetry();
     } else {
@@ -8323,6 +8349,9 @@ async fn apply_command_result(
                     app.active_route_limits,
                 )
                 .await;
+                // `/config model` and similar paths only emit UpdateCompaction;
+                // keep the live sub-agent cap aligned with App after posture refresh.
+                sync_subagent_runtime_config(engine_handle, app, config).await;
             }
             AppAction::UpdateStreamChunkTimeout(timeout_secs) => {
                 let _ = engine_handle
@@ -8380,6 +8409,7 @@ async fn apply_command_result(
                                     app.active_route_limits,
                                 )
                                 .await;
+                                sync_subagent_runtime_config(engine_handle, app, config).await;
                             }
                             app.add_message(HistoryCell::System {
                                 content: outcome.final_message.clone(),
@@ -10456,6 +10486,7 @@ async fn handle_view_events(
                                 app.active_route_limits,
                             )
                             .await;
+                            sync_subagent_runtime_config(engine_handle, app, config).await;
                         }
                         AppAction::UpdateStreamChunkTimeout(timeout_secs) => {
                             let _ = engine_handle

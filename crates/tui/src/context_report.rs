@@ -927,6 +927,7 @@ mod tests {
                 use_mouse_capture: false,
                 use_bracketed_paste: false,
                 max_subagents: 1,
+                max_subagents_cli_override: false,
                 skills_dir: PathBuf::from("."),
                 memory_path: memory_path.clone(),
                 notes_path: tmp.path().join("notes.txt"),

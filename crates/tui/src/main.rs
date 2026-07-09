@@ -7140,8 +7140,19 @@ async fn run_interactive(
 
     let model = config.default_model();
     let provider = config.api_provider();
+    let max_subagents_cli_override = cli.max_subagents.is_some();
     let max_subagents = cli.max_subagents.map_or_else(
-        || config.max_subagents_for_provider(provider),
+        || {
+            let posture = crate::core::engine::EngineConfig::resolve_harness_posture(
+                &config.harness_profiles,
+                provider.as_str(),
+                &model,
+            );
+            crate::route_budget::max_subagents_for_posture(
+                posture.max_subagents,
+                config.max_subagents_for_provider(provider),
+            )
+        },
         |value| value.clamp(1, MAX_SUBAGENTS),
     );
     let use_alt_screen = should_use_alt_screen(cli, config);
@@ -7232,6 +7243,7 @@ async fn run_interactive(
             resume_session_id,
             initial_input,
             max_subagents,
+            max_subagents_cli_override,
         },
     )
     .await
@@ -7729,11 +7741,20 @@ async fn run_exec_agent(
     let effective_model = route.model;
     let active_route_limits =
         resolve_cli_route_limits(&execution_config, effective_provider, &effective_model);
+    let harness_posture = EngineConfig::resolve_harness_posture(
+        &execution_config.harness_profiles,
+        effective_provider.as_str(),
+        &effective_model,
+    );
+    // When the caller passed the boot-time config default (not an explicit CLI
+    // override), re-derive against the effective route so posture can tighten
+    // the cap after auto-routing. Explicit CLI values are left untouched.
     let max_subagents = if max_subagents == config.max_subagents_for_provider(config.api_provider())
     {
-        execution_config
-            .max_subagents_for_provider(effective_provider)
-            .clamp(1, MAX_SUBAGENTS)
+        crate::route_budget::max_subagents_for_posture(
+            harness_posture.max_subagents,
+            execution_config.max_subagents_for_provider(effective_provider),
+        )
     } else {
         max_subagents
     };
@@ -7751,11 +7772,6 @@ async fn run_exec_agent(
             active_route_limits,
         )
     };
-    let harness_posture = EngineConfig::resolve_harness_posture(
-        &execution_config.harness_profiles,
-        effective_provider.as_str(),
-        &effective_model,
-    );
     let effective_compact_percent = crate::route_budget::threshold_pct_for_strategy(
         harness_posture.compaction_strategy,
         settings.auto_compact_threshold_percent,

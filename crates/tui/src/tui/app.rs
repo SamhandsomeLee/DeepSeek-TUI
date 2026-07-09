@@ -1146,6 +1146,10 @@ pub struct TuiOptions {
     pub use_bracketed_paste: bool,
     /// Maximum number of concurrent sub-agents.
     pub max_subagents: usize,
+    /// True when `max_subagents` came from an explicit CLI `--max-subagents`
+    /// (or an equivalent test override). When set, harness posture must not
+    /// rewrite the cap on boot or route changes.
+    pub max_subagents_cli_override: bool,
     #[allow(dead_code)]
     pub skills_dir: PathBuf,
     #[allow(dead_code)]
@@ -1881,6 +1885,8 @@ pub struct App {
     pub allow_shell: bool,
     pub verbosity: Option<String>,
     pub max_subagents: usize,
+    /// Explicit CLI `--max-subagents` (or test) override; blocks posture rewrite.
+    pub max_subagents_cli_override: bool,
     /// Per-SSE-chunk idle timeout for streamed turns, in seconds.
     pub stream_chunk_timeout_secs: u64,
     /// Cached sub-agent snapshots for UI views.
@@ -2440,6 +2446,7 @@ impl App {
             use_mouse_capture,
             use_bracketed_paste,
             max_subagents,
+            max_subagents_cli_override,
             skills_dir: global_skills_dir,
             memory_path,
             notes_path: _,
@@ -2877,6 +2884,7 @@ impl App {
             allow_shell,
             verbosity: config.verbosity.clone(),
             max_subagents,
+            max_subagents_cli_override,
             stream_chunk_timeout_secs: config.stream_chunk_timeout_secs(),
             subagent_cache: Vec::new(),
             subagent_terminal_seen_at: HashMap::new(),
@@ -3035,6 +3043,11 @@ impl App {
             app.notify_yolo_compat_once();
         }
         app.refresh_active_harness_resolution();
+        // Explicit CLI `--max-subagents` wins over posture for the whole
+        // session. Otherwise let posture tighten the concurrent cap.
+        if !app.max_subagents_cli_override {
+            app.apply_harness_max_subagents(config.max_subagents_for_provider(provider));
+        }
         app
     }
 
@@ -6064,6 +6077,21 @@ impl App {
     /// unrelated runtime behavior when refreshed.
     pub fn refresh_active_harness_resolution(&mut self) {
         self.active_harness_resolution = self.harness_resolution();
+    }
+
+    /// Apply the resolved harness posture's `max_subagents` onto `self.max_subagents`.
+    ///
+    /// `config_default` is the value from `Config::max_subagents_for_provider`
+    /// (already the runtime default when posture is 0). No-op when an explicit
+    /// CLI `--max-subagents` override is active (CLI > posture > config).
+    pub fn apply_harness_max_subagents(&mut self, config_default: usize) {
+        if self.max_subagents_cli_override {
+            return;
+        }
+        self.max_subagents = crate::route_budget::max_subagents_for_posture(
+            self.active_harness_resolution.posture.max_subagents,
+            config_default,
+        );
     }
 
     pub fn set_active_route_limits(&mut self, limits: RouteLimits) {

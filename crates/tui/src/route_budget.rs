@@ -42,6 +42,24 @@ pub(crate) fn threshold_pct_for_strategy(
     }
 }
 
+/// Resolve the effective sub-agent concurrency cap from harness posture.
+///
+/// `posture_cap == 0` is identity: return `config_default` clamped to
+/// `[1, MAX_SUBAGENTS]` (zero-regression).
+/// `posture_cap > 0` uses the posture value, still clamped to the global
+/// ceiling — posture must never raise the attack surface above
+/// [`crate::config::MAX_SUBAGENTS`]. Explicit CLI overrides are applied by
+/// callers *before* invoking this helper.
+#[must_use]
+pub(crate) fn max_subagents_for_posture(posture_cap: usize, config_default: usize) -> usize {
+    use crate::config::MAX_SUBAGENTS;
+    if posture_cap > 0 {
+        posture_cap.clamp(1, MAX_SUBAGENTS)
+    } else {
+        config_default.clamp(1, MAX_SUBAGENTS)
+    }
+}
+
 /// Preserve only route limits that came from a concrete offering.
 #[must_use]
 pub(crate) fn known_route_limits(limits: RouteLimits) -> Option<RouteLimits> {
@@ -376,5 +394,37 @@ mod tests {
             threshold_pct_for_strategy(HarnessCompactionStrategy::Aggressive, base),
         );
         assert!(aggressive_trigger < default_trigger);
+    }
+
+    #[test]
+    fn max_subagents_for_posture_zero_is_identity() {
+        assert_eq!(max_subagents_for_posture(0, 20), 20);
+        assert_eq!(max_subagents_for_posture(0, 8), 8);
+    }
+
+    #[test]
+    fn max_subagents_for_posture_overrides_default() {
+        assert_eq!(max_subagents_for_posture(10, 20), 10);
+    }
+
+    #[test]
+    fn max_subagents_for_posture_cannot_exceed_ceiling() {
+        assert_eq!(
+            max_subagents_for_posture(999, 20),
+            crate::config::MAX_SUBAGENTS
+        );
+    }
+
+    #[test]
+    fn max_subagents_for_posture_clamps_config_default() {
+        assert_eq!(
+            max_subagents_for_posture(0, 0),
+            1,
+            "zero config default still clamps to the floor"
+        );
+        assert_eq!(
+            max_subagents_for_posture(0, 999),
+            crate::config::MAX_SUBAGENTS
+        );
     }
 }

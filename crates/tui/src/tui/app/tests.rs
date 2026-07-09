@@ -18,6 +18,7 @@ fn test_options(yolo: bool) -> TuiOptions {
         use_mouse_capture: false,
         use_bracketed_paste: true,
         max_subagents: 1,
+        max_subagents_cli_override: false,
         skills_dir: PathBuf::from("."),
         memory_path: PathBuf::from("memory.md"),
         notes_path: PathBuf::from("notes.txt"),
@@ -2326,6 +2327,103 @@ fn app_boot_refreshes_active_harness_posture() {
         app.active_harness_resolution.posture.kind,
         codewhale_config::HarnessPostureKind::CacheHeavy
     );
+}
+
+#[test]
+fn cache_heavy_route_caps_subagents_at_ten() {
+    let mut options = test_options(false);
+    options.model = "deepseek-v4-pro".to_string();
+    options.skip_onboarding = true;
+    options.max_subagents = crate::config::DEFAULT_MAX_SUBAGENTS;
+    options.max_subagents_cli_override = false;
+    let mut config = Config::default();
+    config.provider = Some("deepseek".to_string());
+    let app = App::new(options, &config);
+    assert_eq!(app.active_harness_resolution.posture.max_subagents, 10);
+    assert_eq!(app.max_subagents, 10);
+}
+
+#[test]
+fn standard_route_keeps_config_subagent_default() {
+    let mut options = test_options(false);
+    options.model = "gpt-x".to_string();
+    options.skip_onboarding = true;
+    options.max_subagents = crate::config::DEFAULT_MAX_SUBAGENTS;
+    options.max_subagents_cli_override = false;
+    let mut config = Config::default();
+    config.provider = Some("openai".to_string());
+    let app = App::new(options, &config);
+    assert_eq!(app.active_harness_resolution.posture.max_subagents, 0);
+    assert_eq!(app.max_subagents, crate::config::DEFAULT_MAX_SUBAGENTS);
+}
+
+#[test]
+fn explicit_cli_max_subagents_beats_posture() {
+    let mut options = test_options(false);
+    options.model = "deepseek-v4-pro".to_string();
+    options.skip_onboarding = true;
+    options.max_subagents = 5;
+    options.max_subagents_cli_override = true;
+    let mut config = Config::default();
+    config.provider = Some("deepseek".to_string());
+    let app = App::new(options, &config);
+    assert_eq!(
+        app.active_harness_resolution.posture.kind,
+        codewhale_config::HarnessPostureKind::CacheHeavy
+    );
+    assert_eq!(
+        app.max_subagents, 5,
+        "explicit CLI/test override must not be overwritten by posture"
+    );
+}
+
+#[test]
+fn explicit_cli_equal_to_config_default_still_beats_posture() {
+    // Regression: value-equality with config default must not look like "no CLI".
+    let mut options = test_options(false);
+    options.model = "deepseek-v4-pro".to_string();
+    options.skip_onboarding = true;
+    options.max_subagents = crate::config::DEFAULT_MAX_SUBAGENTS;
+    options.max_subagents_cli_override = true;
+    let mut config = Config::default();
+    config.provider = Some("deepseek".to_string());
+    let app = App::new(options, &config);
+    assert_eq!(
+        app.max_subagents,
+        crate::config::DEFAULT_MAX_SUBAGENTS,
+        "CLI --max-subagents matching the config default must still pin the cap"
+    );
+}
+
+#[test]
+fn apply_harness_max_subagents_respects_cli_override_flag() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.api_provider = ApiProvider::Deepseek;
+    app.model = "deepseek-v4-pro".to_string();
+    app.auto_model = false;
+    app.max_subagents = 5;
+    app.max_subagents_cli_override = true;
+    app.refresh_active_harness_resolution();
+    app.apply_harness_max_subagents(crate::config::DEFAULT_MAX_SUBAGENTS);
+    assert_eq!(app.max_subagents, 5);
+}
+
+#[test]
+fn apply_harness_max_subagents_tracks_route_change() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.api_provider = ApiProvider::Deepseek;
+    app.model = "deepseek-v4-pro".to_string();
+    app.auto_model = false;
+    app.max_subagents_cli_override = false;
+    app.refresh_active_harness_resolution();
+    app.apply_harness_max_subagents(crate::config::DEFAULT_MAX_SUBAGENTS);
+    assert_eq!(app.max_subagents, 10);
+
+    app.api_provider = ApiProvider::Openai;
+    app.model = "gpt-x".to_string();
+    app.refresh_active_harness_resolution();
+    app.apply_harness_max_subagents(crate::config::DEFAULT_MAX_SUBAGENTS);
+    assert_eq!(app.max_subagents, crate::config::DEFAULT_MAX_SUBAGENTS);
 }
 
 #[test]

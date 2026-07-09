@@ -370,6 +370,7 @@ mod tests {
             use_mouse_capture: false,
             use_bracketed_paste: true,
             max_subagents: 1,
+            max_subagents_cli_override: false,
             skills_dir: home.join("skills"),
             memory_path: home.join("memory.md"),
             notes_path: home.join("notes.txt"),

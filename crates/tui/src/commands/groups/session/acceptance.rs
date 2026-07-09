@@ -706,6 +706,7 @@ fn create_test_app_with_tmpdir(tmpdir: &TempDir) -> App {
         use_mouse_capture: false,
         use_bracketed_paste: true,
         max_subagents: 1,
+        max_subagents_cli_override: false,
         skills_dir: tmpdir.path().join("skills"),
         memory_path: tmpdir.path().join("memory.md"),
         notes_path: tmpdir.path().join("notes.txt"),

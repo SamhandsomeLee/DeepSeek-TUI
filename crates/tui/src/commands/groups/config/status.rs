@@ -226,6 +226,7 @@ mod tests {
             use_mouse_capture: false,
             use_bracketed_paste: true,
             max_subagents: 1,
+            max_subagents_cli_override: false,
             skills_dir: PathBuf::from("/tmp/test-skills"),
             memory_path: PathBuf::from("memory.md"),
             notes_path: PathBuf::from("notes.txt"),
