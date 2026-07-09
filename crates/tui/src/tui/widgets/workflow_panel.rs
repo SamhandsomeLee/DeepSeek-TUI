@@ -2017,4 +2017,364 @@ mod tests {
         assert!(joined.contains("Build"), "{joined}");
         assert!(joined.contains("compile"), "{joined}");
     }
+
+    // ── #4131 dogfood scenario projections ──────────────────────────────────
+
+    /// WF-A1: read-only repo audit — scout phase on main workspace, labeled
+    /// children, no worktree marker, synthesizer phase present.
+    #[test]
+    fn dogfood_read_only_repo_audit_panel() {
+        let mut panel = WorkflowPanel::new("wf_a1", "read-only repo audit", 1_000);
+        panel.apply_event(WorkflowPanelEvent::PhaseStarted {
+            title: "Scout".to_string(),
+            at_ms: 1_100,
+        });
+        for (id, label, role) in [
+            ("t1", "map crates", "explore"),
+            ("t2", "scan unsafe", "explore"),
+            ("t3", "scan unwrap", "explore"),
+        ] {
+            panel.apply_event(WorkflowPanelEvent::TaskStarted {
+                task_id: id.to_string(),
+                label: Some(label.to_string()),
+                profile: Some(role.to_string()),
+                model: Some("flash".to_string()),
+                strength: Some("low".to_string()),
+                resolved_model: Some("deepseek-v4-flash".to_string()),
+                worktree: false,
+                workspace: None,
+                at_ms: 1_200,
+            });
+            panel.apply_event(WorkflowPanelEvent::TaskCompleted {
+                task_id: id.to_string(),
+                status: WorkflowRowStatus::Succeeded,
+                at_ms: 1_500,
+            });
+        }
+        panel.apply_event(WorkflowPanelEvent::PhaseStarted {
+            title: "Synthesize".to_string(),
+            at_ms: 1_600,
+        });
+        panel.apply_event(WorkflowPanelEvent::TaskStarted {
+            task_id: "t4".to_string(),
+            label: Some("audit summary".to_string()),
+            profile: Some("general".to_string()),
+            model: None,
+            strength: None,
+            resolved_model: None,
+            worktree: false,
+            workspace: None,
+            at_ms: 1_700,
+        });
+        panel.apply_event(WorkflowPanelEvent::TaskCompleted {
+            task_id: "t4".to_string(),
+            status: WorkflowRowStatus::Succeeded,
+            at_ms: 2_000,
+        });
+        panel.apply_event(WorkflowPanelEvent::RunCompleted {
+            status: WorkflowPanelLifecycle::Succeeded,
+            error: None,
+            at_ms: 2_100,
+        });
+
+        let header = panel.header_text(140);
+        assert!(
+            header.contains("success") || header.contains("completed"),
+            "{header}"
+        );
+        assert!(header.contains("0 fail"), "{header}");
+        assert!(
+            header.contains("4/") || header.contains("4 child") || header.contains("0/"),
+            "{header}"
+        );
+
+        // Selected phase is Synthesize; scout labels live in earlier phases.
+        panel.selected_phase = 0;
+        let scout_body = panel.render_lines(120);
+        let scout_joined: String = scout_body
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(scout_joined.contains("map crates"), "{scout_joined}");
+        assert!(scout_joined.contains("main"), "{scout_joined}");
+        assert!(
+            !scout_joined.contains(" wt "),
+            "read-only scouts stay on main: {scout_joined}"
+        );
+
+        let card = panel.render_history_card(
+            120,
+            true,
+            &WorkflowHistoryExtras {
+                result_summary: Some("no critical issues".to_string()),
+                ..WorkflowHistoryExtras::default()
+            },
+        );
+        let card_text: String = card
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            card_text.contains("Scout") || card_text.contains("Synthesize"),
+            "{card_text}"
+        );
+        assert!(card_text.contains("no critical issues"), "{card_text}");
+        assert!(
+            !card_text.to_ascii_lowercase().contains("unknown child"),
+            "{card_text}"
+        );
+    }
+
+    /// WF-A2: staged bugfix — implementer worktree + verifier on main.
+    #[test]
+    fn dogfood_staged_worktree_implementer_verifier() {
+        let mut panel = WorkflowPanel::new("wf_a2", "staged docs fix", 1_000);
+        panel.apply_event(WorkflowPanelEvent::PhaseStarted {
+            title: "Implement".to_string(),
+            at_ms: 1_100,
+        });
+        panel.apply_event(WorkflowPanelEvent::TaskStarted {
+            task_id: "impl".to_string(),
+            label: Some("implementer".to_string()),
+            profile: Some("implementer".to_string()),
+            model: Some("pro".to_string()),
+            strength: None,
+            resolved_model: Some("deepseek-v4-pro".to_string()),
+            worktree: true,
+            workspace: Some(PathBuf::from("/tmp/wt-impl")),
+            at_ms: 1_200,
+        });
+        panel.apply_event(WorkflowPanelEvent::TaskCompleted {
+            task_id: "impl".to_string(),
+            status: WorkflowRowStatus::Succeeded,
+            at_ms: 2_000,
+        });
+        panel.apply_event(WorkflowPanelEvent::PhaseStarted {
+            title: "Verify".to_string(),
+            at_ms: 2_100,
+        });
+        panel.apply_event(WorkflowPanelEvent::TaskStarted {
+            task_id: "ver".to_string(),
+            label: Some("verifier".to_string()),
+            profile: Some("verifier".to_string()),
+            model: Some("flash".to_string()),
+            strength: None,
+            resolved_model: None,
+            worktree: false,
+            workspace: None,
+            at_ms: 2_200,
+        });
+        panel.apply_event(WorkflowPanelEvent::TaskCompleted {
+            task_id: "ver".to_string(),
+            status: WorkflowRowStatus::Succeeded,
+            at_ms: 3_000,
+        });
+        panel.apply_event(WorkflowPanelEvent::RunCompleted {
+            status: WorkflowPanelLifecycle::Succeeded,
+            error: None,
+            at_ms: 3_100,
+        });
+
+        assert_eq!(panel.phases.len(), 2);
+        assert_eq!(panel.phases[0].title, "Implement");
+        assert_eq!(panel.phases[1].title, "Verify");
+
+        panel.selected_phase = 0;
+        let implement_body = panel.render_lines(140);
+        let impl_text: String = implement_body
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(impl_text.contains("implementer"), "{impl_text}");
+        assert!(
+            impl_text.contains("wt") || impl_text.contains("worktree"),
+            "implementer should show worktree marker: {impl_text}"
+        );
+
+        panel.selected_phase = 1;
+        let verify_body = panel.render_lines(140);
+        let ver_text: String = verify_body
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(ver_text.contains("verifier"), "{ver_text}");
+        assert!(ver_text.contains("main"), "{ver_text}");
+    }
+
+    /// WF-A3: partial failure + synthesis — fail count visible, summary card.
+    #[test]
+    fn dogfood_partial_failure_and_synthesis() {
+        let mut panel = WorkflowPanel::new("wf_a3", "partial failure synthesis", 1_000);
+        panel.apply_event(WorkflowPanelEvent::PhaseStarted {
+            title: "Parallel scouts".to_string(),
+            at_ms: 1_100,
+        });
+        for (id, label, status) in [
+            ("a", "scout-a", WorkflowRowStatus::Succeeded),
+            ("b", "scout-b-fail", WorkflowRowStatus::Failed),
+            ("c", "scout-c", WorkflowRowStatus::Succeeded),
+        ] {
+            panel.apply_event(WorkflowPanelEvent::TaskStarted {
+                task_id: id.to_string(),
+                label: Some(label.to_string()),
+                profile: Some("explore".to_string()),
+                model: None,
+                strength: None,
+                resolved_model: None,
+                worktree: false,
+                workspace: None,
+                at_ms: 1_200,
+            });
+            panel.apply_event(WorkflowPanelEvent::TaskCompleted {
+                task_id: id.to_string(),
+                status,
+                at_ms: 1_500,
+            });
+        }
+        if let Some(row) = panel.find_row_mut("b") {
+            row.error = Some("scout refused to produce summary".to_string());
+        }
+        panel.apply_event(WorkflowPanelEvent::PhaseStarted {
+            title: "Synthesize".to_string(),
+            at_ms: 1_600,
+        });
+        panel.apply_event(WorkflowPanelEvent::TaskStarted {
+            task_id: "syn".to_string(),
+            label: Some("synthesizer".to_string()),
+            profile: Some("general".to_string()),
+            model: None,
+            strength: None,
+            resolved_model: None,
+            worktree: false,
+            workspace: None,
+            at_ms: 1_700,
+        });
+        panel.apply_event(WorkflowPanelEvent::TaskCompleted {
+            task_id: "syn".to_string(),
+            status: WorkflowRowStatus::Succeeded,
+            at_ms: 2_000,
+        });
+        // Partial success at run level: completed with surviving synthesis.
+        panel.apply_event(WorkflowPanelEvent::RunCompleted {
+            status: WorkflowPanelLifecycle::Succeeded,
+            error: None,
+            at_ms: 2_100,
+        });
+
+        let (failed, cancelled) = panel.failure_cancel_counts();
+        assert_eq!(failed, 1, "exactly one parallel slot failed");
+        assert_eq!(cancelled, 0);
+        let header = panel.header_text(140);
+        assert!(header.contains("1 fail"), "{header}");
+
+        let card = panel.render_history_card(
+            140,
+            true,
+            &WorkflowHistoryExtras {
+                result_summary: Some("2/3 scouts ok; scout-b failed".to_string()),
+                ..WorkflowHistoryExtras::default()
+            },
+        );
+        let joined: String = card
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("scout-b-fail") || joined.contains("fail"),
+            "{joined}"
+        );
+        assert!(joined.contains("2/3 scouts ok"), "{joined}");
+    }
+
+    /// WF-A4: cancellation mid-run — running children cancelled, done preserved.
+    #[test]
+    fn dogfood_cancellation_mid_run() {
+        let mut panel = WorkflowPanel::new("wf_a4", "cancel mid-run", 1_000);
+        panel.apply_event(WorkflowPanelEvent::PhaseStarted {
+            title: "Long work".to_string(),
+            at_ms: 1_100,
+        });
+        panel.apply_event(WorkflowPanelEvent::TaskStarted {
+            task_id: "slow-1".to_string(),
+            label: Some("slow-1".to_string()),
+            profile: Some("explore".to_string()),
+            model: None,
+            strength: None,
+            resolved_model: None,
+            worktree: false,
+            workspace: None,
+            at_ms: 1_200,
+        });
+        panel.apply_event(WorkflowPanelEvent::TaskStarted {
+            task_id: "slow-2".to_string(),
+            label: Some("slow-2".to_string()),
+            profile: Some("explore".to_string()),
+            model: None,
+            strength: None,
+            resolved_model: None,
+            worktree: false,
+            workspace: None,
+            at_ms: 1_210,
+        });
+        panel.apply_event(WorkflowPanelEvent::TaskCompleted {
+            task_id: "slow-1".to_string(),
+            status: WorkflowRowStatus::Succeeded,
+            at_ms: 1_500,
+        });
+
+        // Operator hits panel cancel.
+        let run_id = panel.request_cancel().expect("cancel while running");
+        assert_eq!(run_id, "wf_a4");
+        assert!(panel.cancel_requested);
+        assert!(panel.request_cancel().is_none(), "second cancel is no-op");
+        assert_eq!(panel.take_cancel_emit().as_deref(), Some("wf_a4"));
+
+        // Host interrupt finalizes remaining runners.
+        panel.finalize_interrupt();
+        assert_eq!(panel.lifecycle, WorkflowPanelLifecycle::Cancelled);
+
+        let slow1 = panel
+            .phases
+            .iter()
+            .flat_map(|p| p.rows.iter())
+            .find(|r| r.task_id == "slow-1")
+            .expect("slow-1");
+        let slow2 = panel
+            .phases
+            .iter()
+            .flat_map(|p| p.rows.iter())
+            .find(|r| r.task_id == "slow-2")
+            .expect("slow-2");
+        assert_eq!(slow1.status, WorkflowRowStatus::Succeeded);
+        assert_eq!(slow2.status, WorkflowRowStatus::Cancelled);
+
+        let (failed, cancelled) = panel.failure_cancel_counts();
+        assert_eq!(failed, 0);
+        assert_eq!(cancelled, 1);
+        let header = panel.header_text(120);
+        assert!(
+            header.contains("cancel") || header.contains("cancelled"),
+            "{header}"
+        );
+    }
 }

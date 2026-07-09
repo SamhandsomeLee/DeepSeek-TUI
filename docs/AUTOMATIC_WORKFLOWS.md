@@ -81,3 +81,17 @@ Automatic Workflow is suppressed for:
 - Estimated children above `auto_start_child_limit` (ask or shrink first)
 
 In those cases CodeWhale uses direct tools or a single `agent` instead.
+
+## Dogfood scenarios (#4131)
+
+Release-lane dogfood for automatic Workflow lives in
+[DOGFOOD_AUTOMATIC_WORKFLOWS.md](DOGFOOD_AUTOMATIC_WORKFLOWS.md). It covers:
+
+1. Read-only repo audit  
+2. Staged bug fix with worktree implementer + verifier  
+3. Partial failure and synthesis  
+4. Cancellation mid-run  
+
+Checked-in fixtures: [`docs/examples/dogfood-automatic/`](examples/dogfood-automatic/).
+Panel regression tests use the `dogfood_` prefix in
+`crates/tui/src/tui/widgets/workflow_panel.rs`.

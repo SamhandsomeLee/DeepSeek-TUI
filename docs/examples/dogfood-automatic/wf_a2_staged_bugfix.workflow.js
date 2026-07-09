@@ -1,0 +1,53 @@
+/**
+ * #4131 WF-A2 — staged bug fix with worktree implementer + verifier.
+ *
+ * Expected UI: Implement phase with worktree-isolated implementer, then Verify
+ * phase. Write/worktree plans should surface approval when
+ * require_approval_for_writes is true.
+ *
+ * Run: /workflow run docs/examples/dogfood-automatic/wf_a2_staged_bugfix.workflow.js
+ */
+export default async function (args) {
+  const target = args?.target ?? "docs/AUTOMATIC_WORKFLOWS.md";
+  const change =
+    args?.change ??
+    "Add a one-line note that #4131 dogfood scenarios live in docs/DOGFOOD_AUTOMATIC_WORKFLOWS.md.";
+
+  phase("Implement");
+  const implement = await task({
+    description: `Implement minimal docs fix in an isolated worktree: ${target}`,
+    label: "implementer",
+    type: "implementer",
+    // Prefer worktree isolation for write children (product default #4120).
+    worktree: true,
+    prompt: [
+      `Edit only ${target}.`,
+      change,
+      "Keep the change minimal and reversible. Do not push. Do not touch unrelated files.",
+      "Return: path edited, unified-diff summary, worktree path if any.",
+    ].join("\n"),
+  });
+
+  phase("Verify");
+  const verify = await task({
+    description: "Verify the implementer change without further edits.",
+    label: "verifier",
+    type: "verifier",
+    worktree: false,
+    prompt: [
+      "Read the implementer result and re-check the target file.",
+      "Confirm the intended one-line clarification is present and nothing else was changed.",
+      "Do not implement further edits. Return PASS/FAIL with evidence.",
+      "",
+      "implementer_result:",
+      String(implement ?? "(missing)"),
+    ].join("\n"),
+  });
+
+  return {
+    scenario: "WF-A2",
+    target,
+    implement,
+    verify,
+  };
+}
