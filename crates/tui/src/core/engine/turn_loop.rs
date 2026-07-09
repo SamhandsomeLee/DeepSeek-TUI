@@ -274,7 +274,12 @@ impl Engine {
         let mut context_recovery_attempts = 0u8;
         let mut tool_catalog = tools.unwrap_or_default();
         if !tool_catalog.is_empty() {
-            ensure_advanced_tooling(&mut tool_catalog, mode, &self.config.tools_always_load);
+            ensure_advanced_tooling(
+                &mut tool_catalog,
+                mode,
+                &self.config.tools_always_load,
+                self.config.harness_tool_surface(),
+            );
         }
         if let Some(registry) = tool_registry {
             let issues = tool_catalog_consistency_issues(&tool_catalog, registry);
@@ -1780,6 +1785,37 @@ impl Engine {
                     blocked_error = Some(ToolError::permission_denied(format!(
                         "'{tool_name}' is not available in Plan mode - switch to Act mode (`/mode act`) to modify files or run write-capable tools."
                     )));
+                }
+
+                // Harness ReadOnly: deny non-read-only execution even if the
+                // model hallucinates a tool name that was filtered from the catalog.
+                // Advanced builtins (code_execution / js_execution) are never read-only.
+                if blocked_error.is_none()
+                    && matches!(
+                        self.config.harness_tool_surface(),
+                        codewhale_config::HarnessToolSurface::ReadOnly
+                    )
+                {
+                    let harness_read_only = if McpPool::is_mcp_tool(&tool_name) {
+                        mcp_tool_is_read_only(&tool_name)
+                    } else if tool_name == CODE_EXECUTION_TOOL_NAME
+                        || tool_name == JS_EXECUTION_TOOL_NAME
+                    {
+                        false
+                    } else if is_tool_search_tool(&tool_name) {
+                        true
+                    } else {
+                        read_only
+                    };
+                    if !tool_allowed_for_harness_surface(
+                        self.config.harness_tool_surface(),
+                        harness_read_only,
+                    ) {
+                        blocked_error = Some(ToolError::permission_denied(format!(
+                            "'{tool_name}' is not available under harness tool_surface=read-only \
+                             (only read-only tools are allowed; switch posture or use a Full profile)."
+                        )));
+                    }
                 }
 
                 // #3026: a hook `ask` decision forces the approval prompt even

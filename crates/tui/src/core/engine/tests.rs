@@ -1738,7 +1738,12 @@ fn plugin_or_benchmark_tools_marked_loaded_stay_active() {
         .find(|tool| tool.name == "KB_search")
         .expect("benchmark tool in catalog");
     bench_tool.defer_loading = Some(false);
-    ensure_advanced_tooling(&mut catalog, AppMode::Agent, &always_load);
+    ensure_advanced_tooling(
+        &mut catalog,
+        AppMode::Agent,
+        &always_load,
+        codewhale_config::HarnessToolSurface::Full,
+    );
 
     let active = initial_active_tools(&catalog);
     assert!(
@@ -1829,7 +1834,12 @@ fn agent_catalog_advertises_and_searches_core_action_tools() {
         AppMode::Agent,
         &always_load,
     );
-    ensure_advanced_tooling(&mut catalog, AppMode::Agent, &always_load);
+    ensure_advanced_tooling(
+        &mut catalog,
+        AppMode::Agent,
+        &always_load,
+        codewhale_config::HarnessToolSurface::Full,
+    );
 
     let issues = tool_catalog_consistency_issues(&catalog, &registry);
     assert!(
@@ -1988,7 +1998,12 @@ fn print_agent_tool_catalog_metrics() {
         AppMode::Agent,
         &always_load,
     );
-    ensure_advanced_tooling(&mut catalog, AppMode::Agent, &always_load);
+    ensure_advanced_tooling(
+        &mut catalog,
+        AppMode::Agent,
+        &always_load,
+        codewhale_config::HarnessToolSurface::Full,
+    );
     let active = initial_active_tools(&catalog);
     let active_catalog = active_tools_for_step(&catalog, &active, false);
     let active_json = serde_json::to_vec(&active_catalog).expect("serialize active");
@@ -3396,6 +3411,69 @@ fn deferred_tool_preflight_skips_already_active_tools() {
             .is_none(),
         "already active tools should execute normally"
     );
+}
+
+#[test]
+fn posture_readonly_never_widens_yolo_registry() {
+    let (engine, _handle) = Engine::new(EngineConfig::default(), &Config::default());
+    let mut registry = engine
+        .build_turn_tool_registry_builder(
+            AppMode::Yolo,
+            engine.config.todos.clone(),
+            engine.config.plan_state.clone(),
+        )
+        .build(engine.build_tool_context(AppMode::Yolo, true));
+    let before: HashSet<_> = registry.names().into_iter().map(str::to_string).collect();
+    assert!(before.contains("write_file"));
+    assert!(before.contains("exec_shell"));
+
+    apply_harness_tool_surface_to_registry(
+        &mut registry,
+        codewhale_config::HarnessToolSurface::ReadOnly,
+    );
+    let after: HashSet<_> = registry.names().into_iter().map(str::to_string).collect();
+    assert!(after.is_subset(&before));
+    assert!(!after.contains("write_file"));
+    assert!(!after.contains("exec_shell"));
+    assert!(!after.contains("apply_patch"));
+    assert!(after.contains("read_file"));
+}
+
+#[test]
+fn posture_full_is_noop_on_agent_registry() {
+    let (engine, _handle) = Engine::new(EngineConfig::default(), &Config::default());
+    let mut registry = engine
+        .build_turn_tool_registry_builder(
+            AppMode::Agent,
+            engine.config.todos.clone(),
+            engine.config.plan_state.clone(),
+        )
+        .build(engine.build_tool_context(AppMode::Agent, false));
+    let before: HashSet<_> = registry.names().into_iter().map(str::to_string).collect();
+    apply_harness_tool_surface_to_registry(
+        &mut registry,
+        codewhale_config::HarnessToolSurface::Full,
+    );
+    let after: HashSet<_> = registry.names().into_iter().map(str::to_string).collect();
+    assert_eq!(before, after);
+}
+
+#[test]
+fn plan_plus_readonly_does_not_grow() {
+    let (engine, _handle) = Engine::new(EngineConfig::default(), &Config::default());
+    let mut registry = engine
+        .build_turn_tool_registry_builder(
+            AppMode::Plan,
+            engine.config.todos.clone(),
+            engine.config.plan_state.clone(),
+        )
+        .build(engine.build_tool_context(AppMode::Plan, false));
+    let before_len = registry.len();
+    apply_harness_tool_surface_to_registry(
+        &mut registry,
+        codewhale_config::HarnessToolSurface::ReadOnly,
+    );
+    assert!(registry.len() <= before_len);
 }
 
 #[test]
@@ -5953,7 +6031,12 @@ fn tool_search_activates_discovered_deferred_tools() {
         },
     ];
     let always_load = HashSet::new();
-    ensure_advanced_tooling(&mut catalog, AppMode::Agent, &always_load);
+    ensure_advanced_tooling(
+        &mut catalog,
+        AppMode::Agent,
+        &always_load,
+        codewhale_config::HarnessToolSurface::Full,
+    );
     let mut active = initial_active_tools(&catalog);
     let result = execute_tool_search(
         TOOL_SEARCH_NAME,
@@ -5975,7 +6058,12 @@ fn tool_search_can_discover_request_user_input_modal_tool() {
         AppMode::Agent,
         &always_load,
     );
-    ensure_advanced_tooling(&mut catalog, AppMode::Agent, &always_load);
+    ensure_advanced_tooling(
+        &mut catalog,
+        AppMode::Agent,
+        &always_load,
+        codewhale_config::HarnessToolSurface::Full,
+    );
 
     let mut active = initial_active_tools(&catalog);
     assert!(!active.contains(REQUEST_USER_INPUT_NAME));
@@ -6007,7 +6095,12 @@ fn tool_search_catalog_with_matches(count: usize) -> Vec<Tool> {
         })
         .collect::<Vec<_>>();
     let always_load = HashSet::new();
-    ensure_advanced_tooling(&mut catalog, AppMode::Agent, &always_load);
+    ensure_advanced_tooling(
+        &mut catalog,
+        AppMode::Agent,
+        &always_load,
+        codewhale_config::HarnessToolSurface::Full,
+    );
     catalog
 }
 
@@ -6067,7 +6160,12 @@ fn tool_search_respects_and_caps_max_results() {
 fn tool_search_schema_exposes_max_results_default_and_cap() {
     let mut catalog = Vec::new();
     let always_load = HashSet::new();
-    ensure_advanced_tooling(&mut catalog, AppMode::Agent, &always_load);
+    ensure_advanced_tooling(
+        &mut catalog,
+        AppMode::Agent,
+        &always_load,
+        codewhale_config::HarnessToolSurface::Full,
+    );
 
     let tool = catalog
         .iter()
@@ -6119,7 +6217,12 @@ async fn code_execution_runs_through_common_executor_after_approval_gate() {
 fn plan_mode_catalog_skips_code_execution_tool_but_agent_keeps_it() {
     let mut plan_catalog = vec![api_tool("read_file")];
     let always_load = HashSet::new();
-    ensure_advanced_tooling(&mut plan_catalog, AppMode::Plan, &always_load);
+    ensure_advanced_tooling(
+        &mut plan_catalog,
+        AppMode::Plan,
+        &always_load,
+        codewhale_config::HarnessToolSurface::Full,
+    );
     assert!(
         !plan_catalog
             .iter()
@@ -6128,7 +6231,12 @@ fn plan_mode_catalog_skips_code_execution_tool_but_agent_keeps_it() {
     );
 
     let mut agent_catalog = vec![api_tool("read_file")];
-    ensure_advanced_tooling(&mut agent_catalog, AppMode::Agent, &always_load);
+    ensure_advanced_tooling(
+        &mut agent_catalog,
+        AppMode::Agent,
+        &always_load,
+        codewhale_config::HarnessToolSurface::Full,
+    );
     assert!(
         agent_catalog
             .iter()

@@ -7,14 +7,19 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
+use codewhale_config::HarnessToolSurface;
 use serde_json::{Value, json};
 
 use crate::mcp::McpPool;
 use crate::model_profile::ToolSurfaceBudget;
 use crate::models::Tool;
-use crate::tools::spec::{ToolError, ToolResult, optional_str, optional_u64, required_str};
+use crate::tools::registry::ToolRegistry;
+use crate::tools::spec::{
+    ToolError, ToolResult, ToolSpec, optional_str, optional_u64, required_str,
+};
 use crate::tui::app::AppMode;
 
 use crate::dependencies::ExternalTool;
@@ -257,11 +262,93 @@ fn apply_tool_surface_budget(
     }
 }
 
+/// Whether a tool may remain visible/executable under a harness tool surface.
+///
+/// `Full` / `Auto` always allow (zero-regression identity vs Mode).
+/// `ReadOnly` allows only tools that are read-only by capability — never widens.
+#[must_use]
+pub(super) fn tool_allowed_for_harness_surface(
+    surface: HarnessToolSurface,
+    is_read_only: bool,
+) -> bool {
+    match surface {
+        HarnessToolSurface::Full | HarnessToolSurface::Auto => true,
+        HarnessToolSurface::ReadOnly => is_read_only,
+    }
+}
+
+/// Narrow a built Mode registry for harness posture.
+///
+/// `Full` / `Auto` are no-ops. `ReadOnly` removes every non-read-only tool
+/// (never inserts). Mode remains the ceiling; this only intersects.
+pub(super) fn apply_harness_tool_surface_to_registry(
+    registry: &mut ToolRegistry,
+    surface: HarnessToolSurface,
+) {
+    if !matches!(surface, HarnessToolSurface::ReadOnly) {
+        return;
+    }
+    let to_remove: Vec<String> = registry
+        .all()
+        .into_iter()
+        .filter(|tool| !tool.is_read_only())
+        .map(|tool| tool.name().to_string())
+        .collect();
+    for name in to_remove {
+        let _ = registry.remove_tool(&name);
+    }
+}
+
+/// Built-in MCP helpers known to be read-only (mirrors `mcp_tool_is_read_only`).
+fn mcp_tool_name_is_read_only(name: &str) -> bool {
+    matches!(
+        name,
+        "list_mcp_resources"
+            | "list_mcp_resource_templates"
+            | "mcp_read_resource"
+            | "read_mcp_resource"
+            | "mcp_get_prompt"
+    )
+}
+
+/// Narrow MCP API tools for harness posture.
+///
+/// Unknown MCP tools are treated as non-read-only (fail closed) so ReadOnly
+/// never widens the attack surface.
+pub(super) fn filter_mcp_tools_for_harness_surface(
+    surface: HarnessToolSurface,
+    mcp_tools: Vec<Tool>,
+) -> Vec<Tool> {
+    match surface {
+        HarnessToolSurface::Full | HarnessToolSurface::Auto => mcp_tools,
+        HarnessToolSurface::ReadOnly => mcp_tools
+            .into_iter()
+            .filter(|tool| mcp_tool_name_is_read_only(&tool.name))
+            .collect(),
+    }
+}
+
+/// Keep only read-only specs from a list (test helper / shared predicate).
+#[cfg(test)]
+fn read_only_tool_names(tools: &[Arc<dyn ToolSpec>]) -> HashSet<String> {
+    tools
+        .iter()
+        .filter(|tool| tool.is_read_only())
+        .map(|tool| tool.name().to_string())
+        .collect()
+}
+
 pub(super) fn ensure_advanced_tooling(
     catalog: &mut Vec<Tool>,
     mode: AppMode,
     always_load: &HashSet<String>,
+    surface: HarnessToolSurface,
 ) {
+    // Interpreter tools execute code — never advertise them under harness
+    // ReadOnly, even though they are appended after the Mode registry filter.
+    // `tool_search` is read-only discovery and remains available.
+    let allow_exec_tools = tool_allowed_for_harness_surface(surface, false);
+
     // code_execution depends on a locally-installed Python interpreter
     // (python3 / python / py -3). Before v0.8.31, the tool was always
     // advertised and would fail at execution time on Windows where
@@ -269,7 +356,8 @@ pub(super) fn ensure_advanced_tooling(
     // once it appeared in the catalog. We now probe at catalog-build
     // time and only advertise when an interpreter resolves. See
     // `crate::dependencies::resolve_python_interpreter` for the probe.
-    if mode != AppMode::Plan
+    if allow_exec_tools
+        && mode != AppMode::Plan
         && !catalog.iter().any(|t| t.name == CODE_EXECUTION_TOOL_NAME)
         && crate::dependencies::resolve_python_interpreter().is_some()
     {
@@ -300,7 +388,8 @@ pub(super) fn ensure_advanced_tooling(
     // actually use. Plan mode hides shell/exec surfaces (including
     // both interpreter tools) by construction; Agent / YOLO advertise
     // the tool only when `resolve_node()` succeeds.
-    if mode != AppMode::Plan
+    if allow_exec_tools
+        && mode != AppMode::Plan
         && !catalog.iter().any(|t| t.name == JS_EXECUTION_TOOL_NAME)
         && crate::dependencies::resolve_node().is_some()
     {
@@ -1096,4 +1185,153 @@ pub(super) async fn execute_code_execution_tool(
         success,
         metadata: Some(payload),
     })
+}
+
+#[cfg(test)]
+mod harness_tool_surface_tests {
+    use super::*;
+    use crate::tools::registry::ToolRegistryBuilder;
+    use crate::tools::spec::ToolContext;
+    use tempfile::tempdir;
+
+    fn agentish_registry() -> ToolRegistry {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        ToolRegistryBuilder::new()
+            .with_agent_tools_policy(crate::worker_profile::ShellPolicy::Full)
+            .build(ctx)
+    }
+
+    #[test]
+    fn full_and_auto_surfaces_are_noop() {
+        for surface in [HarnessToolSurface::Full, HarnessToolSurface::Auto] {
+            let mut registry = agentish_registry();
+            let before: HashSet<_> = registry.names().into_iter().map(str::to_string).collect();
+            apply_harness_tool_surface_to_registry(&mut registry, surface);
+            let after: HashSet<_> = registry.names().into_iter().map(str::to_string).collect();
+            assert_eq!(before, after);
+        }
+    }
+
+    #[test]
+    fn readonly_intersects_not_widens() {
+        let mut registry = agentish_registry();
+        let before: HashSet<_> = registry.names().into_iter().map(str::to_string).collect();
+        let before_readonly = read_only_tool_names(&registry.all());
+        apply_harness_tool_surface_to_registry(&mut registry, HarnessToolSurface::ReadOnly);
+        let after: HashSet<_> = registry.names().into_iter().map(str::to_string).collect();
+
+        assert!(after.is_subset(&before), "ReadOnly must never add tools");
+        assert_eq!(after, before_readonly);
+        assert!(
+            !after.contains("write_file"),
+            "write_file must be removed under ReadOnly"
+        );
+        assert!(
+            !after.contains("exec_shell"),
+            "exec_shell must be removed under ReadOnly"
+        );
+        assert!(
+            after.contains("read_file"),
+            "read_file should remain under ReadOnly"
+        );
+    }
+
+    #[test]
+    fn readonly_never_adds_tools_to_empty_registry() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let mut registry = ToolRegistryBuilder::new().build(ctx);
+        apply_harness_tool_surface_to_registry(&mut registry, HarnessToolSurface::ReadOnly);
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn tool_allowed_predicate_matches_surface() {
+        assert!(tool_allowed_for_harness_surface(
+            HarnessToolSurface::Full,
+            false
+        ));
+        assert!(tool_allowed_for_harness_surface(
+            HarnessToolSurface::Auto,
+            false
+        ));
+        assert!(!tool_allowed_for_harness_surface(
+            HarnessToolSurface::ReadOnly,
+            false
+        ));
+        assert!(tool_allowed_for_harness_surface(
+            HarnessToolSurface::ReadOnly,
+            true
+        ));
+    }
+
+    fn mcp_tool(name: &str) -> Tool {
+        Tool {
+            tool_type: None,
+            name: name.to_string(),
+            description: String::new(),
+            input_schema: json!({}),
+            allowed_callers: None,
+            defer_loading: None,
+            input_examples: None,
+            strict: None,
+            cache_control: None,
+        }
+    }
+
+    #[test]
+    fn mcp_filter_keeps_only_known_readonly_names() {
+        let tools = vec![mcp_tool("list_mcp_resources"), mcp_tool("some_write_mcp")];
+        let filtered =
+            filter_mcp_tools_for_harness_surface(HarnessToolSurface::ReadOnly, tools.clone());
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "list_mcp_resources");
+
+        let identity = filter_mcp_tools_for_harness_surface(HarnessToolSurface::Full, tools);
+        assert_eq!(identity.len(), 2);
+    }
+
+    #[test]
+    fn ensure_advanced_tooling_skips_exec_under_readonly() {
+        let always_load = HashSet::new();
+        let mut catalog = vec![mcp_tool("read_file")];
+        ensure_advanced_tooling(
+            &mut catalog,
+            AppMode::Agent,
+            &always_load,
+            HarnessToolSurface::ReadOnly,
+        );
+        let names: HashSet<_> = catalog.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            !names.contains(CODE_EXECUTION_TOOL_NAME),
+            "ReadOnly must not re-widen catalog with code_execution"
+        );
+        assert!(
+            !names.contains(JS_EXECUTION_TOOL_NAME),
+            "ReadOnly must not re-widen catalog with js_execution"
+        );
+        assert!(
+            names.contains(TOOL_SEARCH_NAME),
+            "tool_search is read-only discovery and should remain"
+        );
+    }
+
+    #[test]
+    fn ensure_advanced_tooling_keeps_exec_under_full() {
+        let always_load = HashSet::new();
+        let mut catalog = vec![mcp_tool("read_file")];
+        ensure_advanced_tooling(
+            &mut catalog,
+            AppMode::Agent,
+            &always_load,
+            HarnessToolSurface::Full,
+        );
+        // Presence depends on local Python/Node; assert the Full path is not
+        // hard-blocked the way ReadOnly is (tool_search always lands).
+        assert!(
+            catalog.iter().any(|t| t.name == TOOL_SEARCH_NAME),
+            "Full surface should still install tool_search"
+        );
+    }
 }

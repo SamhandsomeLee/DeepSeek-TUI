@@ -39,7 +39,7 @@ pub(crate) fn format_harness_status(app: &App) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "Harness profile (compaction strategy and max_subagents are live; other knobs are preview)"
+        "Harness profile (compaction, max_subagents, and tool_surface are live; other knobs are preview)"
     );
     let _ = writeln!(out);
     push_row(&mut out, "Provider", app.active_provider_route());
@@ -53,7 +53,7 @@ pub(crate) fn format_harness_status(app: &App) -> String {
     );
     let _ = writeln!(
         out,
-        "             max_subagents={} (live)  compaction={} (live)  tools={}  safety={}",
+        "             max_subagents={} (live)  compaction={} (live)  tools={} (live)  safety={}",
         posture.max_subagents,
         compaction_strategy_label(posture.compaction_strategy),
         tool_surface_label(posture.tool_surface),
@@ -173,8 +173,9 @@ mod tests {
         );
         let output = format_harness_status(&app);
 
-        assert!(output.contains("compaction strategy and max_subagents are live"));
+        assert!(output.contains("compaction, max_subagents, and tool_surface are live"));
         assert!(output.contains("max_subagents=10 (live)"));
+        assert!(output.contains("tools=full (live)"));
         assert!(output.contains("Provider"));
         assert!(output.contains("deepseek"));
         assert!(output.contains("cache-heavy"));

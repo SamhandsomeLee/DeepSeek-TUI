@@ -441,6 +441,12 @@ impl EngineConfig {
     pub fn harness_compaction_strategy(&self) -> codewhale_config::HarnessCompactionStrategy {
         self.harness_posture.compaction_strategy
     }
+
+    /// Tool catalog shape carried on this engine's resolved posture.
+    #[must_use]
+    pub fn harness_tool_surface(&self) -> codewhale_config::HarnessToolSurface {
+        self.harness_posture.tool_surface
+    }
 }
 
 impl Default for EngineConfig {
@@ -2693,6 +2699,11 @@ impl Engine {
             std::collections::HashSet::new();
         if let Some(ref mut tool_registry) = tool_registry {
             plugin_tool_names = configure_plugin_tools(tool_registry, self.config.tools.as_ref());
+            // Harness ReadOnly intersects the Mode-built registry; Full/Auto no-op.
+            apply_harness_tool_surface_to_registry(
+                tool_registry,
+                self.config.harness_tool_surface(),
+            );
         }
 
         let mcp_tools = if self.config.features.enabled(Feature::Mcp) {
@@ -2700,6 +2711,8 @@ impl Engine {
         } else {
             Vec::new()
         };
+        let mcp_tools =
+            filter_mcp_tools_for_harness_surface(self.config.harness_tool_surface(), mcp_tools);
         let tools = tool_registry.as_ref().map(|registry| {
             let capability = crate::model_profile::resolved_capability_profile(
                 self.api_config.api_provider(),
@@ -3990,10 +4003,11 @@ use self::streaming::{
 };
 use self::tool_catalog::{
     CODE_EXECUTION_TOOL_NAME, JS_EXECUTION_TOOL_NAME, MULTI_TOOL_PARALLEL_NAME,
-    REQUEST_USER_INPUT_NAME, active_tools_for_step, build_model_tool_catalog_with_surface,
-    ensure_advanced_tooling, execute_code_execution_tool, execute_tool_search,
-    initial_active_tools, is_tool_search_tool, maybe_hydrate_requested_deferred_tool,
-    missing_tool_error_message, tool_catalog_consistency_issues,
+    REQUEST_USER_INPUT_NAME, active_tools_for_step, apply_harness_tool_surface_to_registry,
+    build_model_tool_catalog_with_surface, ensure_advanced_tooling, execute_code_execution_tool,
+    execute_tool_search, filter_mcp_tools_for_harness_surface, initial_active_tools,
+    is_tool_search_tool, maybe_hydrate_requested_deferred_tool, missing_tool_error_message,
+    tool_allowed_for_harness_surface, tool_catalog_consistency_issues,
 };
 #[cfg(test)]
 use self::tool_catalog::{
