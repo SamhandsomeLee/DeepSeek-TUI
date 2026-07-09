@@ -461,8 +461,8 @@ fn run_lane_command(args: LaneArgs) -> Result<()> {
                 println!("No lanes under {}", reg.root().display());
             } else {
                 println!(
-                    "{:<16} {:<10} {:<12} {:<16} {:<10} {}",
-                    "ID", "STATUS", "RUNTIME", "WORKFLOW", "ISSUE", "STARTED"
+                    "{:<16} {:<10} {:<12} {:<16} {:<10} STARTED",
+                    "ID", "STATUS", "RUNTIME", "WORKFLOW", "ISSUE"
                 );
                 for lane in lanes {
                     println!(
