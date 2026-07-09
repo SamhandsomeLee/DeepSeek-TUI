@@ -5,16 +5,17 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use codewhale_workflow::{
     AgentType, BranchResult, BranchSpec, BudgetSpec, ControlNodeKind, ControlNodeResult,
-    IsolationMode, LeafResult, LeafSpec, ReduceSpec, SequenceSpec, TaskMode,
+    LeafResult, LeafSpec, ReduceSpec, SequenceSpec, TaskMode,
     WorkflowExecution as IrWorkflowExecution, WorkflowMemoUsage, WorkflowNode,
     WorkflowRunStatus as IrWorkflowRunStatus, WorkflowSpec, WorkflowUsage,
-    compile_javascript_workflow, compile_typescript_workflow,
+    compile_javascript_workflow, compile_typescript_workflow, leaf_wants_worktree,
 };
 use codewhale_workflow_js::{
     BudgetSnapshot, DriverError, ProgressEvent, SpawnedTask, TaskCompletion, TaskRequest,
@@ -25,13 +26,14 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
+use crate::core::events::Event;
 use crate::tools::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
     optional_bool, optional_str, optional_u64,
 };
 use crate::tools::subagent::{
     SharedSubAgentManager, SubAgentCompletion, SubAgentRuntime, SubAgentStatus,
-    WorkflowTaskSpawnMetadata, spawn_workflow_task,
+    WorkflowTaskSpawnIdentity, WorkflowTaskSpawnMetadata, spawn_workflow_task,
 };
 use crate::tools::verifier::run_workflow_completion_gates;
 use crate::utils::spawn_supervised;
@@ -191,6 +193,14 @@ struct WorkflowTaskStartedEvent {
     git_branch: Option<String>,
     parent_task_id: Option<String>,
     depth: u32,
+    /// Workflow run that admitted this child (#4119).
+    workflow_run_id: Option<String>,
+    /// Phase title/id active (or declared on the task) at spawn (#4119).
+    workflow_phase_id: Option<String>,
+    /// Typed task label — UI must prefer this over prompt text (#4119).
+    workflow_task_label: Option<String>,
+    /// 0-based admission order among children of this run (#4119).
+    workflow_child_index: Option<u32>,
 }
 
 impl WorkflowUiEventKind {
@@ -342,6 +352,7 @@ impl ToolSpec for WorkflowTool {
     fn description(&self) -> &'static str {
         concat!(
             "Start, run, inspect, or cancel a Workflow. Workflows execute deterministic JS with args, phase/log progress, and task(...) calls that dispatch real sub-agents through Fleet/sub-agent scheduling. ",
+            "Provide exactly one of script, source_path, or plan (structured planner JSON). ",
             "Use action=start for detached orchestration and action=status with run_id to inspect progress. Use action=run when the model needs the final result before continuing."
         )
     }
@@ -366,6 +377,10 @@ impl ToolSpec for WorkflowTool {
                 "source_path": {
                     "type": "string",
                     "description": "Path to a .workflow.js script inside the workspace. Use instead of script for checked-in workflows."
+                },
+                "plan": {
+                    "type": "object",
+                    "description": "Structured planner plan JSON (#4124). Alternative to script/source_path. Accepts goal, risk, max_children, token_budget, phases[], and/or children[] (or IR nodes). Lowered to Workflow JS with parallel() partial-success semantics."
                 },
                 "args": {
                     "description": "JSON value exposed to the script as args. Defaults to null."
@@ -478,7 +493,7 @@ async fn start_workflow(
             source.spec.as_ref(),
         );
         record.verify_on_complete = verify_on_complete;
-        record.events.push(WorkflowUiEvent::at(
+        let started = WorkflowUiEvent::at(
             record.started_at_ms,
             WorkflowUiEventKind::RunStarted {
                 workflow_id: record.workflow_id.clone(),
@@ -486,9 +501,23 @@ async fn start_workflow(
                 source_path: record.source_path.clone(),
                 token_budget: record.token_budget,
             },
-        ));
+        );
+        record.events.push(started.clone());
         runs_guard.insert(run_id.clone(), record.clone());
         state.record_snapshot(&record);
+        // #4122: emit RunStarted immediately so the panel + history card open
+        // before the first task/phase (including wait:false fire-and-forget).
+        if let Some(tx) = runtime.event_tx.as_ref() {
+            if let Ok(mut value) = serde_json::to_value(&started) {
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("run_id".to_string(), json!(run_id));
+                }
+                let _ = tx.try_send(Event::WorkflowUi {
+                    run_id: run_id.clone(),
+                    event: value,
+                });
+            }
+        }
     }
 
     let driver = SubAgentWorkflowDriver::new(
@@ -662,15 +691,17 @@ async fn run_workflow_vm(
         .and_then(|mut guard| {
             let record = guard.get_mut(&run_id)?;
             if record.status != WorkflowRunStatus::Cancelled {
-                record
-                    .events
-                    .push(WorkflowUiEvent::new(budget_event_kind(final_budget)));
-                record
-                    .events
-                    .push(WorkflowUiEvent::new(WorkflowUiEventKind::RunCompleted {
-                        status: record.status,
-                        error: record.error.clone(),
-                    }));
+                let budget_event = WorkflowUiEvent::new(budget_event_kind(final_budget));
+                let completed = WorkflowUiEvent::new(WorkflowUiEventKind::RunCompleted {
+                    status: record.status,
+                    error: record.error.clone(),
+                });
+                record.events.push(budget_event.clone());
+                record.events.push(completed.clone());
+                // Live stream terminal events even when recorded outside the
+                // driver helper (completion path).
+                driver.emit_ui_event(&budget_event);
+                driver.emit_ui_event(&completed);
             }
             Some(record.clone())
         })
@@ -722,13 +753,347 @@ fn workflow_source(input: &Value, context: &ToolContext) -> Result<WorkflowSourc
         .or_else(|| optional_str(input, "source"))
         .map(str::to_string);
     let source_path = optional_str(input, "source_path").or_else(|| optional_str(input, "path"));
-    match (script, source_path) {
-        (Some(source), None) if !source.trim().is_empty() => workflow_source_from_raw(source, None),
-        (None, Some(path)) => read_workflow_source_path(path, context),
-        (Some(_), Some(_)) => Err(ToolError::invalid_input(
-            "Use either script or source_path, not both",
-        )),
+    let plan = input.get("plan").filter(|value| !value.is_null());
+
+    let provided = [
+        script.as_ref().is_some_and(|s| !s.trim().is_empty()),
+        source_path.is_some(),
+        plan.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    if provided > 1 {
+        return Err(ToolError::invalid_input(
+            "Use exactly one of script, source_path, or plan",
+        ));
+    }
+
+    match (script, source_path, plan) {
+        (Some(source), None, None) if !source.trim().is_empty() => {
+            workflow_source_from_raw(source, None)
+        }
+        (None, Some(path), None) => read_workflow_source_path(path, context),
+        (None, None, Some(plan_value)) => workflow_source_from_plan(plan_value),
         _ => Err(ToolError::missing_field("script")),
+    }
+}
+
+/// Planner-to-workflow structured launch path (#4124).
+///
+/// Accepts product-shaped plans (`goal` + `phases`/`children`) or IR-shaped
+/// plans (`goal` + `nodes`), validates them, and lowers to imperative JS that
+/// uses `parallel()` (partial success) rather than raw `Promise.all()`.
+fn workflow_source_from_plan(plan_value: &Value) -> Result<WorkflowSource, ToolError> {
+    let spec = structured_plan_to_workflow_spec(plan_value)?;
+    let lowered = lower_declarative_workflow_to_imperative_js(&spec)?;
+    Ok(WorkflowSource {
+        source: lowered,
+        path: None,
+        spec: Some(spec),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct StructuredWorkflowPlan {
+    goal: String,
+    #[serde(default)]
+    risk: Option<String>,
+    #[serde(default)]
+    max_children: Option<usize>,
+    #[serde(default)]
+    token_budget: Option<u64>,
+    #[serde(default)]
+    phases: Vec<StructuredPlanPhase>,
+    #[serde(default)]
+    children: Vec<StructuredPlanChild>,
+    /// Escape hatch: full Workflow IR nodes (kind/spec or JS authoring shapes).
+    #[serde(default)]
+    nodes: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StructuredPlanPhase {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    parallel: Option<bool>,
+    #[serde(default)]
+    children: Vec<StructuredPlanChild>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StructuredPlanChild {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(alias = "description")]
+    prompt: String,
+    #[serde(default, alias = "type", alias = "agent_type")]
+    agent_type: Option<String>,
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+fn structured_plan_to_workflow_spec(plan_value: &Value) -> Result<WorkflowSpec, ToolError> {
+    if !plan_value.is_object() {
+        return Err(ToolError::invalid_input(
+            "Workflow plan must be a JSON object with goal and phases/children (or nodes)",
+        ));
+    }
+
+    let plan: StructuredWorkflowPlan =
+        serde_json::from_value(plan_value.clone()).map_err(|err| {
+            ToolError::invalid_input(format!("Invalid structured Workflow plan: {err}"))
+        })?;
+
+    let goal = plan.goal.trim();
+    if goal.is_empty() {
+        return Err(ToolError::invalid_input(
+            "Workflow plan goal must be a non-empty string",
+        ));
+    }
+
+    // IR / declarative nodes escape hatch: re-parse as workflow({...}) object.
+    if let Some(nodes) = plan.nodes.as_ref() {
+        if !nodes.is_array() {
+            return Err(ToolError::invalid_input(
+                "Workflow plan.nodes must be an array of workflow nodes",
+            ));
+        }
+        let mut object = plan_value.clone();
+        if let Some(obj) = object.as_object_mut() {
+            obj.insert("goal".to_string(), Value::String(goal.to_string()));
+            if let Some(token_budget) = plan.token_budget {
+                let mut budget = obj.get("budget").cloned().unwrap_or_else(|| json!({}));
+                if let Some(budget_obj) = budget.as_object_mut() {
+                    budget_obj.insert("max_tokens".to_string(), json!(token_budget));
+                }
+                obj.insert("budget".to_string(), budget);
+            }
+        }
+        let wrapped = format!("workflow({});", object);
+        return compile_javascript_workflow("<structured plan>", &wrapped).map_err(|err| {
+            ToolError::invalid_input(format!("Invalid structured Workflow plan nodes: {err}"))
+        });
+    }
+
+    let default_mode = plan_risk_to_mode(plan.risk.as_deref())?;
+    let mut nodes = Vec::new();
+
+    if !plan.phases.is_empty() {
+        for (phase_index, phase) in plan.phases.iter().enumerate() {
+            let phase_id = phase
+                .id
+                .as_deref()
+                .or(phase.title.as_deref())
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("phase-{}", phase_index + 1));
+            let children = plan_children_to_leaves(
+                &phase.children,
+                default_mode,
+                plan.token_budget,
+                &phase_id,
+            )?;
+            if children.is_empty() {
+                return Err(ToolError::invalid_input(format!(
+                    "Workflow plan phase '{phase_id}' must declare at least one child"
+                )));
+            }
+            let parallel = phase.parallel.unwrap_or(children.len() > 1);
+            if parallel && children.len() > 1 {
+                nodes.push(WorkflowNode::BranchSet(BranchSpec {
+                    id: phase_id,
+                    description: phase.title.clone(),
+                    parallel: true,
+                    budget: BudgetSpec {
+                        max_tokens: plan.token_budget,
+                        ..BudgetSpec::default()
+                    },
+                    permissions: Default::default(),
+                    model_policy: Default::default(),
+                    children: children.into_iter().map(WorkflowNode::Leaf).collect(),
+                }));
+            } else if children.len() == 1 {
+                nodes.push(WorkflowNode::Leaf(
+                    children.into_iter().next().expect("one child"),
+                ));
+            } else {
+                nodes.push(WorkflowNode::Sequence(SequenceSpec {
+                    id: phase_id,
+                    children: children.into_iter().map(WorkflowNode::Leaf).collect(),
+                }));
+            }
+        }
+    } else if !plan.children.is_empty() {
+        let children =
+            plan_children_to_leaves(&plan.children, default_mode, plan.token_budget, "plan")?;
+        if children.len() == 1 {
+            nodes.push(WorkflowNode::Leaf(
+                children.into_iter().next().expect("one child"),
+            ));
+        } else {
+            nodes.push(WorkflowNode::BranchSet(BranchSpec {
+                id: "plan".to_string(),
+                description: Some(goal.to_string()),
+                parallel: true,
+                budget: BudgetSpec {
+                    max_tokens: plan.token_budget,
+                    ..BudgetSpec::default()
+                },
+                permissions: Default::default(),
+                model_policy: Default::default(),
+                children: children.into_iter().map(WorkflowNode::Leaf).collect(),
+            }));
+        }
+    } else {
+        return Err(ToolError::invalid_input(
+            "Workflow plan must include phases, children, or nodes",
+        ));
+    }
+
+    let mut total_children = 0usize;
+    count_plan_leaves(&nodes, &mut total_children);
+    if let Some(max_children) = plan.max_children
+        && total_children > max_children
+    {
+        return Err(ToolError::invalid_input(format!(
+            "Workflow plan declares {total_children} children which exceeds max_children={max_children}"
+        )));
+    }
+
+    Ok(WorkflowSpec {
+        id: None,
+        goal: goal.to_string(),
+        description: plan.risk.clone(),
+        budget: BudgetSpec {
+            max_tokens: plan.token_budget,
+            ..BudgetSpec::default()
+        },
+        permissions: Default::default(),
+        model_policy: Default::default(),
+        promotion_policy: Default::default(),
+        nodes,
+    })
+}
+
+fn plan_risk_to_mode(risk: Option<&str>) -> Result<TaskMode, ToolError> {
+    match risk.map(str::trim).filter(|s| !s.is_empty()) {
+        None | Some("read_only") | Some("readonly") | Some("low") | Some("safe") => {
+            Ok(TaskMode::ReadOnly)
+        }
+        Some("writes") | Some("write") | Some("read_write") | Some("readwrite")
+        | Some("medium") => Ok(TaskMode::ReadWrite),
+        Some("elevated") | Some("high") | Some("shell") | Some("network") => {
+            // Elevated risk still launches as read_write; approval gates (#4126)
+            // consume the risk string via plan description.
+            Ok(TaskMode::ReadWrite)
+        }
+        Some(other) => Err(ToolError::invalid_input(format!(
+            "Invalid plan risk '{other}'. Use read_only, writes, or elevated."
+        ))),
+    }
+}
+
+fn plan_children_to_leaves(
+    children: &[StructuredPlanChild],
+    default_mode: TaskMode,
+    token_budget: Option<u64>,
+    phase_id: &str,
+) -> Result<Vec<LeafSpec>, ToolError> {
+    if children.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut leaves = Vec::with_capacity(children.len());
+    for (index, child) in children.iter().enumerate() {
+        let prompt = child.prompt.trim();
+        if prompt.is_empty() {
+            return Err(ToolError::invalid_input(format!(
+                "Workflow plan child {} in phase '{phase_id}' must have a non-empty prompt",
+                index + 1
+            )));
+        }
+        let id = child
+            .id
+            .as_deref()
+            .or(child.label.as_deref())
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{phase_id}-child-{}", index + 1));
+        let agent_type = parse_plan_agent_type(child.agent_type.as_deref())?;
+        let mode = match child.mode.as_deref().map(str::trim) {
+            None | Some("") => default_mode,
+            Some("read_only") | Some("readonly") => TaskMode::ReadOnly,
+            Some("read_write") | Some("readwrite") | Some("writes") | Some("write") => {
+                TaskMode::ReadWrite
+            }
+            Some(other) => {
+                return Err(ToolError::invalid_input(format!(
+                    "Invalid plan child mode '{other}' on '{id}'. Use read_only or read_write."
+                )));
+            }
+        };
+        let profile = child
+            .profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(|p| p.to_ascii_lowercase());
+        leaves.push(LeafSpec {
+            id,
+            prompt: prompt.to_string(),
+            agent_type,
+            profile,
+            mode,
+            isolation: Default::default(),
+            file_scope: Vec::new(),
+            depends_on_results: Vec::new(),
+            budget: BudgetSpec {
+                max_tokens: token_budget,
+                ..BudgetSpec::default()
+            },
+            permissions: Default::default(),
+            model_policy: Default::default(),
+        });
+    }
+    Ok(leaves)
+}
+
+fn parse_plan_agent_type(raw: Option<&str>) -> Result<AgentType, ToolError> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(AgentType::General),
+        Some("general") | Some("worker") | Some("delegate") => Ok(AgentType::General),
+        Some("explore") | Some("scout") => Ok(AgentType::Explore),
+        Some("plan") | Some("planner") => Ok(AgentType::Plan),
+        Some("review") | Some("reviewer") => Ok(AgentType::Review),
+        Some("implementer") | Some("builder") | Some("implement") => Ok(AgentType::Implementer),
+        Some("verifier") | Some("verify") => Ok(AgentType::Verifier),
+        Some(other) => Err(ToolError::invalid_input(format!(
+            "Invalid plan child type '{other}'. Use general, explore, plan, review, implementer, or verifier."
+        ))),
+    }
+}
+
+fn count_plan_leaves(nodes: &[WorkflowNode], total: &mut usize) {
+    for node in nodes {
+        match node {
+            WorkflowNode::Leaf(_) => *total += 1,
+            WorkflowNode::BranchSet(spec) => count_plan_leaves(&spec.children, total),
+            WorkflowNode::Sequence(spec) => count_plan_leaves(&spec.children, total),
+            WorkflowNode::Reduce(_)
+            | WorkflowNode::TeacherReview(_)
+            | WorkflowNode::LoopUntil(_)
+            | WorkflowNode::Cond(_)
+            | WorkflowNode::Expand(_) => {}
+        }
     }
 }
 
@@ -871,7 +1236,7 @@ impl DeclarativeWorkflowLowerer {
 
     fn lower_node(&mut self, node: &WorkflowNode, phase: Option<&str>) -> Result<(), ToolError> {
         match node {
-            WorkflowNode::Leaf(spec) => self.lower_leaf(spec, phase),
+            WorkflowNode::Leaf(spec) => self.lower_leaf(spec, phase, /* parallel */ false),
             WorkflowNode::BranchSet(spec) => self.lower_branch(spec),
             WorkflowNode::Sequence(spec) => self.lower_sequence(spec),
             WorkflowNode::Reduce(spec) => self.lower_reduce(spec),
@@ -882,11 +1247,16 @@ impl DeclarativeWorkflowLowerer {
         }
     }
 
-    fn lower_leaf(&mut self, spec: &LeafSpec, phase: Option<&str>) -> Result<(), ToolError> {
+    fn lower_leaf(
+        &mut self,
+        spec: &LeafSpec,
+        phase: Option<&str>,
+        parallel: bool,
+    ) -> Result<(), ToolError> {
         self.line(format!(
             "__results[{}] = await task({});",
             js_string(&spec.id),
-            leaf_task_options_expression(spec, phase)?
+            leaf_task_options_expression(spec, phase, parallel)?
         ));
         Ok(())
     }
@@ -904,12 +1274,16 @@ impl DeclarativeWorkflowLowerer {
                 };
                 leaves.push(leaf);
             }
+            // #4124: use Workflow `parallel()` (all-settled / partial success)
+            // instead of raw Promise.all, which aborts siblings on first failure.
             let temp = self.next_temp("parallel");
-            self.line(format!("const {temp} = await Promise.all(["));
+            self.line(format!("const {temp} = await parallel(["));
             for leaf in &leaves {
+                // Parallel write-capable children default to worktree isolation
+                // (#4120) unless the plan explicitly sets isolation: shared.
                 self.line(format!(
-                    "  task({}),",
-                    leaf_task_options_expression(leaf, Some(&spec.id))?
+                    "  () => task({}),",
+                    leaf_task_options_expression(leaf, Some(&spec.id), /* parallel */ true)?
                 ));
             }
             self.line("]);");
@@ -1008,13 +1382,19 @@ fn leaf_description(spec: &LeafSpec) -> String {
     description
 }
 
-fn leaf_task_options_expression(spec: &LeafSpec, phase: Option<&str>) -> Result<String, ToolError> {
+fn leaf_task_options_expression(
+    spec: &LeafSpec,
+    phase: Option<&str>,
+    parallel: bool,
+) -> Result<String, ToolError> {
     validate_leaf_runtime_contract(spec)?;
     Ok(task_options_expression(
         leaf_description_expression(spec),
         leaf_subagent_type(spec)?,
         spec.profile.as_deref(),
-        matches!(spec.isolation, IsolationMode::Worktree),
+        // Parallel write-capable children default to worktree isolation (#4120).
+        // Explicit isolation: shared is the approved same-worktree override.
+        leaf_wants_worktree(spec, parallel),
         spec.budget.max_tokens,
         &spec.id,
         phase,
@@ -1203,6 +1583,11 @@ struct SubAgentWorkflowDriver {
     completion_tx: mpsc::UnboundedSender<SubAgentCompletion>,
     completion_state: Arc<Mutex<CompletionState>>,
     child_ids: Arc<Mutex<Vec<String>>>,
+    /// Monotonic 0-based child admission counter for `workflow_child_index`.
+    child_counter: AtomicU32,
+    /// Latest `phase(...)` title observed on this run (used when a task omits
+    /// an explicit `phase` option).
+    current_phase: Mutex<Option<String>>,
     task_records: Arc<Mutex<HashMap<String, RuntimeTaskRecord>>>,
     total_budget: Option<u64>,
     last_budget_event: Arc<Mutex<Option<BudgetSnapshot>>>,
@@ -1225,6 +1610,8 @@ impl SubAgentWorkflowDriver {
             completion_tx,
             completion_state: Arc::new(Mutex::new(CompletionState::default())),
             child_ids: Arc::new(Mutex::new(Vec::new())),
+            child_counter: AtomicU32::new(0),
+            current_phase: Mutex::new(None),
             task_records: Arc::new(Mutex::new(HashMap::new())),
             total_budget,
             last_budget_event: Arc::new(Mutex::new(None)),
@@ -1286,6 +1673,26 @@ impl SubAgentWorkflowDriver {
         if recorded {
             self.state.record_event(&self.run_id, &event);
         }
+        // #4122: stream typed events live into the panel + history card.
+        self.emit_ui_event(&event);
+    }
+
+    /// Publish a flattened WorkflowUiEvent on the engine event bus so the TUI
+    /// can hydrate the panel while the tool is still running.
+    fn emit_ui_event(&self, event: &WorkflowUiEvent) {
+        let Some(tx) = self.runtime.event_tx.as_ref() else {
+            return;
+        };
+        let Ok(mut value) = serde_json::to_value(event) else {
+            return;
+        };
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("run_id".to_string(), json!(self.run_id));
+        }
+        let _ = tx.try_send(Event::WorkflowUi {
+            run_id: self.run_id.clone(),
+            event: value,
+        });
     }
 
     fn record_budget_snapshot(&self, snapshot: BudgetSnapshot) {
@@ -1311,10 +1718,16 @@ impl SubAgentWorkflowDriver {
         metadata: &WorkflowTaskSpawnMetadata,
         result: &crate::tools::subagent::SubAgentResult,
     ) {
+        // Prefer typed spawn metadata over request fields so panel/history never
+        // need to re-derive labels from the child prompt (#4119).
+        let label = metadata
+            .workflow_task_label
+            .clone()
+            .or_else(|| request.label.clone());
         self.record_run_event(WorkflowUiEvent::new(WorkflowUiEventKind::TaskStarted(
             Box::new(WorkflowTaskStartedEvent {
                 task_id: agent_id.to_string(),
-                label: request.label.clone(),
+                label,
                 profile: request.profile.clone(),
                 model: request.model.clone(),
                 strength: request.model_strength.clone(),
@@ -1327,6 +1740,10 @@ impl SubAgentWorkflowDriver {
                 git_branch: result.git_branch.clone(),
                 parent_task_id: metadata.parent_task_id.clone(),
                 depth: metadata.depth,
+                workflow_run_id: metadata.workflow_run_id.clone(),
+                workflow_phase_id: metadata.workflow_phase_id.clone(),
+                workflow_task_label: metadata.workflow_task_label.clone(),
+                workflow_child_index: metadata.workflow_child_index,
             }),
         )));
     }
@@ -1432,7 +1849,32 @@ impl WorkflowDriver for SubAgentWorkflowDriver {
             .clone()
             .with_parent_completion_tx(self.completion_tx.clone());
         let request_record = request.clone();
-        let result = spawn_workflow_task(request, self.manager.clone(), runtime)
+        let workflow_child_index = self.child_counter.fetch_add(1, Ordering::SeqCst);
+        let workflow_phase_id = request
+            .phase
+            .as_ref()
+            .map(|phase| phase.trim())
+            .filter(|phase| !phase.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                self.current_phase
+                    .lock()
+                    .ok()
+                    .and_then(|phase| phase.clone())
+            });
+        let workflow_task_label = request
+            .label
+            .as_ref()
+            .map(|label| label.trim())
+            .filter(|label| !label.is_empty())
+            .map(str::to_string);
+        let identity = WorkflowTaskSpawnIdentity {
+            workflow_run_id: self.run_id.clone(),
+            workflow_phase_id,
+            workflow_task_label,
+            workflow_child_index,
+        };
+        let result = spawn_workflow_task(request, self.manager.clone(), runtime, identity)
             .await
             .map_err(|err| DriverError::Rejected(err.to_string()))?;
         let task_id = result.result.agent_id.clone();
@@ -1468,10 +1910,15 @@ impl WorkflowDriver for SubAgentWorkflowDriver {
                 format!("log: {message}"),
                 WorkflowUiEvent::new(WorkflowUiEventKind::Log { message }),
             ),
-            ProgressEvent::Phase { title } => (
-                format!("phase: {title}"),
-                WorkflowUiEvent::new(WorkflowUiEventKind::PhaseStarted { title }),
-            ),
+            ProgressEvent::Phase { title } => {
+                if let Ok(mut current) = self.current_phase.lock() {
+                    *current = Some(title.clone());
+                }
+                (
+                    format!("phase: {title}"),
+                    WorkflowUiEvent::new(WorkflowUiEventKind::PhaseStarted { title }),
+                )
+            }
             ProgressEvent::TaskSchemaValidationFailed { task_id, message } => {
                 self.record_schema_validation_failure(&task_id, message.clone());
                 schema_error = Some(WorkflowSchemaError {
@@ -1498,6 +1945,8 @@ impl WorkflowDriver for SubAgentWorkflowDriver {
         }
         self.state.record_progress(&self.run_id, &message);
         self.state.record_event(&self.run_id, &ui_event);
+        // #4122: phase/schema/log progress streams into the live panel path.
+        self.emit_ui_event(&ui_event);
     }
 }
 
@@ -2174,6 +2623,7 @@ mod tests {
     use crate::tools::ToolRegistryBuilder;
     use crate::tools::subagent::{SubAgentRuntime, new_shared_subagent_manager};
     use axum::{Json, Router, routing::post};
+    use codewhale_workflow::{IsolationMode, leaf_is_write_capable};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
@@ -2208,6 +2658,222 @@ mod tests {
     }
 
     #[test]
+    fn parallel_write_children_default_to_worktree_isolation() {
+        // #4120: write-capable parallel leaves get worktree: true by default.
+        let source = r#"
+export default workflow({
+  "goal": "parallel write isolation default",
+  "nodes": [
+    {
+      "branch": {
+        "id": "implement",
+        "parallel": true,
+        "children": [
+          {
+            "agent": {
+              "id": "left",
+              "prompt": "Patch left lane",
+              "agent_type": "implementer",
+              "mode": "read_write",
+              "file_scope": ["src/left.rs"]
+            }
+          },
+          {
+            "agent": {
+              "id": "right",
+              "prompt": "Patch right lane",
+              "agent_type": "implementer",
+              "mode": "read_write",
+              "file_scope": ["src/right.rs"]
+            }
+          }
+        ]
+      }
+    }
+  ]
+});
+"#;
+        let adapted = adapt_workflow_source(source, None).expect("lower parallel write workflow");
+        let spec = adapted.spec.expect("declarative spec");
+        let WorkflowNode::BranchSet(branch) = &spec.nodes[0] else {
+            panic!("expected branch_set");
+        };
+        assert!(branch.parallel);
+        for child in &branch.children {
+            let WorkflowNode::Leaf(leaf) = child else {
+                panic!("expected leaf");
+            };
+            assert!(leaf_is_write_capable(leaf));
+            assert!(
+                leaf_wants_worktree(leaf, true),
+                "parallel write leaf {} should default to worktree",
+                leaf.id
+            );
+            assert_eq!(leaf.isolation, IsolationMode::Auto);
+        }
+        assert!(
+            adapted.source.contains("worktree: true"),
+            "lowered JS should request worktree isolation:\n{}",
+            adapted.source
+        );
+        // Both parallel children should carry the worktree flag.
+        assert_eq!(
+            adapted.source.matches("worktree: true").count(),
+            2,
+            "each parallel write child should get worktree: true:\n{}",
+            adapted.source
+        );
+    }
+
+    #[test]
+    fn parallel_write_same_worktree_requires_explicit_shared_isolation() {
+        // #4120: isolation: shared is the approved same-worktree override.
+        let source = r#"
+export default workflow({
+  "goal": "parallel write same-worktree override",
+  "nodes": [
+    {
+      "branch": {
+        "id": "implement",
+        "parallel": true,
+        "children": [
+          {
+            "agent": {
+              "id": "shared-writer",
+              "prompt": "Patch in the parent checkout",
+              "agent_type": "implementer",
+              "mode": "read_write",
+              "isolation": "shared",
+              "file_scope": ["src/shared.rs"]
+            }
+          },
+          {
+            "agent": {
+              "id": "isolated-writer",
+              "prompt": "Patch in a worktree",
+              "agent_type": "implementer",
+              "mode": "read_write",
+              "isolation": "worktree",
+              "file_scope": ["src/isolated.rs"]
+            }
+          }
+        ]
+      }
+    }
+  ]
+});
+"#;
+        let adapted =
+            adapt_workflow_source(source, None).expect("lower same-worktree override workflow");
+        let spec = adapted.spec.expect("declarative spec");
+        let WorkflowNode::BranchSet(branch) = &spec.nodes[0] else {
+            panic!("expected branch_set");
+        };
+        let leaves: Vec<&LeafSpec> = branch
+            .children
+            .iter()
+            .map(|child| match child {
+                WorkflowNode::Leaf(leaf) => leaf,
+                _ => panic!("expected leaf"),
+            })
+            .collect();
+        assert_eq!(leaves[0].isolation, IsolationMode::Shared);
+        assert!(
+            !leaf_wants_worktree(leaves[0], true),
+            "explicit shared should keep same-worktree"
+        );
+        assert_eq!(leaves[1].isolation, IsolationMode::Worktree);
+        assert!(leaf_wants_worktree(leaves[1], true));
+
+        // Only the explicit worktree child should emit worktree: true.
+        assert_eq!(
+            adapted.source.matches("worktree: true").count(),
+            1,
+            "same-worktree override must not force worktree on shared leaf:\n{}",
+            adapted.source
+        );
+        assert!(
+            adapted.source.contains("shared-writer") && adapted.source.contains("isolated-writer"),
+            "both children should still be lowered:\n{}",
+            adapted.source
+        );
+    }
+
+    #[test]
+    fn parallel_read_only_children_do_not_default_to_worktree() {
+        let source = r#"
+export default workflow({
+  "goal": "parallel read-only stays shared",
+  "nodes": [
+    {
+      "branch": {
+        "id": "audit",
+        "parallel": true,
+        "children": [
+          {
+            "agent": {
+              "id": "review-a",
+              "prompt": "Review A",
+              "agent_type": "review",
+              "mode": "read_only"
+            }
+          },
+          {
+            "agent": {
+              "id": "review-b",
+              "prompt": "Review B",
+              "agent_type": "verifier",
+              "mode": "read_only"
+            }
+          }
+        ]
+      }
+    }
+  ]
+});
+"#;
+        let adapted = adapt_workflow_source(source, None).expect("lower parallel read-only");
+        assert!(
+            !adapted.source.contains("worktree: true"),
+            "read-only parallel children should not get worktree isolation:\n{}",
+            adapted.source
+        );
+    }
+
+    #[test]
+    fn sequential_write_children_do_not_default_to_worktree() {
+        let source = r#"
+export default workflow({
+  "goal": "sequential write stays shared by default",
+  "nodes": [
+    {
+      "sequence": {
+        "id": "implement",
+        "children": [
+          {
+            "agent": {
+              "id": "writer",
+              "prompt": "Patch sequentially",
+              "agent_type": "implementer",
+              "mode": "read_write",
+              "file_scope": ["src/main.rs"]
+            }
+          }
+        ]
+      }
+    }
+  ]
+});
+"#;
+        let adapted = adapt_workflow_source(source, None).expect("lower sequential write");
+        assert!(
+            !adapted.source.contains("worktree: true"),
+            "sequential writes should not default to worktree:\n{}",
+            adapted.source
+        );
+    }
+
+    #[test]
     fn inline_script_and_source_path_are_mutually_exclusive() {
         let ctx = ToolContext::new(".");
         let err = workflow_source(
@@ -2218,7 +2884,168 @@ mod tests {
             &ctx,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("either script or source_path"));
+        assert!(
+            err.to_string()
+                .contains("exactly one of script, source_path, or plan"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn structured_plan_lowers_to_parallel_not_promise_all() {
+        // #4124: planner plan → JS with parallel() partial-success semantics.
+        let ctx = ToolContext::new(".");
+        let source = workflow_source(
+            &json!({
+                "plan": {
+                    "goal": "audit two independent scopes",
+                    "risk": "read_only",
+                    "max_children": 8,
+                    "token_budget": 120000,
+                    "phases": [{
+                        "id": "scout",
+                        "title": "Scout",
+                        "children": [
+                            {
+                                "id": "left",
+                                "label": "left-lane",
+                                "prompt": "Inspect crates/left",
+                                "type": "explore"
+                            },
+                            {
+                                "id": "right",
+                                "prompt": "Inspect crates/right",
+                                "type": "explore"
+                            }
+                        ]
+                    }]
+                }
+            }),
+            &ctx,
+        )
+        .expect("structured plan should lower");
+
+        assert!(
+            source.source.contains("await parallel(["),
+            "lowered JS must use parallel():\n{}",
+            source.source
+        );
+        assert!(
+            !source.source.contains("Promise.all"),
+            "lowered JS must not use raw Promise.all:\n{}",
+            source.source
+        );
+        assert!(
+            source.source.contains("() => task("),
+            "parallel slots should be thunks:\n{}",
+            source.source
+        );
+        let spec = source.spec.expect("plan should produce WorkflowSpec");
+        assert_eq!(spec.goal, "audit two independent scopes");
+        assert_eq!(spec.budget.max_tokens, Some(120000));
+        assert_eq!(spec.nodes.len(), 1);
+        let WorkflowNode::BranchSet(branch) = &spec.nodes[0] else {
+            panic!("expected parallel branch for multi-child phase");
+        };
+        assert!(branch.parallel);
+        assert_eq!(branch.children.len(), 2);
+    }
+
+    #[test]
+    fn structured_plan_validation_errors_are_typed() {
+        let ctx = ToolContext::new(".");
+        let missing_goal = workflow_source(
+            &json!({
+                "plan": {
+                    "goal": "   ",
+                    "children": [{ "prompt": "do work" }]
+                }
+            }),
+            &ctx,
+        )
+        .unwrap_err();
+        assert!(missing_goal.to_string().contains("goal"), "{missing_goal}");
+
+        let over_limit = workflow_source(
+            &json!({
+                "plan": {
+                    "goal": "too many children",
+                    "max_children": 1,
+                    "children": [
+                        { "id": "a", "prompt": "one" },
+                        { "id": "b", "prompt": "two" }
+                    ]
+                }
+            }),
+            &ctx,
+        )
+        .unwrap_err();
+        assert!(
+            over_limit.to_string().contains("max_children"),
+            "{over_limit}"
+        );
+
+        let bad_type = workflow_source(
+            &json!({
+                "plan": {
+                    "goal": "bad type",
+                    "children": [{ "prompt": "x", "type": "wizard" }]
+                }
+            }),
+            &ctx,
+        )
+        .unwrap_err();
+        assert!(
+            bad_type.to_string().contains("Invalid plan child type"),
+            "{bad_type}"
+        );
+
+        let exclusive = workflow_source(
+            &json!({
+                "script": "return 1;",
+                "plan": { "goal": "x", "children": [{ "prompt": "y" }] }
+            }),
+            &ctx,
+        )
+        .unwrap_err();
+        assert!(
+            exclusive
+                .to_string()
+                .contains("exactly one of script, source_path, or plan"),
+            "{exclusive}"
+        );
+    }
+
+    #[test]
+    fn declarative_parallel_branch_uses_parallel_helper() {
+        let source = r#"
+export default workflow({
+  "goal": "partial success fan-out",
+  "nodes": [
+    {
+      "branch": {
+        "id": "fan",
+        "parallel": true,
+        "children": [
+          { "agent": { "id": "a", "prompt": "A", "agent_type": "explore", "mode": "read_only" } },
+          { "agent": { "id": "b", "prompt": "B", "agent_type": "explore", "mode": "read_only" } }
+        ]
+      }
+    }
+  ]
+});
+"#;
+        let adapted = adapt_workflow_source(source, None).expect("lower declarative");
+        assert!(
+            adapted.source.contains("await parallel(["),
+            "declarative parallel must lower via parallel():\n{}",
+            adapted.source
+        );
+        assert!(
+            !adapted.source.contains("Promise.all"),
+            "must not emit raw Promise.all:\n{}",
+            adapted.source
+        );
     }
 
     #[test]
@@ -2345,6 +3172,14 @@ mod tests {
         assert_eq!(task_started["worktree"], false);
         assert!(task_started["parent_task_id"].is_null());
         assert_eq!(task_started["depth"], 1);
+        // #4119: workflow identity on spawn / task_started metadata.
+        assert_eq!(
+            task_started["workflow_run_id"].as_str(),
+            payload["run_id"].as_str()
+        );
+        assert_eq!(task_started["workflow_phase_id"], "dispatch");
+        assert_eq!(task_started["workflow_task_label"], "inspect-child");
+        assert_eq!(task_started["workflow_child_index"], 0);
         assert!(
             events.iter().any(|event| event["type"] == "task_completed"
                 && event["task_id"] == child_id
@@ -2362,12 +3197,73 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn declarative_parallel_spawn_failure_fails_before_reduce() {
+    async fn workflow_spawn_records_carry_child_index_and_phase_metadata() {
+        // #4119: sequential children get monotonic workflow_child_index and
+        // inherit the active phase when task options omit `phase`.
+        let _retry_guard = workflow_test_retry_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 4);
+        let (client, calls) = fake_chat_client("ok").await;
+        let runtime = SubAgentRuntime::new(
+            client,
+            "deepseek-v4-flash".to_string(),
+            ctx.clone(),
+            true,
+            None,
+            manager.clone(),
+        );
+        let tool = WorkflowTool::new(manager.clone(), runtime);
+
+        let result = tool
+            .execute(
+                json!({
+                    "action": "run",
+                    "script": "phase('alpha'); await task({ description: 'first', type: 'explore', allowedTools: [], label: 'one' }); phase('beta'); await task({ description: 'second', type: 'explore', allowedTools: [], label: 'two', phase: 'beta-explicit' }); return { ok: true };"
+                }),
+                &ctx,
+            )
+            .await
+            .expect("workflow run should complete");
+        let payload: Value = serde_json::from_str(&result.content).expect("json result");
+        assert_eq!(payload["status"], "completed", "{payload}");
+        assert_eq!(payload["child_ids"].as_array().unwrap().len(), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let mut started: Vec<&Value> = payload["events"]
+            .as_array()
+            .expect("events")
+            .iter()
+            .filter(|event| event["type"] == "task_started")
+            .collect();
+        started.sort_by_key(|event| event["workflow_child_index"].as_u64().unwrap_or(u64::MAX));
+        assert_eq!(started.len(), 2, "{started:#?}");
+
+        assert_eq!(started[0]["workflow_run_id"], payload["run_id"]);
+        assert_eq!(started[0]["workflow_phase_id"], "alpha");
+        assert_eq!(started[0]["workflow_task_label"], "one");
+        assert_eq!(started[0]["workflow_child_index"], 0);
+        assert_eq!(started[0]["label"], "one");
+
+        assert_eq!(started[1]["workflow_run_id"], payload["run_id"]);
+        // Explicit task phase wins over the driver's current phase.
+        assert_eq!(started[1]["workflow_phase_id"], "beta-explicit");
+        assert_eq!(started[1]["workflow_task_label"], "two");
+        assert_eq!(started[1]["workflow_child_index"], 1);
+        assert_eq!(started[1]["label"], "two");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn declarative_parallel_spawn_failure_nulls_slot_and_continues() {
+        // #4124: parallel() is all-settled — a rejected spawn becomes a null slot
+        // (with a breadcrumb) instead of aborting the rest of the script the way
+        // raw Promise.all would. Downstream reduce still runs on partial results.
         let _retry_guard = workflow_test_retry_guard();
         let tmp = tempfile::tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path().to_path_buf());
         let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
-        let (client, calls) = fake_chat_client("should not be called").await;
+        let (client, calls) = fake_chat_client("reduce-with-partial").await;
         let runtime = SubAgentRuntime::new(
             client,
             "deepseek-v4-flash".to_string(),
@@ -2383,7 +3279,7 @@ mod tests {
                 json!({
                     "action": "run",
                     "script": r#"export default workflow({
-                        "goal": "fail fast",
+                        "goal": "partial success fan-out",
                         "nodes": [
                             {
                                 "branch": {
@@ -2404,7 +3300,7 @@ mod tests {
                                 "reduce": {
                                     "id": "summary",
                                     "inputs": ["bad-profile"],
-                                    "prompt": "This reduce must not run."
+                                    "prompt": "Summarize whatever survived the parallel fan-out."
                                 }
                             }
                         ]
@@ -2413,21 +3309,32 @@ mod tests {
                 &ctx,
             )
             .await
-            .expect("failed workflow still returns run record");
+            .expect("partial-success workflow still returns run record");
         let payload: Value = serde_json::from_str(&result.content).expect("json result");
 
-        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["status"], "completed");
+        assert!(payload["error"].is_null());
         assert!(
-            payload["error"]
-                .as_str()
-                .unwrap()
-                .contains("Unknown profile 'missing-profile'"),
-            "{}",
-            payload["error"]
+            payload["result"]["bad-profile"].is_null(),
+            "failed parallel slot should be null: {}",
+            payload["result"]
         );
-        assert!(payload["result"].is_null());
-        assert_eq!(payload["execution"]["status"], "failed");
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(payload["result"]["summary"], "reduce-with-partial");
+        let progress = payload["progress"]
+            .as_array()
+            .expect("progress array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            progress.contains("missing-profile") && progress.contains("dropped a failed slot"),
+            "breadcrumb should surface the spawn rejection:\n{progress}"
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) >= 1,
+            "reduce should still run after a null parallel slot"
+        );
     }
 
     #[tokio::test]

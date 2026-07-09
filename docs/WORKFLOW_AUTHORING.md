@@ -1,9 +1,22 @@
 # Workflow Authoring
 
+> **Ordinary multi-agent work does not require this file.** Prefer natural
+> language + soft-auto launch: CodeWhale decides, indicates the plan, and may
+> ask setup questions via the TUI modal. See
+> [Automatic Workflows](AUTOMATIC_WORKFLOWS.md).
+
 Workflow has one runtime boundary: authored source lowers to typed
 Rust `WorkflowSpec`, Rust validates the IR, and the scheduler/headless worker
 runtime executes leaves. Authoring languages do not get hidden authority to own
 files, shell, network, providers, cancellation, or TUI state.
+
+Compatibility launch paths on the `workflow` tool:
+
+| Input | When to use |
+|-------|-------------|
+| `plan` | Structured goal / phases / children (preferred agent path) |
+| `script` | Short inline JS the model owns |
+| `source_path` | Checked-in `.workflow.js` / `.workflow.ts` in the workspace |
 
 For a guided walkthrough from Fleet task specs to Workflow authoring and
 monitoring, see [Fleet + Workflow Tutorial](FLEET_WORKFLOW_TUTORIAL.md).

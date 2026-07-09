@@ -185,6 +185,16 @@ pub enum Event {
         message: crate::tools::subagent::MailboxMessage,
     },
 
+    /// Live workflow UI event (#4122). Mirrors a typed `WorkflowUiEvent` JSON
+    /// object so the TUI can advance the WorkflowPanel and the compact history
+    /// card while a run is still in flight (not only on tool complete).
+    WorkflowUi {
+        run_id: String,
+        /// Flattened event JSON: `{"type":"task_started", "at_ms":…, …}`.
+        /// Callers inject `run_id` on the object when available.
+        event: Value,
+    },
+
     // === System Events ===
     /// An error occurred
     Error {

@@ -685,6 +685,66 @@ fn verifier_config_parses_hunt_policy_and_merges_overrides() {
 }
 
 #[test]
+fn workflow_config_defaults_when_omitted_and_overrides_round_trip() {
+    // #4128: omitted `[workflow]` resolves through the accessor to product
+    // defaults; explicit overrides load and survive serialize → parse.
+    let omitted: Config = toml::from_str("").expect("empty config");
+    assert!(omitted.workflow.is_none());
+    assert_eq!(
+        omitted.workflow_config(),
+        codewhale_config::WorkflowConfigToml::default()
+    );
+
+    let config: Config = toml::from_str(
+        r#"
+        [workflow]
+        automatic = false
+        auto_start_read_only = false
+        require_approval_for_writes = true
+        auto_start_child_limit = 4
+        max_children = 32
+        max_depth = 1
+        default_token_budget = 90000
+        max_parallel_writes_without_worktree = 1
+        persist_completed_activity = false
+        persist_completed_across_restarts = false
+        "#,
+    )
+    .expect("parse workflow config");
+
+    let workflow = config.workflow.clone().expect("workflow table");
+    assert!(!workflow.automatic);
+    assert!(!workflow.auto_start_read_only);
+    assert!(workflow.require_approval_for_writes);
+    assert_eq!(workflow.auto_start_child_limit, 4);
+    assert_eq!(workflow.max_children, 32);
+    assert_eq!(workflow.max_depth, 1);
+    assert_eq!(workflow.default_token_budget, 90_000);
+    assert_eq!(workflow.max_parallel_writes_without_worktree, 1);
+    assert!(!workflow.persist_completed_activity);
+    assert!(!workflow.persist_completed_across_restarts);
+    assert_eq!(config.workflow_config(), workflow);
+
+    let serialized = toml::to_string_pretty(&workflow).expect("serialize workflow");
+    let round_tripped: codewhale_config::WorkflowConfigToml =
+        toml::from_str(&serialized).expect("round-trip parse");
+    assert_eq!(round_tripped, workflow);
+
+    // Profile/project overlays replace the whole table when present.
+    let merged = merge_config(
+        Config {
+            workflow: Some(codewhale_config::WorkflowConfigToml::default()),
+            ..Config::default()
+        },
+        Config {
+            workflow: Some(workflow.clone()),
+            ..Config::default()
+        },
+    );
+    assert_eq!(merged.workflow_config(), workflow);
+}
+
+#[test]
 fn search_provider_defaults_to_duckduckgo() {
     assert_eq!(SearchProvider::default(), SearchProvider::DuckDuckGo);
 }

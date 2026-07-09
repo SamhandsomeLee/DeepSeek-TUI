@@ -2,8 +2,13 @@
 //!
 //! Issue #4121 (CODEWHALE_0_8_68 §2.4). Progress lives here instead of flooding
 //! the chat transcript: a collapsible header above the composer plus an
-//! expanded phase/row body. Events are applied through [`WorkflowPanelEvent`];
-//! routing from the tool event stream lands in #4122.
+//! expanded phase/row body. Events are applied through [`WorkflowPanelEvent`].
+//!
+//! Issue #4122 routes the same event stream into a compact history card that
+//! reuses this state machine: collapsed summarizes lifecycle/children/phases/
+//! failures/elapsed; expanded adds phase/child summaries, artifact links,
+//! final result, and failure details. Direct sub-agent cards share helpers
+//! from this module where practical.
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,7 +18,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
-use serde_json::Value;
+use serde_json::{Value, json};
 use unicode_width::UnicodeWidthStr;
 
 use crate::palette;
@@ -277,7 +282,9 @@ impl WorkflowPanelEvent {
             }),
             "task_started" => Some(Self::TaskStarted {
                 task_id: opt_str(value, "task_id")?,
-                label: opt_str(value, "label"),
+                // Prefer typed workflow metadata over generic label so rows
+                // never fall back to prompt parsing (#4119).
+                label: opt_str(value, "workflow_task_label").or_else(|| opt_str(value, "label")),
                 profile: opt_str(value, "profile"),
                 model: opt_str(value, "model").or_else(|| opt_str(value, "resolved_model")),
                 strength: opt_str(value, "strength"),
@@ -338,9 +345,25 @@ pub struct WorkflowPanel {
     pub completed_at_ms: Option<u64>,
     pub error: Option<String>,
     pub cancel_requested: bool,
+    /// Optional final result / verification summary for the history card.
+    pub result_summary: Option<String>,
+    /// Source script path or other durable artifact pointer.
+    pub source_path: Option<PathBuf>,
+    /// Spillover / full-output path when the tool result was large.
+    pub spillover_path: Option<PathBuf>,
     /// Set when the operator requested cancel from the panel (mouse/key).
     /// Consumed by the host to drive `/workflow cancel`.
     cancel_emit: Option<String>,
+}
+
+/// Extra fields the history card can show that are not part of the live panel
+/// progress surface (artifact links, final result text).
+#[derive(Debug, Clone, Default)]
+pub struct WorkflowHistoryExtras {
+    pub result_summary: Option<String>,
+    pub source_path: Option<PathBuf>,
+    pub spillover_path: Option<PathBuf>,
+    pub verification_summary: Option<String>,
 }
 
 impl WorkflowPanel {
@@ -361,8 +384,525 @@ impl WorkflowPanel {
             completed_at_ms: None,
             error: None,
             cancel_requested: false,
+            result_summary: None,
+            source_path: None,
+            spillover_path: None,
             cancel_emit: None,
         }
+    }
+
+    /// Hydrate panel state from a workflow tool JSON payload (run record or a
+    /// snapshot produced by [`Self::to_run_json`]). Prefers the typed `events`
+    /// array when present; falls back to summary + phase fields.
+    #[must_use]
+    pub fn from_run_json(value: &Value) -> Option<Self> {
+        if value.get("action").and_then(Value::as_str) == Some("status") {
+            return None;
+        }
+        let run_id = value
+            .get("run_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())?
+            .to_string();
+        let label = value
+            .get("workflow_goal")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("workflow_id").and_then(Value::as_str))
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(&run_id)
+            .to_string();
+        let at_ms = value
+            .get("started_at_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let mut panel = Self::new(run_id.clone(), label.clone(), at_ms);
+
+        if let Some(events) = value.get("events").and_then(Value::as_array) {
+            for event in events {
+                let mut event = event.clone();
+                if let Some(obj) = event.as_object_mut() {
+                    obj.entry("run_id".to_string())
+                        .or_insert_with(|| Value::String(run_id.clone()));
+                }
+                panel.apply_json_event(&event);
+            }
+        } else if let Some(phases) = value.get("phases").and_then(Value::as_array) {
+            for phase_val in phases {
+                let title = phase_val
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Work");
+                panel.phases.push(WorkflowPanelPhase::new(title));
+                let phase_idx = panel.phases.len() - 1;
+                if let Some(rows) = phase_val.get("rows").and_then(Value::as_array) {
+                    for row in rows {
+                        let task_id = row
+                            .get("task_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("task")
+                            .to_string();
+                        let status = row
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .map(WorkflowRowStatus::from_ir_status)
+                            .unwrap_or(WorkflowRowStatus::Pending);
+                        panel.phases[phase_idx].rows.push(WorkflowPanelRow {
+                            task_id: task_id.clone(),
+                            label: row
+                                .get("label")
+                                .and_then(Value::as_str)
+                                .unwrap_or(&task_id)
+                                .to_string(),
+                            profile: opt_str(row, "profile"),
+                            model: opt_str(row, "model"),
+                            strength: opt_str(row, "strength"),
+                            worktree: row
+                                .get("worktree")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                            workspace: opt_str(row, "workspace").map(PathBuf::from),
+                            status,
+                            started_at_ms: row
+                                .get("started_at_ms")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(at_ms),
+                            completed_at_ms: row.get("completed_at_ms").and_then(Value::as_u64),
+                            error: opt_str(row, "error"),
+                            schema_error: opt_str(row, "schema_error"),
+                        });
+                    }
+                }
+            }
+            if !panel.phases.is_empty() {
+                panel.selected_phase = panel.phases.len() - 1;
+            }
+        } else if let Some(child_count) =
+            value
+                .get("child_count")
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    value
+                        .get("child_ids")
+                        .and_then(Value::as_array)
+                        .map(|a| a.len() as u64)
+                })
+        {
+            // Bare summary without events: synthesize a Work phase so child
+            // count still surfaces on the history card.
+            if child_count > 0 {
+                let mut phase = WorkflowPanelPhase::new("Work");
+                for i in 0..child_count {
+                    let id = value
+                        .get("child_ids")
+                        .and_then(Value::as_array)
+                        .and_then(|ids| ids.get(i as usize))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("child-{i}"));
+                    phase.rows.push(WorkflowPanelRow {
+                        task_id: id.clone(),
+                        label: id,
+                        profile: None,
+                        model: None,
+                        strength: None,
+                        worktree: false,
+                        workspace: None,
+                        status: WorkflowRowStatus::Succeeded,
+                        started_at_ms: at_ms,
+                        completed_at_ms: value.get("completed_at_ms").and_then(Value::as_u64),
+                        error: None,
+                        schema_error: None,
+                    });
+                }
+                panel.phases.push(phase);
+            }
+        }
+
+        if let Some(status) = value.get("status").and_then(Value::as_str) {
+            let life = lifecycle_from_status(status);
+            if life.is_terminal() {
+                panel.lifecycle = life;
+                panel.completed_at_ms = value
+                    .get("completed_at_ms")
+                    .and_then(Value::as_u64)
+                    .or(panel.completed_at_ms);
+            } else if panel.lifecycle.is_running() {
+                panel.lifecycle = life;
+            }
+        }
+        if let Some(error) = opt_str(value, "error") {
+            panel.error = Some(error);
+        }
+        if let Some(spent) = value.get("budget_spent").and_then(Value::as_u64) {
+            panel.budget_spent = spent;
+        }
+        if let Some(total) = value
+            .get("token_budget")
+            .or_else(|| value.get("budget_total"))
+            .and_then(Value::as_u64)
+        {
+            panel.budget_total = Some(total);
+        }
+        if let Some(remaining) = value.get("budget_remaining").and_then(Value::as_u64) {
+            panel.budget_remaining = Some(remaining);
+        }
+        // Apply extras after events so RunStarted reset does not wipe them.
+        if panel.source_path.is_none() {
+            panel.source_path = opt_str(value, "source_path").map(PathBuf::from);
+        }
+        if panel.result_summary.is_none() {
+            panel.result_summary = value
+                .get("result")
+                .and_then(summarize_result_value)
+                .or_else(|| opt_str(value, "result_summary"));
+        }
+        if let Some(verification) = value.get("verification")
+            && let Some(summary) = verification.get("summary").and_then(Value::as_str)
+        {
+            let trimmed = summary.trim();
+            if !trimmed.is_empty() {
+                panel.result_summary = Some(match panel.result_summary.take() {
+                    Some(existing) => format!("{existing} · verify: {trimmed}"),
+                    None => format!("verify: {trimmed}"),
+                });
+            }
+        }
+        // Prefer the goal label from the payload when events used a fallback.
+        if !label.is_empty() && panel.label == run_id {
+            panel.label = label;
+        }
+        Some(panel)
+    }
+
+    /// Snapshot panel state into a JSON blob suitable for the history cell
+    /// (and re-hydration via [`Self::from_run_json`]).
+    #[must_use]
+    pub fn to_run_json(&self) -> Value {
+        let status = match self.lifecycle {
+            WorkflowPanelLifecycle::Pending => "pending",
+            WorkflowPanelLifecycle::Running => "running",
+            WorkflowPanelLifecycle::Succeeded => "completed",
+            WorkflowPanelLifecycle::Failed => "failed",
+            WorkflowPanelLifecycle::Cancelled => "cancelled",
+        };
+        let (done, total) = self.done_total();
+        let (failed, cancelled) = self.failure_cancel_counts();
+        json!({
+            "run_id": self.run_id,
+            "status": status,
+            "workflow_goal": self.label,
+            "started_at_ms": self.started_at_ms,
+            "completed_at_ms": self.completed_at_ms,
+            "child_count": total,
+            "done_count": done,
+            "phase_count": self.phase_count(),
+            "failure_count": failed,
+            "cancel_count": cancelled,
+            "error": self.error,
+            "result_summary": self.result_summary,
+            "source_path": self.source_path.as_ref().map(|p| p.display().to_string()),
+            "spillover_path": self.spillover_path.as_ref().map(|p| p.display().to_string()),
+            "token_budget": self.budget_total,
+            "budget_spent": self.budget_spent,
+            "budget_remaining": self.budget_remaining,
+            "phases": self.phases.iter().map(|phase| {
+                json!({
+                    "title": phase.title,
+                    "rows": phase.rows.iter().map(|row| {
+                        json!({
+                            "task_id": row.task_id,
+                            "label": row.label,
+                            "profile": row.profile,
+                            "model": row.model,
+                            "strength": row.strength,
+                            "worktree": row.worktree,
+                            "workspace": row.workspace.as_ref().map(|p| p.display().to_string()),
+                            "status": row.status.label(),
+                            "started_at_ms": row.started_at_ms,
+                            "completed_at_ms": row.completed_at_ms,
+                            "error": row.error,
+                            "schema_error": row.schema_error,
+                        })
+                    }).collect::<Vec<_>>(),
+                })
+            }).collect::<Vec<_>>(),
+        })
+    }
+
+    /// Compact one-line history-card summary: lifecycle, children, phases,
+    /// failures, elapsed (#4122 AC). The free-text goal lives on the expanded
+    /// body so the fixed header summary budget (≈56 cols) never drops counts.
+    #[must_use]
+    pub fn compact_summary_text(&self, width: usize) -> String {
+        let (_done, total) = self.done_total();
+        let (failed, _cancelled) = self.failure_cancel_counts();
+        let phases = self.phase_count();
+        let elapsed = self.elapsed_label();
+        let child_word = if total == 1 { "child" } else { "children" };
+        let phase_word = if phases == 1 { "phase" } else { "phases" };
+        let raw = format!(
+            "workflow {life} · {total} {child_word} · {phases} {phase_word} · {failed} fail · {elapsed}",
+            life = self.lifecycle.label(),
+        );
+        truncate_line_to_width(&raw, width.max(1))
+    }
+
+    /// Elapsed label shared with direct sub-agent cards.
+    #[must_use]
+    pub fn elapsed_label(&self) -> String {
+        // Guard against epoch-zero starts (bare status payloads without
+        // timestamps) which would otherwise render multi-year elapsed times.
+        if self.started_at_ms == 0 {
+            if let Some(completed) = self.completed_at_ms {
+                return format_elapsed(completed);
+            }
+            return "0s".to_string();
+        }
+        let end = self.completed_at_ms.unwrap_or_else(now_ms);
+        format_elapsed(end.saturating_sub(self.started_at_ms))
+    }
+
+    /// Compact summary line content (without card chrome). Callers in
+    /// `history.rs` wrap this with the shared tool-header + rail.
+    #[must_use]
+    pub fn history_header_summary(&self, width: usize) -> String {
+        self.compact_summary_text(width)
+    }
+
+    /// Expanded history-card body lines (phase/child summaries, links,
+    /// result, failures). Empty when the card should stay compact.
+    #[must_use]
+    pub fn history_expanded_lines(
+        &self,
+        width: u16,
+        extras: &WorkflowHistoryExtras,
+    ) -> Vec<Line<'static>> {
+        let content_width = usize::from(width).max(1);
+        let mut lines = Vec::new();
+
+        if !self.label.trim().is_empty() {
+            lines.push(Line::from(Span::styled(
+                truncate_line_to_width(
+                    &format!("goal: {}", short_label(self.label.trim(), 160)),
+                    content_width,
+                ),
+                Style::default().fg(palette::TEXT_TOOL_OUTPUT),
+            )));
+        }
+
+        // Phase summary strip (same chips as the panel body).
+        if !self.phases.is_empty() {
+            let mut chips = Vec::new();
+            for (idx, phase) in self.phases.iter().take(MAX_PHASE_SUMMARY).enumerate() {
+                let (done, running, failed, cancelled) = phase.counts();
+                let marker = if idx == self.selected_phase { ">" } else { " " };
+                chips.push(format!(
+                    "{marker}{title}[{done}✓ {running}… {failed}! {cancelled}⊘]",
+                    title = short_label(&phase.title, 14),
+                ));
+            }
+            if self.phases.len() > MAX_PHASE_SUMMARY {
+                chips.push(format!("+{}", self.phases.len() - MAX_PHASE_SUMMARY));
+            }
+            lines.push(Line::from(Span::styled(
+                truncate_line_to_width(&format!("phases: {}", chips.join("  ")), content_width),
+                Style::default().fg(palette::TEXT_MUTED),
+            )));
+        }
+
+        // Child summary across all phases.
+        let children: Vec<String> = self
+            .phases
+            .iter()
+            .flat_map(|p| p.rows.iter())
+            .take(8)
+            .map(|row| {
+                format!(
+                    "{label} ({status})",
+                    label = short_label(&row.label, 16),
+                    status = row.status.label()
+                )
+            })
+            .collect();
+        if !children.is_empty() {
+            let more = self
+                .phases
+                .iter()
+                .map(|p| p.rows.len())
+                .sum::<usize>()
+                .saturating_sub(children.len());
+            let mut body = children.join(" · ");
+            if more > 0 {
+                body = format!("{body} · +{more} more");
+            }
+            lines.push(Line::from(Span::styled(
+                truncate_line_to_width(&format!("children: {body}"), content_width),
+                Style::default().fg(palette::TEXT_TOOL_OUTPUT),
+            )));
+        }
+
+        let result = extras
+            .result_summary
+            .as_deref()
+            .or(self.result_summary.as_deref())
+            .or(extras.verification_summary.as_deref());
+        if let Some(result) = result.filter(|s| !s.trim().is_empty()) {
+            lines.push(Line::from(Span::styled(
+                truncate_line_to_width(
+                    &format!("result: {}", short_label(result.trim(), 160)),
+                    content_width,
+                ),
+                Style::default().fg(palette::TEXT_TOOL_OUTPUT),
+            )));
+        }
+
+        let source = extras
+            .source_path
+            .as_ref()
+            .or(self.source_path.as_ref())
+            .map(|p| p.display().to_string());
+        if let Some(path) = source.filter(|s| !s.is_empty()) {
+            lines.push(Line::from(Span::styled(
+                truncate_line_to_width(&format!("source: {path}"), content_width),
+                Style::default().fg(palette::TEXT_MUTED),
+            )));
+        }
+        let spill = extras
+            .spillover_path
+            .as_ref()
+            .or(self.spillover_path.as_ref())
+            .map(|p| p.display().to_string());
+        if let Some(path) = spill.filter(|s| !s.is_empty()) {
+            lines.push(Line::from(Span::styled(
+                truncate_line_to_width(&format!("artifact: {path}"), content_width),
+                Style::default().fg(palette::TEXT_MUTED),
+            )));
+        } else if self.lifecycle.is_terminal() {
+            lines.push(Line::from(Span::styled(
+                truncate_line_to_width(
+                    "transcript: full run JSON available via tool details (v)",
+                    content_width,
+                ),
+                Style::default().fg(palette::TEXT_MUTED),
+            )));
+        }
+
+        if let Some(error) = self.error.as_deref().filter(|s| !s.trim().is_empty()) {
+            lines.push(Line::from(Span::styled(
+                truncate_line_to_width(
+                    &format!("error: {}", short_label(error, 160)),
+                    content_width,
+                ),
+                Style::default().fg(palette::STATUS_ERROR),
+            )));
+        }
+        for row in self.phases.iter().flat_map(|p| p.rows.iter()) {
+            if let Some(schema) = row.schema_error.as_deref() {
+                lines.push(Line::from(Span::styled(
+                    truncate_line_to_width(
+                        &format!(
+                            "schema {}: {}",
+                            short_label(&row.task_id, 12),
+                            short_label(schema, 120)
+                        ),
+                        content_width,
+                    ),
+                    Style::default().fg(palette::STATUS_ERROR),
+                )));
+            } else if row.status.is_failure()
+                && let Some(err) = row.error.as_deref()
+            {
+                lines.push(Line::from(Span::styled(
+                    truncate_line_to_width(
+                        &format!(
+                            "fail {}: {}",
+                            short_label(&row.label, 14),
+                            short_label(err, 120)
+                        ),
+                        content_width,
+                    ),
+                    Style::default().fg(palette::STATUS_ERROR),
+                )));
+            }
+        }
+
+        lines
+    }
+
+    /// Full history-card lines including a simple self-contained header so
+    /// unit tests (and direct sub-agent cards) can render without history.rs.
+    ///
+    /// Public convergence API for #4122 — also exercised by unit tests and
+    /// `DelegateCard::as_workflow_history_panel`.
+    #[must_use]
+    #[allow(dead_code)] // public API used by direct sub-agent projection + tests
+    pub fn render_history_card(
+        &self,
+        width: u16,
+        expanded: bool,
+        extras: &WorkflowHistoryExtras,
+    ) -> Vec<Line<'static>> {
+        let content_width = usize::from(width).max(1);
+        let mut lines = Vec::new();
+        let glyph = if expanded { '▼' } else { '▶' };
+        let summary = self.compact_summary_text(content_width.saturating_sub(2));
+        lines.push(Line::from(Span::styled(
+            truncate_line_to_width(&format!("{glyph} {summary}"), content_width),
+            Style::default()
+                .fg(self.lifecycle.color())
+                .add_modifier(Modifier::BOLD),
+        )));
+        if expanded {
+            lines.extend(self.history_expanded_lines(width, extras));
+        }
+        lines
+    }
+
+    /// Single-agent "mini workflow" view for direct sub-agent cards so they
+    /// share the same lifecycle/elapsed/result concepts as workflow runs.
+    #[must_use]
+    #[allow(dead_code)] // public API used by DelegateCard + tests
+    pub fn from_direct_subagent(
+        agent_id: impl Into<String>,
+        role: impl Into<String>,
+        lifecycle: WorkflowPanelLifecycle,
+        started_at_ms: u64,
+        completed_at_ms: Option<u64>,
+        summary: Option<String>,
+        error: Option<String>,
+    ) -> Self {
+        let agent_id = agent_id.into();
+        let role = role.into();
+        let mut panel = Self::new(agent_id.clone(), role.clone(), started_at_ms);
+        panel.lifecycle = lifecycle;
+        panel.completed_at_ms = completed_at_ms;
+        panel.expanded = false;
+        panel.result_summary = summary.clone();
+        panel.error = error.clone();
+        let status = match lifecycle {
+            WorkflowPanelLifecycle::Pending => WorkflowRowStatus::Pending,
+            WorkflowPanelLifecycle::Running => WorkflowRowStatus::Running,
+            WorkflowPanelLifecycle::Succeeded => WorkflowRowStatus::Succeeded,
+            WorkflowPanelLifecycle::Failed => WorkflowRowStatus::Failed,
+            WorkflowPanelLifecycle::Cancelled => WorkflowRowStatus::Cancelled,
+        };
+        let mut phase = WorkflowPanelPhase::new("Agent");
+        phase.rows.push(WorkflowPanelRow {
+            task_id: agent_id,
+            label: role,
+            profile: None,
+            model: None,
+            strength: None,
+            worktree: false,
+            workspace: None,
+            status,
+            started_at_ms,
+            completed_at_ms,
+            error,
+            schema_error: None,
+        });
+        panel.phases.push(phase);
+        panel
     }
 
     /// Apply a stream of events. `RunStarted` replaces any prior completed run.
@@ -372,7 +912,7 @@ impl WorkflowPanel {
                 run_id,
                 workflow_id,
                 workflow_goal,
-                source_path: _,
+                source_path,
                 token_budget,
                 at_ms,
             } => {
@@ -386,6 +926,7 @@ impl WorkflowPanel {
                 );
                 self.budget_total = token_budget;
                 self.budget_remaining = token_budget;
+                self.source_path = source_path;
             }
             WorkflowPanelEvent::RunCompleted {
                 status,
@@ -862,7 +1403,10 @@ fn short_label(text: &str, max: usize) -> String {
     truncate_line_to_width(trimmed, max)
 }
 
-fn format_elapsed(ms: u64) -> String {
+/// Format an elapsed duration for panel headers and history cards. Shared with
+/// direct sub-agent cards so both surfaces use the same vocabulary.
+#[must_use]
+pub fn format_elapsed(ms: u64) -> String {
     let secs = ms / 1000;
     if secs < 60 {
         format!("{secs}s")
@@ -878,6 +1422,37 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn summarize_result_value(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(short_label(t, 200))
+            }
+        }
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Array(items) => Some(format!("{} item(s)", items.len())),
+        Value::Object(map) => {
+            if let Some(s) = map
+                .get("summary")
+                .or_else(|| map.get("message"))
+                .or_else(|| map.get("text"))
+                .and_then(Value::as_str)
+            {
+                let t = s.trim();
+                if !t.is_empty() {
+                    return Some(short_label(t, 200));
+                }
+            }
+            Some(format!("{} field(s)", map.len()))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1219,5 +1794,227 @@ mod tests {
         assert!(header.contains("1 fail"), "{header}");
         assert!(header.contains("1 cancel"), "{header}");
         assert!(header.contains("2/2"), "{header}");
+    }
+
+    #[test]
+    fn task_started_json_prefers_workflow_task_label_over_generic_label() {
+        // #4119: panel rows use typed workflow metadata, not prompt text.
+        let event = WorkflowPanelEvent::from_json_value(&json!({
+            "type": "task_started",
+            "task_id": "child-1",
+            "label": "fallback-label",
+            "workflow_task_label": "typed-label",
+            "workflow_run_id": "run-xyz",
+            "workflow_phase_id": "dispatch",
+            "workflow_child_index": 2,
+            "at_ms": 42,
+        }))
+        .expect("task_started parses");
+        match event {
+            WorkflowPanelEvent::TaskStarted { label, .. } => {
+                assert_eq!(label.as_deref(), Some("typed-label"));
+            }
+            other => panic!("expected TaskStarted, got {other:?}"),
+        }
+
+        let mut panel = WorkflowPanel::new("run-xyz", "goal", 1);
+        panel.apply_json_event(&json!({
+            "type": "task_started",
+            "task_id": "child-1",
+            "label": "fallback-label",
+            "workflow_task_label": "typed-label",
+            "at_ms": 42,
+        }));
+        let row = panel
+            .phases
+            .iter()
+            .flat_map(|phase| phase.rows.iter())
+            .find(|row| row.task_id == "child-1")
+            .expect("row recorded");
+        assert_eq!(row.label, "typed-label");
+    }
+
+    #[test]
+    fn compact_history_card_summarizes_lifecycle_children_phases_failures_elapsed() {
+        let mut panel = started_panel();
+        panel.apply_event(WorkflowPanelEvent::TaskCompleted {
+            task_id: "t1".to_string(),
+            status: WorkflowRowStatus::Failed,
+            at_ms: 2_000,
+        });
+        panel.apply_event(WorkflowPanelEvent::RunCompleted {
+            status: WorkflowPanelLifecycle::Failed,
+            error: Some("scout failed".to_string()),
+            at_ms: 2_100,
+        });
+        let lines = panel.render_history_card(120, false, &WorkflowHistoryExtras::default());
+        assert_eq!(lines.len(), 1, "compact is a single summary line");
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(joined.contains('▶'), "collapsed glyph: {joined}");
+        assert!(
+            joined.contains("failed") || joined.contains("fail"),
+            "{joined}"
+        );
+        assert!(joined.contains("1 child"), "{joined}");
+        assert!(joined.contains("1 phase"), "{joined}");
+        assert!(joined.contains("1 fail"), "{joined}");
+        // elapsed is present (0s or more depending on timestamps)
+        assert!(
+            joined.contains('s') || joined.contains('m'),
+            "elapsed time expected: {joined}"
+        );
+        // Goal is reserved for the expanded body so compact stays under the
+        // tool-header summary budget.
+        assert!(
+            !joined.contains("ship v0.8.68"),
+            "compact must not spend budget on free-text goal: {joined}"
+        );
+    }
+
+    #[test]
+    fn expanded_history_card_shows_phase_child_result_links_and_failures() {
+        let mut panel = started_panel();
+        panel.source_path = Some(PathBuf::from("workflows/demo.workflow.js"));
+        panel.apply_event(WorkflowPanelEvent::TaskCompleted {
+            task_id: "t1".to_string(),
+            status: WorkflowRowStatus::Failed,
+            at_ms: 2_000,
+        });
+        if let Some(row) = panel.find_row_mut("t1") {
+            row.error = Some("timeout waiting for model".to_string());
+        }
+        panel.apply_event(WorkflowPanelEvent::RunCompleted {
+            status: WorkflowPanelLifecycle::Failed,
+            error: Some("phase Analyze failed".to_string()),
+            at_ms: 2_100,
+        });
+        let extras = WorkflowHistoryExtras {
+            result_summary: Some("no ship blockers found".to_string()),
+            source_path: None,
+            spillover_path: Some(PathBuf::from("/tmp/workflow-out.json")),
+            verification_summary: None,
+        };
+        let lines = panel.render_history_card(120, true, &extras);
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains('▼'), "expanded glyph: {joined}");
+        assert!(joined.contains("goal:"), "{joined}");
+        assert!(joined.contains("ship v0.8.68"), "{joined}");
+        assert!(joined.contains("phases:"), "{joined}");
+        assert!(joined.contains("Analyze"), "{joined}");
+        assert!(joined.contains("children:"), "{joined}");
+        assert!(joined.contains("scout crates"), "{joined}");
+        assert!(joined.contains("result:"), "{joined}");
+        assert!(joined.contains("no ship blockers"), "{joined}");
+        assert!(
+            joined.contains("source:") || joined.contains("demo.workflow"),
+            "{joined}"
+        );
+        assert!(joined.contains("artifact:"), "{joined}");
+        assert!(joined.contains("error:"), "{joined}");
+        assert!(joined.contains("phase Analyze failed"), "{joined}");
+        assert!(
+            joined.contains("fail") || joined.contains("timeout"),
+            "{joined}"
+        );
+    }
+
+    #[test]
+    fn direct_subagent_card_reuses_history_renderer() {
+        let panel = WorkflowPanel::from_direct_subagent(
+            "agent_abc",
+            "explore",
+            WorkflowPanelLifecycle::Succeeded,
+            1_000,
+            Some(4_500),
+            Some("found 3 call sites".to_string()),
+            None,
+        );
+        let compact = panel.render_history_card(100, false, &WorkflowHistoryExtras::default());
+        let joined: String = compact
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(
+            joined.contains("success") || joined.contains("explore"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("1 child") || joined.contains("1 children"),
+            "{joined}"
+        );
+        assert!(joined.contains("3s") || joined.contains("s"), "{joined}");
+
+        let expanded = panel.render_history_card(
+            100,
+            true,
+            &WorkflowHistoryExtras {
+                result_summary: Some("found 3 call sites".to_string()),
+                ..WorkflowHistoryExtras::default()
+            },
+        );
+        let joined: String = expanded
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("children:"), "{joined}");
+        assert!(joined.contains("result:"), "{joined}");
+        assert!(joined.contains("found 3 call sites"), "{joined}");
+    }
+
+    #[test]
+    fn from_run_json_round_trips_events_into_history_card() {
+        let value = json!({
+            "run_id": "workflow_demo",
+            "status": "completed",
+            "workflow_goal": "ship it",
+            "started_at_ms": 1000,
+            "completed_at_ms": 5000,
+            "events": [
+                {
+                    "type": "run_started",
+                    "at_ms": 1000,
+                    "run_id": "workflow_demo",
+                    "workflow_goal": "ship it"
+                },
+                {"type": "phase_started", "at_ms": 1100, "title": "Build"},
+                {
+                    "type": "task_started",
+                    "at_ms": 1200,
+                    "task_id": "t1",
+                    "label": "compile",
+                    "profile": "implementer"
+                },
+                {
+                    "type": "task_completed",
+                    "at_ms": 4000,
+                    "task_id": "t1",
+                    "status": "succeeded"
+                },
+                {"type": "run_completed", "at_ms": 5000, "status": "completed"}
+            ]
+        });
+        let panel = WorkflowPanel::from_run_json(&value).expect("hydrate");
+        assert_eq!(panel.lifecycle, WorkflowPanelLifecycle::Succeeded);
+        let compact = panel.compact_summary_text(120);
+        assert!(compact.contains("1 child"), "{compact}");
+        assert!(compact.contains("success"), "{compact}");
+        let expanded = panel.history_expanded_lines(120, &WorkflowHistoryExtras::default());
+        let joined: String = expanded
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("goal:"), "{joined}");
+        assert!(joined.contains("ship it"), "{joined}");
+        assert!(joined.contains("Build"), "{joined}");
+        assert!(joined.contains("compile"), "{joined}");
     }
 }

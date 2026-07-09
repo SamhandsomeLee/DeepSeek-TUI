@@ -471,9 +471,57 @@ pub enum TaskMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum IsolationMode {
+    /// Runtime chooses isolation.
+    ///
+    /// Parallel write-capable children resolve to [`IsolationMode::Worktree`]
+    /// so concurrent writers do not collide in the parent checkout. Explicit
+    /// [`IsolationMode::Shared`] is the plan-level same-worktree override.
     #[default]
+    Auto,
+    /// Share the parent checkout (same-worktree).
     Shared,
+    /// Dedicated git worktree / branch.
     Worktree,
+}
+
+impl IsolationMode {
+    /// Resolve [`IsolationMode::Auto`] for a leaf.
+    ///
+    /// When `parallel_write` is true (leaf is write-capable inside a parallel
+    /// branch), Auto becomes Worktree. Otherwise Auto becomes Shared.
+    #[must_use]
+    pub fn resolve(self, parallel_write: bool) -> Self {
+        match self {
+            Self::Auto if parallel_write => Self::Worktree,
+            Self::Auto => Self::Shared,
+            other => other,
+        }
+    }
+
+    /// Whether the resolved mode provisions a dedicated worktree.
+    #[must_use]
+    pub fn wants_worktree(self, parallel_write: bool) -> bool {
+        matches!(self.resolve(parallel_write), Self::Worktree)
+    }
+}
+
+/// A leaf is write-capable when it can mutate the workspace.
+///
+/// Used by workflow lowering to decide the default isolation for parallel
+/// children (#4120).
+#[must_use]
+pub fn leaf_is_write_capable(spec: &LeafSpec) -> bool {
+    spec.mode == TaskMode::ReadWrite
+        || spec.permissions.allow_write
+        || matches!(spec.agent_type, AgentType::Implementer)
+}
+
+/// Effective worktree flag for a leaf given whether it is being lowered inside
+/// a parallel branch.
+#[must_use]
+pub fn leaf_wants_worktree(spec: &LeafSpec, parallel: bool) -> bool {
+    let parallel_write = parallel && leaf_is_write_capable(spec);
+    spec.isolation.wants_worktree(parallel_write)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2357,6 +2405,65 @@ mod tests {
 
         let parsed: WorkflowConfig = serde_json::from_str(&json).expect("parse workflow");
         assert_eq!(parsed, workflow);
+    }
+
+    #[test]
+    fn isolation_auto_defaults_parallel_write_to_worktree() {
+        assert_eq!(IsolationMode::default(), IsolationMode::Auto);
+        assert_eq!(
+            IsolationMode::Auto.resolve(/* parallel_write */ true),
+            IsolationMode::Worktree
+        );
+        assert_eq!(
+            IsolationMode::Auto.resolve(/* parallel_write */ false),
+            IsolationMode::Shared
+        );
+        // Explicit shared is the approved same-worktree override.
+        assert_eq!(
+            IsolationMode::Shared.resolve(/* parallel_write */ true),
+            IsolationMode::Shared
+        );
+        assert!(IsolationMode::Worktree.wants_worktree(false));
+        assert!(!IsolationMode::Shared.wants_worktree(true));
+    }
+
+    #[test]
+    fn leaf_write_capable_and_worktree_defaults() {
+        let read_only = LeafSpec {
+            id: "ro".to_string(),
+            prompt: "inspect".to_string(),
+            agent_type: AgentType::Explore,
+            profile: None,
+            mode: TaskMode::ReadOnly,
+            isolation: IsolationMode::Auto,
+            file_scope: Vec::new(),
+            depends_on_results: Vec::new(),
+            budget: BudgetSpec::default(),
+            permissions: PermissionSpec::default(),
+            model_policy: ModelPolicy::default(),
+        };
+        assert!(!leaf_is_write_capable(&read_only));
+        assert!(!leaf_wants_worktree(&read_only, true));
+
+        let mut write = read_only.clone();
+        write.id = "rw".to_string();
+        write.mode = TaskMode::ReadWrite;
+        write.agent_type = AgentType::Implementer;
+        assert!(leaf_is_write_capable(&write));
+        // Parallel write-capable + Auto → worktree by default.
+        assert!(leaf_wants_worktree(&write, true));
+        // Sequential write-capable stays shared unless isolation is worktree.
+        assert!(!leaf_wants_worktree(&write, false));
+
+        write.isolation = IsolationMode::Shared;
+        assert!(
+            !leaf_wants_worktree(&write, true),
+            "explicit shared is the same-worktree override"
+        );
+
+        write.isolation = IsolationMode::Worktree;
+        assert!(leaf_wants_worktree(&write, true));
+        assert!(leaf_wants_worktree(&write, false));
     }
 
     #[test]

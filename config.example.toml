@@ -1120,6 +1120,36 @@ default_text_model = "deepseek-ai/deepseek-v4-pro"
 # ```
 
 # ─────────────────────────────────────────────────────────────────────────────────
+# Workflow automatic launch, approval, isolation, and activity (#4128)
+# ─────────────────────────────────────────────────────────────────────────────────
+# First-class knobs for automatic Workflow orchestration. When the table is
+# omitted entirely, the runtime uses these product defaults. Later launch,
+# approval, and activity-persistence paths all read through this one model.
+# [workflow]
+# # Allow the parent agent to auto-launch Workflow for multi-agent work.
+# # Set false to require an explicit `/workflow` opt-in.
+# automatic = true
+# # Auto-start read-only plans without an approval card when automatic is on.
+# auto_start_read_only = true
+# # Require an approval card before write/shell/network/high-budget launches.
+# require_approval_for_writes = true
+# # Soft cap on children admitted by automatic launch (larger plans ask first).
+# auto_start_child_limit = 8
+# # Hard ceiling on children in one Workflow run.
+# max_children = 64
+# # Maximum nested Workflow / child-orchestration depth.
+# max_depth = 2
+# # Default shared token budget for a Workflow run and its children.
+# default_token_budget = 120000
+# # Parallel write children that may share the parent worktree without
+# # isolation. 0 forces worktree isolation for parallel writes.
+# max_parallel_writes_without_worktree = 0
+# # Keep completed Workflow activity visible until the next run / clear.
+# persist_completed_activity = true
+# # Persist completed activity across process restarts via the run journal.
+# persist_completed_across_restarts = true
+
+# ─────────────────────────────────────────────────────────────────────────────────
 # Agent Fleet trust, security, and role registry (#3165, #3167)
 # ─────────────────────────────────────────────────────────────────────────────────
 # [fleet]

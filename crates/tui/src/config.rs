@@ -2055,6 +2055,12 @@ pub struct Config {
     /// Provider/model harness posture profiles (preview schema; read-only display).
     #[serde(default)]
     pub harness_profiles: Vec<codewhale_config::HarnessProfile>,
+    /// Workflow automatic-launch, approval, isolation, and activity
+    /// persistence knobs (#4128). When absent, consumers use
+    /// [`codewhale_config::WorkflowConfigToml::default`] via
+    /// [`Self::workflow_config`].
+    #[serde(default)]
+    pub workflow: Option<codewhale_config::WorkflowConfigToml>,
 
     /// Sub-agent model overrides.
     #[serde(default)]
@@ -4038,6 +4044,15 @@ impl Config {
         self.fleet.clone().unwrap_or_default()
     }
 
+    /// Parsed `[workflow]` table, or product defaults when the table is absent
+    /// (#4128 / Section 2.11). Automatic launch, approval, isolation, and
+    /// activity-persistence consumers should read through this accessor so
+    /// omitted keys share one model.
+    #[must_use]
+    pub fn workflow_config(&self) -> codewhale_config::WorkflowConfigToml {
+        self.workflow.clone().unwrap_or_default()
+    }
+
     /// Return the configured DeepSeek reasoning-effort tier, if any.
     #[must_use]
     pub fn reasoning_effort(&self) -> Option<&str> {
@@ -5656,6 +5671,7 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
         } else {
             override_cfg.harness_profiles
         },
+        workflow: override_cfg.workflow.or(base.workflow),
         subagents: override_cfg.subagents.or(base.subagents),
         strict_tool_mode: override_cfg.strict_tool_mode.or(base.strict_tool_mode),
         runtime_api: override_cfg.runtime_api.or(base.runtime_api),
@@ -6421,6 +6437,37 @@ pub fn save_api_key_for(provider: ApiProvider, api_key: &str) -> Result<PathBuf>
         }),
     );
 
+    Ok(config_path)
+}
+
+/// Persist a default model for `provider` via the comment-preserving config
+/// path used by guided provider setup (#3875). DeepSeek writes root
+/// `default_text_model`; other hosted providers write `[providers.<name>] model`.
+pub fn save_provider_model_for(provider: ApiProvider, model: &str) -> Result<PathBuf> {
+    let model = model.trim();
+    anyhow::ensure!(!model.is_empty(), "model cannot be empty");
+
+    let config_path = default_config_path()
+        .context("Failed to resolve config path: home directory not found.")?;
+    ensure_parent_dir(&config_path)?;
+
+    if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
+        crate::config_persistence::mutate_config_document(&config_path, |doc| {
+            crate::config_persistence::set_document_value(doc, &["default_text_model"], model)
+        })
+        .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
+        return Ok(config_path);
+    }
+
+    let key_inside = provider_config_key(provider).context("provider model table")?;
+    crate::config_persistence::mutate_config_document(&config_path, |doc| {
+        crate::config_persistence::set_document_value(
+            doc,
+            &["providers", key_inside, "model"],
+            model,
+        )
+    })
+    .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
     Ok(config_path)
 }
 

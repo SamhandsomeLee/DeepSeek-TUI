@@ -5446,6 +5446,71 @@ fn empty_fallback_providers_do_not_serialize() {
 }
 
 #[test]
+fn workflow_config_defaults_match_product_surface() {
+    // #4128 / Section 2.11: omitted `[workflow]` keys resolve to the
+    // documented product defaults so launch/approval/persist share one model.
+    let defaults = WorkflowConfigToml::default();
+    assert!(defaults.automatic);
+    assert!(defaults.auto_start_read_only);
+    assert!(defaults.require_approval_for_writes);
+    assert_eq!(defaults.auto_start_child_limit, 8);
+    assert_eq!(defaults.max_children, 64);
+    assert_eq!(defaults.max_depth, 2);
+    assert_eq!(defaults.default_token_budget, 120_000);
+    assert_eq!(defaults.max_parallel_writes_without_worktree, 0);
+    assert!(defaults.persist_completed_activity);
+    assert!(defaults.persist_completed_across_restarts);
+}
+
+#[test]
+fn workflow_config_absent_table_stays_none_empty_table_fills_defaults() {
+    let absent: ConfigToml = toml::from_str("").expect("empty config parses");
+    assert!(absent.workflow.is_none());
+
+    let empty_table: ConfigToml = toml::from_str(
+        r#"
+[workflow]
+"#,
+    )
+    .expect("empty workflow table should parse");
+    assert_eq!(
+        empty_table.workflow.expect("workflow table present"),
+        WorkflowConfigToml::default()
+    );
+}
+
+#[test]
+fn workflow_config_partial_override_and_round_trip() {
+    let config: ConfigToml = toml::from_str(
+        r#"
+[workflow]
+automatic = false
+max_children = 16
+default_token_budget = 50000
+"#,
+    )
+    .expect("workflow overrides should parse");
+
+    let workflow = config.workflow.expect("workflow table");
+    assert!(!workflow.automatic);
+    assert_eq!(workflow.max_children, 16);
+    assert_eq!(workflow.default_token_budget, 50_000);
+    // Unset keys keep product defaults.
+    assert!(workflow.auto_start_read_only);
+    assert!(workflow.require_approval_for_writes);
+    assert_eq!(workflow.auto_start_child_limit, 8);
+    assert_eq!(workflow.max_depth, 2);
+    assert_eq!(workflow.max_parallel_writes_without_worktree, 0);
+    assert!(workflow.persist_completed_activity);
+    assert!(workflow.persist_completed_across_restarts);
+
+    let serialized = toml::to_string_pretty(&workflow).expect("workflow serializes");
+    let round_tripped: WorkflowConfigToml =
+        toml::from_str(&serialized).expect("serialized workflow parses");
+    assert_eq!(round_tripped, workflow);
+}
+
+#[test]
 fn fleet_exec_config_default_matches_subagent_depth() {
     // Fleet workers and standalone sub-agents share one recursion axis:
     // the fleet default equals DEFAULT_SPAWN_DEPTH (3) and affords >=3

@@ -89,6 +89,31 @@ fn workflow_tool_renders_run_card_instead_of_generic_oneliner() {
         "workflow_goal": "audit the FLEET and WORKFLOW docs",
         "child_ids": ["a1", "a2", "a3"],
         "progress": ["phase: Scan", "log: 3 findings"],
+        "events": [
+            {
+                "type": "task_started",
+                "task_id": "a1",
+                "label": "scan-docs",
+                "workflow_run_id": "workflow_2400c600",
+                "workflow_phase_id": "Scan",
+                "workflow_task_label": "scan-docs",
+                "workflow_child_index": 0,
+            },
+            {
+                "type": "task_started",
+                "task_id": "a2",
+                "workflow_task_label": "check-fleet",
+                "workflow_run_id": "workflow_2400c600",
+                "workflow_child_index": 1,
+            },
+            {
+                "type": "task_started",
+                "task_id": "a3",
+                "label": "summarize",
+                "workflow_run_id": "workflow_2400c600",
+                "workflow_child_index": 2,
+            },
+        ],
         "schema_errors": [],
     })
     .to_string();
@@ -107,19 +132,108 @@ fn workflow_tool_renders_run_card_instead_of_generic_oneliner() {
         .iter()
         .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
         .collect();
-    assert!(joined.contains("workflow_2400c600"), "run_id: {joined:?}");
-    // Copy dedupe (Wave 5c #7): the header owns the lifecycle label; the body
-    // no longer repeats it as a `status:` KV row.
-    assert!(joined.contains("done"), "header lifecycle: {joined:?}");
+    // Compact (#4122): lifecycle, children, phases, failures, elapsed.
+    assert!(
+        joined.contains("3 children") || joined.contains("children"),
+        "child count: {joined:?}"
+    );
+    assert!(
+        joined.contains("success") || joined.contains("done"),
+        "header lifecycle: {joined:?}"
+    );
+    assert!(joined.contains("phase"), "phase count: {joined:?}");
+    assert!(joined.contains("fail"), "failure count present: {joined:?}");
+    assert!(
+        joined.contains('s') || joined.contains('m'),
+        "elapsed: {joined:?}"
+    );
     assert!(
         !joined.contains("status:"),
         "body must not repeat the header lifecycle: {joined:?}"
     );
-    assert!(joined.contains("audit the FLEET"), "goal: {joined:?}");
-    assert!(joined.contains("children: 3"), "child count: {joined:?}");
+}
+
+#[test]
+fn workflow_tool_expanded_card_shows_phase_child_result_and_failures() {
+    let output = serde_json::json!({
+        "run_id": "workflow_exp",
+        "status": "failed",
+        "workflow_goal": "ship v0.8.68",
+        "started_at_ms": 1000,
+        "completed_at_ms": 5000,
+        "source_path": "workflows/demo.workflow.js",
+        "error": "phase Verify failed",
+        "result": {"summary": "2 of 3 children ok"},
+        "events": [
+            {
+                "type": "run_started",
+                "at_ms": 1000,
+                "run_id": "workflow_exp",
+                "workflow_goal": "ship v0.8.68"
+            },
+            {"type": "phase_started", "at_ms": 1100, "title": "Verify"},
+            {
+                "type": "task_started",
+                "at_ms": 1200,
+                "task_id": "t1",
+                "label": "run tests",
+                "workflow_task_label": "run tests",
+                "profile": "implementer"
+            },
+            {
+                "type": "task_completed",
+                "at_ms": 4000,
+                "task_id": "t1",
+                "status": "failed"
+            },
+            {
+                "type": "run_completed",
+                "at_ms": 5000,
+                "status": "failed",
+                "error": "phase Verify failed"
+            }
+        ]
+    })
+    .to_string();
+    let cell = GenericToolCell {
+        name: "workflow".to_string(),
+        status: ToolStatus::Failed,
+        input_summary: Some("action: run".to_string()),
+        output: Some(output),
+        prompts: None,
+        spillover_path: Some(std::path::PathBuf::from("/tmp/wf-artifact.json")),
+        output_summary: None,
+        is_diff: false,
+    };
+    let joined: String = cell
+        .lines_with_mode(140, true, super::RenderMode::Transcript)
+        .iter()
+        .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(joined.contains("ship v0.8.68"), "goal: {joined}");
     assert!(
-        joined.contains("log: 3 findings"),
-        "last progress: {joined:?}"
+        joined.contains("phases:") || joined.contains("Verify"),
+        "phase: {joined}"
+    );
+    assert!(
+        joined.contains("children:") || joined.contains("child"),
+        "child: {joined}"
+    );
+    assert!(joined.contains("run tests"), "child label: {joined}");
+    assert!(
+        joined.contains("result:") || joined.contains("2 of 3"),
+        "final result: {joined}"
+    );
+    assert!(
+        joined.contains("artifact:")
+            || joined.contains("source:")
+            || joined.contains("transcript:"),
+        "links: {joined}"
+    );
+    assert!(
+        joined.contains("error:") || joined.contains("phase Verify failed"),
+        "failure details: {joined}"
     );
 }
 

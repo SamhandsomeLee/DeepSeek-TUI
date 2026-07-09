@@ -1311,10 +1311,9 @@ impl GenericToolCell {
             return lines;
         }
 
-        // #4038: give the `workflow` tool a purpose-built run card (run_id,
-        // status, goal, children, progress, schema errors) instead of
-        // collapsing to a one-line generic header or dumping raw JSON.
-        if let Some(lines) = self.try_render_as_workflow(width, low_motion) {
+        // #4038 / #4122: purpose-built workflow run card (compact in live,
+        // expanded in transcript) shared with the WorkflowPanel state machine.
+        if let Some(lines) = self.try_render_as_workflow(width, low_motion, mode) {
             return lines;
         }
 
@@ -1518,15 +1517,17 @@ impl GenericToolCell {
         ))
     }
 
-    /// Render the `workflow` tool as a compact run card rather than the
-    /// generic one-line header (live) or a large JSON dump (transcript).
-    /// Fields are parsed defensively from the tool's JSON output, which is
-    /// either a single `WorkflowRunRecord` or a `{action:"status",
-    /// runs:[...]}` list; anything that does not parse falls back to the
-    /// generic renderer. The header owns the lifecycle label (Wave 5c #7);
-    /// the body deliberately carries no `status:` KV. Full live overlay
-    /// (#4038) is future work.
-    fn try_render_as_workflow(&self, width: u16, low_motion: bool) -> Option<Vec<Line<'static>>> {
+    /// Render the `workflow` tool via the shared WorkflowPanel history-card
+    /// renderer (#4122). Live mode stays compact (lifecycle, children, phases,
+    /// failures, elapsed); transcript mode expands phase/child summaries,
+    /// artifact/transcript links, final result, and failure details.
+    /// Status-list payloads keep a multi-run summary card.
+    fn try_render_as_workflow(
+        &self,
+        width: u16,
+        low_motion: bool,
+        mode: RenderMode,
+    ) -> Option<Vec<Line<'static>>> {
         if self.name != "workflow" {
             return None;
         }
@@ -1585,85 +1586,67 @@ impl GenericToolCell {
             return Some(wrap_card_rail(lines));
         }
 
-        let run_id = value
-            .get("run_id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("workflow");
+        use crate::tui::widgets::workflow_panel::{WorkflowHistoryExtras, WorkflowPanel};
+        let panel = WorkflowPanel::from_run_json(&value)?;
+        // Prefer the panel's lifecycle-aware status label when the tool cell
+        // is still marked running but the snapshot already terminal (or vice
+        // versa during live streaming).
+        let header_status = match panel.lifecycle {
+            crate::tui::widgets::workflow_panel::WorkflowPanelLifecycle::Failed
+            | crate::tui::widgets::workflow_panel::WorkflowPanelLifecycle::Cancelled => {
+                ToolStatus::Failed
+            }
+            crate::tui::widgets::workflow_panel::WorkflowPanelLifecycle::Succeeded => {
+                ToolStatus::Success
+            }
+            crate::tui::widgets::workflow_panel::WorkflowPanelLifecycle::Pending
+            | crate::tui::widgets::workflow_panel::WorkflowPanelLifecycle::Running => {
+                if self.status == ToolStatus::Failed {
+                    ToolStatus::Failed
+                } else if self.status == ToolStatus::Success {
+                    ToolStatus::Success
+                } else {
+                    ToolStatus::Running
+                }
+            }
+        };
+        let summary = panel.history_header_summary(usize::from(width).saturating_sub(18));
         lines.push(render_tool_header_with_family_and_summary(
             family,
-            Some(run_id),
-            tool_status_label(self.status),
-            self.status,
+            Some(summary.as_str()),
+            tool_status_label(header_status),
+            header_status,
             None,
             low_motion,
         ));
-        if let Some(goal) = value
-            .get("workflow_goal")
-            .and_then(serde_json::Value::as_str)
-            && !goal.trim().is_empty()
-        {
-            lines.extend(render_card_detail_line(
-                Some("goal"),
-                &truncate_text(goal.trim(), 200),
-                tool_value_style(),
-                width,
-            ));
-        }
-        let child_count = value
-            .get("child_ids")
-            .and_then(serde_json::Value::as_array)
-            .map(|a| a.len())
-            .unwrap_or(0);
-        lines.extend(render_compact_kv(
-            "children",
-            &child_count.to_string(),
-            tool_value_style(),
-            width,
-        ));
-        if let Some(progress) = value.get("progress").and_then(serde_json::Value::as_array)
-            && let Some(last) = progress.last().and_then(serde_json::Value::as_str)
-        {
-            lines.extend(render_card_detail_line(
-                Some("progress"),
-                &format!("{} ({} events)", truncate_text(last, 160), progress.len()),
-                tool_value_style(),
-                width,
-            ));
-        }
-        if let Some(verification) = value.get("verification")
-            && let Some(summary) = verification
-                .get("summary")
-                .and_then(serde_json::Value::as_str)
-        {
-            lines.extend(render_card_detail_line(
-                Some("verification"),
-                &truncate_text(summary, 200),
-                tool_value_style(),
-                width,
-            ));
-        }
-        let schema_error_count = value
-            .get("schema_errors")
-            .and_then(serde_json::Value::as_array)
-            .map(|a| a.len())
-            .unwrap_or(0);
-        if schema_error_count > 0 {
-            lines.extend(render_card_detail_line(
-                Some("schema errors"),
-                &schema_error_count.to_string(),
-                tool_value_style(),
-                width,
-            ));
-        }
-        if let Some(error) = value.get("error").and_then(serde_json::Value::as_str)
-            && !error.trim().is_empty()
-        {
-            lines.extend(render_card_detail_line(
-                Some("error"),
-                &truncate_text(error.trim(), 200),
-                tool_value_style(),
-                width,
-            ));
+        let expanded = matches!(mode, RenderMode::Transcript);
+        if expanded {
+            let extras = WorkflowHistoryExtras {
+                result_summary: panel.result_summary.clone(),
+                source_path: panel.source_path.clone().or_else(|| {
+                    value
+                        .get("source_path")
+                        .and_then(serde_json::Value::as_str)
+                        .map(std::path::PathBuf::from)
+                }),
+                spillover_path: self.spillover_path.clone(),
+                verification_summary: value
+                    .get("verification")
+                    .and_then(|v| v.get("summary"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            };
+            for detail in panel.history_expanded_lines(width, &extras) {
+                // history_expanded_lines omit the leading indent; re-use the
+                // card detail path so rails and spacing stay consistent.
+                let text: String = detail.spans.iter().map(|s| s.content.as_ref()).collect();
+                lines.extend(render_card_detail_line(
+                    None,
+                    &text,
+                    tool_value_style(),
+                    width,
+                ));
+            }
         }
         Some(wrap_card_rail(lines))
     }

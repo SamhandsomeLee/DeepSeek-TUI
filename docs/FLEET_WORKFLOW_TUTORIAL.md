@@ -8,10 +8,16 @@ of the problem:
 - **Workflow** describes orchestration: phases, branches, reducers, loops, and
   agent leaves that can dispatch through the Fleet/sub-agent runtime.
 
-The supported path today is a reviewed structured spec. CodeWhale can help you
-draft a Fleet task spec or Workflow source, but it should show the plan before
-launching multi-worker work. A one-sentence natural language request should not
-silently generate `tasks.json` and start workers without review.
+**Default product path:** ask in natural language. Soft-auto Workflow decides
+when orchestration helps, **tells you the shape**, may open
+`request_user_input` for 1–2 setup choices, then launches — you do not need to
+write workflow files for ordinary multi-agent work. Details:
+[Automatic Workflows](AUTOMATIC_WORKFLOWS.md).
+
+This tutorial covers the **manual** Fleet task-spec / checked-in Workflow path
+for operators who want durable host workers and reviewable specs. A
+one-sentence request should still not silently generate `tasks.json` and start
+workers without indication or approval.
 
 ## 1. Prepare The Workspace
 

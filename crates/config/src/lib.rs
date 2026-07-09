@@ -390,6 +390,11 @@ pub struct ConfigToml {
     /// workers inherit conservative Sandbox defaults.
     #[serde(default)]
     pub fleet: Option<FleetConfigToml>,
+    /// Workflow automatic-launch, approval, isolation, and activity
+    /// persistence knobs (#4128 / Section 2.11). When absent, consumers use
+    /// [`WorkflowConfigToml::default`].
+    #[serde(default)]
+    pub workflow: Option<WorkflowConfigToml>,
     #[serde(flatten)]
     pub extras: BTreeMap<String, toml::Value>,
 }
@@ -1486,6 +1491,112 @@ impl FleetConfigToml {
             .get(name)
             .cloned()
             .or_else(|| built_in_role_presets().get(name).cloned())
+    }
+}
+
+/// On-disk schema for the `[workflow]` table (#4128 / Section 2.11).
+///
+/// Automatic Workflow launch, write/approval gates, child/isolation budgets,
+/// and completed-activity persistence all read from this one model. When the
+/// table is absent, consumers resolve [`WorkflowConfigToml::default`].
+/// See `config.example.toml` for documentation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowConfigToml {
+    /// Allow the parent agent to auto-launch Workflow for multi-agent work.
+    /// Product default is on; set `false` to require explicit `/workflow`.
+    #[serde(default = "default_workflow_automatic")]
+    pub automatic: bool,
+    /// When automatic launch is enabled, start read-only child plans without
+    /// an approval card. Write/shell/network plans still consult
+    /// [`Self::require_approval_for_writes`].
+    #[serde(default = "default_workflow_auto_start_read_only")]
+    pub auto_start_read_only: bool,
+    /// Require an operator approval card before launching plans that write,
+    /// elevate shell/network, or otherwise leave the read-only envelope.
+    #[serde(default = "default_workflow_require_approval_for_writes")]
+    pub require_approval_for_writes: bool,
+    /// Soft upper bound on children admitted by automatic launch. Larger plans
+    /// should ask the operator or use explicit `/workflow`.
+    #[serde(default = "default_workflow_auto_start_child_limit")]
+    pub auto_start_child_limit: u32,
+    /// Hard ceiling on total children in one Workflow run.
+    #[serde(default = "default_workflow_max_children")]
+    pub max_children: u32,
+    /// Maximum nested Workflow / child-orchestration depth.
+    #[serde(default = "default_workflow_max_depth")]
+    pub max_depth: u32,
+    /// Default shared token budget for a Workflow run and its children.
+    #[serde(default = "default_workflow_default_token_budget")]
+    pub default_token_budget: u64,
+    /// How many parallel write children may share the parent worktree without
+    /// isolation. `0` forces worktree isolation for parallel writes.
+    #[serde(default = "default_workflow_max_parallel_writes_without_worktree")]
+    pub max_parallel_writes_without_worktree: u32,
+    /// Keep completed Workflow activity visible in the session activity surface
+    /// until the next run (or explicit clear).
+    #[serde(default = "default_workflow_persist_completed_activity")]
+    pub persist_completed_activity: bool,
+    /// Persist completed Workflow activity across process restarts via the
+    /// durable run journal.
+    #[serde(default = "default_workflow_persist_completed_across_restarts")]
+    pub persist_completed_across_restarts: bool,
+}
+
+fn default_workflow_automatic() -> bool {
+    true
+}
+
+fn default_workflow_auto_start_read_only() -> bool {
+    true
+}
+
+fn default_workflow_require_approval_for_writes() -> bool {
+    true
+}
+
+fn default_workflow_auto_start_child_limit() -> u32 {
+    8
+}
+
+fn default_workflow_max_children() -> u32 {
+    64
+}
+
+fn default_workflow_max_depth() -> u32 {
+    2
+}
+
+fn default_workflow_default_token_budget() -> u64 {
+    120_000
+}
+
+fn default_workflow_max_parallel_writes_without_worktree() -> u32 {
+    0
+}
+
+fn default_workflow_persist_completed_activity() -> bool {
+    true
+}
+
+fn default_workflow_persist_completed_across_restarts() -> bool {
+    true
+}
+
+impl Default for WorkflowConfigToml {
+    fn default() -> Self {
+        Self {
+            automatic: default_workflow_automatic(),
+            auto_start_read_only: default_workflow_auto_start_read_only(),
+            require_approval_for_writes: default_workflow_require_approval_for_writes(),
+            auto_start_child_limit: default_workflow_auto_start_child_limit(),
+            max_children: default_workflow_max_children(),
+            max_depth: default_workflow_max_depth(),
+            default_token_budget: default_workflow_default_token_budget(),
+            max_parallel_writes_without_worktree:
+                default_workflow_max_parallel_writes_without_worktree(),
+            persist_completed_activity: default_workflow_persist_completed_activity(),
+            persist_completed_across_restarts: default_workflow_persist_completed_across_restarts(),
+        }
     }
 }
 

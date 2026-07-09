@@ -290,6 +290,8 @@ Use `/provider` when you want to switch away from the default DeepSeek route.
 Provider IDs, environment variables, model defaults, and capability notes are
 kept in the provider registry document.
 
+Soft-auto multi-agent work: [AUTOMATIC_WORKFLOWS.md](AUTOMATIC_WORKFLOWS.md).
+
 Next for durable multi-worker work: [FLEET_WORKFLOW_TUTORIAL.md](FLEET_WORKFLOW_TUTORIAL.md)
 walks through Fleet task specs, monitoring, and Workflow authoring.
 
