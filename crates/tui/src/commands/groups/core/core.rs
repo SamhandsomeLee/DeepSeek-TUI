@@ -50,14 +50,21 @@ pub fn help(app: &mut App, topic: Option<&str>) -> CommandResult {
 
 /// Clear conversation history
 pub fn clear(app: &mut App) -> CommandResult {
-    let todos_cleared = reset_conversation_state(app);
+    if app.session_transition_blocked() {
+        return CommandResult::error(
+            tr(app.ui_locale, MessageId::ClearConversationBusy).to_string(),
+        );
+    }
+    if !reset_conversation_state(app) {
+        return CommandResult::error(
+            tr(app.ui_locale, MessageId::ClearConversationBusy).to_string(),
+        );
+    }
     app.current_session_id = None;
+    app.current_session_metadata = None;
+    app.session_title = None;
     let locale = app.ui_locale;
-    let message = if todos_cleared {
-        tr(locale, MessageId::ClearConversation).to_string()
-    } else {
-        tr(locale, MessageId::ClearConversationBusy).to_string()
-    };
+    let message = tr(locale, MessageId::ClearConversation).to_string();
     CommandResult::with_message_and_action(
         message,
         AppAction::SyncSession {
@@ -73,6 +80,12 @@ pub fn clear(app: &mut App) -> CommandResult {
 
 /// Reset the active conversation without choosing the next session id.
 pub(crate) fn reset_conversation_state(app: &mut App) -> bool {
+    // Work state is the only contended portion. Acquire and clear it first so
+    // `/clear` and `/new` are all-or-nothing rather than losing conversation
+    // state while leaving an old To-do attached to the next session.
+    if !app.clear_todos() {
+        return false;
+    }
     app.clear_history();
     app.mark_history_updated();
     app.api_messages.clear();
@@ -90,7 +103,6 @@ pub(crate) fn reset_conversation_state(app: &mut App) -> bool {
     app.session.subagent_cost_event_seqs.clear();
     app.session.displayed_cost_high_water = 0.0;
     app.session.displayed_cost_high_water_cny = 0.0;
-    let todos_cleared = app.clear_todos();
     app.tool_log.clear();
     app.tool_cells.clear();
     app.tool_details_by_cell.clear();
@@ -109,7 +121,7 @@ pub(crate) fn reset_conversation_state(app: &mut App) -> bool {
     app.session.last_warmup_key = None;
     app.session.last_tool_catalog = None;
     app.session.last_base_url = None;
-    todos_cleared
+    true
 }
 
 /// Exit the application
@@ -835,6 +847,55 @@ mod tests {
         assert!(app.session_artifacts.is_empty());
         assert!(app.current_session_id.is_none());
         assert!(matches!(result.action, Some(AppAction::SyncSession { .. })));
+    }
+
+    #[test]
+    fn clear_is_all_or_nothing_when_work_state_is_busy() {
+        let mut app = create_test_app();
+        app.history.push(HistoryCell::User {
+            content: "keep me".to_string(),
+        });
+        app.api_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![],
+        });
+        app.current_session_id = Some("current-session".to_string());
+        let plan_state = app.plan_state.clone();
+        let _held = plan_state.try_lock().expect("hold plan lock");
+
+        let result = clear(&mut app);
+
+        assert!(result.is_error);
+        assert!(result.action.is_none());
+        assert_eq!(app.history.len(), 1);
+        assert_eq!(app.api_messages.len(), 1);
+        assert_eq!(app.current_session_id.as_deref(), Some("current-session"));
+        assert!(result.message.as_deref().is_some_and(|message| {
+            message.contains("Nothing cleared") && message.contains("busy")
+        }));
+    }
+
+    #[test]
+    fn clear_rejects_an_active_turn_without_mutating_session_state() {
+        let mut app = create_test_app();
+        app.history.push(HistoryCell::User {
+            content: "keep active turn".to_string(),
+        });
+        app.api_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![],
+        });
+        app.current_session_id = Some("active-session".to_string());
+        app.is_loading = true;
+        app.runtime_turn_status = Some("in_progress".to_string());
+
+        let result = clear(&mut app);
+
+        assert!(result.is_error);
+        assert!(result.action.is_none());
+        assert_eq!(app.history.len(), 1);
+        assert_eq!(app.api_messages.len(), 1);
+        assert_eq!(app.current_session_id.as_deref(), Some("active-session"));
     }
 
     #[test]

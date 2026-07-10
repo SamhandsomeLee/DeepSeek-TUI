@@ -351,7 +351,9 @@ impl SessionPickerView {
         self.apply_sort_and_filter();
         self.refresh_preview();
         self.status = Some(format!("Renamed to \"{new_title}\""));
-        ViewAction::None
+        ViewAction::Emit(ViewEvent::SessionRenamed {
+            metadata: saved.metadata,
+        })
     }
 
     fn refresh_preview(&mut self) {
@@ -1026,6 +1028,36 @@ mod tests {
         };
         view.apply_sort_and_filter();
         view
+    }
+
+    #[test]
+    fn rename_selected_persists_and_emits_saved_metadata() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
+        let manager = SessionManager::default_location().expect("session manager");
+        let mut saved = saved_session_with_messages(vec![text_message("user", "hello")]);
+        saved.metadata.id = "session-01".to_string();
+        saved.metadata.title = "Before".to_string();
+        manager.save_session(&saved).expect("save session");
+        let mut view = picker_with(vec![saved.metadata.clone()], None);
+
+        let action = view.rename_selected("After");
+
+        let ViewAction::Emit(ViewEvent::SessionRenamed { metadata }) = action else {
+            panic!("expected SessionRenamed event");
+        };
+        assert_eq!(metadata.id, "session-01");
+        assert_eq!(metadata.title, "After");
+        assert_eq!(view.sessions[0].title, "After");
+        assert_eq!(
+            manager
+                .load_session("session-01")
+                .expect("load renamed session")
+                .metadata
+                .title,
+            "After"
+        );
     }
 
     fn buffer_row_text(buf: &Buffer, area: Rect, y: u16) -> String {

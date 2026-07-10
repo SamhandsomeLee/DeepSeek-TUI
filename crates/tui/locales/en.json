@@ -278,7 +278,7 @@
     "SettingsTitle": "Settings:",
     "SettingsConfigFile": "Config file:",
     "ClearConversation": "Conversation cleared",
-    "ClearConversationBusy": "Conversation cleared (plan state busy; run /clear again if needed)",
+    "ClearConversationBusy": "Nothing cleared (Work state or runtime work busy; wait, then try /clear again)",
     "ModelChanged": "Model changed: {old} →, {new}",
     "LinksTitle": "Provider Links:",
     "LinksDashboard": "Dashboard:",

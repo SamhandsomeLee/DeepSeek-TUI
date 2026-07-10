@@ -61,11 +61,11 @@ pub fn rename(app: &mut App, arg: Option<&str>) -> CommandResult {
     rename_with_manager(new_title, &session_id, &manager, app)
 }
 
-fn rename_with_manager(
+pub(crate) fn rename_with_manager(
     new_title: &str,
     session_id: &str,
     manager: &SessionManager,
-    app: &App,
+    app: &mut App,
 ) -> CommandResult {
     let mut session = match manager.load_session(session_id) {
         Ok(s) => s,
@@ -79,11 +79,29 @@ fn rename_with_manager(
         u64::from(app.session.total_tokens),
         app.system_prompt.as_ref(),
     );
+    session.work_state = match app.work_state_snapshot() {
+        Ok(state) => state,
+        Err(err) => {
+            return CommandResult::error(format!(
+                "Could not snapshot Work state before rename: {err}"
+            ));
+        }
+    };
+    session.context_references = app.session_context_references.clone();
+    session.artifacts = app.session_artifacts.clone();
+    session.metadata.model = app.model_selection_for_persistence();
+    session.metadata.model_provider = app.api_provider.as_str().to_string();
+    session.metadata.workspace.clone_from(&app.workspace);
+    session.metadata.mode = Some(app.mode.as_setting().to_string());
     app.sync_cost_to_metadata(&mut session.metadata);
     session.metadata.title = new_title.to_string();
 
     match manager.save_session(&session) {
-        Ok(_) => CommandResult::message(format!("Session renamed to \"{new_title}\"")),
+        Ok(_) => {
+            app.current_session_metadata = Some(session.metadata.clone());
+            app.session_title = Some(new_title.to_string());
+            CommandResult::message(format!("Session renamed to \"{new_title}\""))
+        }
         Err(e) => CommandResult::error(format!("Could not save session: {e}")),
     }
 }
@@ -169,26 +187,58 @@ mod tests {
     fn rename_persists_new_title() {
         let tmp = TempDir::new().unwrap();
         let manager = make_session_manager(&tmp);
-        let app = make_app(&tmp);
+        let mut app = make_app(&tmp);
 
-        let session =
-            create_saved_session_with_mode(&[], "deepseek-v4-pro", tmp.path(), 0, None, None);
+        let stale_prompt = crate::models::SystemPrompt::Text("stale prompt".to_string());
+        let session = create_saved_session_with_mode(
+            &[],
+            "deepseek-v4-pro",
+            tmp.path(),
+            0,
+            Some(&stale_prompt),
+            None,
+        );
         let session_id = session.metadata.id.clone();
         manager.save_session(&session).unwrap();
+        app.set_model_selection("openrouter/new-route".to_string());
+        app.api_provider = crate::config::ApiProvider::Openrouter;
+        app.mode = crate::tui::app::AppMode::Operate;
+        app.system_prompt = None;
+        {
+            let mut todos = app.todos.try_lock().expect("todos lock");
+            todos.add(
+                "live rename state".to_string(),
+                crate::tools::todo::TodoStatus::InProgress,
+            );
+        }
+        let expected_work_state = app.work_state_snapshot().expect("work snapshot");
 
-        let result = rename_with_manager("Brand New Title", &session_id, &manager, &app);
+        let result = rename_with_manager("Brand New Title", &session_id, &manager, &mut app);
         assert!(!result.is_error);
         assert!(result.message.unwrap().contains("Brand New Title"));
 
         let reloaded = manager.load_session(&session_id).unwrap();
         assert_eq!(reloaded.metadata.title, "Brand New Title");
+        assert_eq!(reloaded.work_state, expected_work_state);
+        assert!(reloaded.system_prompt.is_none());
+        assert_eq!(reloaded.metadata.model, "openrouter/new-route");
+        assert_eq!(reloaded.metadata.model_provider, "openrouter");
+        assert_eq!(reloaded.metadata.workspace, app.workspace);
+        assert_eq!(reloaded.metadata.mode.as_deref(), Some("operate"));
+        assert_eq!(app.session_title.as_deref(), Some("Brand New Title"));
+        assert_eq!(
+            app.current_session_metadata
+                .as_ref()
+                .map(|metadata| metadata.title.as_str()),
+            Some("Brand New Title")
+        );
     }
 
     #[test]
     fn rename_title_at_max_length_succeeds() {
         let tmp = TempDir::new().unwrap();
         let manager = make_session_manager(&tmp);
-        let app = make_app(&tmp);
+        let mut app = make_app(&tmp);
 
         let session =
             create_saved_session_with_mode(&[], "deepseek-v4-pro", tmp.path(), 0, None, None);
@@ -196,7 +246,7 @@ mod tests {
         manager.save_session(&session).unwrap();
 
         let max_title = "中".repeat(MAX_TITLE_LEN);
-        let result = rename_with_manager(&max_title, &session_id, &manager, &app);
+        let result = rename_with_manager(&max_title, &session_id, &manager, &mut app);
         assert!(!result.is_error);
 
         let reloaded = manager.load_session(&session_id).unwrap();

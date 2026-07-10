@@ -45,7 +45,7 @@ impl TodoStatus {
 }
 
 /// A single todo item.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TodoItem {
     pub id: u32,
     pub content: String,
@@ -53,11 +53,21 @@ pub struct TodoItem {
 }
 
 /// Snapshot of a todo list for display or serialization.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TodoListSnapshot {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub items: Vec<TodoItem>,
+    #[serde(default)]
     pub completion_pct: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_progress_id: Option<u32>,
+}
+
+impl TodoListSnapshot {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
 }
 
 /// Mutable list of todo items with helper operations.
@@ -85,6 +95,48 @@ impl TodoList {
             completion_pct: self.completion_percentage(),
             in_progress_id: self.in_progress_id(),
         }
+    }
+
+    /// Rebuild a mutable list from a persisted snapshot.
+    ///
+    /// Derived snapshot fields are deliberately recomputed. IDs and the
+    /// single-in-progress invariant are validated before any live state is
+    /// replaced, so malformed session data cannot leave a half-restored list.
+    pub fn from_snapshot(snapshot: &TodoListSnapshot) -> Result<Self, String> {
+        let mut seen = std::collections::HashSet::with_capacity(snapshot.items.len());
+        let mut in_progress_count = 0usize;
+        let mut max_id = 0u32;
+        let mut items = Vec::with_capacity(snapshot.items.len());
+
+        for item in &snapshot.items {
+            if item.id == 0 {
+                return Err("To-do item IDs must be greater than zero".to_string());
+            }
+            if !seen.insert(item.id) {
+                return Err(format!("Duplicate To-do item ID {}", item.id));
+            }
+            if item.status == TodoStatus::InProgress {
+                in_progress_count += 1;
+                if in_progress_count > 1 {
+                    return Err("Only one To-do item may be in progress".to_string());
+                }
+            }
+            max_id = max_id.max(item.id);
+            items.push(TodoItem {
+                id: item.id,
+                content: item.content.clone(),
+                status: item.status,
+            });
+        }
+
+        let next_id = if items.is_empty() {
+            1
+        } else {
+            max_id
+                .checked_add(1)
+                .ok_or_else(|| "To-do item IDs are exhausted".to_string())?
+        };
+        Ok(Self { items, next_id })
     }
 
     /// Add a new todo item.
@@ -625,6 +677,81 @@ fn work_progress_metadata(snapshot: &TodoListSnapshot, tool_name: &str) -> serde
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persisted_snapshot_restores_ids_status_and_recomputes_metrics() {
+        let snapshot = TodoListSnapshot {
+            items: vec![
+                TodoItem {
+                    id: 4,
+                    content: " inspect ".to_string(),
+                    status: TodoStatus::Completed,
+                },
+                TodoItem {
+                    id: 9,
+                    content: "patch".to_string(),
+                    status: TodoStatus::InProgress,
+                },
+            ],
+            completion_pct: 0,
+            in_progress_id: None,
+        };
+
+        let mut restored = TodoList::from_snapshot(&snapshot).expect("restore");
+        let restored_snapshot = restored.snapshot();
+        assert_eq!(restored_snapshot.items[0].id, 4);
+        assert_eq!(restored_snapshot.items[0].content, " inspect ");
+        assert_eq!(restored_snapshot.items[1].id, 9);
+        assert_eq!(restored_snapshot.completion_pct, 50);
+        assert_eq!(restored_snapshot.in_progress_id, Some(9));
+        assert_eq!(
+            restored.add("verify".to_string(), TodoStatus::Pending).id,
+            10
+        );
+    }
+
+    #[test]
+    fn malformed_persisted_snapshot_is_rejected_deterministically() {
+        let duplicate = TodoListSnapshot {
+            items: vec![
+                TodoItem {
+                    id: 1,
+                    content: "one".to_string(),
+                    status: TodoStatus::InProgress,
+                },
+                TodoItem {
+                    id: 1,
+                    content: "two".to_string(),
+                    status: TodoStatus::Pending,
+                },
+            ],
+            ..TodoListSnapshot::default()
+        };
+        assert_eq!(
+            TodoList::from_snapshot(&duplicate).unwrap_err(),
+            "Duplicate To-do item ID 1"
+        );
+
+        let multiple_active = TodoListSnapshot {
+            items: vec![
+                TodoItem {
+                    id: 1,
+                    content: "one".to_string(),
+                    status: TodoStatus::InProgress,
+                },
+                TodoItem {
+                    id: 2,
+                    content: "two".to_string(),
+                    status: TodoStatus::InProgress,
+                },
+            ],
+            ..TodoListSnapshot::default()
+        };
+        assert_eq!(
+            TodoList::from_snapshot(&multiple_active).unwrap_err(),
+            "Only one To-do item may be in progress"
+        );
+    }
 
     #[tokio::test]
     async fn work_update_returns_canonical_task_update_metadata() {

@@ -24,6 +24,7 @@
 //!   naturally backpressures via the spawn pool. A few outstanding
 //!   `SavedSession` values in the channel (< 1 MB) is negligible pressure.
 
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use tokio::sync::mpsc;
@@ -112,16 +113,21 @@ pub fn persist(request: PersistRequest) {
 ///
 /// The returned handle should be passed to [`init_actor`] so that the
 /// `persist()` free function can reach it from anywhere in the TUI.
-pub fn spawn_persistence_actor(manager: SessionManager) -> PersistActorHandle {
+pub fn spawn_persistence_actor(
+    manager: SessionManager,
+) -> (PersistActorHandle, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = mpsc::unbounded_channel::<PersistRequest>();
     let handle = PersistActorHandle { tx };
 
-    spawn_supervised(
+    let task = spawn_supervised(
         "persistence-actor",
         std::panic::Location::caller(),
         async move {
             let mut latest_checkpoint: Option<SavedSession> = None;
-            let mut latest_session: Option<SavedSession> = None;
+            // Latest-wins per session id. Coalescing into one global slot can
+            // drop session A when an immediate `/new` queues session B before
+            // the actor drains.
+            let mut latest_sessions: BTreeMap<String, SavedSession> = BTreeMap::new();
             let mut latest_offline_queue: Option<PendingOfflineQueue> = None;
             let mut should_clear: bool = false;
 
@@ -138,7 +144,7 @@ pub fn spawn_persistence_actor(manager: SessionManager) -> PersistActorHandle {
                             should_clear = false;
                         }
                         PersistRequest::SessionSnapshot(session) => {
-                            latest_session = Some(session);
+                            latest_sessions.insert(session.metadata.id.clone(), session);
                         }
                         PersistRequest::OfflineQueue { state, session_id } => {
                             latest_offline_queue =
@@ -156,7 +162,7 @@ pub fn spawn_persistence_actor(manager: SessionManager) -> PersistActorHandle {
                             flush_inner(
                                 &manager,
                                 latest_checkpoint.as_ref(),
-                                latest_session.as_ref(),
+                                &latest_sessions,
                                 latest_offline_queue.as_ref(),
                                 should_clear,
                             );
@@ -173,8 +179,8 @@ pub fn spawn_persistence_actor(manager: SessionManager) -> PersistActorHandle {
                 if let Some(ref session) = latest_checkpoint.take() {
                     let _ = manager.save_checkpoint(session);
                 }
-                if let Some(ref session) = latest_session.take() {
-                    let _ = manager.save_session(session);
+                for (_, session) in std::mem::take(&mut latest_sessions) {
+                    let _ = manager.save_session(&session);
                 }
                 if let Some(ref request) = latest_offline_queue.take() {
                     apply_offline_queue_request(&manager, request);
@@ -187,7 +193,7 @@ pub fn spawn_persistence_actor(manager: SessionManager) -> PersistActorHandle {
                         should_clear = false;
                     }
                     Some(PersistRequest::SessionSnapshot(session)) => {
-                        latest_session = Some(session);
+                        latest_sessions.insert(session.metadata.id.clone(), session);
                     }
                     Some(PersistRequest::OfflineQueue { state, session_id }) => {
                         latest_offline_queue =
@@ -204,7 +210,7 @@ pub fn spawn_persistence_actor(manager: SessionManager) -> PersistActorHandle {
                         flush_inner(
                             &manager,
                             latest_checkpoint.as_ref(),
-                            latest_session.as_ref(),
+                            &latest_sessions,
                             latest_offline_queue.as_ref(),
                             should_clear,
                         );
@@ -215,7 +221,7 @@ pub fn spawn_persistence_actor(manager: SessionManager) -> PersistActorHandle {
                         flush_inner(
                             &manager,
                             latest_checkpoint.as_ref(),
-                            latest_session.as_ref(),
+                            &latest_sessions,
                             latest_offline_queue.as_ref(),
                             should_clear,
                         );
@@ -226,14 +232,14 @@ pub fn spawn_persistence_actor(manager: SessionManager) -> PersistActorHandle {
         },
     );
 
-    handle
+    (handle, task)
 }
 
 /// Write any pending work to disk (used on shutdown).
 fn flush_inner(
     manager: &SessionManager,
     checkpoint: Option<&SavedSession>,
-    session: Option<&SavedSession>,
+    sessions: &BTreeMap<String, SavedSession>,
     offline_queue: Option<&PendingOfflineQueue>,
     should_clear: bool,
 ) {
@@ -243,7 +249,7 @@ fn flush_inner(
     if let Some(s) = checkpoint {
         let _ = manager.save_checkpoint(s);
     }
-    if let Some(s) = session {
+    for s in sessions.values() {
         let _ = manager.save_session(s);
     }
     if let Some(request) = offline_queue {
@@ -289,7 +295,7 @@ mod tests {
         let sessions_dir = tmp.path().join("sessions");
         let manager = SessionManager::new(sessions_dir.clone()).expect("manager");
         let queue_path = sessions_dir.join("checkpoints").join("offline_queue.json");
-        let handle = spawn_persistence_actor(manager);
+        let (handle, task) = spawn_persistence_actor(manager);
 
         let state = OfflineQueueState {
             messages: vec![QueuedSessionMessage {
@@ -312,5 +318,84 @@ mod tests {
         handle.try_send(PersistRequest::ClearOfflineQueue);
         wait_until(|| !queue_path.exists()).await;
         handle.try_send(PersistRequest::Shutdown);
+        task.await.expect("persistence actor join");
+    }
+
+    #[tokio::test]
+    async fn shutdown_wait_flushes_queued_session_before_returning() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sessions_dir = tmp.path().join("sessions");
+        let manager = SessionManager::new(sessions_dir.clone()).expect("manager");
+        let verification_manager = SessionManager::new(sessions_dir).expect("verification manager");
+        let session = crate::session_manager::create_saved_session_with_mode(
+            &[],
+            "deepseek-v4-pro",
+            tmp.path(),
+            0,
+            None,
+            Some("agent"),
+        );
+        let session_id = session.metadata.id.clone();
+        let (handle, task) = spawn_persistence_actor(manager);
+
+        handle.try_send(PersistRequest::SessionSnapshot(session));
+        handle.try_send(PersistRequest::Shutdown);
+        task.await.expect("persistence actor join");
+
+        let loaded = verification_manager
+            .load_session(&session_id)
+            .expect("shutdown must flush queued session");
+        assert_eq!(loaded.metadata.id, session_id);
+    }
+
+    #[tokio::test]
+    async fn shutdown_flushes_latest_snapshot_for_each_session_id() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sessions_dir = tmp.path().join("sessions");
+        let manager = SessionManager::new(sessions_dir.clone()).expect("manager");
+        let verification_manager = SessionManager::new(sessions_dir).expect("verification manager");
+        let mut first = crate::session_manager::create_saved_session_with_mode(
+            &[],
+            "deepseek-v4-pro",
+            tmp.path(),
+            0,
+            None,
+            Some("agent"),
+        );
+        first.metadata.title = "Session A".to_string();
+        let mut second = crate::session_manager::create_saved_session_with_mode(
+            &[],
+            "deepseek-v4-pro",
+            tmp.path(),
+            0,
+            None,
+            Some("agent"),
+        );
+        second.metadata.title = "Session B".to_string();
+        let first_id = first.metadata.id.clone();
+        let second_id = second.metadata.id.clone();
+        let (handle, task) = spawn_persistence_actor(manager);
+
+        handle.try_send(PersistRequest::SessionSnapshot(first));
+        handle.try_send(PersistRequest::SessionSnapshot(second));
+        handle.try_send(PersistRequest::Shutdown);
+        task.await.expect("persistence actor join");
+
+        assert_eq!(
+            verification_manager
+                .load_session(&first_id)
+                .expect("session A flushed")
+                .metadata
+                .title,
+            "Session A"
+        );
+        assert_eq!(
+            verification_manager
+                .load_session(&second_id)
+                .expect("session B flushed")
+                .metadata
+                .title,
+            "Session B"
+        );
     }
 }

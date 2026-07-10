@@ -11,6 +11,8 @@ mod new;
 mod purge;
 mod relay;
 mod rename;
+#[cfg(test)]
+pub(crate) use rename::rename_with_manager;
 mod save;
 mod sessions;
 // This group dir intentionally has a `session.rs` child module with the same

@@ -17,6 +17,8 @@ pub use traits::CommandInfo;
 
 // Long-standing public paths that predate the group layout.
 pub use groups::project::share;
+#[cfg(test)]
+pub(crate) use groups::session::rename_with_manager as rename_session_with_manager;
 
 // Voice capture plumbing shared with the hotbar and the UI event loop.
 pub use groups::core::voice;

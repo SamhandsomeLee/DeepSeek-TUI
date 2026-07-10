@@ -276,7 +276,7 @@
     "SettingsTitle": "Cài đặt:",
     "SettingsConfigFile": "Tệp cấu hình:",
     "ClearConversation": "Đã xóa cuộc trò chuyện",
-    "ClearConversationBusy": "Đã xóa cuộc trò chuyện (trạng thái plan đang bận; chạy lại /clear nếu cần)",
+    "ClearConversationBusy": "Chưa xóa nội dung nào (trạng thái Công việc hoặc tác vụ thời gian chạy đang bận; hãy chờ rồi thử lại /clear)",
     "ModelChanged": "Đã thay đổi mô hình: {old} → {new}",
     "LinksTitle": "Liên kết nhà cung cấp:",
     "LinksDashboard": "Bảng điều khiển:",

@@ -47,7 +47,7 @@ impl StepStatus {
 }
 
 /// Input representation for a plan item.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanItemArg {
     pub step: String,
     pub status: StepStatus,
@@ -136,7 +136,7 @@ impl PlanStep {
 }
 
 /// Serializable snapshot for display
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -346,6 +346,28 @@ impl PlanState {
                 })
                 .collect(),
         }
+    }
+
+    /// Restore persisted plan data through the same normalization path used by
+    /// `update_plan`. Timing is intentionally session-local and starts fresh.
+    #[must_use]
+    pub fn from_snapshot(snapshot: &PlanSnapshot) -> Self {
+        let mut state = Self::default();
+        state.update(UpdatePlanArgs {
+            title: snapshot.title.clone(),
+            objective: snapshot.objective.clone(),
+            context_summary: snapshot.context_summary.clone(),
+            explanation: snapshot.explanation.clone(),
+            sources_used: snapshot.sources_used.clone(),
+            critical_files: snapshot.critical_files.clone(),
+            constraints: snapshot.constraints.clone(),
+            recommended_approach: snapshot.recommended_approach.clone(),
+            verification_plan: snapshot.verification_plan.clone(),
+            risks_and_unknowns: snapshot.risks_and_unknowns.clone(),
+            handoff_packet: snapshot.handoff_packet.clone(),
+            plan: snapshot.items.clone(),
+        });
+        state
     }
 
     pub fn explanation(&self) -> Option<&str> {
@@ -752,6 +774,27 @@ mod tests {
         assert_eq!(snapshot.items.len(), 1);
         assert_eq!(snapshot.items[0].step, "render sections");
         assert_eq!(snapshot.items[0].status, StepStatus::InProgress);
+    }
+
+    #[test]
+    fn plan_state_restores_from_persisted_snapshot() {
+        let snapshot = PlanSnapshot {
+            objective: Some("Restore Work state".to_string()),
+            items: vec![
+                PlanItemArg {
+                    step: "inspect".to_string(),
+                    status: StepStatus::Completed,
+                },
+                PlanItemArg {
+                    step: "verify".to_string(),
+                    status: StepStatus::InProgress,
+                },
+            ],
+            ..PlanSnapshot::default()
+        };
+
+        let restored = PlanState::from_snapshot(&snapshot);
+        assert_eq!(restored.snapshot(), snapshot);
     }
 
     #[test]

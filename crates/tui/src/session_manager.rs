@@ -8,6 +8,8 @@
 
 use crate::artifacts::ArtifactRecord;
 use crate::models::{ContentBlock, Message, SystemPrompt};
+use crate::tools::plan::PlanSnapshot;
+use crate::tools::todo::TodoListSnapshot;
 use crate::tui::file_mention::ContextReference;
 use crate::utils::write_atomic;
 use chrono::{DateTime, Utc};
@@ -192,6 +194,23 @@ impl SessionMetadata {
     }
 }
 
+/// Durable Work-panel state. Optional on [`SavedSession`] so every session
+/// written before v0.8.68 remains loadable without migration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionWorkState {
+    #[serde(default, skip_serializing_if = "TodoListSnapshot::is_empty")]
+    pub todos: TodoListSnapshot,
+    #[serde(default, skip_serializing_if = "PlanSnapshot::is_empty")]
+    pub plan: PlanSnapshot,
+}
+
+impl SessionWorkState {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.todos.is_empty() && self.plan.is_empty()
+    }
+}
+
 /// A saved session containing full conversation history
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SavedSession {
@@ -212,6 +231,9 @@ pub struct SavedSession {
     /// Artifact contents are stored in the session-owned artifact directory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<ArtifactRecord>,
+    /// To-do and plan state shown in the Work sidebar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_state: Option<SessionWorkState>,
 }
 
 /// Manager for session persistence operations
@@ -847,6 +869,7 @@ pub fn create_saved_session_with_id_and_mode(
         system_prompt: system_prompt_to_string(system_prompt),
         context_references: Vec::new(),
         artifacts: Vec::new(),
+        work_state: None,
     }
 }
 
@@ -863,9 +886,7 @@ pub fn update_session(
     session.metadata.updated_at = Utc::now();
     session.metadata.message_count = messages.len();
     session.metadata.total_tokens = total_tokens;
-    if system_prompt.is_some() {
-        session.system_prompt = system_prompt_to_string(system_prompt);
-    }
+    session.system_prompt = system_prompt_to_string(system_prompt);
     session
 }
 
@@ -1163,6 +1184,7 @@ mod tests {
             system_prompt: None,
             context_references: Vec::new(),
             artifacts: Vec::new(),
+            work_state: None,
         };
         manager.save_session(&session).expect("save");
     }
@@ -1195,6 +1217,7 @@ mod tests {
             system_prompt: None,
             context_references: Vec::new(),
             artifacts: Vec::new(),
+            work_state: None,
         };
         manager.save_session(&session).expect("save empty");
     }

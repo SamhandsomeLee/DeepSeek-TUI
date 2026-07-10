@@ -276,7 +276,7 @@
     "SettingsTitle": "设置：",
     "SettingsConfigFile": "配置文件：",
     "ClearConversation": "对话已清空",
-    "ClearConversationBusy": "对话已清空（Plan 状态忙碌；如需再次清空请运行 /clear）",
+    "ClearConversationBusy": "未清空任何内容（工作状态或运行时任务正忙；请等待后重试 /clear）",
     "ModelChanged": "模型已切换：{old} → {new}",
     "LinksTitle": "服务商链接：",
     "LinksDashboard": "控制台：",

@@ -276,7 +276,7 @@
     "SettingsTitle": "Configuraciones:",
     "SettingsConfigFile": "Archivo de configuración:",
     "ClearConversation": "Conversación limpia",
-    "ClearConversationBusy": "Conversación limpia (estado del plan ocupado; ejecuta /clear de nuevo si es necesario)",
+    "ClearConversationBusy": "No se borró nada (el estado de Trabajo o la ejecución está ocupada; espera y vuelve a intentar /clear)",
     "ModelChanged": "Modelo cambiado: {old} →, {new}",
     "LinksTitle": "Enlaces de proveedores:",
     "LinksDashboard": "Panel:",

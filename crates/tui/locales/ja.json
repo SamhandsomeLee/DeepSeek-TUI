@@ -276,7 +276,7 @@
     "SettingsTitle": "設定：",
     "SettingsConfigFile": "設定ファイル：",
     "ClearConversation": "会話履歴をクリアしました",
-    "ClearConversationBusy": "会話履歴をクリアしました（plan 状態が忙しい；必要なら /clear を再度実行）",
+    "ClearConversationBusy": "何もクリアされませんでした（Work 状態またはランタイム処理が実行中です。待ってから /clear を再実行してください）",
     "ModelChanged": "モデルを変更しました: {old} → {new}",
     "LinksTitle": "プロバイダーリンク：",
     "LinksDashboard": "ダッシュボード：",

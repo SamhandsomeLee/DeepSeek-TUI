@@ -557,6 +557,9 @@ pub enum ViewEvent {
     SessionSelected {
         session_id: String,
     },
+    SessionRenamed {
+        metadata: crate::session_manager::SessionMetadata,
+    },
     SessionDeleted {
         session_id: String,
         title: String,
