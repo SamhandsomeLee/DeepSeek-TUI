@@ -1434,13 +1434,11 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
 
+    #[cfg(unix)]
     fn write_test_executable(path: &Path) {
         std::fs::write(path, b"test executable").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     /// Verify the arch mapping used when constructing asset names.
