@@ -632,10 +632,17 @@ pub fn render_header(area: Rect, buf: &mut Buffer, app: &App) {
 
 /// Render the fixed one-line footer. It owns phase, cost, and the keys that
 /// open detail; route, permission, repository, MCP, and context do not repeat.
-pub fn render_footer(area: Rect, buf: &mut Buffer, app: &App) {
+///
+/// Transient notices come from the app's toast system, never the legacy
+/// `status_message` sink: informational acknowledgements carry a TTL and
+/// expire on their own, warnings and errors hold as sticky toasts until
+/// resolved, and a notice from one view can no longer outlive its moment
+/// and read as permanent idle chrome.
+pub fn render_footer(area: Rect, buf: &mut Buffer, app: &mut App) {
     if area.width == 0 || area.height == 0 {
         return;
     }
+    let status_toast = app.active_status_toast();
     let phase = ShellPhase::from_app(app);
     let tier = ShellTier::for_chrome_width(area.width);
     Block::default()
@@ -657,19 +664,16 @@ pub fn render_footer(area: Rect, buf: &mut Buffer, app: &App) {
     ];
     if tier != ShellTier::Compact
         && phase != ShellPhase::Done
-        && let Some(status) = app
-            .status_message
-            .as_deref()
-            .map(str::trim)
-            .filter(|status| !status.is_empty() && *status != phase_label)
+        && let Some(toast) = status_toast
+            .filter(|toast| !toast.text.trim().is_empty() && toast.text.trim() != phase_label)
     {
         left.push(Span::styled(
             " · ",
             Style::default().fg(app.ui_theme.text_dim),
         ));
         left.push(Span::styled(
-            truncate_to_width(status, 40),
-            Style::default().fg(app.ui_theme.text_muted),
+            truncate_to_width(toast.text.trim(), 40),
+            Style::default().fg(crate::tui::ui::status_color(toast.level)),
         ));
     }
     let cost = app.displayed_session_cost_for_currency(app.cost_currency);
@@ -812,6 +816,63 @@ mod tests {
             workspace_session_count: 2,
             worktree_available: true,
         }
+    }
+
+    fn footer_text(app: &mut App) -> String {
+        let area = Rect::new(0, 0, 100, 1);
+        let mut buf = Buffer::empty(area);
+        render_footer(area, &mut buf, app);
+        (0..area.width).map(|x| buf[(x, 0)].symbol()).collect()
+    }
+
+    /// The footer consumes the toast system, not the legacy status sink: an
+    /// informational acknowledgement must leave on its own instead of
+    /// becoming permanent idle chrome.
+    #[test]
+    fn footer_notices_expire_instead_of_becoming_permanent_chrome() {
+        let mut app = test_app();
+        app.status_message = Some("Auto-compaction enabled".to_string());
+
+        let fresh = footer_text(&mut app);
+        assert!(
+            fresh.contains("Auto-compaction enabled"),
+            "a fresh notice should surface once: {fresh}"
+        );
+
+        for toast in &mut app.status_toasts {
+            toast.created_at = Instant::now() - Duration::from_secs(60);
+        }
+        let later = footer_text(&mut app);
+        assert!(
+            !later.contains("Auto-compaction"),
+            "an informational acknowledgement must expire without user action: {later}"
+        );
+        assert!(
+            later.contains("idle"),
+            "the stable phase fact survives the expiry: {later}"
+        );
+    }
+
+    /// Errors are sticky: they outlive the informational TTL window and stay
+    /// until their own resolution window passes.
+    #[test]
+    fn footer_errors_outlive_informational_acknowledgements() {
+        let mut app = test_app();
+        app.status_message = Some("Provider request failed: timeout".to_string());
+
+        let fresh = footer_text(&mut app);
+        assert!(fresh.contains("failed"), "error notice missing: {fresh}");
+
+        if let Some(sticky) = app.sticky_status.as_mut() {
+            sticky.created_at = Instant::now() - Duration::from_secs(6);
+        } else {
+            panic!("an error must be promoted to the sticky slot");
+        }
+        let held = footer_text(&mut app);
+        assert!(
+            held.contains("failed"),
+            "errors must hold past the informational window: {held}"
+        );
     }
 
     #[test]
