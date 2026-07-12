@@ -37,7 +37,7 @@ pub struct ThemePickerView {
     system_ui_theme: UiTheme,
     /// Effective session treatment, reported separately from theme so the
     /// picker never claims an ombre is active under Terminal or Flat.
-    ocean_treatment: String,
+    ocean_treatment: crate::tui::ocean::OceanTreatment,
     row_hitboxes: RefCell<Vec<(Rect, usize)>>,
     last_mouse_selected: Option<usize>,
 }
@@ -46,11 +46,14 @@ impl ThemePickerView {
     #[cfg(test)]
     #[must_use]
     pub fn new(original_name: String) -> Self {
-        Self::new_with_treatment(original_name, "ombre".to_string())
+        Self::new_with_treatment(original_name, crate::tui::ocean::OceanTreatment::Ombre)
     }
 
     #[must_use]
-    pub fn new_with_treatment(original_name: String, ocean_treatment: String) -> Self {
+    pub fn new_with_treatment(
+        original_name: String,
+        ocean_treatment: crate::tui::ocean::OceanTreatment,
+    ) -> Self {
         // If the persisted name matches one of the entries, start there;
         // otherwise fall back to "System" so the cursor lands on a valid row.
         let selected = SELECTABLE_THEMES
@@ -230,7 +233,7 @@ impl ModalView for ThemePickerView {
 
         let treatment = if matches!(self.current(), ThemeId::Terminal) {
             "Treatment  Ombre unavailable — Terminal owns the background"
-        } else if self.ocean_treatment.eq_ignore_ascii_case("flat") {
+        } else if self.ocean_treatment.is_flat() {
             "Treatment  Flat — active"
         } else {
             "Treatment  Ombre — active"
@@ -501,7 +504,10 @@ mod tests {
     fn treatment_report_names_effective_appearance() {
         let area = ratatui::layout::Rect::new(0, 0, 100, 30);
 
-        let flat = ThemePickerView::new_with_treatment("dark".to_string(), "flat".to_string());
+        let flat = ThemePickerView::new_with_treatment(
+            "dark".to_string(),
+            crate::tui::ocean::OceanTreatment::Flat,
+        );
         let mut flat_buf = ratatui::buffer::Buffer::empty(area);
         flat.render(area, &mut flat_buf);
         let flat_text = flat_buf
@@ -511,8 +517,10 @@ mod tests {
             .collect::<String>();
         assert!(flat_text.contains("Treatment  Flat — active"));
 
-        let terminal =
-            ThemePickerView::new_with_treatment("terminal".to_string(), "ombre".to_string());
+        let terminal = ThemePickerView::new_with_treatment(
+            "terminal".to_string(),
+            crate::tui::ocean::OceanTreatment::Ombre,
+        );
         let mut terminal_buf = ratatui::buffer::Buffer::empty(area);
         terminal.render(area, &mut terminal_buf);
         let terminal_text = terminal_buf

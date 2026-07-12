@@ -1685,7 +1685,8 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
             app.needs_redraw = true;
         }
         "ocean_treatment" | "treatment" | "background_treatment" => {
-            app.ocean_treatment = settings.ocean_treatment.clone();
+            app.ocean_treatment =
+                crate::tui::ocean::OceanTreatment::parse(&settings.ocean_treatment);
             app.needs_redraw = true;
         }
         "bracketed_paste" | "paste" => {

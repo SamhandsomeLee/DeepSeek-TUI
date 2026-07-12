@@ -1838,8 +1838,9 @@ pub struct App {
     pub ocean_completion_started_at: Option<Instant>,
     /// Enables the authored underwater phase and ambient motion system.
     pub fancy_animations: bool,
-    /// `ombre` or `flat`; appearance is independent from motion settings.
-    pub ocean_treatment: String,
+    /// Typed appearance treatment; appearance is independent from motion
+    /// settings, and every underwater treatment keeps ambient life.
+    pub ocean_treatment: crate::tui::ocean::OceanTreatment,
     /// Distinct pre-session menu. Once dismissed, the normal idle ocean owns
     /// the empty session and this state stays hidden.
     pub launch: LaunchState,
@@ -2601,7 +2602,7 @@ impl App {
         let low_motion = settings.low_motion;
         let constrained_frame_rate = settings.constrained_frame_rate;
         let fancy_animations = settings.fancy_animations;
-        let ocean_treatment = settings.ocean_treatment.clone();
+        let ocean_treatment = crate::tui::ocean::OceanTreatment::parse(&settings.ocean_treatment);
         let synchronized_output_enabled = settings.synchronized_output_enabled();
         let status_indicator = settings.status_indicator.clone();
         let show_thinking = settings.show_thinking;

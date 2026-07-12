@@ -9,6 +9,81 @@ use ratatui::style::Color;
 
 use crate::palette::{PaletteMode, UiTheme};
 
+/// Appearance treatment for the underwater shell.
+///
+/// Parsed once from persisted settings so rendering and scheduling code can
+/// branch on typed state instead of scattered string comparisons. Treatment
+/// is appearance only: ambient life belongs to every underwater treatment,
+/// while motion is governed separately by `low_motion`/`fancy_animations`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OceanTreatment {
+    /// State-reactive water column painted from the theme's [`OceanRamp`].
+    #[default]
+    Ombre,
+    /// Plain theme surface with the same state grammar and ambient life.
+    Flat,
+    /// Legacy full-chrome compatibility shell. Persisted settings normalize
+    /// unknown values to ombre, so this is reachable only through explicit
+    /// internal selection (tests and future compatibility wiring).
+    Classic,
+}
+
+impl OceanTreatment {
+    #[must_use]
+    pub fn parse(value: &str) -> Self {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("flat") {
+            Self::Flat
+        } else if value.eq_ignore_ascii_case("classic") {
+            Self::Classic
+        } else {
+            Self::Ombre
+        }
+    }
+
+    #[must_use]
+    pub fn is_ombre(self) -> bool {
+        self == Self::Ombre
+    }
+
+    #[must_use]
+    pub fn is_flat(self) -> bool {
+        self == Self::Flat
+    }
+
+    #[must_use]
+    pub fn is_classic(self) -> bool {
+        self == Self::Classic
+    }
+
+    /// Every underwater treatment keeps idle ambient life; only the legacy
+    /// classic shell stays still. Flat means a plain surface, not a lifeless
+    /// ocean, and Terminal-owned backgrounds still carry foreground life.
+    #[must_use]
+    pub fn supports_ambient_life(self) -> bool {
+        !self.is_classic()
+    }
+}
+
+/// Minimum empty-water size that earns decorative ambient life. Below this,
+/// content and controls own every cell. Shared by the renderer and the idle
+/// animation scheduler so redraws are never scheduled for invisible life.
+pub const AMBIENT_MIN_WIDTH: u16 = 68;
+pub const AMBIENT_MIN_HEIGHT: u16 = 15;
+
+/// Ambient-life ink for a theme, independent of the ombre ramp. Flat keeps
+/// the same sunk seafoam as ombre; palettes without RGB surfaces (Terminal)
+/// fall back to the raw secondary accent so the terminal's own palette
+/// colors the life.
+#[must_use]
+pub fn ambient_ink(theme: &UiTheme) -> Color {
+    let seafoam = rgb(theme.accent_secondary).unwrap_or((79, 209, 197));
+    match rgb(theme.surface_bg) {
+        Some(base) => color(mix(seafoam, base, 0.42)),
+        None => theme.accent_secondary,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OceanRamp {
     pub surface: Color,
@@ -159,6 +234,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn treatment_parses_saved_values_and_defaults_to_ombre() {
+        assert_eq!(OceanTreatment::parse("flat"), OceanTreatment::Flat);
+        assert_eq!(OceanTreatment::parse(" FLAT "), OceanTreatment::Flat);
+        assert_eq!(OceanTreatment::parse("classic"), OceanTreatment::Classic);
+        assert_eq!(OceanTreatment::parse("ombre"), OceanTreatment::Ombre);
+        assert_eq!(OceanTreatment::parse("kelp"), OceanTreatment::Ombre);
+        assert_eq!(OceanTreatment::parse(""), OceanTreatment::Ombre);
+    }
+
+    #[test]
+    fn every_underwater_treatment_keeps_ambient_life() {
+        assert!(OceanTreatment::Ombre.supports_ambient_life());
+        assert!(OceanTreatment::Flat.supports_ambient_life());
+        assert!(!OceanTreatment::Classic.supports_ambient_life());
+    }
+
+    #[test]
+    fn ambient_ink_matches_the_ramp_and_survives_reset_surfaces() {
+        // RGB themes: flat fish wear the same sunk seafoam as the ombre ramp
+        // so switching treatment never recolors the life.
+        let theme = crate::palette::UI_THEME;
+        let ramp = OceanRamp::for_theme(&theme).expect("RGB theme");
+        assert_eq!(ambient_ink(&theme), ramp.ambient);
+
+        // Terminal-owned surfaces have no RGB base; the raw secondary accent
+        // lets the terminal's own palette color the life.
+        let terminal = crate::palette::TERMINAL_UI_THEME;
+        assert_eq!(ambient_ink(&terminal), terminal.accent_secondary);
     }
 
     #[test]

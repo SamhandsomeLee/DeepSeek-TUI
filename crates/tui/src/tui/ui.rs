@@ -3616,10 +3616,21 @@ async fn run_event_loop(
         maybe_throttled_recovery_snapshot(app, Instant::now(), &mut last_recovery_snapshot_at);
         let history_has_live_motion = history_has_live_motion(&app.history);
         let active_cell_has_live_motion = active_cell_has_live_motion(app);
+        // Idle ambient motion belongs to every underwater treatment: ombre
+        // breathes its water column, while flat and Terminal-owned animate
+        // foreground life only. Schedule redraws only when something can
+        // actually move — the ombre field at any size, or ambient life once
+        // the empty water is large enough to earn it.
+        let ombre_field_breathes = app.ocean_treatment.is_ombre()
+            && crate::tui::ocean::OceanRamp::for_theme(&app.ui_theme).is_some();
+        let ambient_life_visible = app.viewport.last_transcript_area.is_some_and(|area| {
+            area.width >= crate::tui::ocean::AMBIENT_MIN_WIDTH
+                && area.height >= crate::tui::ocean::AMBIENT_MIN_HEIGHT
+        });
         let underwater_idle_motion = !app.low_motion
             && app.fancy_animations
-            && app.ocean_treatment == "ombre"
-            && crate::tui::ocean::OceanRamp::for_theme(&app.ui_theme).is_some()
+            && app.ocean_treatment.supports_ambient_life()
+            && (ombre_field_breathes || ambient_life_visible)
             && app.onboarding == OnboardingState::None
             && !app.attention_hold_active()
             && app.history.is_empty()
@@ -8809,7 +8820,7 @@ async fn apply_command_result(
                     app.view_stack.push(
                         crate::tui::theme_picker::ThemePickerView::new_with_treatment(
                             original,
-                            app.ocean_treatment.clone(),
+                            app.ocean_treatment,
                         ),
                     );
                 }
@@ -9879,7 +9890,7 @@ fn render_classic_header(area: Rect, buf: &mut Buffer, app: &App) {
 
 fn render(f: &mut Frame, app: &mut App, config: &Config) {
     let size = f.area();
-    let classic_shell = app.ocean_treatment.eq_ignore_ascii_case("classic");
+    let classic_shell = app.ocean_treatment.is_classic();
     app.sidebar_hover = crate::tui::app::SidebarHoverState::default();
 
     // Clear entire area with the configured app background.

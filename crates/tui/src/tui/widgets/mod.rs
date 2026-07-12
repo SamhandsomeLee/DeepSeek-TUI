@@ -66,6 +66,9 @@ pub struct ChatWidget {
     jump_to_latest_button: Option<Rect>,
     background: Color,
     ocean_ramp: Option<crate::tui::ocean::OceanRamp>,
+    /// Ink for idle fish/bubbles. Present for every underwater treatment —
+    /// flat and Terminal-owned keep ambient life without the ombre field.
+    ambient_ink: Option<Color>,
     ocean_elapsed_ms: u128,
     ocean_animated: bool,
     ambient_life: bool,
@@ -86,9 +89,15 @@ impl ChatWidget {
     pub fn new(app: &mut App, area: Rect) -> Self {
         let content_area = area;
         let background = app.ui_theme.surface_bg;
-        let ocean_ramp = (app.ocean_treatment == "ombre")
+        let ocean_ramp = app
+            .ocean_treatment
+            .is_ombre()
             .then(|| crate::tui::ocean::OceanRamp::for_theme(&app.ui_theme))
             .flatten();
+        let ambient_ink = app
+            .ocean_treatment
+            .supports_ambient_life()
+            .then(|| crate::tui::ocean::ambient_ink(&app.ui_theme));
         let ocean_elapsed_ms = app.ocean_started_at.elapsed().as_millis();
         let render_empty_state = should_render_empty_state(app);
         // Ambient phase animation is an empty-water affordance. Once real
@@ -120,6 +129,7 @@ impl ChatWidget {
                 jump_to_latest_button: None,
                 background,
                 ocean_ramp,
+                ambient_ink,
                 ocean_elapsed_ms,
                 ocean_animated,
                 ambient_life: app.input.trim().is_empty() && !app.attention_hold_active(),
@@ -401,9 +411,7 @@ impl ChatWidget {
         // handled separately; active work starts at the top and appends in
         // place until scrolling is genuinely necessary. The old anchoring is
         // retained only inside the explicitly selected classic treatment.
-        if app.ocean_treatment.eq_ignore_ascii_case("classic")
-            && app.viewport.transcript_scroll.is_at_tail()
-        {
+        if app.ocean_treatment.is_classic() && app.viewport.transcript_scroll.is_at_tail() {
             app.viewport.last_transcript_padding_top = visible_lines.saturating_sub(lines.len());
             pad_lines_to_bottom(&mut lines, visible_lines);
         } else {
@@ -432,6 +440,7 @@ impl ChatWidget {
             jump_to_latest_button,
             background,
             ocean_ramp,
+            ambient_ink,
             ocean_elapsed_ms,
             ocean_animated,
             ambient_life: false,
@@ -541,15 +550,7 @@ impl Renderable for ChatWidget {
             Paragraph::new(self.lines.clone()).style(Style::default().bg(self.background));
         paragraph.render(area, buf);
 
-        render_underwater_field(
-            area,
-            buf,
-            self.ocean_ramp,
-            &self.lines,
-            self.ambient_life,
-            self.ocean_elapsed_ms,
-            self.ocean_animated,
-        );
+        self.render_underwater_field(area, buf);
 
         // #3029: the transcript carries OSC 8 hyperlinks in-band inside span
         // content. Scan the rendered buffer for those payloads, blank the
@@ -592,40 +593,46 @@ impl Renderable for ChatWidget {
     }
 }
 
-fn render_underwater_field(
-    area: Rect,
-    buf: &mut Buffer,
-    ramp: Option<crate::tui::ocean::OceanRamp>,
-    lines: &[Line<'static>],
-    ambient_life: bool,
-    elapsed_ms: u128,
-    animated: bool,
-) {
-    let Some(ramp) = ramp else {
-        return;
-    };
-
-    for local_y in 0..area.height {
-        let protected = lines
-            .get(usize::from(local_y))
-            .and_then(occupied_text_bounds);
-        let row_bg = if animated {
-            ramp.color_at_phase(local_y, area.height, elapsed_ms)
-        } else {
-            ramp.color_at(local_y, area.height)
-        };
-        for local_x in 0..area.width {
-            let is_protected = protected.is_some_and(|(start, end)| {
-                usize::from(local_x) >= start && usize::from(local_x) < end
-            });
-            if !is_protected {
-                buf[(area.x + local_x, area.y + local_y)].set_bg(row_bg);
+impl ChatWidget {
+    /// Paint the underwater field. The water column belongs to ombre;
+    /// ambient life belongs to every underwater treatment. Flat keeps the
+    /// theme surface and Terminal keeps its inherited background, but
+    /// neither means a lifeless ocean.
+    fn render_underwater_field(&self, area: Rect, buf: &mut Buffer) {
+        if let Some(ramp) = self.ocean_ramp {
+            for local_y in 0..area.height {
+                let protected = self
+                    .lines
+                    .get(usize::from(local_y))
+                    .and_then(occupied_text_bounds);
+                let row_bg = if self.ocean_animated {
+                    ramp.color_at_phase(local_y, area.height, self.ocean_elapsed_ms)
+                } else {
+                    ramp.color_at(local_y, area.height)
+                };
+                for local_x in 0..area.width {
+                    let is_protected = protected.is_some_and(|(start, end)| {
+                        usize::from(local_x) >= start && usize::from(local_x) < end
+                    });
+                    if !is_protected {
+                        buf[(area.x + local_x, area.y + local_y)].set_bg(row_bg);
+                    }
+                }
             }
         }
-    }
 
-    if ambient_life {
-        render_ambient_life(area, buf, ramp, lines, elapsed_ms, animated);
+        if self.ambient_life
+            && let Some(ink) = self.ambient_ink
+        {
+            render_ambient_life(
+                area,
+                buf,
+                ink,
+                &self.lines,
+                self.ocean_elapsed_ms,
+                self.ocean_animated,
+            );
+        }
     }
 }
 
@@ -657,12 +664,14 @@ fn occupied_text_bounds(line: &Line<'_>) -> Option<(usize, usize)> {
 fn render_ambient_life(
     area: Rect,
     buf: &mut Buffer,
-    ramp: crate::tui::ocean::OceanRamp,
+    ink: Color,
     lines: &[Line<'static>],
     elapsed_ms: u128,
     animated: bool,
 ) {
-    if area.width < 68 || area.height < 15 {
+    if area.width < crate::tui::ocean::AMBIENT_MIN_WIDTH
+        || area.height < crate::tui::ocean::AMBIENT_MIN_HEIGHT
+    {
         return;
     }
 
@@ -721,8 +730,11 @@ fn render_ambient_life(
             .get(usize::from(local_y))
             .and_then(occupied_text_bounds);
         let mark_width = UnicodeWidthStr::width(mark);
+        // A one-cell gap on either side keeps life from visually attaching
+        // to occupied text, not merely from overlapping it.
         let collides = protected.is_some_and(|(start, end)| {
-            usize::from(local_x) < end && usize::from(local_x) + mark_width > start
+            usize::from(local_x) < end.saturating_add(1)
+                && usize::from(local_x) + mark_width > start.saturating_sub(1)
         });
         if collides || local_x.saturating_add(mark_width as u16) > area.width {
             continue;
@@ -730,7 +742,7 @@ fn render_ambient_life(
         for (offset, ch) in mark.chars().enumerate() {
             buf[(area.x + local_x + offset as u16, area.y + local_y)]
                 .set_symbol(&ch.to_string())
-                .set_fg(ramp.ambient);
+                .set_fg(ink);
         }
     }
 }
@@ -1037,7 +1049,7 @@ impl Renderable for ComposerWidget<'_> {
             // Top-right corner: editor state plus transient turn receipts.
             // Receipts are lifecycle chrome, not transcript content; they
             // should appear briefly without displacing conversation rows.
-            if self.app.ocean_treatment.eq_ignore_ascii_case("classic")
+            if self.app.ocean_treatment.is_classic()
                 && let Some(chrome) = composer_top_right_chrome(self.app, area.width)
             {
                 block = block.title_top(chrome.right_aligned());
@@ -1051,7 +1063,7 @@ impl Renderable for ComposerWidget<'_> {
                 .borders(Borders::TOP)
                 .border_style(Style::default().fg(self.app.ui_theme.border))
                 .style(background);
-            if self.app.ocean_treatment.eq_ignore_ascii_case("classic")
+            if self.app.ocean_treatment.is_classic()
                 && let Some(chrome) = composer_top_right_chrome(self.app, area.width)
             {
                 block = block.title_top(chrome.right_aligned());
@@ -4954,7 +4966,7 @@ mod tests {
     #[test]
     fn composer_border_renders_session_title() {
         let mut app = create_test_app();
-        app.ocean_treatment = "classic".to_string();
+        app.ocean_treatment = crate::tui::ocean::OceanTreatment::Classic;
         app.composer_density = ComposerDensity::Comfortable;
         app.session_title = Some("my-session".to_string());
         let slash_menu_entries = Vec::<SlashMenuEntry>::new();
@@ -4978,7 +4990,7 @@ mod tests {
     #[test]
     fn composer_border_renders_active_turn_receipt() {
         let mut app = create_test_app();
-        app.ocean_treatment = "classic".to_string();
+        app.ocean_treatment = crate::tui::ocean::OceanTreatment::Classic;
         app.composer_density = ComposerDensity::Comfortable;
         app.set_receipt_text("✓ turn completed · 2 tool(s) used");
         let slash_menu_entries = Vec::<SlashMenuEntry>::new();
@@ -5312,20 +5324,47 @@ mod tests {
     }
 
     #[test]
-    fn flat_treatment_keeps_theme_surface_and_state_content() {
+    fn flat_treatment_keeps_theme_surface_and_ambient_life() {
         let mut app = create_test_app();
-        app.ocean_treatment = "flat".to_string();
+        app.ocean_treatment = crate::tui::ocean::OceanTreatment::Flat;
+        app.low_motion = false;
+        app.fancy_animations = true;
         let area = Rect::new(0, 0, 100, 20);
         let base = app.ui_theme.surface_bg;
         let mut buf = Buffer::empty(area);
         ChatWidget::new(&mut app, area).render(area, &mut buf);
 
         assert_eq!(buf[(0, 0)].bg, base);
-        assert_eq!(buf[(0, 19)].bg, base);
-        assert_eq!(buf[(11, 14)].symbol(), " ", "flat has no ambient fish");
+        assert_eq!(buf[(0, 19)].bg, base, "flat keeps the plain theme surface");
+        let rendered = buffer_text(&buf, area);
+        assert!(
+            rendered.contains("><>") || rendered.contains("<><"),
+            "flat means a plain surface, not a lifeless ocean — idle fish must survive:\n{rendered}"
+        );
         assert!(
             (0..area.height).any(|y| (0..area.width).any(|x| buf[(x, y)].symbol() == "F")),
             "Fleet setup remains available in flat mode"
+        );
+    }
+
+    #[test]
+    fn terminal_owned_background_still_carries_foreground_life() {
+        let mut app = create_test_app();
+        app.ui_theme = crate::palette::TERMINAL_UI_THEME;
+        app.low_motion = false;
+        app.fancy_animations = true;
+        let area = Rect::new(0, 0, 100, 20);
+        let mut buf = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut buf);
+
+        assert!(
+            (0..area.height).all(|y| (0..area.width).all(|x| buf[(x, y)].bg == Color::Reset)),
+            "the Terminal treatment must never paint a background"
+        );
+        let rendered = buffer_text(&buf, area);
+        assert!(
+            rendered.contains("><>") || rendered.contains("<><"),
+            "Terminal keeps foreground ambient life without owning the background:\n{rendered}"
         );
     }
 
@@ -5469,7 +5508,7 @@ mod tests {
         let mut app = create_test_app();
         let custom = ratatui::style::Color::Rgb(26, 27, 38);
         app.ui_theme = app.ui_theme.with_background_color(custom);
-        app.ocean_treatment = "flat".to_string();
+        app.ocean_treatment = crate::tui::ocean::OceanTreatment::Flat;
         app.add_message(HistoryCell::Assistant {
             content: "ready".to_string(),
             streaming: false,
