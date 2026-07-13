@@ -181,7 +181,6 @@ pub struct FleetSetupSnapshot {
     max_admitted: usize,
     subagent_spawn_depth: u32,
     fleet_spawn_depth: u32,
-    token_budget: Option<u64>,
     api_timeout_secs: u64,
     heartbeat_timeout_secs: u64,
     /// Lowercased roster member ids with their origin labels (built-in /
@@ -242,7 +241,6 @@ impl FleetSetupSnapshot {
             max_admitted: config.max_admitted_subagents_for_provider(app.api_provider),
             subagent_spawn_depth: config.subagent_max_spawn_depth_for_provider(app.api_provider),
             fleet_spawn_depth,
-            token_budget: config.subagent_token_budget_for_provider(app.api_provider),
             api_timeout_secs: config.subagent_api_timeout_secs_for_provider(app.api_provider),
             heartbeat_timeout_secs: config
                 .subagent_heartbeat_timeout_secs_for_provider(app.api_provider),
@@ -913,12 +911,6 @@ impl FleetSetupView {
         let role = &ROLES[self.role_idx.min(ROLES.len() - 1)];
         let (profile_value, _) = profile_file_status(&self.snapshot.workspace);
         let file_stem = profile_file_stem(&role.label);
-        let token_budget = self
-            .snapshot
-            .token_budget
-            .map(|budget| format!("{budget} tokens"))
-            .unwrap_or_else(|| "unbounded".to_string());
-
         let mut lines: Vec<Line> = Vec::new();
         let section = |lines: &mut Vec<Line>, label: &str, body: String| {
             lines.push(Line::from(Span::styled(
@@ -1021,7 +1013,7 @@ impl FleetSetupView {
             &mut lines,
             "Review policy",
             format!(
-                "Budget {token_budget} · {}s api, {}s heartbeat. Fleet -> exec runs the workers; /fleet status (or /subagents) inspects the ledger.",
+                "Workers run without a token cap by default · {}s api, {}s heartbeat. Fleet -> exec runs the workers; /fleet status (or /subagents) inspects the ledger.",
                 self.snapshot.api_timeout_secs, self.snapshot.heartbeat_timeout_secs
             ),
         );
@@ -1274,7 +1266,6 @@ mod tests {
             max_admitted: 20,
             subagent_spawn_depth: 3,
             fleet_spawn_depth: 3,
-            token_budget: Some(100_000),
             api_timeout_secs: 120,
             heartbeat_timeout_secs: 300,
             roster_members: crate::fleet::roster::FleetRoster::built_ins_only()

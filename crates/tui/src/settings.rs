@@ -400,7 +400,9 @@ impl Default for Settings {
             mention_menu_limit: 128,
             mention_walk_depth: 10,
             mention_menu_behavior: "fuzzy".to_string(),
-            show_thinking: true,
+            // Reasoning is useful when explicitly requested, but it should
+            // never displace the actual conversation in the default TUI.
+            show_thinking: false,
             show_tool_details: false,
             locale: "auto".to_string(),
             theme: "system".to_string(),
@@ -1690,7 +1692,7 @@ mod tests {
         let mut settings = Settings::default();
         // Density is calm by default; motion is an independent axis.
         assert!(settings.calm_mode);
-        assert!(settings.show_thinking);
+        assert!(!settings.show_thinking);
 
         let changed = settings.apply_preset("CALM").expect("calm preset applies");
         assert_eq!(
@@ -1707,12 +1709,8 @@ mod tests {
         assert!(settings.low_motion);
         assert!(!settings.fancy_animations);
         assert!(!settings.show_tool_details);
-        // Evidence preserved: the calm preset must NOT hide thinking — it only
-        // quiets motion and verbose tool detail.
-        assert!(
-            settings.show_thinking,
-            "calm preset must keep thinking visible"
-        );
+        // Calm does not override the user's reasoning preference.
+        assert!(!settings.show_thinking);
     }
 
     #[test]
@@ -1724,8 +1722,8 @@ mod tests {
         assert!(settings.fancy_animations);
         assert_eq!(settings.transcript_spacing, "comfortable");
         assert_eq!(settings.tool_collapse_mode, "compact");
-        // Thinking stays visible — compact is not "hide evidence".
-        assert!(settings.show_thinking);
+        // Thinking is opt-in so the transcript stays focused on the chat.
+        assert!(!settings.show_thinking);
     }
 
     #[test]

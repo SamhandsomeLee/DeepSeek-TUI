@@ -79,6 +79,12 @@ pub fn for_route(config: &Config, provider: ApiProvider) -> BillingPresentation 
 
     let provider_config = config.provider_config_for(provider);
     match provider {
+        // Z.ai's dedicated Coding endpoint is the GLM Coding Plan route. Its
+        // quota is subscription-backed, so a public API price estimate is not
+        // truthful spend and must not appear as dollars in the UI.
+        ApiProvider::Zai if provider_config.is_some_and(uses_zai_coding_plan) => {
+            BillingPresentation::Subscription("Z.ai Coding Plan quota")
+        }
         ApiProvider::XiaomiMimo if !xiaomi_is_explicit_pay_as_you_go(provider_config) => {
             BillingPresentation::Subscription("MiMo token plan")
         }
@@ -96,6 +102,14 @@ pub fn for_route(config: &Config, provider: ApiProvider) -> BillingPresentation 
         }
         _ => BillingPresentation::Metered,
     }
+}
+
+fn uses_zai_coding_plan(config: &ProviderConfig) -> bool {
+    config.base_url.as_deref().is_some_and(|url| {
+        url.trim()
+            .trim_end_matches('/')
+            .ends_with("/api/coding/paas/v4")
+    })
 }
 
 /// Billing for a child route when its full dispatch config is not present in
@@ -343,6 +357,31 @@ mod tests {
         assert_eq!(
             format_usage_chip(&chip).as_deref(),
             Some("usage: Codex OAuth quota")
+        );
+        assert!(!format_usage_line(&chip).contains('$'));
+    }
+
+    #[test]
+    fn zai_coding_plan_endpoint_never_claims_api_dollars() {
+        let config = config_with(
+            ApiProvider::Zai,
+            ProviderConfig {
+                base_url: Some("https://api.z.ai/api/coding/paas/v4".to_string()),
+                ..ProviderConfig::default()
+            },
+        );
+        let billing = for_route(&config, ApiProvider::Zai);
+        assert_eq!(
+            billing,
+            BillingPresentation::Subscription("Z.ai Coding Plan quota")
+        );
+        let chip = usage_chip(
+            billing,
+            ApiProvider::Zai,
+            "glm-5.2",
+            0.05,
+            CostCurrency::Usd,
+            None,
         );
         assert!(!format_usage_line(&chip).contains('$'));
     }

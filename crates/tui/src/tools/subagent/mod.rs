@@ -1466,8 +1466,9 @@ pub struct SubAgentCompletion {
 }
 
 /// Parent transcript snapshot available to sub-agents that opt into context
-/// forking. The system prompt and leading messages are kept byte-identical to
-/// the parent request so DeepSeek's prefix cache can reuse the warmed prefix.
+/// forking. Leading messages may be inherited as context, but every child
+/// keeps its own resolved system prompt so parent-specific model identity or
+/// role text cannot override the worker's actual route and instructions.
 #[derive(Clone, Debug)]
 pub struct SubAgentForkContext {
     pub system: Option<SystemPrompt>,
@@ -4215,7 +4216,7 @@ impl ToolSpec for AgentTool {
                 "model_strength": {
                     "type": "string",
                     "enum": ["same", "faster"],
-                    "description": "Optional child model strength. Children inherit the active model by default, including type=explore. Choose faster explicitly for read-only lookup/search, status, or other low-risk tasks that can run on a smaller/faster same-family sibling; CodeWhale maps known families such as DeepSeek V4 Pro to Flash and GLM-5.2 to GLM-5-Turbo. No hidden auto-downgrade happens."
+                    "description": "Optional child model strength. Children inherit the active model by default. Choose faster explicitly for read-only lookup/search, status, or other low-risk tasks that can use the configured fast sibling. The run receipt is authoritative for the resolved route; no hidden auto-downgrade happens."
                 },
                 "model": {
                     "type": "string",
@@ -4271,7 +4272,7 @@ impl ToolSpec for AgentTool {
                 "token_budget": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Aggregate token budget for this child and descendants. Declare deliberately for bounded delegation."
+                    "description": "Optional aggregate emergency cap for this child and descendants. Omit it for normal work; only set it when the user explicitly asks for a strict limit."
                 },
                 "workspace_policy": {
                     "type": "string",
@@ -4289,7 +4290,7 @@ impl ToolSpec for AgentTool {
                 },
                 "deliberate": {
                     "type": "boolean",
-                    "description": "When true, require type (or profile), workspace_policy, expected_artifact, write_authority, and token_budget."
+                    "description": "When true, require type (or profile), workspace_policy, expected_artifact, and write_authority. Token budget remains optional."
                 }
             },
             "required": []
@@ -5105,11 +5106,12 @@ fn build_subagent_system_prompt(
 
 fn subagent_request_system_prompt(
     subagent_system_prompt: &str,
-    fork_context: Option<&SubAgentForkContext>,
+    _fork_context: Option<&SubAgentForkContext>,
 ) -> SystemPrompt {
-    fork_context
-        .and_then(|context| context.system.clone())
-        .unwrap_or_else(|| SystemPrompt::Text(subagent_system_prompt.to_string()))
+    // Forking inherits conversation context, not the parent's identity. A
+    // child can have a different provider/model/profile, so its own resolved
+    // role prompt must stay at system precedence.
+    SystemPrompt::Text(subagent_system_prompt.to_string())
 }
 
 fn build_initial_subagent_messages(
@@ -7005,13 +7007,10 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
         if write_authority_str.is_none() {
             missing.push("write_authority");
         }
-        if token_budget.is_none() {
-            missing.push("token_budget");
-        }
         if !missing.is_empty() {
             return Err(ToolError::invalid_input(format!(
                 "deliberate spawn requires: {}. Missing: {}.",
-                "type/profile, workspace_policy, expected_artifact, write_authority, token_budget",
+                "type/profile, workspace_policy, expected_artifact, write_authority",
                 missing.join(", ")
             )));
         }
@@ -8856,7 +8855,7 @@ const EXPLORE_AGENT_INTRO: &str = concat!(
     "Orient first: confirm the workspace/project root, read relevant AGENTS.md/README guidance when the tree is unfamiliar, then search only the likely scope.\n",
     "Use list_dir/file_search, grep_files, and read_file; use RLM only for long inputs or many semantic slices, not basic path discovery.\n",
     "Honor QUESTION, SCOPE, ALREADY_KNOWN, and STOP_CONDITION. Do not repeat ALREADY_KNOWN work unless evidence contradicts it; do not broaden once QUESTION is answered.\n",
-    "DeepSeek V4 can hold broad evidence, but your value is compressed reconnaissance: cite `path:line-range` for each finding and stop once evidence is sufficient. Return partial findings if the next step would be speculative or duplicative.\n",
+    "Your value is compressed reconnaissance: cite `path:line-range` for each finding and stop once evidence is sufficient. Return partial findings if the next step would be speculative or duplicative.\n",
     "CHANGES will almost always be \"None.\" for an explorer.\n\n"
 );
 

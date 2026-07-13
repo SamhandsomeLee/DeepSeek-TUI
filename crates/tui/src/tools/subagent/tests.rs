@@ -896,7 +896,6 @@ fn deliberate_spawn_requires_delegation_fields() {
     );
     let err = missing.unwrap_err().to_string();
     assert!(err.contains("expected_artifact"), "{err}");
-    assert!(err.contains("token_budget"), "{err}");
 
     let ok = parse_spawn_request(&json!({
         "prompt": "review the diff",
@@ -905,11 +904,10 @@ fn deliberate_spawn_requires_delegation_fields() {
         "workspace_policy": "shared",
         "expected_artifact": "review findings",
         "write_authority": "read_only",
-        "token_budget": 50000,
     }))
     .expect("deliberate spawn with all fields");
     assert_eq!(ok.agent_type, SubAgentType::Review);
-    assert_eq!(ok.token_budget, Some(50_000));
+    assert_eq!(ok.token_budget, None);
     assert_eq!(ok.write_authority, Some(SpawnWriteAuthority::ReadOnly));
     assert_eq!(ok.expected_artifact.as_deref(), Some("review findings"));
     assert!(
@@ -1699,7 +1697,7 @@ fn forked_subagent_messages_preserve_parent_prefix_then_append_task() {
 
     assert_eq!(
         subagent_request_system_prompt("child system", Some(&fork_context)),
-        parent_system
+        SystemPrompt::Text("child system".to_string())
     );
     assert_eq!(messages.first(), Some(&parent_message));
     assert_eq!(messages.len(), 4);

@@ -1415,7 +1415,10 @@ struct TaskPanelRowSets {
 fn task_panel_row_sets(app: &App) -> TaskPanelRowSets {
     let explicit_tasks_focus = app.sidebar_focus == SidebarFocus::Tasks;
     let active = active_tool_rows(app);
-    let reasoning = reasoning_task_rows(app);
+    // Model reasoning belongs to the optional transcript detail, never to the
+    // activity surface. Keeping it out of this top-level panel prevents a
+    // long thinking stream from crowding out workers and real work.
+    let reasoning = Vec::new();
     // Auto/Pinned mode deliberately skips live-tool dedup (passes an empty
     // slice), matching the previous per-consumer call sites.
     let background = background_task_rows(app, if explicit_tasks_focus { &active } else { &[] });
@@ -2237,17 +2240,6 @@ fn background_task_rows(app: &App, active_rows: &[SidebarToolRow]) -> Vec<TaskPa
         .iter()
         .filter(|task| task.kind == TaskPanelEntryKind::Background)
         .filter(|task| !background_task_duplicates_live_tool(task, active_rows))
-        .cloned()
-        .collect();
-    rows.sort_by_key(|task| (task_status_rank(task.status.as_str()), task.id.clone()));
-    rows
-}
-
-fn reasoning_task_rows(app: &App) -> Vec<TaskPanelEntry> {
-    let mut rows: Vec<TaskPanelEntry> = app
-        .task_panel
-        .iter()
-        .filter(|task| task.kind == TaskPanelEntryKind::ModelReasoning)
         .cloned()
         .collect();
     rows.sort_by_key(|task| (task_status_rank(task.status.as_str()), task.id.clone()));
@@ -5238,7 +5230,7 @@ mod tests {
     }
 
     #[test]
-    fn tasks_panel_renders_model_reasoning_outside_background_commands() {
+    fn tasks_panel_hides_model_reasoning_from_activity() {
         let mut app = create_test_app();
         app.sidebar_focus = SidebarFocus::Tasks;
         app.task_panel.push(TaskPanelEntry {
@@ -5256,13 +5248,10 @@ mod tests {
         let text = lines_to_text(&task_panel_lines(&app, 80, 8));
 
         assert!(
-            text.iter().any(|line| line == "Model reasoning"),
-            "reasoning section missing: {text:?}"
-        );
-        assert!(
-            text.iter()
-                .any(|line| line.contains("thinking running 4.2s")),
-            "reasoning row should show live thinking duration: {text:?}"
+            !text
+                .iter()
+                .any(|line| line.contains("Model reasoning") || line.contains("thinking")),
+            "reasoning must stay out of the Activity panel: {text:?}"
         );
         assert!(
             !text.iter().any(|line| line.contains("Bash jobs")),

@@ -12,6 +12,7 @@ use crate::tui::command_palette::{
 };
 use crate::tui::context_menu::{ContextMenuEntry, ContextMenuView};
 use crate::tui::history::HistoryCell;
+use crate::tui::pager::PagerView;
 use crate::tui::scrolling::{ScrollDirection, TranscriptScroll};
 use crate::tui::selection::{SelectionAutoscroll, TranscriptSelectionPoint};
 use crate::tui::ui_text::{
@@ -678,6 +679,13 @@ pub(crate) fn apply_sidebar_row_action(app: &mut App, action: SidebarRowAction) 
             Vec::new()
         }
         SidebarRowAction::OpenAgentDetail { agent_id } => {
+            // Prefer the worker's actual message transcript over the compact
+            // status card. The card intentionally keeps only a few activity
+            // lines; Open must show the conversation the worker had.
+            if open_agent_chat_pager(app, &agent_id) {
+                app.needs_redraw = true;
+                return Vec::new();
+            }
             let cell_index = app.history.iter().position(|cell| {
                 matches!(
                     cell,
@@ -733,6 +741,73 @@ pub(crate) fn apply_sidebar_row_action(app: &mut App, action: SidebarRowAction) 
             Vec::new()
         }
     }
+}
+
+fn open_agent_chat_pager(app: &mut App, agent_id: &str) -> bool {
+    use crate::tools::handle::{HandleValue, VarHandle};
+
+    let lookup = VarHandle {
+        kind: "var_handle".to_string(),
+        session_id: format!("agent:{agent_id}"),
+        name: "full_transcript".to_string(),
+        type_name: String::new(),
+        length: 0,
+        repr_preview: String::new(),
+        sha256: String::new(),
+    };
+    let payload = match app.runtime_services.handle_store.try_lock() {
+        Ok(store) => match store.get(&lookup) {
+            Some(record) => match &record.value {
+                HandleValue::Json(value) => value.clone(),
+                HandleValue::Text(_) => return false,
+            },
+            None => return false,
+        },
+        Err(_) => return false,
+    };
+    let Some(messages) = payload
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return false;
+    };
+
+    let omitted = payload
+        .get("omitted_messages")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let mut text = String::new();
+    if omitted > 0 {
+        text.push_str(&format!(
+            "{omitted} earlier messages were retained in the worker checkpoint but are not available in this live session.\n\n"
+        ));
+    }
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("message");
+        let content = message.get("content").cloned().unwrap_or_default();
+        text.push_str(&format!("── {role} ──\n"));
+        text.push_str(
+            &serde_json::to_string_pretty(&content).unwrap_or_else(|_| content.to_string()),
+        );
+        text.push_str("\n\n");
+    }
+    if text.trim().is_empty() {
+        return false;
+    }
+    let width = app
+        .viewport
+        .last_transcript_area
+        .map(|area| area.width)
+        .unwrap_or(80);
+    app.view_stack.push(PagerView::from_text(
+        format!("Agent chat — {agent_id}"),
+        &text,
+        width.saturating_sub(2),
+    ));
+    true
 }
 
 pub(crate) fn mouse_hits_transcript_scrollbar(app: &App, mouse: MouseEvent) -> bool {
