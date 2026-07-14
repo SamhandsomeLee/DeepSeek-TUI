@@ -88,6 +88,28 @@ fn config_update_preview_suppresses_only_success_message_not_action_or_errors() 
 }
 
 #[test]
+fn config_refresh_preserves_active_search_filter() {
+    let mut app = create_test_app();
+    let mut view = ConfigView::new_for_app(&app);
+    for ch in "model".chars() {
+        let _ = view.handle_key(KeyEvent::new(
+            crossterm::event::KeyCode::Char(ch),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+    }
+    app.view_stack.push(view);
+
+    refresh_config_view_if_open(&mut app, "default_model");
+
+    let mut view = app.view_stack.pop().expect("refreshed config view");
+    let config = view
+        .as_any_mut()
+        .downcast_mut::<ConfigView>()
+        .expect("config view type");
+    assert_eq!(config.filter_query(), "model");
+}
+
+#[test]
 fn workflow_panel_plain_letters_return_to_composer() {
     let mut app = create_test_app();
     app.workflow_panel = Some(crate::tui::widgets::workflow_panel::WorkflowPanel::new(
@@ -8398,6 +8420,16 @@ fn api_key_paste_shortcut_is_not_plain_text_input() {
 
     let shifted = KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT);
     assert!(crate::tui::key_shortcuts::is_text_input_key(&shifted));
+}
+
+#[test]
+fn international_layout_glyphs_remain_plain_text_input() {
+    for ch in ['\u{00e7}', '\u{00bf}'] {
+        let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+        assert!(crate::tui::key_shortcuts::is_text_input_key(&key));
+        assert!(!crate::tui::shell_key_routing::is_help_shortcut(&key));
+        assert!(!crate::tui::shell_key_routing::is_context_inspector_shortcut(&key));
+    }
 }
 
 #[test]

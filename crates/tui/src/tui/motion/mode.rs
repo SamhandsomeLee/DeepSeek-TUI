@@ -34,21 +34,30 @@ pub enum SpinnerPresentation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MotionPolicy {
     pub mode: MotionMode,
+    constrained_frame_rate: bool,
 }
 
 impl MotionPolicy {
-    /// Derive policy from the two independent settings axes plus any runtime
-    /// force-reduced overlay (tmux, `CODEWHALE_LOW_MOTION`, …).
+    /// Derive presentation semantics independently from the runtime frame cap.
+    /// Terminal compatibility limits may reduce redraw frequency, but must not
+    /// masquerade as an accessibility preference or disable authored motion.
     #[must_use]
-    pub fn from_settings(low_motion: bool, fancy_animations: bool, force_reduced: bool) -> Self {
-        let mode = if low_motion || force_reduced {
+    pub fn from_settings(
+        low_motion: bool,
+        fancy_animations: bool,
+        constrained_frame_rate: bool,
+    ) -> Self {
+        let mode = if low_motion {
             MotionMode::Reduced
         } else if !fancy_animations {
             MotionMode::Still
         } else {
             MotionMode::Full
         };
-        Self { mode }
+        Self {
+            mode,
+            constrained_frame_rate,
+        }
     }
 
     #[must_use]
@@ -77,10 +86,17 @@ impl MotionPolicy {
     #[must_use]
     #[allow(dead_code)] // used by FrameRequester::clamp_to_frame_cap (TUI-DOG-008)
     pub fn min_frame_interval(self) -> Duration {
-        match self.mode {
-            MotionMode::Full => MIN_FRAME_INTERVAL,
-            MotionMode::Reduced | MotionMode::Still => LOW_MOTION_MIN_FRAME_INTERVAL,
+        if self.constrained_frame_rate || !matches!(self.mode, MotionMode::Full) {
+            LOW_MOTION_MIN_FRAME_INTERVAL
+        } else {
+            MIN_FRAME_INTERVAL
         }
+    }
+
+    /// Whether the render loop should use its 30 FPS compatibility cap.
+    #[must_use]
+    pub fn uses_constrained_frame_rate(self) -> bool {
+        self.constrained_frame_rate || !matches!(self.mode, MotionMode::Full)
     }
 
     /// Streaming display-clock interval. Reduced/Still keep the same cadence
@@ -167,10 +183,15 @@ mod tests {
     }
 
     #[test]
-    fn force_reduced_overlay_wins() {
+    fn frame_cap_preserves_authored_motion_semantics() {
         let policy = MotionPolicy::from_settings(false, true, true);
-        assert_eq!(policy.mode, MotionMode::Reduced);
-        assert!(policy.as_low_motion());
+        assert_eq!(policy.mode, MotionMode::Full);
+        assert!(!policy.as_low_motion());
+        assert!(policy.allows_decorative());
+        assert!(policy.allows_catch_up_bursts());
+        assert!(policy.should_request_animation_frames());
+        assert!(policy.uses_constrained_frame_rate());
+        assert_eq!(policy.min_frame_interval(), LOW_MOTION_MIN_FRAME_INTERVAL);
     }
 
     #[test]

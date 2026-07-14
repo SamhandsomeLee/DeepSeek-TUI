@@ -965,6 +965,7 @@ impl ViewStack {
         // is unchanged.
         for view in &self.views {
             let region = view.occupied_region(area);
+            crate::tui::osc8::overlay_frame_links(region, Vec::new());
             render_modal_backdrop(region, buf);
             view.render(area, buf);
         }
@@ -1578,6 +1579,16 @@ impl ConfigView {
         }
     }
 
+    /// Snapshot the active search so live config updates can rebuild the
+    /// modal without making the user's filtered result set jump away.
+    pub(crate) fn filter_query(&self) -> &str {
+        &self.filter
+    }
+
+    pub(crate) fn restore_filter(&mut self, filter: String) {
+        self.update_filter(|current| *current = filter);
+    }
+
     fn visible_rows_cached(&self) -> usize {
         let cached = self.last_visible_rows.get();
         if cached == 0 { 8 } else { cached }
@@ -1769,15 +1780,18 @@ impl ConfigView {
         }))
     }
 
-    fn open_selected_provider_picker(&self) -> Option<ViewAction> {
+    fn open_selected_catalog_picker(&self) -> Option<ViewAction> {
         let row = self.rows.get(self.selected_row_index()?)?;
-        (row.editable && row.key == "provider").then(|| {
-            ViewAction::Emit(ViewEvent::CommandPaletteSelected {
-                action: CommandPaletteAction::ExecuteCommand {
-                    command: "/provider".to_string(),
-                },
-            })
-        })
+        let command = match row.key.as_str() {
+            "provider" if row.editable => "/provider",
+            "model" | "default_model" if row.editable => "/model",
+            _ => return None,
+        };
+        Some(ViewAction::Emit(ViewEvent::CommandPaletteSelected {
+            action: CommandPaletteAction::ExecuteCommand {
+                command: command.to_string(),
+            },
+        }))
     }
 
     fn move_choice(&mut self, delta: isize) {
@@ -2684,7 +2698,7 @@ impl ModalView for ConfigView {
                     .and_then(|idx| self.rows.get(idx))
                     .is_some_and(|row| row.editable)
                 {
-                    if let Some(action) = self.open_selected_provider_picker() {
+                    if let Some(action) = self.open_selected_catalog_picker() {
                         return action;
                     }
                     self.start_edit();
@@ -2697,7 +2711,7 @@ impl ModalView for ConfigView {
                     .and_then(|idx| self.rows.get(idx))
                     .is_some_and(|row| row.editable)
                 {
-                    if let Some(action) = self.open_selected_provider_picker() {
+                    if let Some(action) = self.open_selected_catalog_picker() {
                         return action;
                     }
                     if let Some(action) = self.toggle_selected_boolean() {
@@ -2780,7 +2794,7 @@ impl ModalView for ConfigView {
             self.adjust_scroll(self.visible_rows_cached());
             self.last_mouse_selected = Some(row_idx);
             if activate && self.rows.get(row_idx).is_some_and(|row| row.editable) {
-                if let Some(action) = self.open_selected_provider_picker() {
+                if let Some(action) = self.open_selected_catalog_picker() {
                     return action;
                 }
                 if let Some(action) = self.toggle_selected_boolean() {
@@ -4367,6 +4381,27 @@ api_key_env = "ACME_API_KEY"
     }
 
     #[test]
+    fn config_view_model_rows_use_the_full_model_picker() {
+        let app = create_test_app();
+        for key in ["model", "default_model"] {
+            let mut view = ConfigView::new_for_app(&app);
+            view.selected = view
+                .rows
+                .iter()
+                .position(|row| row.key == key)
+                .expect("model row");
+
+            match view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
+                ViewAction::Emit(ViewEvent::CommandPaletteSelected {
+                    action: CommandPaletteAction::ExecuteCommand { command },
+                }) => assert_eq!(command, "/model", "row {key}"),
+                other => panic!("expected full model picker for {key}, got {other:?}"),
+            }
+            assert!(view.editing.is_none());
+        }
+    }
+
+    #[test]
     fn config_view_experimental_features_show_effective_state_and_overrides() {
         let temp_root = std::env::temp_dir().join(format!(
             "codewhale-experimental-config-view-test-{}",
@@ -5224,6 +5259,21 @@ base_url = "https://api.xiaomimimo.com/v1"
                 );
             }
         }
+    }
+
+    #[test]
+    fn view_stack_masks_links_behind_opaque_modals() {
+        let area = Rect::new(0, 0, 24, 8);
+        crate::tui::osc8::set_frame_links(vec![crate::tui::osc8::LinkRegion {
+            row: 3,
+            col_start: 2,
+            col_end: 18,
+            target: "https://example.invalid/under-modal".to_string(),
+        }]);
+        let mut stack = ViewStack::new();
+        stack.push(BareModal);
+        stack.render(area, &mut Buffer::empty(area));
+        assert!(crate::tui::osc8::take_frame_links().is_empty());
     }
 
     fn buffer_text(buf: &Buffer, area: Rect) -> String {

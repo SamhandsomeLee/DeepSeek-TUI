@@ -975,13 +975,10 @@ impl AppMode {
     /// `Auto` remains an internal variant while the real implementation is
     /// redesigned; do not expose it through user-facing mode selection (#3733).
     /// `Yolo` is kept for parse/back-compat only and is not in the Tab cycle.
-    /// Operate remains explicitly selectable for readiness inspection, but
-    /// Tab must not drop users into a fail-closed mode whose control board and
-    /// host-enforced workflow receipts are not shipped yet.
+    /// Operate remains parseable for restored sessions and compatibility, but
+    /// user-facing selection must not offer a fail-closed mode whose control
+    /// board and host-enforced workflow receipts are not shipped yet.
     pub const CYCLE: [Self; 2] = [Self::Plan, Self::Agent];
-
-    /// User-facing picker / numeric command order: 1 Act / 2 Plan / 3 Operate.
-    pub const CHOICES: [Self; 3] = [Self::Agent, Self::Plan, Self::Operate];
 
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {

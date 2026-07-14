@@ -9,6 +9,8 @@
 //! `Alt+?` and `Alt+C` are still accepted where terminals deliver them but
 //! are never advertised until proven in real terminals (TUI-DOG-003);
 //! `/context` is the guaranteed context path.
+//! Ambiguous macOS Option glyphs (`ç` / `¿`) remain text: terminals do not
+//! identify whether they came from Option or from a user's keyboard layout.
 
 use std::borrow::Cow;
 
@@ -116,9 +118,6 @@ pub fn is_tool_details_shortcut(key: &KeyEvent) -> bool {
 
 #[must_use]
 pub fn is_context_inspector_shortcut(key: &KeyEvent) -> bool {
-    if is_macos_option_c_legacy_key(key) {
-        return true;
-    }
     matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
         && key_shortcuts::alt_nav_modifiers(key.modifiers)
 }
@@ -131,36 +130,9 @@ pub fn is_help_shortcut(key: &KeyEvent) -> bool {
     if matches!(key.code, KeyCode::Char('/')) && key.modifiers.contains(KeyModifiers::CONTROL) {
         return true;
     }
-    if is_macos_option_question_legacy_key(key) {
-        return true;
-    }
     // Alt+? still opens help where the terminal delivers it, but it is not
     // advertised anywhere (TUI-DOG-003).
     matches!(key.code, KeyCode::Char('?')) && key_shortcuts::alt_nav_modifiers(key.modifiers)
-}
-
-/// Terminal.app default Option+C → `ç` when Option is not Meta.
-#[must_use]
-pub fn is_macos_option_c_legacy_key(key: &KeyEvent) -> bool {
-    is_macos_option_c_legacy_key_for_platform(key, cfg!(target_os = "macos"))
-}
-
-#[must_use]
-pub fn is_macos_option_c_legacy_key_for_platform(key: &KeyEvent, is_macos: bool) -> bool {
-    is_macos && key.modifiers.is_empty() && matches!(key.code, KeyCode::Char('\u{00e7}'))
-}
-
-/// Terminal.app default Option+Shift+/ → `¿` when Option is not Meta.
-#[must_use]
-pub fn is_macos_option_question_legacy_key(key: &KeyEvent) -> bool {
-    is_macos_option_question_legacy_key_for_platform(key, cfg!(target_os = "macos"))
-}
-
-#[must_use]
-pub fn is_macos_option_question_legacy_key_for_platform(key: &KeyEvent, is_macos: bool) -> bool {
-    is_macos
-        && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
-        && matches!(key.code, KeyCode::Char('\u{00bf}'))
 }
 
 #[cfg(test)]
@@ -229,24 +201,16 @@ mod tests {
             KeyCode::Char('?'),
             KeyModifiers::ALT
         )));
-        let option_help = KeyEvent::new(KeyCode::Char('\u{00bf}'), KeyModifiers::NONE);
-        assert!(is_macos_option_question_legacy_key_for_platform(
-            &option_help,
-            true
-        ));
-        assert!(!is_macos_option_question_legacy_key_for_platform(
-            &option_help,
-            false
-        ));
+        let inverted_question = KeyEvent::new(KeyCode::Char('\u{00bf}'), KeyModifiers::NONE);
+        assert!(!is_help_shortcut(&inverted_question));
     }
 
     #[test]
-    fn context_accepts_alt_c_and_macos_option_c_unadvertised() {
+    fn context_accepts_explicit_alt_c_without_stealing_layout_characters() {
         let alt_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT);
         assert!(is_context_inspector_shortcut(&alt_c));
-        let option_c = KeyEvent::new(KeyCode::Char('\u{00e7}'), KeyModifiers::NONE);
-        assert!(is_macos_option_c_legacy_key_for_platform(&option_c, true));
-        assert!(!is_macos_option_c_legacy_key_for_platform(&option_c, false));
+        let cedilla = KeyEvent::new(KeyCode::Char('\u{00e7}'), KeyModifiers::NONE);
+        assert!(!is_context_inspector_shortcut(&cedilla));
     }
 
     #[test]

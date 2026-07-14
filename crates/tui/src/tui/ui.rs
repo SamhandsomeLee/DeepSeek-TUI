@@ -3777,7 +3777,7 @@ async fn run_event_loop(
             app.fancy_animations,
             app.constrained_frame_rate,
         );
-        frame_rate_limiter.set_low_motion(motion_policy.as_low_motion());
+        frame_rate_limiter.set_low_motion(motion_policy.uses_constrained_frame_rate());
         app.streaming_state
             .set_low_motion(motion_policy.as_low_motion());
         stream_display_clock.set_allow_catch_up(motion_policy.allows_catch_up_bursts());
@@ -4563,7 +4563,8 @@ async fn run_event_loop(
                 continue;
             }
 
-            // Help: Alt+?, F1, Ctrl+/, and macOS Option+? (¿) — one matcher.
+            // Help: Alt+?, F1, and Ctrl+/ — one matcher. Ambiguous printable
+            // Option glyphs stay composer input on international layouts.
             if crate::tui::shell_key_routing::is_help_shortcut(&key) {
                 if app.view_stack.top_kind() == Some(ModalKind::Help) {
                     app.view_stack.pop();
@@ -5341,8 +5342,9 @@ async fn run_event_loop(
                 {
                     app.status_message = Some("No next tool output".to_string());
                 }
-                // Help chords (Alt+?, F1, Ctrl+/, Option+¿) are handled above
-                // via shell_key_routing::is_help_shortcut so bare `?` stays text.
+                // Help chords (Alt+?, F1, Ctrl+/) are handled above via
+                // shell_key_routing::is_help_shortcut so printable layout
+                // characters stay text.
                 // Shift+Enter steers a running turn. When idle, the
                 // normal composer-newline branch below still handles it
                 // as a multiline input gesture.
@@ -10789,8 +10791,15 @@ fn prepare_config_update_result(
 
 fn refresh_config_view_if_open(app: &mut App, focus_key: &str) {
     if app.view_stack.top_kind() == Some(ModalKind::Config) {
-        app.view_stack.pop();
+        let filter = app.view_stack.pop().and_then(|mut view| {
+            view.as_any_mut()
+                .downcast_mut::<ConfigView>()
+                .map(|config_view| config_view.filter_query().to_string())
+        });
         let mut config_view = ConfigView::new_for_app(app);
+        if let Some(filter) = filter {
+            config_view.restore_filter(filter);
+        }
         config_view.focus_key(focus_key);
         app.view_stack.push(config_view);
     }

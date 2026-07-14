@@ -16,7 +16,8 @@ pub struct MouseOutcome {
 
 /// Handle the work surface's focused keyboard contract. `Alt+W` enters the
 /// surface from the composer; Esc returns ownership to the composer (or clears
-/// a local stop arm / open detail first).
+/// a local stop arm / open detail first). Plain printable input always returns
+/// ownership to the composer instead of becoming a hidden panel shortcut.
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Option<Option<SidebarRowAction>> {
     let rows = project(app);
     if rows.is_empty() {
@@ -32,6 +33,15 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Option<Option<SidebarRowActio
         return None;
     }
 
+    if matches!(key.code, KeyCode::Char(_))
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        release_focus(app);
+        return None;
+    }
+
     let action = match key.code {
         KeyCode::Esc => {
             if app.work_surface.stop_arm.is_some() {
@@ -43,12 +53,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Option<Option<SidebarRowActio
             }
             return Some(None);
         }
-        KeyCode::Up | KeyCode::Char('k') => {
+        KeyCode::Up => {
             move_selection(app, &rows, -1);
             on_selection_changed(app);
             None
         }
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Down => {
             move_selection(app, &rows, 1);
             on_selection_changed(app);
             None
@@ -73,12 +83,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Option<Option<SidebarRowActio
             on_selection_changed(app);
             None
         }
-        KeyCode::Char('x') | KeyCode::Char('X') => selected_row(app, &rows).and_then(|row| {
+        KeyCode::Delete => selected_row(app, &rows).and_then(|row| {
             row.stop_action
                 .clone()
                 .and_then(|action| activate_stop(app, &row.id, action))
         }),
-        KeyCode::Enter | KeyCode::Char(' ') => {
+        KeyCode::Enter => {
             // Enter confirms an armed Stop on the selected row; otherwise it
             // toggles the primary Open/detail action.
             if let Some(arm) = app.work_surface.stop_arm.as_ref()

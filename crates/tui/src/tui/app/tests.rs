@@ -1619,10 +1619,6 @@ fn app_mode_helpers_centralize_parse_labels_and_cycle_order() {
     assert_eq!(AppMode::Auto.number(), '1');
     assert_eq!(AppMode::Yolo.number(), '1');
     assert_eq!(AppMode::Operate.number(), '3');
-    assert_eq!(
-        AppMode::CHOICES,
-        [AppMode::Agent, AppMode::Plan, AppMode::Operate]
-    );
     assert_eq!(AppMode::CYCLE, [AppMode::Plan, AppMode::Agent]);
 
     assert_eq!(AppMode::Plan.next(), AppMode::Agent);

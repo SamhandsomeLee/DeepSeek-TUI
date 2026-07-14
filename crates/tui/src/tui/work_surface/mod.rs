@@ -141,6 +141,27 @@ mod tests {
     }
 
     #[test]
+    fn printable_keys_release_panel_focus_for_the_composer() {
+        let mut app = app();
+        add_task(&mut app, "one");
+        assert!(
+            super::handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT)
+            )
+            .is_some()
+        );
+        assert!(app.work_surface.focused);
+
+        let outcome = super::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        );
+        assert!(outcome.is_none(), "composer must receive the printable key");
+        assert!(!app.work_surface.focused);
+    }
+
+    #[test]
     fn compact_surface_preserves_task_todo_and_stop_control() {
         let mut app = app();
         add_task(&mut app, "shell_compact");

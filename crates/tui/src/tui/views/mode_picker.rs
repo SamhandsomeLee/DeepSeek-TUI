@@ -1,4 +1,4 @@
-//! `/mode` picker for Act / Plan / Operate.
+//! `/mode` picker for the currently supported interactive modes.
 
 use std::cell::RefCell;
 
@@ -20,6 +20,12 @@ use crate::tui::views::{
     render_modal_footer, render_modal_surface,
 };
 
+// Operate remains parseable for restored sessions and explicit compatibility
+// inputs, but it is not a truthful interactive choice until Workflow dispatch
+// exists. Keep the visible roster local to this picker so compatibility does
+// not become a customer-visible affordance.
+const VISIBLE_MODES: [AppMode; 2] = [AppMode::Agent, AppMode::Plan];
+
 pub struct ModePickerView {
     cursor: usize,
     locale: Locale,
@@ -29,7 +35,7 @@ pub struct ModePickerView {
 impl ModePickerView {
     #[must_use]
     pub fn new(current: AppMode, locale: Locale) -> Self {
-        let cursor = AppMode::CHOICES
+        let cursor = VISIBLE_MODES
             .iter()
             .position(|mode| *mode == current)
             .unwrap_or(0);
@@ -41,7 +47,7 @@ impl ModePickerView {
     }
 
     fn selected_mode(&self) -> AppMode {
-        AppMode::CHOICES
+        VISIBLE_MODES
             .get(self.cursor)
             .copied()
             .unwrap_or(AppMode::Agent)
@@ -54,14 +60,14 @@ impl ModePickerView {
     }
 
     fn move_down(&mut self) {
-        let max = AppMode::CHOICES.len().saturating_sub(1);
+        let max = VISIBLE_MODES.len().saturating_sub(1);
         if self.cursor < max {
             self.cursor += 1;
         }
     }
 
     fn select_by_number(&mut self, number: char) -> Option<ViewAction> {
-        let idx = AppMode::CHOICES
+        let idx = VISIBLE_MODES
             .iter()
             .position(|mode| mode.number() == number)?;
         self.cursor = idx;
@@ -124,7 +130,7 @@ impl ModalView for ModePickerView {
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let popup_height = u16::try_from(AppMode::CHOICES.len()).unwrap_or(3) + 7;
+        let popup_height = u16::try_from(VISIBLE_MODES.len()).unwrap_or(2) + 7;
         let popup_area = centered_modal_area(area, 68, popup_height, 44, 8);
 
         render_modal_surface(area, popup_area, buf);
@@ -156,9 +162,9 @@ impl ModalView for ModePickerView {
 
         self.row_hitboxes.borrow_mut().clear();
 
-        let mut lines = Vec::with_capacity(AppMode::CHOICES.len());
+        let mut lines = Vec::with_capacity(VISIBLE_MODES.len());
 
-        for (idx, mode) in AppMode::CHOICES.iter().copied().enumerate() {
+        for (idx, mode) in VISIBLE_MODES.iter().copied().enumerate() {
             let is_cursor = idx == self.cursor;
             let row_style = if is_cursor {
                 Style::default()
@@ -177,11 +183,7 @@ impl ModalView for ModePickerView {
             };
             let pointer = if is_cursor { ">" } else { " " };
             let name = mode.display_name_localized(self.locale);
-            let hint = if mode == AppMode::Operate {
-                "Preview only — every message hits an Operate readiness wall until Fleet/Workflow dispatch exists.".into()
-            } else {
-                mode.picker_hint_localized(self.locale)
-            };
+            let hint = mode.picker_hint_localized(self.locale);
             // Pad by terminal columns, not scalar count, so wide (CJK) mode
             // names keep the hint column aligned.
             let pad = " ".repeat(8usize.saturating_sub(UnicodeWidthStr::width(&*name)));
@@ -300,29 +302,18 @@ mod tests {
     }
 
     #[test]
-    fn operate_copy_explains_the_user_benefit_at_eighty_columns() {
+    fn operate_is_not_advertised_until_workflow_dispatch_exists() {
         let (buf, area) = render_at(80, 24);
         let text = rows(&buf, area).join("\n");
-        assert!(text.contains("Operate"), "{text}");
-        assert!(
-            text.contains("readiness wall") || text.contains("Preview only"),
-            "Operate must stay annotated as blocked until Workflow exists: {text}"
-        );
-        assert!(!text.contains("spawn, wait, verify"), "{text}");
-        assert!(!text.contains("subagents/workflows"), "{text}");
+        assert!(!text.contains("Operate"), "{text}");
     }
 
     #[test]
     fn number_keys_select_modes() {
-        // Visible roster: 1 Act, 2 Plan, 3 Operate. No Multitask / YOLO / gap.
+        // Visible roster: 1 Act, 2 Plan. Operate remains compatibility-only.
         let mut view = ModePickerView::new(AppMode::Agent, Locale::En);
         let action = view.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
-        match action {
-            ViewAction::EmitAndClose(ViewEvent::ModeSelected { mode }) => {
-                assert_eq!(mode, AppMode::Operate);
-            }
-            other => panic!("expected ModeSelected, got {other:?}"),
-        }
+        assert!(matches!(action, ViewAction::None));
 
         // Legacy YOLO shorthand (4) is not offered by the picker.
         let mut view = ModePickerView::new(AppMode::Agent, Locale::En);
