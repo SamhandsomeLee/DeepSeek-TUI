@@ -203,6 +203,17 @@ pub fn has_pricing_for_provider(provider: ApiProvider, model: &str) -> bool {
     calculate_turn_cost_estimate_for_provider(provider, model, &Usage::default()).is_some()
 }
 
+/// Return whether a provider/model route has authoritative pricing for an
+/// already-classified billing surface.
+#[must_use]
+pub(crate) fn has_pricing_for_billing_surface(
+    provider: ApiProvider,
+    model: &str,
+    billing_surface: Option<&str>,
+) -> bool {
+    pricing_for_billing_surface(provider, model, billing_surface).is_some()
+}
+
 fn pricing_for_model_at(model: &str, now: DateTime<Utc>) -> Option<ModelPricing> {
     let lower = model.to_lowercase();
     if lower.starts_with("deepseek-ai/") {
@@ -561,7 +572,16 @@ pub(crate) fn calculate_turn_cost_estimate_for_provider_at(
         crate::provider_lake::catalog_offering_for_model(provider, &catalog_model)
         && OfferingPricing::from_catalog_offering(&offering).is_some()
     {
-        return catalog_cost_estimate_for_route(provider, &catalog_model, &offering, usage);
+        if let Some(estimate) =
+            catalog_cost_estimate_for_route(provider, &catalog_model, &offering, usage)
+        {
+            return Some(estimate);
+        }
+        if catalog_gap_uses_documented_hand_price(provider, &catalog_model, &offering, usage) {
+            let pricing = provider_owned_hand_pricing_at(provider, &catalog_model, recorded_at)?;
+            return Some(cost_estimate_with_pricing(pricing, usage));
+        }
+        return None;
     }
 
     // A few first-party rows predate or intentionally omit a Models.dev entry
@@ -642,6 +662,30 @@ fn provider_owned_hand_pricing_at(
     provider_owns_row
         .then(|| pricing_for_model_at(&model_lower, recorded_at))
         .flatten()
+}
+
+/// Whether a failed catalog estimate is missing only a class whose billing is
+/// explicitly documented by the provider-owned row. Keep this narrow: a hand
+/// row must not fill unrelated catalog gaps (for example an unpublished cache
+/// read rate) merely because the model name is known locally.
+fn catalog_gap_uses_documented_hand_price(
+    provider: ApiProvider,
+    model: &str,
+    offering: &codewhale_config::catalog::CatalogOffering,
+    usage: &Usage,
+) -> bool {
+    if provider != ApiProvider::Openai || !model.eq_ignore_ascii_case("gpt-5.5") {
+        return false;
+    }
+    let Some(pricing) = OfferingPricing::from_catalog_offering(offering) else {
+        return false;
+    };
+    let usage = token_usage_for_pricing(usage);
+    usage.cache_write > 0
+        && pricing.cache_write_per_million.is_none()
+        && (usage.input == 0 || pricing.input_per_million.is_some())
+        && (usage.output == 0 || pricing.output_per_million.is_some())
+        && (usage.cache_read == 0 || pricing.cache_read_per_million.is_some())
 }
 
 /// Estimate usage only from the exact provider offering. Missing prices for a
@@ -1265,6 +1309,34 @@ mod tests {
         assert!((estimate.usd - 1.25).abs() < f64::EPSILON);
         assert_eq!(estimate.cny, 0.0);
         assert!(has_pricing_for_provider(ApiProvider::Openai, "gpt-5-codex"));
+    }
+
+    #[test]
+    fn provider_hand_price_fills_catalog_missing_used_class() {
+        let offering =
+            crate::provider_lake::catalog_offering_for_model(ApiProvider::Openai, "gpt-5.5")
+                .expect("bundled OpenAI route");
+        let catalog_pricing =
+            OfferingPricing::from_catalog_offering(&offering).expect("catalog pricing");
+        assert!(catalog_pricing.cache_write_per_million.is_none());
+        let usage = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            prompt_cache_miss_tokens: Some(0),
+            prompt_cache_write_tokens: Some(1_000_000),
+            ..Default::default()
+        };
+
+        let estimate = calculate_turn_cost_estimate_for_provider_at(
+            ApiProvider::Openai,
+            "gpt-5.5",
+            &usage,
+            Utc::now(),
+        )
+        .expect("provider hand price supplies the missing cache-write class");
+
+        assert!((estimate.usd - 5.0).abs() < f64::EPSILON);
+        assert_eq!(estimate.cny, 0.0);
     }
 
     #[test]
