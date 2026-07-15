@@ -51,8 +51,9 @@ and dead-code removal landed alongside Cursor dogfood evidence for v0.8.67.
 - **[idling11](https://github.com/idling11)** — keyboard-driven keyword search
   for the docs and FAQ surfaces (PR #4364)
 - **[LeoLin990405](https://github.com/LeoLin990405)** — initial bounded
-  workspace-walk approach for large-tree `@` mention discovery (PR #4367),
-  credited in the final fail-soft background implementation for #4365
+  workspace-walk approach and root-cause analysis for large-tree `@` mention
+  discovery (PR #4367), harvested into the final fail-soft background
+  implementation for #4365
 - **[octo-patch](https://github.com/octo-patch)** — MiniMax Messages provider
   support for MiniMax-M3 and MiniMax-M2.7 across OpenAI-compatible and Messages
   routes, regional endpoints, catalog metadata, pricing, and request coverage
