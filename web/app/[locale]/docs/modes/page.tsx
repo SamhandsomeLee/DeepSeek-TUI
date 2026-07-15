@@ -34,7 +34,7 @@ export default async function ModesPage({ params }: { params: Promise<{ locale: 
         {
           name: "Operate",
           description:
-            "用于从同一个输入区协调多项任务。普通消息和只读检查可以留在前台；可执行工作会分派给后台 Fleet worker。只有需要有序阶段、门禁或确定性汇总时才需要 Workflow。",
+            "用于从同一个输入区协调多项任务。父回合可以直接检查、编辑并使用 Shell 或 MCP 工具，其权限姿态、沙箱和安全规则与 Act 相同。独立、并行、后台或长时间工作会优先交给 Fleet worker，但并非所有可执行步骤都必须委派。只有需要有序阶段、门禁或确定性汇总时才需要 Workflow。",
         },
       ]
     : [
@@ -51,7 +51,7 @@ export default async function ModesPage({ params }: { params: Promise<{ locale: 
         {
           name: "Operate",
           description:
-            "Multitask coordination from the same composer. Ordinary messages and read-only inspection can stay in the foreground while executable work is dispatched to background Fleet workers. Workflow is optional unless the work needs ordered phases, gates, or deterministic fan-in.",
+            "Multitask coordination from the same composer. The parent can inspect, edit, and use shell or MCP tools under the same permission posture, sandbox, and safety rules as Act. Fleet workers are preferred for independent, parallel, background, or long-running work, but delegation is not required for every executable step. Workflow is optional unless the work needs ordered phases, gates, or deterministic fan-in.",
         },
       ];
   const postures = isZh

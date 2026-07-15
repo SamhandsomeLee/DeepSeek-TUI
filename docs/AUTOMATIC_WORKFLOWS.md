@@ -1,9 +1,11 @@
 # Automatic Workflows
 
 You do **not** need to write a `.workflow.js` file to coordinate agents. In
-Operate, ordinary messages dispatch background workers directly; Workflow is
-reserved for ordered phases, gates, shared budgets, replay, or deterministic
-fan-in. Act/Agent can still use the optional soft-auto policy described below.
+Operate, ordinary messages can use direct tools or background workers; workers
+are preferred for independent, parallel, background, or long-running work.
+Workflow is reserved for ordered phases, gates, shared budgets, replay, or
+deterministic fan-in. Act/Agent can still use the optional soft-auto policy
+described below.
 
 Related docs:
 
@@ -26,9 +28,10 @@ Related docs:
 5. **Launch** — structured `plan` JSON (goal / phases / children) or a short
    inline script. Parallel branches use `parallel()` partial-success semantics.
 
-In Operate, those same asks use one or more direct background workers unless the
-work needs the stronger Workflow properties above. You can always type
-`/workflow` to request orchestration explicitly.
+In Operate, those same asks prefer one or more direct background workers when
+the split improves throughput, isolation, or context focus. Small or tightly
+coupled work can stay in the parent under the active tool and approval policy.
+You can always type `/workflow` to request orchestration explicitly.
 
 ## Read-only auto-start vs write approval
 

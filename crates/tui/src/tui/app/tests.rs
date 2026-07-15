@@ -1889,6 +1889,9 @@ fn base_policy_for_mode_projects_the_mode_permission_table() {
 
     // Operate uses the Agent baseline.
     let operate = base_policy_for_mode(AppMode::Operate, &prefs);
+    assert_eq!(operate.mode, AppMode::Operate);
+    assert_eq!(operate.allow_shell, agent.allow_shell);
+    assert_eq!(operate.trust_mode, agent.trust_mode);
     assert_eq!(operate.approval_mode, ApprovalMode::Never);
 
     // YOLO: full authority is represented by Bypass, not a separate
@@ -1909,6 +1912,10 @@ fn base_policy_for_mode_projects_the_mode_permission_table() {
     assert!(!agent_min.allow_shell);
     assert!(!agent_min.trust_mode);
     assert_eq!(agent_min.approval_mode, ApprovalMode::Suggest);
+    let operate_min = base_policy_for_mode(AppMode::Operate, &minimal);
+    assert!(!operate_min.allow_shell);
+    assert!(!operate_min.trust_mode);
+    assert_eq!(operate_min.approval_mode, ApprovalMode::Suggest);
 }
 
 #[test]

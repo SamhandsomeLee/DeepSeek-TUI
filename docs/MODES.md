@@ -30,7 +30,7 @@ Run `/mode` to open the mode picker, or switch directly with `/mode act`,
 
 - **Plan**: design-first prompting. Read-only investigation tools stay available; shell and patch execution stay off. Use this when you want to think out loud and produce a plan to hand to a human (yourself later, or a reviewer).
 - **Act** (Agent): multi-step tool use. In interactive TUI sessions, shell tools (`exec_shell`, `task_shell_start`, `task_shell_wait`) are available by default and approval prompts gate each call. Set top-level `allow_shell = false` to hide shell tools for a workspace/profile. File writes are allowed without a prompt.
-- **Operate**: multitask conductor posture. Send ordinary messages; simple answers and read-only inspection stay in the foreground, while executable work is dispatched to background Fleet workers. New messages can start additional lanes while workers continue. Workflow is optional and reserved for work that needs ordered phases, gates, shared budgets, or deterministic fan-in.
+- **Operate**: multitask conductor posture. Send ordinary messages and use the same direct tools, shell configuration, sandbox, approval posture, ask-rules, and repository protections as Act. Codewhale prefers Fleet workers for independent, parallel, background, or long-running work, but delegation is not mandatory. New messages can start additional lanes while workers continue. Workflow is optional and reserved for work that needs ordered phases, gates, shared budgets, or deterministic fan-in.
 
 **Act** is accepted as an alias for Agent mode. Saved settings still normalize to `agent` for backward compatibility.
 
@@ -39,12 +39,17 @@ Run `/mode` to open the mode picker, or switch directly with `/mode act`,
 | Tool family | Plan | Act | Operate |
 |:---|:---:|:---:|:---:|
 | Read-only file, search, and diagnostic tools | yes | yes | yes |
-| File write and patch tools | no | yes | Fleet workers; blocked in the parent |
-| Shell tools (`exec_shell`, `task_shell_start`, waits, interact, cancel) | no | approval-gated by default, hidden when `allow_shell = false` | proven read-only inspection may stay in the parent; shell execution belongs to Fleet workers |
-| Paid or external-service tools | follows approval posture | follows approval posture | read-only in the parent; mutations via workers and the active approval posture |
-| Access outside the workspace root | explicit trusted paths only | only through trusted paths or trust mode | only through the active trusted-path/trust policy; profile availability never widens it |
+| File write and patch tools | no | yes | yes; same active posture and protections as Act |
+| Shell tools (`exec_shell`, `task_shell_start`, waits, interact, cancel) | no | approval-gated by default, hidden when `allow_shell = false` | same as Act; delegation is preferred when parallelism or isolation helps |
+| Paid or external-service tools | follows approval posture | follows approval posture | follows approval posture |
+| Access outside the workspace root | explicit trusted paths only | only through trusted paths or trust mode | same trusted-path/trust policy as Act; Fleet profiles never widen it |
 
-If a shell tool is missing from the model-visible catalog in Agent mode, check
+Operate changes scheduling emphasis, not authority. It neither adds a
+mode-specific tool denial nor bypasses the active approval, sandbox, shell,
+ask-rule, repository-law, or managed-policy boundary. Plan remains the
+mode-specific read-only boundary for shell and write-capable tools.
+
+If a shell tool is missing from the model-visible catalog in Act or Operate, check
 for an explicit `allow_shell = false` in the active config/profile or runtime
 session. Durable tasks and automation keep conservative omitted-field defaults;
 they only receive shell access when their task settings explicitly grant it.

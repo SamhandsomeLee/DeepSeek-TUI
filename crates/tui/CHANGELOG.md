@@ -36,11 +36,12 @@ quieter, docs-first community foundation.
   thinking intent when no explicit reasoning tier is set. Aggregator, Wanjie
   Ark, self-hosted, and custom endpoint model ids remain provider-owned (#4320).
 - Make Operate a message-first multitask surface: ordinary prompts work without
-  a Workflow, executable prompts dispatch bounded background workers, and
-  follow-ups can queue while work is active. The parent remains a read-only
-  coordinator, worker edits and built-in verification still cross the normal
-  approval boundary, child handoffs cannot inherit standing Full Access, and
-  each dispatch produces one durable completion receipt.
+  a Workflow, direct parent tools follow the same approval, sandbox, shell,
+  ask-rule, and repository protections as Act, and follow-ups can queue while
+  work is active. Bounded background workers remain preferred for independent,
+  parallel, isolated, or long-running work; child handoffs cannot inherit
+  standing Full Access, and each dispatch produces one durable completion
+  receipt.
 - Let personal Fleet profiles in `CODEWHALE_HOME/agents` travel across
   repositories while project profiles in `.codewhale/agents` override them.
   Saving refreshes the live roster, and the UI now says explicitly that profile

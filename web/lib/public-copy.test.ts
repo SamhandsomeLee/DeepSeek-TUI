@@ -65,6 +65,9 @@ describe("public website copy contracts", () => {
     expect(modes).toContain("/mode act");
     expect(modes).toContain("Shift+Tab");
     expect(modes).toContain("Plan is always Read Only");
+    expect(modes).toContain("same permission posture, sandbox, and safety rules as Act");
+    expect(faq).toContain("delegation is not mandatory");
+    expect(modeCopy).not.toContain("executable work is dispatched to background Fleet workers");
     expect(install).toContain("New sessions open in Act mode by default");
   });
 
