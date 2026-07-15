@@ -79,6 +79,79 @@ fn live_transcript_command_open_path_is_idempotent() {
 }
 
 #[test]
+fn approval_prompt_keeps_transcript_page_navigation_live() {
+    let mut app = create_test_app();
+    app.viewport.last_transcript_visible = 12;
+    app.view_stack.push(ApprovalView::new(ApprovalRequest::new(
+        "approval-scroll",
+        "exec_shell",
+        "Review command",
+        &serde_json::json!({"command": "git status"}),
+        "approval-scroll-key",
+    )));
+
+    assert!(handle_approval_transcript_key(
+        &mut app,
+        &KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+    ));
+    assert_eq!(app.viewport.pending_scroll_delta, -12);
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Approval));
+
+    assert!(handle_approval_transcript_key(
+        &mut app,
+        &KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+    ));
+    assert_eq!(app.viewport.pending_scroll_delta, -9);
+
+    assert!(
+        !handle_approval_transcript_key(
+            &mut app,
+            &KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        ),
+        "ordinary approval selection keys must stay with the decision card"
+    );
+}
+
+#[test]
+fn transcript_navigation_does_not_capture_keys_for_other_modals() {
+    let mut app = create_test_app();
+    app.view_stack.push(HelpView::new_for_locale(app.ui_locale));
+
+    assert!(!handle_approval_transcript_key(
+        &mut app,
+        &KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+    ));
+    assert_eq!(app.viewport.pending_scroll_delta, 0);
+}
+
+#[test]
+fn approval_mouse_wheel_reviews_transcript_without_closing_card() {
+    let mut app = create_test_app();
+    app.view_stack.push(ApprovalView::new(ApprovalRequest::new(
+        "approval-scroll",
+        "exec_shell",
+        "Review command",
+        &serde_json::json!({"command": "git status"}),
+        "approval-scroll-key",
+    )));
+
+    let events = handle_mouse_event(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 4,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert!(events.is_empty());
+    assert!(app.viewport.pending_scroll_delta < 0);
+    assert!(app.user_scrolled_during_stream);
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Approval));
+}
+
+#[test]
 fn config_update_preview_suppresses_only_success_message_not_action_or_errors() {
     let preview = prepare_config_update_result(
         commands::CommandResult::with_message_and_action(

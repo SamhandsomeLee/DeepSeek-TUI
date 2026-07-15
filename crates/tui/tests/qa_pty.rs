@@ -545,8 +545,7 @@ fn work_surface_real_rows_own_click_wheel_resize_and_stop_confirm() -> anyhow::R
 }
 
 #[test]
-fn approval_modal_real_rows_survive_wheel_resize_and_deny_without_side_effect() -> anyhow::Result<()>
-{
+fn approval_modal_keeps_wheel_for_review_and_denies_without_side_effect() -> anyhow::Result<()> {
     let _guard = qa_pty_test_lock();
     let (base_url, server) = spawn_approval_fixture_server()?;
     let ws = make_sealed_workspace()?;
@@ -583,7 +582,7 @@ fn approval_modal_real_rows_survive_wheel_resize_and_deny_without_side_effect() 
         .find_text("Deny this call")
         .expect("rendered denial option");
     h.send(keys::mouse::wheel_down(deny_row, deny_col))?;
-    h.wait_for_text("❯ [2 / a]", KEY_TIMEOUT)?;
+    h.wait_for_text("❯ [1 / y]", KEY_TIMEOUT)?;
     h.resize(24, 80)?;
     h.wait_for(
         |frame| frame.rows() == 24 && frame.cols() == 80,
@@ -596,6 +595,9 @@ fn approval_modal_real_rows_survive_wheel_resize_and_deny_without_side_effect() 
         .find_text("Deny this call")
         .expect("denial option survived resize");
     h.send(keys::mouse::wheel_down(deny_row, deny_col))?;
+    h.wait_for_text("❯ [1 / y]", KEY_TIMEOUT)?;
+    h.send(keys::key::down())?;
+    h.send(keys::key::down())?;
     h.wait_for_text("❯ [3 / d / n]", KEY_TIMEOUT)?;
     h.send(keys::mouse::click(deny_row, deny_col))?;
     if let Err(err) = h.wait_for_text("DENIAL-HONORED", Duration::from_secs(10)) {

@@ -566,7 +566,7 @@
     "ApprovalOptionDeny": "Từ chối lần gọi này",
     "ApprovalOptionAbortTurn": "Hủy bỏ lượt",
     "ApprovalBlockTitle": "phê duyệt",
-    "ApprovalControlsHint": "  ·  v: tham số  ·  Esc: hủy bỏ",
+    "ApprovalControlsHint": "  ·  PgUp/PgDn: xem lại  ·  v: tham số  ·  Esc: hủy bỏ",
     "ApprovalChooseHint": "Chọn: ",
     "ApprovalChooseAction": "Enter để chọn, hoặc nhấn y/a/d trực tiếp",
     "ApprovalIntentLabel": "Ý định: ",

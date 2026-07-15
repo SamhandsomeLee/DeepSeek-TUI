@@ -4249,6 +4249,14 @@ async fn run_event_loop(
             // to canonical Ctrl+C so the quit-arm flow always runs (#4090).
             normalize_raw_ctrl_c(&mut key);
 
+            // Approval is a decision boundary, not a viewport lock. Keep the
+            // card focused for its ordinary selection keys while letting the
+            // same transcript navigation used by the main shell review the
+            // evidence above it (#4371).
+            if handle_approval_transcript_key(app, &key) {
+                continue;
+            }
+
             // Decision card keyboard routing (v0.8.43 truth-surface).
             // When a card is active, number keys 1-9 select options,
             // j/k or Up/Down navigate, and Enter confirms.
@@ -5938,6 +5946,37 @@ fn decision_card_number_from_key(key: &event::KeyEvent) -> Option<usize> {
     }
 
     Some((c as u8 - b'1' + 1) as usize)
+}
+
+/// Let the transcript remain reviewable while an approval card owns focus.
+fn handle_approval_transcript_key(app: &mut App, key: &event::KeyEvent) -> bool {
+    if app.view_stack.top_kind() != Some(ModalKind::Approval) {
+        return false;
+    }
+
+    let page = app.viewport.last_transcript_visible.max(1);
+    match key.code {
+        KeyCode::PageUp => app.scroll_up(page),
+        KeyCode::PageDown => app.scroll_down(page),
+        KeyCode::Up
+            if key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT | KeyModifiers::CONTROL) =>
+        {
+            app.scroll_up(3);
+        }
+        KeyCode::Down
+            if key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT | KeyModifiers::CONTROL) =>
+        {
+            app.scroll_down(3);
+        }
+        KeyCode::Home => app.scroll_up(usize::MAX),
+        KeyCode::End => app.scroll_to_bottom(),
+        _ => return false,
+    }
+    true
 }
 
 /// Route only non-text controls to a focused workflow panel.
