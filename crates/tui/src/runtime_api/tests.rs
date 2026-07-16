@@ -7,6 +7,7 @@ use crate::test_support::{EnvVarGuard, lock_test_env};
 use anyhow::{Context, bail};
 use futures_util::StreamExt;
 use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::sleep;
@@ -600,6 +601,7 @@ async fn spawn_test_server_with_root_token_mobile_workspace(
         mobile_enabled,
         workspace,
         None,
+        None,
     )
     .await
 }
@@ -611,6 +613,7 @@ async fn spawn_test_server_with_root_token_mobile_workspace_and_subagents(
     mobile_enabled: bool,
     workspace: PathBuf,
     sub_agent_manager: Option<SharedSubAgentManager>,
+    fleet_codewhale_binary: Option<String>,
 ) -> Result<
     Option<(
         SocketAddr,
@@ -625,6 +628,7 @@ async fn spawn_test_server_with_root_token_mobile_workspace_and_subagents(
         mobile_enabled,
         workspace,
         sub_agent_manager,
+        fleet_codewhale_binary,
         (None, None),
     )
     .await
@@ -637,6 +641,7 @@ async fn spawn_test_server_with_root_token_mobile_workspace_subagents_and_config
     mobile_enabled: bool,
     workspace: PathBuf,
     sub_agent_manager: Option<SharedSubAgentManager>,
+    fleet_codewhale_binary: Option<String>,
     config_source: (Option<PathBuf>, Option<String>),
 ) -> Result<
     Option<(
@@ -705,6 +710,7 @@ async fn spawn_test_server_with_root_token_mobile_workspace_subagents_and_config
         bind_host: "127.0.0.1".to_string(),
         bind_port: 0,
         mobile_enabled,
+        fleet_codewhale_binary: fleet_codewhale_binary.unwrap_or_else(configured_codewhale_binary),
     };
     let app = build_router(state);
     let listener = match TcpListener::bind("127.0.0.1:0").await {
@@ -751,6 +757,7 @@ async fn spawn_test_server_with_config_path(
         false,
         workspace,
         None,
+        None,
         (Some(config_path), None),
     )
     .await
@@ -777,6 +784,7 @@ async fn spawn_test_server_with_config_path_and_profile(
         false,
         workspace,
         None,
+        None,
         (Some(config_path), Some(config_profile)),
     )
     .await
@@ -801,6 +809,37 @@ async fn read_first_sse_frame(resp: reqwest::Response) -> Result<String> {
             bail!("SSE frame exceeded 64KB without delimiter");
         }
     }
+}
+
+#[cfg(unix)]
+fn write_fake_fleet_binary(root: &Path, marker: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let binary = root.join("fake-codewhale");
+    fs::write(
+        &binary,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nprintf '{{\"type\":\"content\",\"content\":\"restarted through Runtime API\"}}\\n'\nexit 0\n",
+            marker.display()
+        ),
+    )?;
+    let mut permissions = fs::metadata(&binary)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&binary, permissions)?;
+    Ok(binary)
+}
+
+#[cfg(windows)]
+fn write_fake_fleet_binary(root: &Path, marker: &Path) -> Result<PathBuf> {
+    let binary = root.join("fake-codewhale.cmd");
+    fs::write(
+        &binary,
+        format!(
+            "@echo off\r\ntype nul > \"{}\"\r\necho {{\"type\":\"content\",\"content\":\"restarted through Runtime API\"}}\r\nexit /b 0\r\n",
+            marker.display()
+        ),
+    )?;
+    Ok(binary)
 }
 
 fn parse_sse_frame(frame: &str) -> Result<(String, serde_json::Value)> {
@@ -1364,6 +1403,8 @@ async fn fleet_status_runtime_api_exposes_state_and_actions() -> Result<()> {
         },
         1,
     )?;
+    let restarted_marker = root.join("restarted-worker-ran");
+    let fake_codewhale = write_fake_fleet_binary(&root, &restarted_marker)?;
     let worker_id = report.worker_ids[0].clone();
     let sessions_dir = root.join("sessions");
     let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, 2);
@@ -1397,6 +1438,7 @@ async fn fleet_status_runtime_api_exposes_state_and_actions() -> Result<()> {
             false,
             workspace,
             Some(sub_agent_manager),
+            Some(fake_codewhale.display().to_string()),
         )
         .await?
     else {
@@ -1454,7 +1496,39 @@ async fn fleet_status_runtime_api_exposes_state_and_actions() -> Result<()> {
         .json()
         .await?;
     assert_eq!(restarted["action"], "restart");
+    assert_eq!(restarted["execution"], "scheduled");
     assert_eq!(restarted["worker"]["status"], "busy");
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = manager.run_status(&report.run_id).unwrap();
+            if status.completed == 1 && status.running == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("Runtime API restart never drove the replacement attempt to completion")?;
+    assert!(
+        restarted_marker.is_file(),
+        "Runtime API reported a restart without launching its Fleet worker"
+    );
+    let ledger_state = manager.rebuild_state()?;
+    let restarted_task = ledger_state
+        .tasks
+        .values()
+        .find(|task| task.entry.run_id == report.run_id && task.entry.task_id == "task-a")
+        .context("missing restarted task")?;
+    assert_eq!(restarted_task.entry.attempts, 2);
+    assert_eq!(restarted_task.status, FleetTaskLedgerStatus::Completed);
+    let receipt = ledger_state
+        .receipts
+        .values()
+        .find(|receipt| receipt.run_id == report.run_id && receipt.task_id == "task-a")
+        .context("missing restarted receipt")?;
+    assert_eq!(receipt.attempt, Some(2));
+    assert!(receipt.terminal_seq.is_some());
 
     let stopped: serde_json::Value = client
         .post(format!(
@@ -1467,8 +1541,8 @@ async fn fleet_status_runtime_api_exposes_state_and_actions() -> Result<()> {
         .json()
         .await?;
     assert_eq!(stopped["action"], "stop");
-    assert_eq!(stopped["stopped"], 1);
-    assert_eq!(stopped["status"]["cancelled"], 1);
+    assert_eq!(stopped["stopped"], 0);
+    assert_eq!(stopped["status"]["completed"], 1);
 
     handle.abort();
     Ok(())

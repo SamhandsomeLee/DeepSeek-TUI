@@ -1796,6 +1796,7 @@ mod tests {
             id: FleetRunId::from(id),
             name: "smoke".to_string(),
             status: FleetRunStatus::Running,
+            max_workers: None,
             task_specs: vec![],
             worker_specs: vec![],
             labels: BTreeMap::new(),

@@ -41,6 +41,12 @@ pub struct FleetRun {
     pub id: FleetRunId,
     pub name: String,
     pub status: FleetRunStatus,
+    /// Maximum number of workers the manager may drive concurrently.
+    ///
+    /// Older ledgers omit this field; callers fall back to the persisted
+    /// worker roster when resuming those runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_workers: Option<usize>,
     #[serde(default)]
     pub task_specs: Vec<FleetTaskSpec>,
     #[serde(default)]
@@ -1044,6 +1050,7 @@ mod tests {
             id: FleetRunId::from("run-001"),
             name: "dogfood smoke".to_string(),
             status: FleetRunStatus::Running,
+            max_workers: Some(1),
             task_specs: vec![FleetTaskSpec {
                 id: "task-1".to_string(),
                 name: "lint".to_string(),

@@ -7,6 +7,8 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::OpenOptions;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -82,6 +84,18 @@ pub struct FleetRunReport {
     pub leased: usize,
     pub queued: usize,
     pub worker_ids: Vec<String>,
+}
+
+/// Durable restart transition plus the execution context a caller must drive.
+///
+/// Restarting is intentionally split from execution so a live foreground
+/// manager can observe the transition. Standalone callers must pass this
+/// context to [`FleetManager::run_to_completion`] before exiting.
+#[derive(Debug, Clone)]
+pub struct FleetRestartReport {
+    pub run_id: FleetRunId,
+    pub max_workers: usize,
+    pub inspection: FleetWorkerInspection,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -253,6 +267,13 @@ impl FleetManager {
         self.ledger.path()
     }
 
+    fn manager_lock_path(&self, run_id: &FleetRunId) -> PathBuf {
+        self.workspace
+            .join(".codewhale")
+            .join("fleet")
+            .join(format!("manager-{}.lock", safe_path_segment(&run_id.0)))
+    }
+
     pub fn rebuild_state(&self) -> Result<FleetLedgerState> {
         self.ledger.rebuild_state()
     }
@@ -291,6 +312,7 @@ impl FleetManager {
             id: run_id.clone(),
             name: doc.name.unwrap_or_else(|| run_id.0.clone()),
             status: FleetRunStatus::Queued,
+            max_workers: Some(max_workers),
             task_specs: doc.tasks.clone(),
             worker_specs: doc.workers.clone(),
             labels: doc.labels,
@@ -454,6 +476,61 @@ impl FleetManager {
         tick_interval: Duration,
     ) -> Result<FleetStatusSnapshot> {
         let max_workers = max_workers.clamp(1, 128);
+        let manager_lock_path = self.manager_lock_path(run_id);
+        if let Some(parent) = manager_lock_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating fleet manager lock dir {}", parent.display()))?;
+        }
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&manager_lock_path)
+            .with_context(|| {
+                format!("opening fleet manager lock {}", manager_lock_path.display())
+            })?;
+        let mut manager_lock = fd_lock::RwLock::new(lock_file);
+        let standby_interval = tick_interval
+            .min(Duration::from_millis(100))
+            .max(Duration::from_millis(10));
+        let mut observed_owner = false;
+        let _manager_guard = loop {
+            match manager_lock.try_write() {
+                Ok(guard) => {
+                    if observed_owner {
+                        if self.run_has_open_work(run_id)? {
+                            bail!(
+                                "fleet manager for run {} exited with open work; wait for stale reconciliation before resuming",
+                                run_id.0
+                            );
+                        }
+                        return self.run_status(run_id);
+                    }
+                    break guard;
+                }
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                    // Another process owns this run. Wait for it to finish,
+                    // but never treat lock release as permission to relaunch
+                    // its unchanged leased attempts: an orphan child may still
+                    // be alive after a crash. Stale reconciliation owns that
+                    // recovery/generation transition.
+                    observed_owner = true;
+                    if !self.run_has_open_work(run_id)? {
+                        return self.run_status(run_id);
+                    }
+                    tokio::time::sleep(standby_interval).await;
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "locking fleet manager ownership {}",
+                            manager_lock_path.display()
+                        )
+                    });
+                }
+            }
+        };
         loop {
             // A terminal ledger update can race the foreground host process.
             // Do not lease new work onto a logical worker until its executor
@@ -683,13 +760,21 @@ impl FleetManager {
         self.inspect_worker(worker_id)
     }
 
-    pub fn restart_worker(&self, worker_id: &str) -> Result<FleetWorkerInspection> {
+    pub fn restart_worker(&self, worker_id: &str) -> Result<FleetRestartReport> {
         let state = self.ledger.rebuild_state()?;
         let Some(task) = active_task_for_worker(&state, worker_id)
             .or_else(|| latest_task_for_worker(&state, worker_id))
         else {
             bail!("worker {worker_id} has no fleet task to restart");
         };
+        let run = state
+            .runs
+            .get(&task.entry.run_id.0)
+            .ok_or_else(|| anyhow!("fleet run {} does not exist", task.entry.run_id.0))?;
+        let max_workers = run
+            .max_workers
+            .unwrap_or_else(|| run.worker_specs.len().max(1))
+            .clamp(1, 128);
         let now = timestamp();
         let latest_seq = state
             .latest_seq
@@ -720,7 +805,11 @@ impl FleetManager {
         }
         self.ledger
             .update_run_status(&task.entry.run_id, FleetRunStatus::Running, &timestamp())?;
-        self.inspect_worker(worker_id)
+        Ok(FleetRestartReport {
+            run_id: task.entry.run_id.clone(),
+            max_workers,
+            inspection: self.inspect_worker(worker_id)?,
+        })
     }
 
     pub fn stop_all(&self) -> Result<usize> {
@@ -1931,6 +2020,7 @@ mod tests {
                 id: run_id.clone(),
                 name: "resume smoke".to_string(),
                 status: FleetRunStatus::Running,
+                max_workers: Some(workers.len().max(1)),
                 task_specs: tasks.to_vec(),
                 worker_specs: workers.to_vec(),
                 labels: BTreeMap::new(),
@@ -2447,8 +2537,10 @@ while :; do sleep 1; done
         let worker_id = &report.worker_ids[0];
 
         manager.interrupt_worker(worker_id).unwrap();
-        let inspection = manager.restart_worker(worker_id).unwrap();
-        assert_eq!(inspection.status, FleetWorkerStatus::Busy);
+        let restart = manager.restart_worker(worker_id).unwrap();
+        assert_eq!(restart.run_id, report.run_id);
+        assert_eq!(restart.max_workers, 1);
+        assert_eq!(restart.inspection.status, FleetWorkerStatus::Busy);
         let status = manager.run_status(&report.run_id).unwrap();
         assert_eq!(status.running, 1);
         assert_eq!(status.queued, 1);
@@ -2458,6 +2550,126 @@ while :; do sleep 1; done
         let status = manager.run_status(&report.run_id).unwrap();
         assert_eq!(status.cancelled, 2);
         assert_eq!(status.running, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn standalone_restart_drives_replacement_attempt_to_terminal_receipt() {
+        let tmp = TempDir::new().unwrap();
+        let manager = FleetManager::open(tmp.path()).unwrap();
+        let path = task_spec_file(&tmp, vec![task("task-a")]);
+        let marker = tmp.path().join("replacement-attempt-ran");
+        let fake = fake_codewhale(
+            &tmp,
+            &format!(
+                r#"#!/bin/sh
+touch '{}'
+printf '{{"type":"content","content":"replacement attempt"}}\n'
+exit 0
+"#,
+                marker.display()
+            ),
+        );
+        let report = manager.create_run_from_task_spec_path(&path, 1).unwrap();
+        let worker_id = &report.worker_ids[0];
+
+        manager.interrupt_worker(worker_id).unwrap();
+        let restart = manager.restart_worker(worker_id).unwrap();
+        let mut executor = FleetExecutor::new(&manager.workspace);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let status = rt
+            .block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    manager.run_to_completion(
+                        &restart.run_id,
+                        restart.max_workers,
+                        &mut executor,
+                        &fake.display().to_string(),
+                        None,
+                        Duration::from_millis(10),
+                    ),
+                )
+                .await
+            })
+            .expect("standalone restart left a ghost running task")
+            .unwrap();
+
+        assert!(
+            marker.is_file(),
+            "replacement worker process never launched"
+        );
+        assert_eq!(status.completed, 1);
+        assert_eq!(status.running, 0);
+        assert_eq!(status.restarted, 1);
+        let state = manager.rebuild_state().unwrap();
+        let key = task_key(&report.run_id.0, "task-a");
+        assert_eq!(state.tasks[&key].entry.attempts, 2);
+        assert_eq!(state.tasks[&key].status, FleetTaskLedgerStatus::Completed);
+        assert_eq!(state.receipts[&key].attempt, Some(2));
+        assert!(state.receipts[&key].terminal_seq.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_manager_loops_launch_each_attempt_once() {
+        let tmp = TempDir::new().unwrap();
+        let manager = FleetManager::open(tmp.path()).unwrap();
+        let standby = FleetManager::open(tmp.path()).unwrap();
+        let path = task_spec_file(&tmp, vec![task("task-a")]);
+        let starts = tmp.path().join("worker-starts");
+        let fake = fake_codewhale(
+            &tmp,
+            &format!(
+                r#"#!/bin/sh
+printf 'started\n' >> '{}'
+sleep 1
+printf '{{"type":"content","content":"done"}}\n'
+exit 0
+"#,
+                starts.display()
+            ),
+        );
+        let report = manager.create_run_from_task_spec_path(&path, 1).unwrap();
+        let mut primary_executor = FleetExecutor::new(&manager.workspace);
+        let mut standby_executor = FleetExecutor::new(&manager.workspace);
+        let binary = fake.display().to_string();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let (primary_status, standby_status) = rt
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::join!(
+                        manager.run_to_completion(
+                            &report.run_id,
+                            1,
+                            &mut primary_executor,
+                            &binary,
+                            None,
+                            Duration::from_millis(10),
+                        ),
+                        standby.run_to_completion(
+                            &report.run_id,
+                            1,
+                            &mut standby_executor,
+                            &binary,
+                            None,
+                            Duration::from_millis(10),
+                        )
+                    )
+                })
+                .await
+            })
+            .expect("competing Fleet managers did not converge");
+
+        assert_eq!(primary_status.unwrap().completed, 1);
+        assert_eq!(standby_status.unwrap().completed, 1);
+        let starts = std::fs::read_to_string(starts).unwrap();
+        assert_eq!(
+            starts.lines().count(),
+            1,
+            "competing managers launched the same leased attempt more than once"
+        );
     }
 
     #[cfg(unix)]

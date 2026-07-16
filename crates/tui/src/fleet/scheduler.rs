@@ -714,6 +714,7 @@ mod tests {
                 id: run_id.clone(),
                 name: "scheduler smoke".to_string(),
                 status: FleetRunStatus::Queued,
+                max_workers: Some(workers),
                 task_specs: tasks.clone(),
                 worker_specs: (1..=workers)
                     .map(|idx| worker(&format!("worker-{idx}")))

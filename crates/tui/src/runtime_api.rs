@@ -39,6 +39,7 @@ use crate::automation_manager::{
     CreateAutomationRequest, SharedAutomationManager, UpdateAutomationRequest, spawn_scheduler,
 };
 use crate::config::{Config, DEFAULT_TEXT_MODEL};
+use crate::fleet::executor::{FleetExecutor, configured_codewhale_binary};
 use crate::fleet::ledger::{FleetLedgerState, FleetTaskLedgerStatus};
 use crate::fleet::manager::{
     FleetManager, FleetStatusSnapshot, FleetWorkerInspection, FleetWorkerRuntimeProjection,
@@ -109,6 +110,9 @@ pub struct RuntimeApiState {
     bind_host: String,
     bind_port: u16,
     mobile_enabled: bool,
+    /// Executable used by Runtime API-owned Fleet manager loops. Stored on
+    /// state so tests and embedded callers can provide a hermetic worker.
+    fleet_codewhale_binary: String,
     /// Shared McpPool reused for explicit live MCP discovery. Passive API
     /// calls do not initialize this pool so dashboards cannot accidentally
     /// become a second stdio-process owner. The outer mutex guards only the
@@ -478,6 +482,7 @@ pub async fn run_http_server(
         bind_host: options.host.clone(),
         bind_port: options.port,
         mobile_enabled: options.mobile,
+        fleet_codewhale_binary: configured_codewhale_binary(),
         mcp_pool: Arc::new(Mutex::new(None)),
     };
     let app = build_router(state);
@@ -1000,14 +1005,41 @@ async fn restart_fleet_worker(
     Path(worker_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let manager = open_fleet_manager(&state)?;
-    let inspection = manager.restart_worker(&worker_id).map_err(|err| {
+    let report = manager.restart_worker(&worker_id).map_err(|err| {
         ApiError::bad_request(format!(
             "Failed to restart fleet worker '{worker_id}': {err}"
         ))
     })?;
+    let worker = fleet_worker_json(&report.inspection);
+    let run_id = report.run_id.clone();
+    let max_workers = report.max_workers;
+    let workspace = state.workspace.clone();
+    let codewhale_binary = state.fleet_codewhale_binary.clone();
+    tokio::spawn(async move {
+        let mut executor = FleetExecutor::new(&workspace);
+        if let Err(err) = manager
+            .run_to_completion(
+                &run_id,
+                max_workers,
+                &mut executor,
+                &codewhale_binary,
+                None,
+                Duration::from_millis(250),
+            )
+            .await
+        {
+            tracing::error!(
+                run_id = %run_id.0,
+                error = %err,
+                "Runtime API Fleet restart manager exited with an error"
+            );
+        }
+    });
     Ok(Json(json!({
         "action": "restart",
-        "worker": fleet_worker_json(&inspection),
+        "execution": "scheduled",
+        "run_id": report.run_id.0,
+        "worker": worker,
     })))
 }
 

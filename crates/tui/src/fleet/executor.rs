@@ -31,6 +31,18 @@ use super::worker_runtime::{
     fleet_worker_launch_route,
 };
 
+/// Resolve the executable used for Fleet worker subprocesses.
+///
+/// Kept here so every long-lived surface (CLI and Runtime API) launches the
+/// same configured worker binary instead of silently diverging.
+pub fn configured_codewhale_binary() -> String {
+    std::env::var("CODEWHALE_FLEET_CODEWHALE_BINARY")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "codewhale".to_string())
+}
+
 /// Build the `codewhale exec` argv that runs a fleet task headlessly.
 ///
 /// `--auto` is always passed: a headless worker has no human to approve tool

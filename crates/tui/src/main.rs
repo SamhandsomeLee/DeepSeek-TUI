@@ -2061,14 +2061,6 @@ async fn run_fleet_command(workspace: &Path, config: &Config, args: FleetArgs) -
         }
     }
 
-    fn fleet_codewhale_binary() -> String {
-        std::env::var("CODEWHALE_FLEET_CODEWHALE_BINARY")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "codewhale".to_string())
-    }
-
     let fleet_config = config.fleet_config();
     // The configured route is the operator: fleet workers without a
     // task/profile model pin inherit the session's active model.
@@ -2103,7 +2095,7 @@ async fn run_fleet_command(workspace: &Path, config: &Config, args: FleetArgs) -
                 "manager loop running; use `codewhale fleet status`, `inspect`, `interrupt`, or `stop --all` from another terminal."
             );
             let mut executor = FleetExecutor::new(workspace);
-            let codewhale_binary = fleet_codewhale_binary();
+            let codewhale_binary = fleet::executor::configured_codewhale_binary();
             let status = manager
                 .run_to_completion(
                     &report.run_id,
@@ -2140,8 +2132,25 @@ async fn run_fleet_command(workspace: &Path, config: &Config, args: FleetArgs) -
             Ok(())
         }
         FleetCommand::Restart { worker_id } => {
-            let inspection = manager.restart_worker(&worker_id)?;
-            print_inspection(&inspection);
+            let report = manager.restart_worker(&worker_id)?;
+            print_inspection(&report.inspection);
+            println!(
+                "manager loop running for restarted run {}; use `codewhale fleet status`, `inspect`, `interrupt`, or `stop --all` from another terminal.",
+                report.run_id.0
+            );
+            let mut executor = FleetExecutor::new(workspace);
+            let codewhale_binary = fleet::executor::configured_codewhale_binary();
+            let status = manager
+                .run_to_completion(
+                    &report.run_id,
+                    report.max_workers,
+                    &mut executor,
+                    &codewhale_binary,
+                    None,
+                    Duration::from_secs(2),
+                )
+                .await?;
+            print_status(&status);
             Ok(())
         }
         FleetCommand::Resume {
