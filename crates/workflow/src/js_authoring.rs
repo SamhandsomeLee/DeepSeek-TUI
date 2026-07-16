@@ -680,6 +680,16 @@ workflow({
                         && leaf.prompt.contains("do not call `read_file`"),
                     "the scout must finish discovery in one bounded tool round"
                 );
+                assert!(
+                    leaf.prompt.contains("if you can populate all six")
+                        && leaf
+                            .prompt
+                            .contains("never return BLOCK after citing all six")
+                        && leaf
+                            .prompt
+                            .contains("identify each missing owner as MISSING"),
+                    "the scout verdict must follow its own complete evidence artifact"
+                );
             } else {
                 assert!(
                     leaf.prompt.contains("Tools are intentionally unavailable")
