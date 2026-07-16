@@ -5590,34 +5590,44 @@ SOURCE EVIDENCE
 - crates/cli/src/lib.rs: start_lane
 - crates/tui/src/tools/workflow.rs: record_task_started
 - crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::GateUpdated
-- crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::RunCompleted
+- crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::RunCompleted -> terminal_completed_receipt
 - crates/lane/src/runtime.rs: process_exit_receipt -> lane_reconciled"#,
             r#"APPROVE
 PLAN
+- fleets/stopship.toml: name = "stopship" -> named Fleet loading
 - crates/workflow/src/role_resolve.rs: resolve_workflow_agent -> role resolution
+- crates/cli/src/lib.rs: start_lane -> tmux Lane launch
+- crates/tui/src/tools/workflow.rs: record_task_started -> typed task_started
 - crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::GateUpdated -> gate promotion
-- crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::RunCompleted -> terminal workflow receipt
+- crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::RunCompleted -> terminal_completed_receipt
 - crates/lane/src/runtime.rs: process_exit_receipt -> tmux Lane reconciliation"#,
             r#"APPROVE
 EVIDENCE REVIEW
+- fleets/stopship.toml: name = "stopship"
 - crates/workflow/src/role_resolve.rs: resolve_workflow_agent
+- crates/cli/src/lib.rs: start_lane
 - crates/tui/src/tools/workflow.rs: record_task_started
 - crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::GateUpdated
-- crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::RunCompleted
+- crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::RunCompleted -> terminal_completed_receipt
 - crates/lane/src/runtime.rs: process_exit_receipt -> lane_reconciled"#,
             r#"APPROVE
 EVIDENCE MATRIX
+- fleet_load: fleets/stopship.toml: name = "stopship"
+- role_resolution: crates/workflow/src/role_resolve.rs: resolve_workflow_agent
+- lane_launch: crates/cli/src/lib.rs: start_lane
 - task_started: crates/tui/src/tools/workflow.rs: record_task_started
 - gate_updated: crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::GateUpdated
-- run_completed: crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::RunCompleted
-- metadata: crates/workflow/src/role_resolve.rs: resolve_workflow_agent
+- run_completed: crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::RunCompleted -> terminal_completed_receipt
 - lane_exit: crates/lane/src/runtime.rs: process_exit_receipt -> lane_reconciled"#,
             r#"APPROVE
 FINAL RECEIPT
-- declared role and resolved profile: crates/workflow/src/role_resolve.rs: resolve_workflow_agent
-- gate states: crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::GateUpdated
-- terminal status: crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::RunCompleted
-- Lane exit: crates/lane/src/runtime.rs: process_exit_receipt -> lane_reconciled"#,
+- fleet_load: fleets/stopship.toml: name = "stopship"
+- role_resolution: crates/workflow/src/role_resolve.rs: resolve_workflow_agent
+- lane_launch: crates/cli/src/lib.rs: start_lane
+- task_started: crates/tui/src/tools/workflow.rs: record_task_started
+- gate_updated: crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::GateUpdated
+- run_completed: crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::RunCompleted -> terminal_completed_receipt
+- lane_exit: crates/lane/src/runtime.rs: process_exit_receipt -> lane_reconciled"#,
         ];
         let (client, calls) = fake_chat_client_responses(&responses).await;
         let runtime = SubAgentRuntime::new(
@@ -5801,12 +5811,10 @@ FINAL RECEIPT
                 "causal receipt order must be task_completed -> gate_updated -> handoff_promoted -> task_started -> handoff_consumed: {events:#?}"
             );
         }
-        assert!(
-            events.iter().any(|event| {
-                event["type"] == "run_completed" && event["status"] == "completed"
-            }),
-            "{events:#?}"
-        );
+        let terminal_completed_receipt = events
+            .iter()
+            .any(|event| event["type"] == "run_completed" && event["status"] == "completed");
+        assert!(terminal_completed_receipt, "{events:#?}");
     }
 
     #[tokio::test]

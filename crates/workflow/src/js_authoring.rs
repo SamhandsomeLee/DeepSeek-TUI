@@ -713,10 +713,26 @@ workflow({
             } else {
                 assert!(
                     leaf.prompt.contains("Tools are intentionally unavailable")
-                        && leaf.prompt.contains("promoted handoff"),
+                        && leaf.prompt.contains("promoted handoff")
+                        && leaf.prompt.contains("all seven owners")
+                        && leaf.prompt.contains("one concise row per owner"),
                     "{expected_role} must consume promoted evidence without reopening discovery"
                 );
             }
+            assert_eq!(
+                leaf.file_scope
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                vec![
+                    "fleets/stopship.toml",
+                    "crates/cli/src/lib.rs",
+                    "crates/workflow/src/role_resolve.rs",
+                    "crates/tui/src/tools/workflow.rs",
+                    "crates/lane/src/runtime.rs",
+                ],
+                "every acceptance role must carry the same promoted evidence boundary"
+            );
             assert_eq!(leaf.budget.max_steps, Some(max_steps), "{expected_role}");
             let response_budget = match max_steps {
                 6 => "at most six model responses",
