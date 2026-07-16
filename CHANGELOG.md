@@ -13,7 +13,9 @@ Codewhale v0.9.0 replaces the default terminal shell with the underwater
 interaction system, makes Operate message-first, and hardens the Fleet,
 Workflow, routing, accounting, and release surfaces that support day-to-day
 agent work. The release also expands localization and gives the public site a
-quieter, docs-first community foundation.
+quieter, docs-first community foundation. Its provider work replaces the old
+hand-maintained picker boundary with live ProviderLake discovery and adds the
+largest curated model-and-pricing expansion in the project so far.
 
 ### Fixed — final integration
 
@@ -223,6 +225,12 @@ quieter, docs-first community foundation.
   exact `none` / `minimal` / `low` / `medium` / `high` / `max` reasoning
   values. Codewhale does not invent a context window, price, or offline picker
   claim while the provider's public catalog metadata remains inconsistent.
+- Expand the verified offline catalog with Claude Sonnet 5, Claude Fable 5,
+  GPT-5.3 Codex, and Qwen3.7 Plus, including time-aware Sonnet 5 introductory
+  pricing and explicit cache rates. Refresh stale GLM-5.1, Kimi K2.6, Trinity,
+  Qwen3.6, Nemotron, Anthropic, GLM-5.2, Kimi K2.7 Code, GLM-5 Turbo, and
+  GPT-5 Codex price or limit rows; keep Xiaomi MiMo explicitly unpriced where
+  the provider's token plan and pay-as-you-go surfaces cannot be distinguished.
 - MiniMax Messages provider support for MiniMax-M3 and MiniMax-M2.7, with
   OpenAI-compatible and Messages routes, regional endpoint guidance, request
   coverage, catalog limits, and tier-aware pricing (PR #4354 by @octo-patch).
@@ -320,8 +328,8 @@ quieter, docs-first community foundation.
 
 - Stamp every 0.9-era roadmap document with an explicit status (current,
   historical, superseded, principle-only, or future RFC), correct trackers
-  that recorded unshipped work as done, and describe what a next-major
-  release would actually mean today in `docs/AGENT_RUNTIME.md`.
+  that recorded unshipped work as done, and describe what remains after
+  v0.9.0 in `docs/AGENT_RUNTIME.md`.
 - Add `docs/rfcs/UNIFIED_PROVIDER_LOGIN.md`: one `codewhale auth login`
   surface for Anthropic, OpenAI Codex, and xAI, with the Anthropic adapter
   gated on verifying flow permissions before any constants are adopted.
@@ -421,7 +429,13 @@ quieter, docs-first community foundation.
   draft-preview save keypress no longer competes with a separate pager's
   `g`/`G` scroll bindings — the exact TOML preview now renders inline on the
   same Review step that saves it (#4093).
-- The headless `codewhale fleet run` CLI now launches workers on their profile-pinned route, not just records it on the receipt: `codewhale exec` gains a non-secret `--provider` flag, and a worker whose profile pins provider B is dispatched with `--provider B --model <B's model>` even when the parent session is on provider A (credentials still resolve from the worker's own environment; provider is never inferred from the model id). Workers with no profile-bound provider are unchanged — no `--provider`, run-level model. The interactive TUI spawns roster members in-process and does not yet honor the pinned provider (it uses the session provider); that remainder is tracked in #4193 (#4093).
+- `codewhale fleet run` and interactive in-process Fleet launches now honor a
+  profile-pinned provider/model route instead of merely recording it on the
+  receipt. Headless workers receive the non-secret `--provider` and `--model`
+  pair; TUI workers resolve the same explicit route in process. Credentials
+  still come from the worker's environment, provider is never inferred from a
+  model id, and unpinned workers continue to inherit the run route (#4093,
+  #4193).
 - The Fleet setup `m` model-assisted redraft no longer drops a picked
   cross-provider route: the provider/model the operator chose are re-pinned
   onto the drafted profile (a model draft is always `provider: None`), so
