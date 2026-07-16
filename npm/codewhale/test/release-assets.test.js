@@ -3,6 +3,7 @@ const test = require("node:test");
 
 const pkg = require("../package.json");
 const {
+  assertChecksumManifestIncludes,
   assertPackageVersionMatchesBinaryVersion,
   assertReleaseAssetsFresh,
   parseChecksumManifest,
@@ -27,7 +28,7 @@ test("parseChecksumManifest rejects malformed checksum rows", () => {
   );
 });
 
-test("assertReleaseAssetsFresh rejects missing npm-facing assets", () => {
+test("assertReleaseAssetsFresh rejects missing release assets", () => {
   assert.throws(
     () =>
       assertReleaseAssetsFresh(
@@ -35,7 +36,39 @@ test("assertReleaseAssetsFresh rejects missing npm-facing assets", () => {
         ["codewhale-linux-x64", "codewhale-artifacts-sha256.txt"],
         { database_id: 123, created_at: "2026-06-26T00:00:00Z" },
       ),
-    /missing required npm-facing asset/,
+    /missing required release asset/,
+  );
+});
+
+test("assertChecksumManifestIncludes rejects missing bundle manifest and archive rows", () => {
+  const manifest = parseChecksumManifest(
+    `${"a".repeat(64)}  codewhale-linux-x64.tar.gz`,
+  );
+
+  assert.throws(
+    () =>
+      assertChecksumManifestIncludes(
+        manifest,
+        ["codewhale-linux-x64.tar.gz", "codewhale-bundles-sha256.txt"],
+        "Canonical checksum manifest",
+      ),
+    /Canonical checksum manifest is missing codewhale-bundles-sha256\.txt/,
+  );
+});
+
+test("bundle checksum rows use public archive basenames", () => {
+  const manifest = parseChecksumManifest(
+    `${"a".repeat(64)}  bundles/codewhale-linux-x64.tar.gz`,
+  );
+
+  assert.throws(
+    () =>
+      assertChecksumManifestIncludes(
+        manifest,
+        ["codewhale-linux-x64.tar.gz"],
+        "Bundle checksum manifest",
+      ),
+    /Bundle checksum manifest is missing codewhale-linux-x64\.tar\.gz/,
   );
 });
 
@@ -91,4 +124,11 @@ test("assertPackageVersionMatchesBinaryVersion allows packaging-only releases on
       process.env.CODEWHALE_ALLOW_NPM_BINARY_MISMATCH = previous;
     }
   }
+});
+
+test("npm publication is guarded by an exact clean release-tag checkout", () => {
+  assert.match(
+    pkg.scripts.prepublishOnly,
+    /require-release-tag-checkout\.sh && node scripts\/verify-release-assets\.js/,
+  );
 });

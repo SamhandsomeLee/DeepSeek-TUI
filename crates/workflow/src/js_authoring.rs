@@ -636,12 +636,13 @@ workflow({
             panic!("acceptance fixture should begin with one ordered role chain");
         };
         let expected_children = [
-            ("scout", 8, 480, 16_000),
-            ("implementer", 6, 420, 12_000),
-            ("reviewer", 6, 420, 12_000),
-            ("verifier", 6, 420, 12_000),
-            ("release_lead", 4, 300, 8_000),
+            ("scout", 4, 480, 96_000),
+            ("implementer", 3, 420, 72_000),
+            ("reviewer", 3, 420, 72_000),
+            ("verifier", 3, 420, 72_000),
+            ("release_lead", 2, 300, 48_000),
         ];
+        let mut aggregate_token_cap = 0_u64;
         assert_eq!(sequence.children.len(), expected_children.len());
         for (node, (expected_role, max_steps, timeout_secs, max_tokens)) in
             sequence.children.iter().zip(expected_children)
@@ -673,11 +674,21 @@ workflow({
                 "{expected_role}"
             );
             assert_eq!(leaf.budget.max_tokens, Some(max_tokens), "{expected_role}");
+            assert_eq!(
+                max_tokens,
+                u64::from(max_steps) * 24_000,
+                "{expected_role} must retain one bounded 24k envelope per model turn"
+            );
+            aggregate_token_cap = aggregate_token_cap.saturating_add(max_tokens);
             assert!(
                 leaf.profile.is_none(),
                 "Fleet must resolve the declared role"
             );
         }
+        assert_eq!(
+            aggregate_token_cap, 360_000,
+            "the fixture must stay globally bounded when no shared override is supplied"
+        );
 
         let expected_gates = [
             ("scout", "implementer"),

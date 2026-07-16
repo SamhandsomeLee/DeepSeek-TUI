@@ -129,9 +129,11 @@ $:
             mkdir -p target/cnb-release
             BIN_DIR="target/x86_64-unknown-linux-musl/release"
             cp "$BIN_DIR/codewhale" target/cnb-release/codewhale-linux-x64
+            cp "$BIN_DIR/codew" target/cnb-release/codew-linux-x64
             cp "$BIN_DIR/codewhale-tui" target/cnb-release/codewhale-tui-linux-x64
             strip \
               target/cnb-release/codewhale-linux-x64 \
+              target/cnb-release/codew-linux-x64 \
               target/cnb-release/codewhale-tui-linux-x64 \
               || true
 
@@ -139,6 +141,7 @@ $:
               cd target/cnb-release
               sha256sum \
                 codewhale-linux-x64 \
+                codew-linux-x64 \
                 codewhale-tui-linux-x64 \
                 > codewhale-artifacts-sha256.txt
             )
@@ -167,6 +170,7 @@ $:
               echo
               echo "Assets:"
               echo "- codewhale-linux-x64"
+              echo "- codew-linux-x64"
               echo "- codewhale-tui-linux-x64"
               echo "- codewhale-artifacts-sha256.txt"
             } > target/cnb-release/CNB_RELEASE.md
@@ -182,5 +186,6 @@ $:
           settings:
             attachments:
               - target/cnb-release/codewhale-linux-x64
+              - target/cnb-release/codew-linux-x64
               - target/cnb-release/codewhale-tui-linux-x64
               - target/cnb-release/codewhale-artifacts-sha256.txt

@@ -48,8 +48,8 @@ export default async function DocsLayout({
       </section>
 
       <div className="portal-container docs-shell min-w-0">
-        <DocsSidebar locale={locale} />
         <article className="docs-content min-w-0">{children}</article>
+        <DocsSidebar locale={locale} />
       </div>
     </div>
   );

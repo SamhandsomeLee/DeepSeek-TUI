@@ -7,8 +7,8 @@
 //!
 //! This module is the bridge:
 //! - [`build_worker_exec_command`] turns a `FleetTaskSpec` + `FleetExecConfig`
-//!   into the `codewhale exec --output-format stream-json …` argv that a host
-//!   adapter ([`super::host`]) launches locally or over SSH.
+//!   into the `codewhale [route flags] exec --output-format stream-json …`
+//!   argv that a host adapter ([`super::host`]) launches locally or over SSH.
 //! - [`map_exec_stream_line`] maps one stream-json line emitted by that worker
 //!   into a [`FleetWorkerEventPayload`] for the durable ledger, so the ledger
 //!   persists the worker's own event vocabulary instead of a simulated one.
@@ -100,13 +100,12 @@ fn build_worker_exec_command_from_prompt(
     provider: Option<&str>,
     reasoning_effort: Option<&str>,
 ) -> FleetWorkerCommand {
-    let mut args: Vec<String> = vec![
-        "exec".to_string(),
-        "--auto".to_string(),
-        "--output-format".to_string(),
-        "stream-json".to_string(),
-    ];
+    let mut args: Vec<String> = Vec::new();
 
+    // The canonical `codewhale` dispatcher owns these route overrides as
+    // global flags and deliberately rejects them after `exec`. Keep them in
+    // front of the subcommand so Fleet commands work through the installed
+    // dispatcher as well as when a host points directly at `codewhale-tui`.
     if let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) {
         args.push("--model".to_string());
         args.push(model.to_string());
@@ -120,6 +119,13 @@ fn build_worker_exec_command_from_prompt(
         args.push("--provider".to_string());
         args.push(provider.to_string());
     }
+
+    args.extend([
+        "exec".to_string(),
+        "--auto".to_string(),
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+    ]);
 
     // Non-secret thinking tier only (#4137). This is profile metadata and
     // follows the same explicit-only policy as provider: omit it when the
@@ -443,6 +449,30 @@ impl FleetExecutor {
         self.streams.keys().cloned().collect()
     }
 
+    /// Stop a tracked worker at the host boundary.
+    ///
+    /// Operator controls run in a separate process from the foreground Fleet
+    /// manager, so they communicate cancellation through the durable ledger.
+    /// The manager calls this method after observing that terminal state; the
+    /// executor is the only owner that can reliably reach the live local/SSH
+    /// adapter handle.
+    pub fn stop_worker(&mut self, worker_id: &str) -> Result<()> {
+        let ssh_key = match self.streams.get(worker_id).map(|stream| &stream.host) {
+            Some(WorkerStreamHost::Local) => None,
+            Some(WorkerStreamHost::Ssh(key)) => Some(key.clone()),
+            None => return Ok(()),
+        };
+        if let Some(key) = ssh_key {
+            let adapter = self.ssh_adapters.get_mut(&key).ok_or_else(|| {
+                anyhow::anyhow!("tracked SSH Fleet worker {worker_id} has no host adapter")
+            })?;
+            adapter.stop_worker(worker_id)?;
+        } else {
+            self.adapter.stop_worker(worker_id)?;
+        }
+        Ok(())
+    }
+
     /// Stop tracking a terminal worker so the scheduler can reuse the same
     /// logical worker id for the next queued task.
     pub fn forget_worker(&mut self, worker_id: &str) {
@@ -657,6 +687,21 @@ mod tests {
             ..FleetExecConfig::default()
         };
         let cmd = build_worker_exec_command("codewhale", &task("audit"), &exec, Some("glm-5.1"));
+        let exec_idx = cmd
+            .args
+            .iter()
+            .position(|arg| arg == "exec")
+            .expect("worker command must contain exec");
+        let model_idx = cmd
+            .args
+            .iter()
+            .position(|arg| arg == "--model")
+            .expect("worker command must contain --model");
+        assert!(
+            model_idx < exec_idx,
+            "global --model must precede exec: {:?}",
+            cmd.args
+        );
         let joined = cmd.args.join(" ");
         assert!(joined.contains("--model glm-5.1"));
         assert!(joined.contains("--allowed-tools read_file,grep_files"));
@@ -721,10 +766,20 @@ mod tests {
             .iter()
             .position(|a| a == "--provider")
             .expect("--provider must be threaded for a provider-pinned worker");
+        let exec_idx = cmd
+            .args
+            .iter()
+            .position(|a| a == "exec")
+            .expect("worker command must contain exec");
         assert_eq!(
             cmd.args.get(provider_idx + 1).map(String::as_str),
             Some("openrouter"),
             "{:?}",
+            cmd.args
+        );
+        assert!(
+            provider_idx < exec_idx,
+            "global --provider must precede exec: {:?}",
             cmd.args
         );
         let model_idx = cmd
@@ -738,6 +793,11 @@ mod tests {
             "{:?}",
             cmd.args
         );
+        assert!(
+            model_idx < exec_idx,
+            "global --model must precede exec: {:?}",
+            cmd.args
+        );
         let reasoning_idx = cmd
             .args
             .iter()
@@ -747,6 +807,24 @@ mod tests {
             cmd.args.get(reasoning_idx + 1).map(String::as_str),
             Some("max"),
             "{:?}",
+            cmd.args
+        );
+        assert!(
+            reasoning_idx > exec_idx,
+            "exec-only --reasoning-effort must follow exec: {:?}",
+            cmd.args
+        );
+
+        assert_eq!(
+            &cmd.args[..exec_idx],
+            ["--model", "glm-5.2", "--provider", "openrouter"],
+            "route flags must form the complete global prefix: {:?}",
+            cmd.args
+        );
+        assert_eq!(
+            &cmd.args[exec_idx..exec_idx + 4],
+            ["exec", "--auto", "--output-format", "stream-json"],
+            "exec flags must remain behind the subcommand: {:?}",
             cmd.args
         );
 
@@ -787,6 +865,16 @@ mod tests {
             "{:?}",
             cmd.args
         );
+        let exec_idx = cmd
+            .args
+            .iter()
+            .position(|a| a == "exec")
+            .expect("worker command must contain exec");
+        assert!(
+            provider_idx < exec_idx,
+            "global --provider must precede exec: {:?}",
+            cmd.args
+        );
         let model_idx = cmd
             .args
             .iter()
@@ -796,6 +884,11 @@ mod tests {
             cmd.args.get(model_idx + 1).map(String::as_str),
             Some("qwen-2.5-7b"),
             "{:?}",
+            cmd.args
+        );
+        assert!(
+            model_idx < exec_idx,
+            "global --model must precede exec: {:?}",
             cmd.args
         );
     }
@@ -833,6 +926,16 @@ mod tests {
             cmd.args.get(model_idx + 1).map(String::as_str),
             Some("deepseek-v4-pro"),
             "{:?}",
+            cmd.args
+        );
+        let exec_idx = cmd
+            .args
+            .iter()
+            .position(|a| a == "exec")
+            .expect("worker command must contain exec");
+        assert!(
+            model_idx < exec_idx,
+            "global --model must precede exec: {:?}",
             cmd.args
         );
     }

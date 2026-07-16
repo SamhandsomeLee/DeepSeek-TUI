@@ -72,33 +72,35 @@ Picking a concrete model pins its provider explicitly: the saved profile records
 `model` and `provider` fields, so the route it names doesn't depend on
 whichever provider happens to be active when the profile is later loaded.
 Pressing **Enter** ("start") on the review step previews the exact starter
-profile TOML inline on that same screen; nothing is written until you ratify it.
+profile TOML inline on that same screen; nothing is written until you save it.
 The `provider` field may be a built-in provider id such as `openrouter` or a
 user-named OpenAI-compatible provider configured under `[providers.<name>]`
 such as `lm-studio`; the launch path preserves that id and fails closed if the
 provider is not configured.
 
 When a provider is configured, the review step also offers model-assisted
-drafting behind a ratify gate:
+drafting behind an explicit preview-before-save gate:
 
 - Press **`m`** to have your first configured model draft the profile. The
   draft arrives sanitized and bounded — permissions stay at the **fleet floor**
   (no shell, no trust, approval required) regardless of what the model
   proposes.
-- **Drafting is not ratifying.** The exact rendered TOML preview renders
+- **Drafting is not saving.** The exact rendered TOML preview renders
   inline on the review step (not in a separate scrollable viewer), so nothing
-  is saved until you press **`g`** or **Enter** to ratify (or press `m` again
-  to redraft). Ratifying writes the profile to the project or personal scope
+  is saved until you press **`g`** or **Enter** to save (or press `m` again
+  to redraft). Saving writes the profile to the project or personal scope
   shown in the preview.
 
 ## Naming: Modes, Workflow, and Fleet
 
 These names describe different layers, not competing systems. Plan and Act are
-the everyday work modes. Operate accepts ordinary messages and dispatches
-non-local work to background Fleet workers: the host permits read-only
-discovery and coordination but blocks direct parent write/shell fallthrough.
-Workflow is an optional orchestration overlay for work that needs ordering,
-gates, shared budgets, replay, or deterministic fan-in.
+the everyday work modes. Operate accepts ordinary messages and keeps the
+parent's normal tool surface under the same approval, sandbox, shell, ask-rule,
+and repository protections as Act. It prefers background Fleet workers for
+independent, parallel, isolated, or long-running work, but does not require a
+worker for every executable step. Workflow is an optional orchestration overlay
+for work that needs ordering, gates, shared budgets, replay, or deterministic
+fan-in.
 
 - **Workflow** is the repeatable plan and user-facing orchestration
   overlay: a script/IR that decides which phases and agents run next, keeps

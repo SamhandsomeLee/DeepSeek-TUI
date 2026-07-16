@@ -220,7 +220,7 @@ CodeWhale has three visible TUI modes:
 | --- | --- | --- |
 | Plan | Exploration, design, and review before changes | Read-only investigation |
 | Act | Normal multi-step coding work | Tool use with approval gates |
-| Operate | Parallel background tasks from ordinary messages | Parent coordinates; Fleet workers execute |
+| Operate | Direct work plus parallel or background coordination | Tools follow the active posture; delegate when useful |
 
 Switch modes from the TUI with the mode picker:
 
@@ -246,6 +246,11 @@ revision instead of accepting an under-specified plan.
 
 Act mode is the default for most contribution work. It lets CodeWhale read,
 run checks, and edit files while keeping risky actions behind approval gates.
+
+Operate keeps that direct tool surface and its approval, sandbox, shell,
+ask-rule, and repository protections. Its difference is orchestration emphasis:
+CodeWhale prefers Fleet workers for independent, parallel, background, or
+long-running work, while small or tightly coupled work can remain in the parent.
 
 For trusted workspaces where you intentionally want actions to proceed without
 approval prompts, select the Full Access permission posture with `Shift+Tab`.

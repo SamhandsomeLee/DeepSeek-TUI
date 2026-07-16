@@ -8,11 +8,12 @@ of the problem:
 - **Workflow** describes orchestration: phases, branches, reducers, loops, and
   agent leaves that can dispatch through the Fleet/sub-agent runtime.
 
-**Default product path:** ask in natural language. Operate dispatches ordinary
-work to one or more background Fleet workers and keeps the composer available
-for more messages. It chooses Workflow only when ordered phases, gates, shared
-budgets, or deterministic fan-in add real value; you do not need to write
-workflow files for ordinary multi-agent work. Details:
+**Default product path:** ask in natural language. Operate can use direct tools
+under the active posture, and prefers one or more background Fleet workers when
+work is independent, parallel, isolated, or long-running. Background work keeps
+the composer available for more messages. It chooses Workflow only when
+ordered phases, gates, shared budgets, or deterministic fan-in add real value;
+you do not need to write workflow files for ordinary multi-agent work. Details:
 [Automatic Workflows](AUTOMATIC_WORKFLOWS.md).
 
 This tutorial covers the **manual** Fleet task-spec / checked-in Workflow path
@@ -41,7 +42,7 @@ If you want named reusable workers, open the TUI and run:
 
 Pick a role, choose whether that profile inherits the operator route or pins a
 specific provider/model/thinking tier, review the permissions/tools/route
-posture, and ratify the rendered TOML. Project profiles are saved under
+posture, and save the rendered TOML. Project profiles are saved under
 `.codewhale/agents/<role>.toml`. On Review, press `s` before previewing to save
 a personal profile under `$CODEWHALE_HOME/agents/<role>.toml`; it is available
 across repositories, while a same-id project profile remains the higher-priority
@@ -138,7 +139,7 @@ Common task fields:
 | `id`, `name` | Stable task identity and display name. |
 | `objective`, `instructions` | The worker goal and exact operating instructions. |
 | `worker.role` | Built-in or custom role intent, such as `reviewer`, `builder`, `read-only`, or `smoke-runner`. |
-| `worker.profile` / `worker.agent_profile` | Ratified Fleet roster profile resolved from project `.codewhale/agents/`, personal `$CODEWHALE_HOME/agents/`, or `[fleet.profiles]`. |
+| `worker.profile` / `worker.agent_profile` | Saved Fleet roster profile resolved from project `.codewhale/agents/`, personal `$CODEWHALE_HOME/agents/`, or `[fleet.profiles]`. |
 | `worker.tools` | Tool names the task expects the worker to use. |
 | `worker.model` | Preferred explicit model pin. Route resolution still owns provider/model validation. |
 | `worker.model_class`, `worker.loadout` | Compatibility routing hints for older task specs; prefer `worker.profile` plus saved profile route pins for new specs. |

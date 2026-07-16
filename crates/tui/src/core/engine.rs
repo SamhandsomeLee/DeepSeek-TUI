@@ -1639,6 +1639,7 @@ impl Engine {
                             Some(self.tx_event.clone()),
                             Arc::clone(&self.subagent_manager),
                         )
+                        .with_locale_tag(self.config.locale_tag.clone())
                         .with_role_models(self.subagent_role_models())
                         .with_api_config(self.api_config.clone())
                         .with_fleet_roster(self.config.fleet_roster.clone())
@@ -2833,6 +2834,7 @@ impl Engine {
                     Some(self.tx_event.clone()),
                     Arc::clone(&self.subagent_manager),
                 )
+                .with_locale_tag(self.config.locale_tag.clone())
                 .with_role_models(self.subagent_role_models())
                 .with_api_config(self.api_config.clone())
                 .with_fleet_roster(self.config.fleet_roster.clone())

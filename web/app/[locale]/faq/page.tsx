@@ -170,7 +170,7 @@ default_text_model = "openrouter/deepseek/deepseek-v4-pro"`}
         <ul className="list-disc pl-5 space-y-2 text-sm text-ink-soft">
           <li><strong>Plan</strong> — Read-only investigation. Can grep, read files, list directories, fetch URLs. Cannot write or execute shell.</li>
           <li><strong>Act</strong> — Normal interactive coding. Tool availability and approval prompts follow the active configuration and permission posture.</li>
-          <li><strong>Operate</strong> — Ordinary messages and read-only inspection stay in the foreground while executable work is dispatched to background Fleet workers. Workflow is optional for ordered phases and gates.</li>
+          <li><strong>Operate</strong> — Direct tools follow the same permission, sandbox, shell, and safety rules as Act. Fleet workers are preferred for independent, parallel, background, or long-running work, but delegation is not mandatory. Workflow is optional for ordered phases and gates.</li>
         </ul>
         <p className="mt-2">
           When the composer is idle, press <kbd className="font-mono text-xs px-1.5 py-0.5 hairline-t hairline-b hairline-l hairline-r">Tab</kbd> to cycle modes.
@@ -514,7 +514,7 @@ default_text_model = "openrouter/deepseek/deepseek-v4-pro"`}
         <ul className="list-disc pl-5 space-y-2 text-sm text-ink-soft">
           <li><strong>Plan（计划）</strong> — 只读调查。可以 grep、读文件、列目录、抓取 URL。不能写入或执行 Shell。</li>
           <li><strong>Act（执行）</strong> — 常规交互式编码。工具是否可用以及何时请求批准，取决于当前配置和权限姿态。</li>
-          <li><strong>Operate（编排）</strong> — 普通消息和只读检查留在前台，可执行工作分派给后台 Fleet worker；只有需要有序阶段和门禁时才需要 Workflow。</li>
+          <li><strong>Operate（编排）</strong> — 直接工具遵循与 Act 相同的权限、沙箱、Shell 和安全规则。独立、并行、后台或长时间工作会优先交给 Fleet worker，但不强制委派；只有需要有序阶段和门禁时才需要 Workflow。</li>
         </ul>
         <p className="mt-2">
           输入区空闲时，按 <kbd className="font-mono text-xs px-1.5 py-0.5 hairline-t hairline-b hairline-l hairline-r">Tab</kbd> 切换模式。

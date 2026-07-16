@@ -3581,7 +3581,7 @@ async fn run_doctor(config: &Config, workspace: &Path, config_path_override: Opt
             );
         } else {
             println!(
-                "  {} composer stash empty (Ctrl+S in the composer to park a draft)",
+                "  {} composer stash empty (Ctrl+G or Ctrl+S in the composer to park a draft)",
                 "·".dimmed()
             );
         }
@@ -8339,6 +8339,14 @@ async fn build_direct_workflow_tool(
         Some(event_tx),
         manager.clone(),
     )
+    .with_locale_tag(
+        crate::localization::resolve_locale(
+            &crate::settings::Settings::load_persisted()
+                .unwrap_or_default()
+                .locale,
+        )
+        .tag(),
+    )
     .with_role_models(role_models)
     .with_api_config(config.clone())
     .with_fleet_roster(roster)
@@ -11553,18 +11561,58 @@ mod terminal_mode_tests {
         let event = ExecStreamEvent::WorkflowEvent {
             run_id: "workflow_1234".to_string(),
             event: serde_json::json!({
-                "type": "task_completed",
-                "task_id": "agent_1",
-                "status": "succeeded"
+                "type": "handoff_promoted",
+                "artifact_id": "workflow_1234:agent_1:review-gate:review_report",
+                "gate_id": "review-gate",
+                "kind": "review_report",
+                "from_role": "reviewer",
+                "to_role": "verifier",
+                "producer_task_id": "agent_1"
             }),
         };
 
-        let json = serde_json::to_string(&event).expect("serializes");
+        let value = exec_stream_value(&event).expect("serializes");
+        let json = serde_json::to_string(&value).expect("serializes");
         assert!(!json.contains('\n'));
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
         assert_eq!(parsed["type"], "workflow_event");
+        assert_eq!(parsed["schema"], "codewhale.exec-stream");
+        assert_eq!(parsed["schema_version"], 1);
         assert_eq!(parsed["run_id"], "workflow_1234");
-        assert_eq!(parsed["event"]["type"], "task_completed");
+        assert_eq!(parsed["event"]["type"], "handoff_promoted");
+        assert_eq!(
+            parsed["event"]["artifact_id"],
+            "workflow_1234:agent_1:review-gate:review_report"
+        );
+        assert_eq!(parsed["event"]["gate_id"], "review-gate");
+        assert_eq!(parsed["event"]["kind"], "review_report");
+        assert_eq!(parsed["event"]["from_role"], "reviewer");
+        assert_eq!(parsed["event"]["to_role"], "verifier");
+        assert_eq!(parsed["event"]["producer_task_id"], "agent_1");
+        assert!(parsed["event"].get("payload").is_none(), "{parsed}");
+
+        let consumed = ExecStreamEvent::WorkflowEvent {
+            run_id: "workflow_1234".to_string(),
+            event: serde_json::json!({
+                "type": "handoff_consumed",
+                "artifact_id": "workflow_1234:agent_1:review-gate:review_report",
+                "kind": "review_report",
+                "from_role": "reviewer",
+                "to_role": "verifier",
+                "consumer_task_id": "agent_2"
+            }),
+        };
+        let consumed = exec_stream_value(&consumed).expect("serializes consumed receipt");
+        assert_eq!(consumed["type"], "workflow_event");
+        assert_eq!(consumed["schema"], "codewhale.exec-stream");
+        assert_eq!(consumed["schema_version"], 1);
+        assert_eq!(consumed["event"]["type"], "handoff_consumed");
+        assert_eq!(
+            consumed["event"]["artifact_id"],
+            "workflow_1234:agent_1:review-gate:review_report"
+        );
+        assert_eq!(consumed["event"]["consumer_task_id"], "agent_2");
+        assert!(consumed["event"].get("payload").is_none(), "{consumed}");
     }
 
     #[test]

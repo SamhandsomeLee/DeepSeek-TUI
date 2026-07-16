@@ -1,3 +1,8 @@
+// Live acceptance on DeepSeek Flash and GLM-5-Turbo measured the inherited
+// read-only prompt/tool envelope at 17,457 and 17,550 tokens before the first
+// useful tool turn completed. Budget 24k per intended model turn, then pair
+// that token allowance with a small max_steps bound so every role has usable
+// headroom without becoming open-ended. The five role caps total 360k.
 export default workflow({
   "id": "v0868-stopship-lane",
   "goal": "Verify the v0.8.68 Fleet, Workflow, Lane, Runtime, and gate receipt path without changing the workspace",
@@ -67,7 +72,7 @@ export default workflow({
                 "crates/workflow/src/role_resolve.rs",
                 "crates/tui/src/tools/workflow.rs"
               ],
-              "budget": { "max_steps": 8, "timeout_secs": 480, "max_tokens": 16000 }
+              "budget": { "max_steps": 4, "timeout_secs": 480, "max_tokens": 96000 }
             }
           },
           {
@@ -82,7 +87,7 @@ export default workflow({
                 "crates/lane/src/registry.rs",
                 "crates/tui/src/tools/workflow.rs"
               ],
-              "budget": { "max_steps": 6, "timeout_secs": 420, "max_tokens": 12000 }
+              "budget": { "max_steps": 3, "timeout_secs": 420, "max_tokens": 72000 }
             }
           },
           {
@@ -97,7 +102,7 @@ export default workflow({
                 "crates/lane/src/registry.rs",
                 "crates/tui/src/tools/workflow.rs"
               ],
-              "budget": { "max_steps": 6, "timeout_secs": 420, "max_tokens": 12000 }
+              "budget": { "max_steps": 3, "timeout_secs": 420, "max_tokens": 72000 }
             }
           },
           {
@@ -112,7 +117,7 @@ export default workflow({
                 "crates/lane/src/registry.rs",
                 "crates/tui/src/tools/workflow.rs"
               ],
-              "budget": { "max_steps": 6, "timeout_secs": 420, "max_tokens": 12000 }
+              "budget": { "max_steps": 3, "timeout_secs": 420, "max_tokens": 72000 }
             }
           },
           {
@@ -127,7 +132,7 @@ export default workflow({
                 "crates/lane/src/registry.rs",
                 "crates/tui/src/tools/workflow.rs"
               ],
-              "budget": { "max_steps": 4, "timeout_secs": 300, "max_tokens": 8000 }
+              "budget": { "max_steps": 2, "timeout_secs": 300, "max_tokens": 48000 }
             }
           }
         ]

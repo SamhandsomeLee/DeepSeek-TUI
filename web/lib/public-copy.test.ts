@@ -1,5 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { FACTS } from "./facts.generated";
+import { RELEASE_CONTRIBUTORS, RELEASE_HELPERS } from "./release-credits";
 
 function pageSource(path: string): string {
   return readFileSync(new URL(`../app/[locale]/${path}`, import.meta.url), "utf8");
@@ -15,6 +17,9 @@ describe("public website copy contracts", () => {
     expect(layout).not.toContain("Section 02");
     expect(layout).not.toContain("How Codewhale works: ego");
     expect(layout).not.toContain("<Seal");
+    expect(layout.indexOf('<article className="docs-content')).toBeLessThan(
+      layout.indexOf("<DocsSidebar"),
+    );
     expect(search).toContain("docs-topic-row");
     expect(search).not.toContain("40+ Markdown documents");
   });
@@ -65,6 +70,9 @@ describe("public website copy contracts", () => {
     expect(modes).toContain("/mode act");
     expect(modes).toContain("Shift+Tab");
     expect(modes).toContain("Plan is always Read Only");
+    expect(modes).toContain("same permission posture, sandbox, and safety rules as Act");
+    expect(faq).toContain("delegation is not mandatory");
+    expect(modeCopy).not.toContain("executable work is dispatched to background Fleet workers");
     expect(install).toContain("New sessions open in Act mode by default");
   });
 
@@ -77,5 +85,45 @@ describe("public website copy contracts", () => {
     expect(community).toContain("issues/new/choose");
     expect(community).toContain("docs/LOCALIZATION.md");
     expect(community).toContain("Hmbown/CodeWhale/pulls");
+    expect(community).toContain("keeps the weekly archive of repository activity");
+    expect(community).not.toContain("latest one sits near the top");
+  });
+
+  it("keeps current-release website credits in exact changelog parity", () => {
+    expect(FACTS.version).toBeTruthy();
+    const changelog = readFileSync(new URL("../../CHANGELOG.md", import.meta.url), "utf8");
+    const release = changelog
+      .split(`## [${FACTS.version}]`)[1]
+      ?.split("\n## ")[0];
+    const contributorSection = release
+      ?.split("### Contributors")[1]
+      ?.split("\n### ")[0];
+    expect(contributorSection, `missing ${FACTS.version} contributor ledger`).toBeTruthy();
+
+    const changelogHandles = [
+      ...new Set(contributorSection?.match(/@[A-Za-z0-9_-]+/g) ?? []),
+    ].sort();
+    const websiteHandles = [...RELEASE_CONTRIBUTORS, ...RELEASE_HELPERS];
+    const contributorDoc = readFileSync(
+      new URL("../../docs/CONTRIBUTORS.md", import.meta.url),
+      "utf8",
+    );
+    const currentDocBand = contributorDoc
+      .split(`<summary><strong>v${FACTS.version} `)[1]
+      ?.split("</details>")[0];
+    expect(currentDocBand, `missing ${FACTS.version} contributor-doc band`).toBeTruthy();
+    const docHandles = [
+      ...new Set(
+        [...(currentDocBand?.matchAll(/github\.com\/([A-Za-z0-9_-]+)\)/g) ?? [])].map(
+          (match) => `@${match[1]}`,
+        ),
+      ),
+    ].sort();
+
+    expect(new Set(websiteHandles).size, "credit arrays must not overlap or repeat").toBe(
+      websiteHandles.length,
+    );
+    expect([...websiteHandles].sort()).toEqual(changelogHandles);
+    expect(docHandles).toEqual(changelogHandles);
   });
 });

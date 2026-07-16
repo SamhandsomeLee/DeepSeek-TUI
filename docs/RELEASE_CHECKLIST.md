@@ -178,8 +178,8 @@ release anxiety: contributors cannot tell whether their work merged.
       ./scripts/release/verify-release-assets.sh X.Y.Z
       ```
       This checks the local tag, remote tag, successful Release workflow SHA,
-      npm-facing assets, and `codewhale-artifacts-sha256.txt` manifest. If it
-      fails, rerun or repair the GitHub Release workflow before touching any
+      full binary/archive/installer asset set, and both checksum manifests. If
+      it fails, rerun or repair the GitHub Release workflow before touching any
       registry.
 - [ ] The live GitHub Release body has its own `## Contributors` or
       `## Credits` section; do not rely on "see CHANGELOG" alone. Verify with:

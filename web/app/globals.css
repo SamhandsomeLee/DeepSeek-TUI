@@ -102,8 +102,10 @@ h3 { font-size: 1.18rem; line-height: 1.25; }
     font-size: clamp(1.6rem, 7.5vw, 2.2rem);
     overflow-wrap: anywhere;
   }
-  /* prevent latin/CJK heading from blowing past the viewport */
+  /* Keep headings inside the viewport without inserting awkward English hyphens. */
   h1, h2 { hyphens: auto; }
+  html[lang="en"] h1,
+  html[lang="en"] h2 { hyphens: none; }
 }
 
 /* ---------- structural primitives ---------- */
@@ -1069,12 +1071,14 @@ a.body-link:hover { background-size: 100% 6px; color: var(--ink); }
 .docs-shell {
   display: grid;
   grid-template-columns: minmax(13rem, 0.28fr) minmax(0, 0.72fr);
+  grid-template-areas: "sidebar content";
   gap: clamp(2rem, 5vw, 4.5rem);
   align-items: start;
   padding-block: clamp(2.25rem, 5vw, 4rem);
 }
 
 .docs-sidebar {
+  grid-area: sidebar;
   border-top: 1px solid var(--hairline);
 }
 
@@ -1127,6 +1131,7 @@ a.body-link:hover { background-size: 100% 6px; color: var(--ink); }
 }
 
 .docs-content {
+  grid-area: content;
   width: 100%;
   max-width: 52rem;
 }
@@ -1285,6 +1290,9 @@ a.body-link:hover { background-size: 100% 6px; color: var(--ink); }
 @media (max-width: 900px) {
   .docs-shell {
     grid-template-columns: 1fr;
+    grid-template-areas:
+      "content"
+      "sidebar";
   }
 
   .docs-sidebar nav {

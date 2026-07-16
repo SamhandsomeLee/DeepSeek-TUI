@@ -4274,6 +4274,14 @@ async fn run_event_loop(
             // to canonical Ctrl+C so the quit-arm flow always runs (#4090).
             normalize_raw_ctrl_c(&mut key);
 
+            // Approval is a decision boundary, not a viewport lock. Keep the
+            // card focused for its ordinary selection keys while letting the
+            // same transcript navigation used by the main shell review the
+            // evidence above it (#4371).
+            if handle_approval_transcript_key(app, &key) {
+                continue;
+            }
+
             // Decision card keyboard routing (v0.8.43 truth-surface).
             // When a card is active, number keys 1-9 select options,
             // j/k or Up/Down navigate, and Enter confirms.
@@ -5822,16 +5830,20 @@ async fn run_event_loop(
                 {
                     app.delete_word_backward();
                 }
-                KeyCode::Char('s') | KeyCode::Char('S')
+                KeyCode::Char('s')
+                | KeyCode::Char('S')
+                | KeyCode::Char('g')
+                | KeyCode::Char('G')
                     if key.modifiers == KeyModifiers::CONTROL =>
                 {
-                    if send_ctrl_s_queued_message_now(app, config, &engine_handle).await? {
+                    if send_shortcut_queued_message_now(app, config, &engine_handle).await? {
                         continue;
                     }
-                    // #440: park the current draft to the persistent
-                    // stash and clear the composer. Empty composers
-                    // are a no-op so a stray Ctrl+S can't pollute the
-                    // file. Surface a toast so the user sees the
+                    // #440: park the current draft to the persistent stash and
+                    // clear the composer. Ctrl+G is the terminal-safe alias for
+                    // hosts such as Cursor/VS Code that reserve Ctrl+S for Save.
+                    // Empty composers are a no-op so a stray shortcut cannot
+                    // pollute the file. Surface a toast so the user sees the
                     // confirmation (no-op feels broken otherwise).
                     if !app.input.is_empty() {
                         crate::composer_stash::push_stash(&app.input);
@@ -5974,6 +5986,37 @@ fn decision_card_number_from_key(key: &event::KeyEvent) -> Option<usize> {
     }
 
     Some((c as u8 - b'1' + 1) as usize)
+}
+
+/// Let the transcript remain reviewable while an approval card owns focus.
+fn handle_approval_transcript_key(app: &mut App, key: &event::KeyEvent) -> bool {
+    if app.view_stack.top_kind() != Some(ModalKind::Approval) {
+        return false;
+    }
+
+    let page = app.viewport.last_transcript_visible.max(1);
+    match key.code {
+        KeyCode::PageUp => app.scroll_up(page),
+        KeyCode::PageDown => app.scroll_down(page),
+        KeyCode::Up
+            if key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT | KeyModifiers::CONTROL) =>
+        {
+            app.scroll_up(3);
+        }
+        KeyCode::Down
+            if key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT | KeyModifiers::CONTROL) =>
+        {
+            app.scroll_down(3);
+        }
+        KeyCode::Home => app.scroll_up(usize::MAX),
+        KeyCode::End => app.scroll_to_bottom(),
+        _ => return false,
+    }
+    true
 }
 
 /// Route only non-text controls to a focused workflow panel.
@@ -6421,10 +6464,10 @@ fn deliver_fleet_draft_result(
                 if installed {
                     app.status_message = Some(match locale {
                         crate::localization::Locale::ZhHans => {
-                            format!("{model_label} 已起草配置。请查看下方 TOML，然后按 g 批准。")
+                            format!("{model_label} 已起草配置。请查看下方 TOML，然后按 g 保存。")
                         }
                         _ => format!(
-                            "{model_label} drafted the profile. Review the TOML below, then press g to ratify."
+                            "{model_label} drafted the profile. Review the TOML below, then press g to save."
                         ),
                     });
                 }
@@ -7384,7 +7427,7 @@ fn queue_current_draft_for_next_turn(app: &mut App) -> bool {
     true
 }
 
-fn take_ctrl_s_queued_message(app: &mut App) -> Option<(QueuedMessage, Option<usize>)> {
+fn take_shortcut_queued_message(app: &mut App) -> Option<(QueuedMessage, Option<usize>)> {
     if let Some(mut draft) = app.queued_draft.take() {
         if let Some(input) = app.submit_input() {
             draft.display = input;
@@ -7399,12 +7442,12 @@ fn take_ctrl_s_queued_message(app: &mut App) -> Option<(QueuedMessage, Option<us
     None
 }
 
-async fn send_ctrl_s_queued_message_now(
+async fn send_shortcut_queued_message_now(
     app: &mut App,
     config: &Config,
     engine_handle: &EngineHandle,
 ) -> Result<bool> {
-    let Some((message, restore_index)) = take_ctrl_s_queued_message(app) else {
+    let Some((message, restore_index)) = take_shortcut_queued_message(app) else {
         return Ok(false);
     };
     send_taken_queued_message_now(app, config, engine_handle, message, restore_index).await?;
@@ -10541,6 +10584,7 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
     let size = f.area();
     let classic_shell = app.ocean_treatment.is_classic();
     app.sidebar_hover = crate::tui::app::SidebarHoverState::default();
+    app.viewport.last_approval_area = None;
 
     // Clear entire area with the configured app background.
     let background = Block::default().style(Style::default().bg(app.ui_theme.surface_bg));
@@ -10556,6 +10600,9 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
         crate::tui::underwater::render_launch_screen(size, f.buffer_mut(), app);
         crate::tui::underwater::record_launch_row_areas(size, &mut app.launch);
         if !app.view_stack.is_empty() {
+            if app.view_stack.top_kind() == Some(ModalKind::Approval) {
+                app.viewport.last_approval_area = app.view_stack.top_occupied_region(size);
+            }
             let buf = f.buffer_mut();
             app.view_stack.render(size, buf);
         }
@@ -10949,6 +10996,9 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
             refresh_live_transcript_overlay(app);
         } else if app.view_stack.top_kind() == Some(ModalKind::ContextInspector) {
             refresh_context_inspector_overlay(app);
+        }
+        if app.view_stack.top_kind() == Some(ModalKind::Approval) {
+            app.viewport.last_approval_area = app.view_stack.top_occupied_region(size);
         }
         let buf = f.buffer_mut();
         app.view_stack.render(size, buf);
@@ -11760,10 +11810,10 @@ async fn handle_view_events(
                         let zh = app.ui_locale == crate::localization::Locale::ZhHans;
                         app.add_message(HistoryCell::System {
                             content: if zh {
-                                format!("已批准并保存 Fleet 配置：{}", target.display())
+                                format!("已保存 Fleet 配置：{}", target.display())
                             } else {
                                 format!(
-                                    "Fleet {} profile ratified and saved: {}",
+                                    "Fleet {} profile saved: {}",
                                     scope.label(),
                                     target.display()
                                 )

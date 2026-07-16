@@ -8,6 +8,135 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::{Builder as TempDirBuilder, tempdir};
 
+fn built_in_whale_name_that_cannot_be_generated_for(agent_id: &str) -> &'static str {
+    WHALE_NICKNAMES
+        .iter()
+        .chain(WHALE_NICKNAMES_JA)
+        .chain(WHALE_NICKNAMES_ZH_HANT)
+        .chain(WHALE_NICKNAMES_PT_BR)
+        .chain(WHALE_NICKNAMES_ES_419)
+        .chain(WHALE_NICKNAMES_VI)
+        .chain(WHALE_NICKNAMES_KO)
+        .copied()
+        .find(|name| generated_whale_name_base(agent_id, name).is_none())
+        .expect("the combined pools contain labels not generated for one id")
+}
+
+#[test]
+fn generated_whale_names_follow_session_language_without_mixing() {
+    let localized_pools: &[(&str, &[&str])] = &[
+        ("ja", WHALE_NICKNAMES_JA),
+        ("zh-Hant", WHALE_NICKNAMES_ZH_HANT),
+        ("pt-BR", WHALE_NICKNAMES_PT_BR),
+        ("es-419", WHALE_NICKNAMES_ES_419),
+        ("vi", WHALE_NICKNAMES_VI),
+        ("ko", WHALE_NICKNAMES_KO),
+    ];
+
+    for index in 0..64 {
+        let id = format!("agent_locale_{index}");
+        let english = whale_name_for_id_in_locale(&id, "en");
+        let chinese = whale_name_for_id_in_locale(&id, "zh-Hans");
+
+        assert!(english.is_ascii(), "English name leaked locale: {english}");
+        assert!(
+            !chinese.is_ascii(),
+            "Chinese name fell back to English: {chinese}"
+        );
+        let english_index = WHALE_NICKNAMES
+            .iter()
+            .position(|candidate| *candidate == english)
+            .expect("English generated name belongs to the curated pool");
+        assert_eq!(english_index % 2, 0);
+        assert_eq!(WHALE_NICKNAMES[english_index + 1], chinese);
+
+        for (locale, pool) in localized_pools {
+            let generated = whale_name_for_id_in_locale(&id, locale);
+            assert!(
+                pool.contains(&generated.as_str()),
+                "{locale} generated a name from another language: {generated}"
+            );
+        }
+    }
+
+    assert_eq!(
+        whale_name_for_id_in_locale("fallback", "unknown"),
+        whale_name_for_id_in_locale("fallback", "en")
+    );
+}
+
+#[test]
+fn locale_matched_whale_collision_suffix_stays_in_language() {
+    let id = "agent_locale_collision";
+    let base = whale_name_for_id_in_locale(id, "zh-Hans");
+    let active = HashSet::from([base.clone()]);
+    let unique = assign_unique_whale_name_in_locale(id, &active, "zh-Hans");
+
+    assert_ne!(unique, base);
+    assert!(unique.starts_with(&base));
+    assert!(!unique.is_ascii());
+}
+
+#[test]
+fn localized_whale_displays_rederive_legacy_names_from_neutral_ids() {
+    let generated_a = whale_name_for_id_in_locale("agent_english_a", "zh-Hans");
+    let generated_b = whale_name_for_id_in_locale("agent_english_b", "ja");
+    let generated_c = whale_name_for_id_in_locale("agent_english_c", "vi");
+    let explicit_whale_id = "agent_explicit_whale";
+    let explicit_whale = built_in_whale_name_that_cannot_be_generated_for(explicit_whale_id);
+    let displays = localized_whale_display_names(
+        [
+            ("agent_english_a", Some(generated_a.as_str())),
+            ("agent_english_b", Some(generated_b.as_str())),
+            ("agent_english_c", Some(generated_c.as_str())),
+            ("agent_explicit", Some("docs-fixer")),
+            (explicit_whale_id, Some(explicit_whale)),
+        ],
+        "en",
+    );
+
+    for agent_id in ["agent_english_a", "agent_english_b", "agent_english_c"] {
+        let display = displays.get(agent_id).expect("generated display");
+        assert!(
+            display.is_ascii(),
+            "English UI leaked a prior-locale whale name: {display}"
+        );
+        let base = generated_whale_name_base(agent_id, display).expect("English whale display");
+        let index = WHALE_NICKNAMES
+            .iter()
+            .position(|candidate| *candidate == base)
+            .expect("English display belongs to the paired pool");
+        assert_eq!(index % 2, 0, "English display selected a zh-Hans pair");
+    }
+    assert_eq!(
+        displays.get("agent_explicit").map(String::as_str),
+        Some("docs-fixer"),
+        "an explicit non-whale nickname remains user-owned"
+    );
+    assert_eq!(
+        displays.get(explicit_whale_id).map(String::as_str),
+        Some(explicit_whale),
+        "a built-in whale word belonging to another id remains user-owned"
+    );
+}
+
+#[test]
+fn exact_deterministic_whale_match_remains_generated_without_provenance() {
+    let agent_id = "agent_ambiguous_whale";
+    let generated = whale_name_for_id_in_locale(agent_id, "en");
+    let suffixed = format!("{generated} (17)");
+
+    assert_eq!(
+        generated_whale_name_base(agent_id, &generated),
+        Some(generated.as_str())
+    );
+    assert_eq!(
+        generated_whale_name_base(agent_id, &suffixed),
+        Some(generated.as_str()),
+        "a collision suffix remains presentation-only"
+    );
+}
+
 fn make_assignment() -> SubAgentAssignment {
     SubAgentAssignment::new("prompt".to_string(), Some("worker".to_string()))
 }
@@ -3615,6 +3744,109 @@ fn test_persist_and_reload_marks_running_agent_as_interrupted() {
 }
 
 #[test]
+fn generated_whale_name_is_not_persisted_or_replayed_on_load() {
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().to_path_buf();
+    let state_path = default_state_path(tmp.path()).expect("default state path");
+    let mut manager =
+        SubAgentManager::new(workspace.clone(), 2).with_state_path(state_path.clone());
+    let (input_tx, _input_rx) = mpsc::unbounded_channel();
+    let agent_id = "agent_locale_neutral";
+    let generated = whale_name_for_id_in_locale(agent_id, "ja");
+    let mut agent = SubAgent::new(
+        agent_id.to_string(),
+        SubAgentType::General,
+        "work".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        Some(generated.clone()),
+        Some(vec!["read_file".to_string()]),
+        input_tx,
+        PathBuf::from("."),
+        "boot_test".to_string(),
+    );
+    agent.session_name = "docs-worker".to_string();
+    manager.agents.insert(agent.id.clone(), agent);
+    manager
+        .persist_state()
+        .expect("persist state")
+        .join()
+        .expect("persist thread");
+
+    let mut persisted: Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).expect("read persisted state"))
+            .expect("parse persisted state");
+    assert!(
+        persisted["agents"][0].get("nickname").is_none(),
+        "generated locale text is not durable identity"
+    );
+
+    // Recreate a pre-fix state file whose generated display came from a
+    // Japanese session. Loading under a later session must discard it.
+    persisted["agents"][0]["nickname"] = json!(generated);
+    std::fs::write(
+        &state_path,
+        serde_json::to_string_pretty(&persisted).expect("serialize legacy state"),
+    )
+    .expect("write legacy state");
+
+    let mut reloaded = SubAgentManager::new(workspace, 2).with_state_path(state_path);
+    reloaded.load_state().expect("load legacy state");
+    let snapshot = reloaded
+        .get_result(agent_id)
+        .expect("neutral id survives load");
+    assert_eq!(snapshot.agent_id, "agent_locale_neutral");
+    assert_eq!(snapshot.name, "docs-worker");
+    assert_eq!(snapshot.nickname, None);
+}
+
+#[test]
+fn explicit_nonmatching_whale_word_is_persisted_and_loaded() {
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().to_path_buf();
+    let state_path = default_state_path(tmp.path()).expect("default state path");
+    let agent_id = "agent_explicit_whale_word";
+    let explicit_whale = built_in_whale_name_that_cannot_be_generated_for(agent_id);
+    assert!(generated_whale_name_base(agent_id, explicit_whale).is_none());
+
+    let mut manager =
+        SubAgentManager::new(workspace.clone(), 2).with_state_path(state_path.clone());
+    let (input_tx, _input_rx) = mpsc::unbounded_channel();
+    let agent = SubAgent::new(
+        agent_id.to_string(),
+        SubAgentType::General,
+        "work".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        Some(explicit_whale.to_string()),
+        Some(vec!["read_file".to_string()]),
+        input_tx,
+        PathBuf::from("."),
+        "boot_test".to_string(),
+    );
+    manager.agents.insert(agent.id.clone(), agent);
+    manager
+        .persist_state()
+        .expect("persist state")
+        .join()
+        .expect("persist thread");
+
+    let persisted: Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).expect("read persisted state"))
+            .expect("parse persisted state");
+    assert_eq!(
+        persisted["agents"][0]["nickname"],
+        json!(explicit_whale),
+        "the explicit whale-word nickname remains durable"
+    );
+
+    let mut reloaded = SubAgentManager::new(workspace, 2).with_state_path(state_path);
+    reloaded.load_state().expect("load state");
+    let snapshot = reloaded.get_result(agent_id).expect("agent survives load");
+    assert_eq!(snapshot.nickname.as_deref(), Some(explicit_whale));
+}
+
+#[test]
 fn persist_and_reload_preserves_checkpoint_for_interrupted_running_agent() {
     let tmp = tempdir().expect("tempdir");
     let workspace = tmp.path().to_path_buf();
@@ -5074,6 +5306,7 @@ fn stub_runtime() -> SubAgentRuntime {
         client: stub_client(),
         api_config: None,
         model: "deepseek-v4-flash".to_string(),
+        locale_tag: "en".to_string(),
         auto_model: false,
         reasoning_effort: None,
         reasoning_effort_auto: false,

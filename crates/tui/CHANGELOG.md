@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.8.68] - 2026-07-14
+## [0.8.68] - 2026-07-15
 
 Codewhale v0.8.68 replaces the default terminal shell with the underwater
 interaction system, makes Operate message-first, and hardens the Fleet,
@@ -36,11 +36,12 @@ quieter, docs-first community foundation.
   thinking intent when no explicit reasoning tier is set. Aggregator, Wanjie
   Ark, self-hosted, and custom endpoint model ids remain provider-owned (#4320).
 - Make Operate a message-first multitask surface: ordinary prompts work without
-  a Workflow, executable prompts dispatch bounded background workers, and
-  follow-ups can queue while work is active. The parent remains a read-only
-  coordinator, worker edits and built-in verification still cross the normal
-  approval boundary, child handoffs cannot inherit standing Full Access, and
-  each dispatch produces one durable completion receipt.
+  a Workflow, direct parent tools follow the same approval, sandbox, shell,
+  ask-rule, and repository protections as Act, and follow-ups can queue while
+  work is active. Bounded background workers remain preferred for independent,
+  parallel, isolated, or long-running work; child handoffs cannot inherit
+  standing Full Access, and each dispatch produces one durable completion
+  receipt.
 - Let personal Fleet profiles in `CODEWHALE_HOME/agents` travel across
   repositories while project profiles in `.codewhale/agents` override them.
   Saving refreshes the live roster, and the UI now says explicitly that profile
@@ -50,6 +51,9 @@ quieter, docs-first community foundation.
   resolve on send; fuzzy matches stay in the completion popup instead of
   silently attaching an arbitrary same-name file (#4365 by @WavesMan, with the
   initial bounded-walk approach from #4367 by @LeoLin990405).
+- Keep the opt-in `remember` tool in the model-visible first-turn catalog so
+  durable preference capture works without requiring a model to discover a
+  tool it cannot yet know exists (#4373 by @Angel-Hair).
 - Honor each MCP server's advertised discovery capabilities before calling
   optional tools, resources, templates, or prompts; keep optional probes
   independently bounded and fail-soft (#4308 by @nsfoxer).
@@ -65,6 +69,31 @@ quieter, docs-first community foundation.
   events remain visible to `turn_end` observers as explicitly non-model
   lifecycle records. This builds on the scorecard introduced by @findshan in
   #3388.
+- Preserve named custom-provider identity across TUI sessions, `exec --resume`,
+  runtime threads, exports, cache and Workflow receipts. Restores resolve the
+  saved provider against live configuration before creating a client, never
+  infer a provider from the model ID, and fail closed when the named route was
+  removed, invalid, or ambiguous (#4334).
+- Make Fleet launch and teardown deterministic: route flags are placed before
+  `exec`, workers are contained in owned Unix sessions or Windows Job Objects,
+  and cancellation reaps surviving descendants with bounded escalation before
+  manager state settles.
+- Keep the stopship Workflow fixture bounded to measured 24k-per-turn role
+  budgets and a 360k aggregate. Free-form descriptions no longer fabricate
+  write, shell, or network risk; unknown structured risk remains fail-closed.
+- Keep repository trust affirmative and explicit: only `1`/`Y` are advertised
+  as acceptance keys, while Enter remains non-affirmative and explains the
+  required choice.
+- Keep the transcript reviewable while an inline approval card is active:
+  Page Up/Down, modified arrows, Home/End, and the mouse wheel now move through
+  the visible evidence without changing or dismissing the pending decision
+  (#4371 by @amuthantamil).
+- Match generated worker names to the active UI language while preserving
+  explicit user names, and tighten the 89x50 shell rhythm across Fleet rows,
+  choice dialogs, transcript boundaries, and the idle composer.
+- Put docs content and search before the full index on small screens, reduce
+  mobile dead space, and keep the public community copy focused on issues,
+  pull requests, and international contributors.
 
 ### Changed — the underwater shell
 
@@ -167,6 +196,16 @@ quieter, docs-first community foundation.
 
 ### Added
 
+- MiniMax Messages provider support for MiniMax-M3 and MiniMax-M2.7, with
+  OpenAI-compatible and Messages routes, regional endpoint guidance, request
+  coverage, catalog limits, and tier-aware pricing (PR #4354 by @octo-patch).
+- Dynamic MCP server infrastructure and an approval-gated tool that lets the
+  model start a configured MCP server from chat context. Harvested from
+  #3869 and #3866 by @bistack with authorship preserved.
+- Parent `--disallowed-tools` restrictions now flow into sub-agents and Fleet
+  workers by default, including deny-wins, wildcard, catalog-filtering, and
+  multi-generation inheritance coverage. Harvested from #4096 by @JayBeest
+  (#4042).
 - Korean (ko) UI locale with full key parity and onboarding/setup wiring
   (PR #4347 by @moduvoice).
 - Localize the entire underwater layer: 104 new UI strings — launch menu,
@@ -187,11 +226,33 @@ quieter, docs-first community foundation.
 - NetBSD: generate QuickJS bindings at build time so `codewhale-workflow-js`
   compiles (PR #4349 by @ci4ic4).
 - Real-PTY release gates for six-worker fan-out liveness with Esc cancel,
-  multi-terminal route isolation, queued steering via Ctrl+S, the one-shot
+  multi-terminal route isolation, queued steering via terminal-safe Ctrl+G
+  (with Ctrl+S retained where the terminal forwards it), the one-shot
   completion footer, and per-theme ANSI output for every shipped palette.
 
 ### Fixed
 
+- Make release publication complete and source-anchored: every build checks out
+  the resolved tag commit, tag movement is rejected before GHCR, GitHub
+  Release, Homebrew, Cargo, or npm writes, and registry helpers require a clean
+  checkout exactly matching the remote tag. Manual recovery runs are
+  exact-tag-only and execute the same parity gate as automatic tag pushes.
+- Publish a coherent distribution set: both checksum manifests now contain
+  usable public basenames and cover the full 29-asset matrix; GHCR, Homebrew,
+  GitHub archives, and the Linux x64 CNB mirror carry `codewhale`, `codew`, and
+  `codewhale-tui`. The CNB shortcut now fails clearly outside Linux/OpenHarmony
+  x64 instead of promising assets that the mirror does not build.
+- Preserve task text when a skill is invoked through dollar, unified-slash, or
+  explicit skill syntax, while keeping bare skill invocations and management
+  subcommands intact (PR #4372 by @nightt5879, co-authored by @CCChisato;
+  #3915).
+- Honor MCP server discovery capabilities: require advertised or legacy
+  `tools/list`, keep optional resource/template/prompt probes independently
+  bounded and fail-soft, and format descriptions Unicode-safely (#4308,
+  harvested with co-authorship from @nsfoxer).
+- Age-evict terminal sub-agent worker records from the state ledger so
+  long-lived, high-fan-out sessions do not keep rewriting multi-megabyte
+  terminal history (#4217; root-cause and fix direction from @yekern).
 - Resolve the sub-agent completion/cancellation race with one terminal-state
   claim: cancellation suppresses late mailbox/parent/UI delivery, while a
   completed result remains publicly running until its notification is safely
@@ -330,16 +391,16 @@ quieter, docs-first community foundation.
   only the active one), a picked route's provider is persisted explicitly in
   the saved profile TOML (`provider = "..."`, never inferred from the model
   id), and the loader/route resolver read that field back out verbatim. The
-  draft-preview ratify keypress no longer competes with a separate pager's
+  draft-preview save keypress no longer competes with a separate pager's
   `g`/`G` scroll bindings — the exact TOML preview now renders inline on the
-  same Review step that ratifies it (#4093).
+  same Review step that saves it (#4093).
 - The headless `codewhale fleet run` CLI now launches workers on their profile-pinned route, not just records it on the receipt: `codewhale exec` gains a non-secret `--provider` flag, and a worker whose profile pins provider B is dispatched with `--provider B --model <B's model>` even when the parent session is on provider A (credentials still resolve from the worker's own environment; provider is never inferred from the model id). Workers with no profile-bound provider are unchanged — no `--provider`, run-level model. The interactive TUI spawns roster members in-process and does not yet honor the pinned provider (it uses the session provider); that remainder is tracked in #4193 (#4093).
 - The Fleet setup `m` model-assisted redraft no longer drops a picked
   cross-provider route: the provider/model the operator chose are re-pinned
   onto the drafted profile (a model draft is always `provider: None`), so
-  ratifying it keeps the explicit route instead of persisting an ambiguous,
+  saving it keeps the explicit route instead of persisting an ambiguous,
   provider-scoped profile (#4093).
-- Ratifying a Fleet profile now fails with a clear message when it pins a
+- Saving a Fleet profile now fails with a clear message when it pins a
   provider that has no configured credentials, using the same
   configured-provider check the model picker uses (#4093).
 - Workflow correctness: completion polling fails closed instead of
@@ -397,12 +458,21 @@ quieter, docs-first community foundation.
   now map to Act + Full Access permissions via a compatibility shim and
   show a one-shot deprecation notice; removal is planned for 0.9.0.
 
+### Known issues
+
+- Android/Termux arm64 remains a preview in v0.8.68. The target, asset wiring,
+  updater selection, dependency graph, and source-build path have automated or
+  static coverage, but shell/PTY/config/TUI startup and runtime behavior remain
+  unverified on a real device (#4236, #4242). Do not use a GNU/Linux arm64
+  archive in Termux.
+
 ### Contributors
 
 Thank you to the international community whose code, reports, reviews, and
 reproductions shaped v0.8.68:
 
-- [@bistack](https://github.com/bistack),
+- [@amuthantamil](https://github.com/amuthantamil),
+  [@bistack](https://github.com/bistack),
   [@bruce6135](https://github.com/bruce6135),
   [@CCChisato](https://github.com/CCChisato),
   [@ci4ic4](https://github.com/ci4ic4),
@@ -461,11 +531,11 @@ reproductions shaped v0.8.68:
   save, and a `/constitution` manager command as the primary constitution
   management surface, with file state shown in setup and actions surfaced in
   diagnostics (#3793, #3806, #3811).
-- Added model-assisted constitution and fleet-profile drafting behind an
-  explicit ratify gate, with untrusted-draft provenance recorded so
-  model-authored text is never applied silently. Updating users keep their
-  existing constitution unchanged, and a localized constitution checkpoint is
-  required after update (#3794).
+- Added model-assisted constitution drafting behind an explicit ratify gate
+  and fleet-profile drafting behind an explicit preview-before-save gate, with
+  untrusted-draft provenance recorded so model-authored text is never applied
+  silently. Updating users keep their existing constitution unchanged, and a
+  localized constitution checkpoint is required after update (#3794).
 - Added the Hotbar route editor v1 with route-switch slot actions and support
   for custom model routes, plus a configured-provider route manager for
   `/provider` and `/model` with a missing-auth handoff into provider key

@@ -79,6 +79,157 @@ fn live_transcript_command_open_path_is_idempotent() {
 }
 
 #[test]
+fn approval_prompt_keeps_transcript_page_navigation_live() {
+    let mut app = create_test_app();
+    app.viewport.last_transcript_visible = 12;
+    app.view_stack.push(ApprovalView::new(ApprovalRequest::new(
+        "approval-scroll",
+        "exec_shell",
+        "Review command",
+        &serde_json::json!({"command": "git status"}),
+        "approval-scroll-key",
+    )));
+
+    assert!(handle_approval_transcript_key(
+        &mut app,
+        &KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+    ));
+    assert_eq!(app.viewport.pending_scroll_delta, -12);
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Approval));
+
+    assert!(handle_approval_transcript_key(
+        &mut app,
+        &KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+    ));
+    assert_eq!(app.viewport.pending_scroll_delta, 0);
+
+    assert!(handle_approval_transcript_key(
+        &mut app,
+        &KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL),
+    ));
+    assert_eq!(app.viewport.pending_scroll_delta, -3);
+
+    assert!(handle_approval_transcript_key(
+        &mut app,
+        &KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+    ));
+    assert!(app.viewport.pending_scroll_delta < -1_000_000);
+    assert!(app.user_scrolled_during_stream);
+
+    assert!(handle_approval_transcript_key(
+        &mut app,
+        &KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+    ));
+    assert_eq!(app.viewport.pending_scroll_delta, 0);
+    assert!(!app.user_scrolled_during_stream);
+
+    assert!(handle_approval_transcript_key(
+        &mut app,
+        &KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+    ));
+    assert_eq!(app.viewport.pending_scroll_delta, 3);
+    assert!(app.user_scrolled_during_stream);
+
+    assert!(
+        !handle_approval_transcript_key(
+            &mut app,
+            &KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        ),
+        "ordinary approval selection keys must stay with the decision card"
+    );
+}
+
+#[test]
+fn transcript_navigation_does_not_capture_keys_for_other_modals() {
+    let mut app = create_test_app();
+    app.view_stack.push(HelpView::new_for_locale(app.ui_locale));
+
+    assert!(!handle_approval_transcript_key(
+        &mut app,
+        &KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+    ));
+    assert_eq!(app.viewport.pending_scroll_delta, 0);
+}
+
+#[test]
+fn approval_mouse_wheel_reviews_transcript_without_closing_card() {
+    let mut app = create_test_app();
+    app.view_stack.push(ApprovalView::new(ApprovalRequest::new(
+        "approval-scroll",
+        "exec_shell",
+        "Review command",
+        &serde_json::json!({"command": "git status"}),
+        "approval-scroll-key",
+    )));
+
+    let events = handle_mouse_event(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 4,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert!(events.is_empty());
+    assert!(app.viewport.pending_scroll_delta < 0);
+    assert!(app.user_scrolled_during_stream);
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Approval));
+}
+
+#[test]
+fn approval_wheel_preserves_sidebar_and_work_surface_ownership() {
+    let mut app = create_test_app();
+    app.view_stack.push(ApprovalView::new(ApprovalRequest::new(
+        "approval-scroll",
+        "exec_shell",
+        "Review command",
+        &serde_json::json!({"command": "git status"}),
+        "approval-scroll-key",
+    )));
+    app.viewport.last_sidebar_area = Some(Rect::new(60, 0, 20, 20));
+    app.work_surface.last_area = Some(Rect::new(0, 0, 30, 20));
+    app.viewport.last_approval_area = Some(Rect::new(0, 12, 80, 8));
+
+    for (column, row) in [(65, 4), (10, 4)] {
+        let events = handle_mouse_event(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(events.is_empty());
+        assert_eq!(
+            app.viewport.pending_scroll_delta, 0,
+            "approval wheel leaked from side surface at ({column}, {row})"
+        );
+    }
+
+    for (column, row) in [(65, 15), (10, 15)] {
+        let before = app.viewport.pending_scroll_delta;
+        let events = handle_mouse_event(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(events.is_empty());
+        assert!(
+            app.viewport.pending_scroll_delta < before,
+            "visible approval did not outrank underlying side surface at ({column}, {row})"
+        );
+    }
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Approval));
+}
+
+#[test]
 fn config_update_preview_suppresses_only_success_message_not_action_or_errors() {
     let preview = prepare_config_update_result(
         commands::CommandResult::with_message_and_action(
@@ -8701,7 +8852,7 @@ async fn steer_user_message_records_prompt_for_cancel_restore() {
 }
 
 #[tokio::test]
-async fn ctrl_s_sends_next_queued_message_into_running_turn() {
+async fn composer_send_shortcut_sends_next_queued_message_into_running_turn() {
     let mut app = create_test_app();
     app.is_loading = true;
     app.queue_message(crate::tui::app::QueuedMessage::new(
@@ -8712,9 +8863,9 @@ async fn ctrl_s_sends_next_queued_message_into_running_turn() {
     let mut engine = crate::core::engine::mock_engine_handle();
 
     assert!(
-        send_ctrl_s_queued_message_now(&mut app, &config, &engine.handle)
+        send_shortcut_queued_message_now(&mut app, &config, &engine.handle)
             .await
-            .expect("ctrl+s send succeeds")
+            .expect("composer send shortcut succeeds")
     );
 
     assert_eq!(app.queued_message_count(), 0);
@@ -8725,7 +8876,7 @@ async fn ctrl_s_sends_next_queued_message_into_running_turn() {
 }
 
 #[tokio::test]
-async fn ctrl_s_sends_edited_queued_draft_into_running_turn() {
+async fn composer_send_shortcut_sends_edited_queued_draft_into_running_turn() {
     let mut app = create_test_app();
     app.is_loading = true;
     app.queued_draft = Some(crate::tui::app::QueuedMessage::new(
@@ -8738,9 +8889,9 @@ async fn ctrl_s_sends_edited_queued_draft_into_running_turn() {
     let mut engine = crate::core::engine::mock_engine_handle();
 
     assert!(
-        send_ctrl_s_queued_message_now(&mut app, &config, &engine.handle)
+        send_shortcut_queued_message_now(&mut app, &config, &engine.handle)
             .await
-            .expect("ctrl+s draft send succeeds")
+            .expect("composer send shortcut succeeds")
     );
 
     assert!(app.queued_draft.is_none());
@@ -8920,6 +9071,29 @@ async fn operate_streaming_enter_queues_another_parallel_task() {
     assert_eq!(toast.level, StatusToastLevel::Info);
     assert!(toast.text.contains("Queued task"));
     assert!(toast.text.contains("dispatches next"));
+}
+
+#[tokio::test]
+async fn inline_skill_request_keeps_instruction_when_busy_queueing() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.streaming_message_index = Some(0);
+    app.active_skill = Some("Use the test skill".to_string());
+    let config = Config::default();
+    let engine = crate::core::engine::mock_engine_handle();
+
+    let queued = build_queued_message(&mut app, "do X".to_string());
+    assert!(app.active_skill.is_none(), "skill must be consumed once");
+    submit_or_steer_message(&mut app, &config, &engine.handle, queued)
+        .await
+        .expect("streaming skill request queues");
+
+    let queued = app.queued_messages.front().expect("queued skill request");
+    assert_eq!(queued.display, "do X");
+    assert_eq!(
+        queued.skill_instruction.as_deref(),
+        Some("Use the test skill")
+    );
 }
 
 #[tokio::test]

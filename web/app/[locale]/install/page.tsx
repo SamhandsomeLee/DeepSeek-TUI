@@ -293,8 +293,8 @@ codewhale doctor`;
           </h2>
           <p className="text-sm text-ink-soft max-w-2xl mb-10">
             {isZh
-              ? "如果上面的脚本路径不适合你，从下面找到匹配你情况的一条。每条都安装同一组 codewhale / codewhale-tui 二进制。"
-              : "If the script above doesn't fit your setup, pick the row that matches your situation. Every path installs the same codewhale / codewhale-tui binary pair."}
+              ? "如果上面的脚本路径不适合你，请从下面选择匹配你环境的方式。各渠道的命令和打包形式有所不同，说明会明确列出安装内容。"
+              : "If the script above doesn't fit your setup, choose the channel that matches your environment. Command availability and packaging differ by channel, and each description states exactly what it installs."}
           </p>
 
           <div className="space-y-10">

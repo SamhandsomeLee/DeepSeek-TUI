@@ -5332,7 +5332,7 @@ mod tests {
             empty_composer_visual_rows(Some(COMPOSER_PLACEHOLDER), 40, 4),
             1
         );
-        assert_eq!(widget.cursor_pos(area), Some((2, 4)));
+        assert_eq!(widget.cursor_pos(area), Some((2, 3)));
     }
 
     #[test]
@@ -5361,7 +5361,7 @@ mod tests {
             empty_composer_visual_rows(Some(COMPOSER_PLACEHOLDER), 14, 4),
             1
         );
-        assert_eq!(widget.cursor_pos(area), Some((2, 4)));
+        assert_eq!(widget.cursor_pos(area), Some((2, 3)));
     }
 
     #[test]
@@ -5393,6 +5393,12 @@ mod tests {
         assert!(
             row_text(&buf, area, cursor_y).contains(COMPOSER_PLACEHOLDER),
             "prompt and hint should share one row: {rendered}"
+        );
+        assert!(
+            row_text(&buf, area, cursor_y.saturating_add(1))
+                .trim()
+                .is_empty(),
+            "comfortable composer should keep a quiet row before the footer: {rendered}"
         );
     }
 
@@ -5625,9 +5631,9 @@ mod tests {
     #[test]
     fn composer_top_padding_uses_clamp() {
         // content_lines=0 is clamped to 1
-        assert_eq!(composer_top_padding(0, 3), 2);
+        assert_eq!(composer_top_padding(0, 3), 1);
         // content_lines=1
-        assert_eq!(composer_top_padding(1, 3), 2);
+        assert_eq!(composer_top_padding(1, 3), 1);
         // content_lines=3 fills the budget
         assert_eq!(composer_top_padding(3, 3), 0);
         // content_lines > budget is clamped

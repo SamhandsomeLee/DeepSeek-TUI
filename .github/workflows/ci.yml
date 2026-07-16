@@ -139,6 +139,12 @@ jobs:
         run: ./scripts/release/check-versions.sh
       - name: Check OHOS dependency graph
         run: ./scripts/release/check-ohos-deps.sh
+      - name: Check release helper contracts
+        run: |
+          bash scripts/release/generate-release-body.test.sh
+          bash scripts/release/require-release-tag-checkout.test.sh
+          bash scripts/release/verify-remote-tag.test.sh
+          bash .github/scripts/update-homebrew-tap.test.sh
 
   lint:
     name: Lint

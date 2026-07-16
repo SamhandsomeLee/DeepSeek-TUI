@@ -130,6 +130,7 @@ codewhale workflow run stopship \
   --issue 4178 \
   --fleet v0868-stopship \
   --runtime tmux \
+  --token-budget 360000 \
   --goal "Verify v0.8.68 role resolution, gates, and terminal receipts without editing the workspace."
 
 codewhale lane list
@@ -178,9 +179,15 @@ first non-empty line to the gate outcome, while verdict words later in prose do
 not control admission. Every fixture gate sets `require_explicit_verdict`, so a
 missing or malformed first-line verdict blocks the next role instead of passing
 on child completion alone. The host-emitted `gate_updated` receipt remains
-authoritative. Prompts require grep-first, bounded source reads, with per-role
-token caps of 16k/12k/12k/12k/8k from scout through release lead. Those caps
-are structural guardrails, not proof that a live provider run will complete.
+authoritative. Prompts require grep-first, bounded source reads. Live DeepSeek
+Flash and GLM-5-Turbo acceptance measured 17,457 and 17,550 tokens respectively
+before the first useful tool turn completed, so the old 16k/12k/12k/12k/8k
+caps could not admit even one turn. The fixture now budgets 24k per intended
+model turn, with paired step/token caps of 4/96k, 3/72k, 3/72k, 3/72k, and
+2/48k from scout through release lead. The 360k shared cap above matches that
+bounded aggregate; a lower caller-supplied shared cap can still stop the chain
+before every role runs. These are structural guardrails with measured
+headroom, not proof that a live provider run will complete.
 Acceptance needs all of these in `lane logs`: role-resolved `task_started`
 events, passed or blocked `gate_updated` events, `run_completed`, and the
 terminal Lane receipt.

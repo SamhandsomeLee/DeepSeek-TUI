@@ -32,7 +32,7 @@ use crate::palette;
 use crate::tui::app::App;
 use crate::tui::views::{
     ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, centered_modal_area,
-    render_modal_footer, render_modal_surface, truncate_view_text,
+    render_modal_footer_with_gutter, render_modal_surface, truncate_view_text,
 };
 
 const PROFILE_DIR: &str = ".codewhale/agents";
@@ -868,7 +868,15 @@ impl ModalView for FleetSetupView {
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
         self.row_hitboxes.borrow_mut().clear();
-        let popup_area = centered_modal_area(area, 96, 30, 60, 16);
+        // Choice steps have a bounded list/detail body and should not expand
+        // into a tall empty card on roomy terminals. Review is proof-dense and
+        // scrollable, so it keeps the extra row budgeted for the footer gutter.
+        let preferred_height = match self.step {
+            Step::Role => 21,
+            Step::Model => 22,
+            Step::Review => 31,
+        };
+        let popup_area = centered_modal_area(area, 96, preferred_height, 60, 16);
         render_modal_surface(area, popup_area, buf);
 
         let step_no = match self.step {
@@ -899,7 +907,7 @@ impl ModalView for FleetSetupView {
         block.render(popup_area, buf);
 
         let hints = self.footer_hints();
-        let content = render_modal_footer(inner, buf, &hints);
+        let content = render_modal_footer_with_gutter(inner, buf, &hints);
 
         // Header (intro + breadcrumb) above the step body.
         let chunks = Layout::default()
@@ -1359,7 +1367,7 @@ mod tests {
     use crossterm::event::KeyModifiers;
     use unicode_width::UnicodeWidthStr;
 
-    const BLOCKER_SIZES: [(u16, u16); 4] = [(80, 24), (100, 30), (120, 32), (160, 40)];
+    const BLOCKER_SIZES: [(u16, u16); 5] = [(80, 24), (89, 50), (100, 30), (120, 32), (160, 40)];
 
     fn snapshot() -> FleetSetupSnapshot {
         FleetSetupSnapshot {
@@ -2167,6 +2175,80 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn review_at_cursor_size_keeps_content_and_actions_apart() {
+        let rows = render_through_stack(
+            || {
+                let mut view = FleetSetupView::from_snapshot(snapshot());
+                view.step = Step::Review;
+                view
+            },
+            89,
+            50,
+        );
+        let popup = centered_modal_area(Rect::new(0, 0, 89, 50), 96, 31, 60, 16);
+        let review_row = rows
+            .iter()
+            .position(|row| row.contains("Review & save"))
+            .expect("review heading");
+        let review_col = rows[review_row]
+            .chars()
+            .position(|ch| ch == 'R')
+            .expect("review heading column") as u16;
+        assert!(
+            review_col >= popup.x.saturating_add(2),
+            "body copy must not touch the popup border: {:?}",
+            rows[review_row]
+        );
+
+        let action_row = rows
+            .iter()
+            .rposition(|row| row.contains("cancel"))
+            .expect("footer cancel action");
+        let footer_row = rows[..action_row]
+            .iter()
+            .rposition(|row| row.contains("scroll"))
+            .expect("footer shortcut row");
+        assert!(footer_row > 0);
+        let gutter = rows[footer_row - 1]
+            .chars()
+            .skip(usize::from(popup.x.saturating_add(1)))
+            .take(usize::from(popup.width.saturating_sub(2)))
+            .collect::<String>();
+        assert!(
+            gutter.trim().is_empty(),
+            "review body needs a quiet row before the action rail: {gutter:?}"
+        );
+    }
+
+    #[test]
+    fn choice_steps_at_cursor_size_stay_content_sized() {
+        for (step, expected_height) in [(Step::Role, 21usize), (Step::Model, 22usize)] {
+            let rows = render_through_stack(
+                || {
+                    let mut view = FleetSetupView::from_snapshot(snapshot());
+                    view.step = step;
+                    view
+                },
+                89,
+                50,
+            );
+            let top = rows
+                .iter()
+                .position(|row| row.contains("Fleet setup — your agent team"))
+                .expect("fleet setup title");
+            let bottom = rows
+                .iter()
+                .rposition(|row| row.contains("Step "))
+                .expect("fleet setup step receipt");
+            assert_eq!(
+                bottom - top + 1,
+                expected_height,
+                "choice card should follow its content instead of filling the 89x50 frame"
+            );
         }
     }
 

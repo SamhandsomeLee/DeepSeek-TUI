@@ -3349,10 +3349,14 @@ mod tests {
             "Answer conversation",
             "honor that request even for read-only work",
             "silently collapse it into parent-local discovery",
-            "dispatch one or more `agent` workers",
+            "Use ordinary tools directly",
+            "same approval posture, sandbox, shell configuration",
+            "Prefer one or more `agent` workers",
+            "Delegation is not mandatory",
             "background",
             "Treat each queued user message as another task",
             "Use `workflow` only when",
+            "scheduling emphasis, not tool authority",
             "Keep internal mechanics internal",
         ] {
             assert!(

@@ -211,9 +211,9 @@ const SUBAGENT_TYPE_DESCRIPTION: &str = "Sub-agent type. Accepted vocabulary: ge
 /// don't conflate with existing agent type labels. Porpoises (Phocoenidae)
 /// are excluded because their name doesn't carry well as a friendly label.
 ///
-/// English and Simplified-Chinese names are interleaved so any newly spawned
-/// agent has a roughly even chance of either — the goal is friendly variety,
-/// not a strict locale match.
+/// English and Simplified-Chinese names are stored as adjacent pairs. Name
+/// selection follows the active session locale; it never mixes languages in
+/// one session. Smaller curated pools below cover every other shipped locale.
 ///
 /// Taxonomy source: Society for Marine Mammalogy (2025).
 pub const WHALE_NICKNAMES: &[&str] = &[
@@ -321,27 +321,136 @@ pub const WHALE_NICKNAMES: &[&str] = &[
     "拉河豚",
 ];
 
-/// Return a deterministic whale name for a given agent ID using a hash of
-/// the ID string. The same ID always gets the same name — stable across
-/// session restarts for persisted agents.
+const WHALE_NICKNAMES_JA: &[&str] = &[
+    "シロナガスクジラ",
+    "ザトウクジラ",
+    "マッコウクジラ",
+    "ナガスクジラ",
+    "イワシクジラ",
+    "ミンククジラ",
+    "コククジラ",
+    "ホッキョククジラ",
+    "シロイルカ",
+    "イッカク",
+    "シャチ",
+    "ゴンドウクジラ",
+];
+
+const WHALE_NICKNAMES_ZH_HANT: &[&str] = &[
+    "藍鯨",
+    "座頭鯨",
+    "抹香鯨",
+    "長鬚鯨",
+    "塞鯨",
+    "布氏鯨",
+    "小鬚鯨",
+    "灰鯨",
+    "弓頭鯨",
+    "白鯨",
+    "獨角鯨",
+    "虎鯨",
+];
+
+const WHALE_NICKNAMES_PT_BR: &[&str] = &[
+    "Azul",
+    "Jubarte",
+    "Cachalote",
+    "Baleia-fin",
+    "Baleia-sei",
+    "Baleia-de-bryde",
+    "Baleia-minke",
+    "Cinzenta",
+    "Baleia-franca",
+    "Beluga",
+    "Narval",
+    "Orca",
+];
+
+const WHALE_NICKNAMES_ES_419: &[&str] = &[
+    "Azul",
+    "Jorobada",
+    "Cachalote",
+    "Rorcual común",
+    "Rorcual sei",
+    "Rorcual de Bryde",
+    "Rorcual aliblanco",
+    "Gris",
+    "Ballena franca",
+    "Beluga",
+    "Narval",
+    "Orca",
+];
+
+const WHALE_NICKNAMES_VI: &[&str] = &[
+    "Cá voi xanh",
+    "Cá voi lưng gù",
+    "Cá nhà táng",
+    "Cá voi vây",
+    "Cá voi Sei",
+    "Cá voi Bryde",
+    "Cá voi Minke",
+    "Cá voi xám",
+    "Cá voi đầu cong",
+    "Cá voi trắng",
+    "Kỳ lân biển",
+    "Cá voi sát thủ",
+];
+
+const WHALE_NICKNAMES_KO: &[&str] = &[
+    "대왕고래",
+    "혹등고래",
+    "향유고래",
+    "참고래",
+    "보리고래",
+    "브라이드고래",
+    "밍크고래",
+    "귀신고래",
+    "북극고래",
+    "흰고래",
+    "외뿔고래",
+    "범고래",
+];
+
+/// Return a deterministic whale name in the active UI locale.
 #[must_use]
-pub fn whale_name_for_id(id: &str) -> String {
+pub fn whale_name_for_id_in_locale(id: &str, locale_tag: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     id.hash(&mut hasher);
-    let idx = (hasher.finish() as usize) % WHALE_NICKNAMES.len();
+    let hash = hasher.finish() as usize;
+    let normalized = locale_tag.trim().to_ascii_lowercase();
+
+    let localized_pool = match normalized.as_str() {
+        "ja" => Some(WHALE_NICKNAMES_JA),
+        "zh-hant" => Some(WHALE_NICKNAMES_ZH_HANT),
+        "pt-br" => Some(WHALE_NICKNAMES_PT_BR),
+        "es-419" => Some(WHALE_NICKNAMES_ES_419),
+        "vi" => Some(WHALE_NICKNAMES_VI),
+        "ko" => Some(WHALE_NICKNAMES_KO),
+        _ => None,
+    };
+    if let Some(pool) = localized_pool {
+        return pool[hash % pool.len()].to_string();
+    }
+
+    debug_assert_eq!(WHALE_NICKNAMES.len() % 2, 0);
+    let pair_count = WHALE_NICKNAMES.len() / 2;
+    let pair = hash % pair_count;
+    let language_offset = usize::from(normalized == "zh-hans");
+    let idx = pair * 2 + language_offset;
     WHALE_NICKNAMES[idx].to_string()
 }
 
-/// Assign a unique whale name for an agent ID, avoiding collisions with
-/// names already in `active_names`. If the deterministic name is taken,
-/// appends a numeric suffix (e.g. "Orca (2)").
+/// Assign a unique locale-matched whale name for an agent ID.
+/// If the deterministic name is taken, appends a numeric suffix (for example,
+/// `Orca (2)`).
 #[must_use]
-pub fn assign_unique_whale_name(
+pub fn assign_unique_whale_name_in_locale(
     id: &str,
     active_names: &std::collections::HashSet<String>,
+    locale_tag: &str,
 ) -> String {
-    let base = whale_name_for_id(id);
+    let base = whale_name_for_id_in_locale(id, locale_tag);
     if !active_names.contains(&base) {
         return base;
     }
@@ -364,6 +473,96 @@ pub fn assign_unique_whale_name(
     }
     // Fallback (should never reach here)
     format!("{base} ({})", id.get(..4).unwrap_or("?"))
+}
+
+/// Return the unsuffixed whale label when `name` could have been generated for
+/// this exact agent id in a shipped locale. Numeric collision suffixes are
+/// presentation-only and do not make the label user-authored.
+fn generated_whale_name_base<'a>(agent_id: &str, name: &'a str) -> Option<&'a str> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let base = name
+        .rsplit_once(" (")
+        .and_then(|(base, suffix)| {
+            suffix
+                .strip_suffix(')')
+                .filter(|number| !number.is_empty() && number.chars().all(|ch| ch.is_ascii_digit()))
+                .map(|_| base)
+        })
+        .unwrap_or(name);
+
+    // With no persisted provenance bit, the narrowest truthful test is whether
+    // this exact agent id could have generated the label in a shipped locale.
+    // A user-authored label that happens to be a whale word for some other id
+    // remains explicit. An exact deterministic match is inherently ambiguous
+    // and stays classified as generated for backward compatibility.
+    crate::localization::Locale::shipped()
+        .iter()
+        .any(|locale| whale_name_for_id_in_locale(agent_id, locale.tag()) == base)
+        .then_some(base)
+}
+
+/// Derive the generated whale labels shown for a set of workers from their
+/// locale-neutral ids and the active UI language.
+///
+/// Persisted `nickname` values predate locale-scoped naming and may contain a
+/// whale label chosen under another language. Those generated values are
+/// deliberately ignored here. A nickname that this agent id could not have
+/// generated is an explicit custom label and remains intact, even when it is a
+/// whale word from a built-in pool.
+#[must_use]
+pub(crate) fn localized_whale_display_names<'a>(
+    agents: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+    locale_tag: &str,
+) -> std::collections::HashMap<String, String> {
+    let mut by_id = std::collections::BTreeMap::<String, Option<String>>::new();
+    for (agent_id, nickname) in agents {
+        if agent_id.trim().is_empty() {
+            continue;
+        }
+        let nickname = nickname
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string);
+        by_id
+            .entry(agent_id.to_string())
+            .and_modify(|existing| {
+                if existing.is_none() && nickname.is_some() {
+                    *existing = nickname.clone();
+                }
+            })
+            .or_insert(nickname);
+    }
+
+    let mut names = std::collections::HashMap::with_capacity(by_id.len());
+    let mut active_names = std::collections::HashSet::new();
+
+    // Reserve explicit labels first so generated names never shadow them.
+    for (agent_id, nickname) in &by_id {
+        let Some(nickname) = nickname
+            .as_deref()
+            .filter(|name| generated_whale_name_base(agent_id, name).is_none())
+        else {
+            continue;
+        };
+        active_names.insert(nickname.to_string());
+        names.insert(agent_id.clone(), nickname.to_string());
+    }
+
+    // BTreeMap iteration makes collision suffix ownership stable even when
+    // manager/progress event order changes between frames or session loads.
+    for agent_id in by_id.keys() {
+        if names.contains_key(agent_id) {
+            continue;
+        }
+        let name = assign_unique_whale_name_in_locale(agent_id, &active_names, locale_tag);
+        active_names.insert(name.clone());
+        names.insert(agent_id.clone(), name);
+    }
+
+    names
 }
 
 // === Types ===
@@ -1391,7 +1590,7 @@ struct PersistedSubAgent {
     assignment: SubAgentAssignment,
     #[serde(default)]
     model: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     nickname: Option<String>,
     status: SubAgentStatus,
     result: Option<String>,
@@ -1507,6 +1706,9 @@ pub struct SubAgentRuntime {
     /// would send model B's id to provider A's endpoint, the exact #4093 defect.
     pub api_config: Option<std::sync::Arc<crate::config::Config>>,
     pub model: String,
+    /// Active UI/model locale used for generated human-facing worker names.
+    /// Internal ids and session handles remain language-neutral.
+    pub locale_tag: String,
     pub auto_model: bool,
     pub reasoning_effort: Option<String>,
     pub reasoning_effort_auto: bool,
@@ -1613,6 +1815,7 @@ impl SubAgentRuntime {
             client,
             api_config: None,
             model,
+            locale_tag: "en".to_string(),
             auto_model: false,
             reasoning_effort: None,
             reasoning_effort_auto: false,
@@ -1648,6 +1851,13 @@ impl SubAgentRuntime {
     #[must_use]
     pub fn with_parent_mode(mut self, mode: AppMode) -> Self {
         self.parent_mode = mode;
+        self
+    }
+
+    /// Match generated worker display names to the active session language.
+    #[must_use]
+    pub fn with_locale_tag(mut self, locale_tag: impl Into<String>) -> Self {
+        self.locale_tag = locale_tag.into();
         self
     }
 
@@ -1863,6 +2073,7 @@ impl SubAgentRuntime {
             client: self.client.clone(),
             api_config: self.api_config.clone(),
             model: self.model.clone(),
+            locale_tag: self.locale_tag.clone(),
             auto_model: self.auto_model,
             reasoning_effort: self.reasoning_effort.clone(),
             reasoning_effort_auto: self.reasoning_effort_auto,
@@ -2198,7 +2409,13 @@ impl SubAgentManager {
                 prompt: agent.prompt.clone(),
                 assignment: agent.assignment.clone(),
                 model: agent.model.clone(),
-                nickname: agent.nickname.clone(),
+                // Generated whale names are locale-derived presentation, not
+                // durable identity. Persist only an explicit custom nickname;
+                // legacy generated values are discarded again on load.
+                nickname: agent
+                    .nickname
+                    .clone()
+                    .filter(|name| generated_whale_name_base(&agent.id, name).is_none()),
                 status: agent.status.clone(),
                 result: agent.result.clone(),
                 steps_taken: agent.steps_taken,
@@ -2355,6 +2572,9 @@ impl SubAgentManager {
         self.agents.clear();
         self.worker_records.clear();
         for persisted in state.agents {
+            let nickname = persisted
+                .nickname
+                .filter(|name| generated_whale_name_base(&persisted.id, name).is_none());
             let mut status = persisted.status;
             if matches!(status, SubAgentStatus::Running) {
                 status = SubAgentStatus::Interrupted(SUBAGENT_RESTART_REASON.to_string());
@@ -2386,7 +2606,10 @@ impl SubAgentManager {
                 } else {
                     persisted.model
                 },
-                nickname: persisted.nickname,
+                // v0.8.68 and earlier persisted generated whale text. It may
+                // have been chosen under a different UI language, so never
+                // replay it into a new session. Explicit custom names survive.
+                nickname,
                 status,
                 result: persisted.result,
                 steps_taken: persisted.steps_taken,
@@ -3249,9 +3472,13 @@ impl SubAgentManager {
             .values()
             .filter_map(|a| a.nickname.clone())
             .collect();
-        let nickname = options
-            .nickname
-            .or_else(|| Some(assign_unique_whale_name(&agent_id, &active_names)));
+        let nickname = options.nickname.or_else(|| {
+            Some(assign_unique_whale_name_in_locale(
+                &agent_id,
+                &active_names,
+                &runtime.locale_tag,
+            ))
+        });
         let tools = build_allowed_tools(&agent_type, allowed_tools, runtime.allow_shell)?;
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let mut agent = SubAgent::new(

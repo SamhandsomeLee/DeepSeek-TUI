@@ -1626,18 +1626,7 @@ impl Engine {
                 // clobbered by it.
                 let mut hook_requires_approval = false;
 
-                if mode == AppMode::Plan
-                    && matches!(
-                        tool_name.as_str(),
-                        "exec_shell"
-                            | "exec_shell_wait"
-                            | "exec_shell_interact"
-                            | "exec_wait"
-                            | "exec_interact"
-                            | CODE_EXECUTION_TOOL_NAME
-                            | JS_EXECUTION_TOOL_NAME
-                    )
-                {
+                if mode_blocks_command_execution(mode, &tool_name) {
                     blocked_error = Some(ToolError::permission_denied(format!(
                         "'{tool_name}' is not available in Plan mode — switch to Act mode (`/mode act`) to run commands and code."
                     )));
@@ -1794,19 +1783,11 @@ impl Engine {
                 }
 
                 if blocked_error.is_none()
-                    && mode == AppMode::Plan
-                    && plan_mode_blocks_write_capable_tool(&tool_name, read_only)
+                    && mode_blocks_write_capable_tool(mode, &tool_name, read_only)
                 {
                     blocked_error = Some(ToolError::permission_denied(format!(
                         "'{tool_name}' is not available in Plan mode - switch to Act mode (`/mode act`) to modify files or run write-capable tools."
                     )));
-                }
-
-                if blocked_error.is_none()
-                    && mode == AppMode::Operate
-                    && let Some(reason) = operate_tool_blocker(&tool_name, &tool_input, read_only)
-                {
-                    blocked_error = Some(ToolError::permission_denied(reason));
                 }
 
                 // #3026: a hook `ask` decision forces the approval prompt even
@@ -3026,60 +3007,24 @@ fn should_pre_tool_snapshot(
         && matches!(tool_name, "write_file" | "edit_file" | "apply_patch")
 }
 
-fn plan_mode_blocks_write_capable_tool(tool_name: &str, read_only: bool) -> bool {
-    matches!(tool_name, "write_file" | "edit_file" | "apply_patch")
-        || (McpPool::is_mcp_tool(tool_name) && !read_only)
-}
-
-/// Host boundary for Operate turns. The operator may answer, inspect context,
-/// and coordinate durable workers, but mutating work belongs to those workers.
-/// This is intentionally based on the tool actually requested rather than a
-/// guess derived from the user's prose.
-fn operate_tool_blocker(tool_name: &str, _input: &Value, read_only: bool) -> Option<String> {
-    if read_only
-        || matches!(
+fn mode_blocks_command_execution(mode: AppMode, tool_name: &str) -> bool {
+    mode == AppMode::Plan
+        && matches!(
             tool_name,
-            REQUEST_USER_INPUT_NAME
-                | "create_goal"
-                | "update_goal"
-                | "update_plan"
-                | "todo_write"
-                | "notify"
+            "exec_shell"
+                | "exec_shell_wait"
+                | "exec_shell_interact"
+                | "exec_wait"
+                | "exec_interact"
+                | CODE_EXECUTION_TOOL_NAME
+                | JS_EXECUTION_TOOL_NAME
         )
-    {
-        return None;
-    }
-
-    if tool_name == "workflow" || tool_name == "agent" || tool_name.starts_with("agents/") {
-        return None;
-    }
-
-    Some(format!(
-        "Operate keeps mutating work in workers. Tool '{tool_name}' would execute directly in the parent; dispatch an `agent` for ordinary work, use `workflow` only for staged or gated work, or switch to Act for intentionally local execution."
-    ))
 }
 
-#[cfg(test)]
-mod operate_contract_tests {
-    use super::*;
-
-    #[test]
-    fn operate_allows_answers_discovery_and_control_plane_tools() {
-        assert!(operate_tool_blocker("read_file", &json!({}), true).is_none());
-        assert!(operate_tool_blocker(REQUEST_USER_INPUT_NAME, &json!({}), false).is_none());
-        assert!(operate_tool_blocker("update_plan", &json!({}), false).is_none());
-        assert!(operate_tool_blocker("agent", &json!({}), false).is_none());
-        assert!(operate_tool_blocker("agents/message", &json!({}), false).is_none());
-        assert!(operate_tool_blocker("workflow", &json!({"action": "start"}), false).is_none());
-        assert!(operate_tool_blocker("workflow", &json!({"action": "run"}), false).is_none());
-    }
-
-    #[test]
-    fn operate_blocks_mutating_parent_execution() {
-        assert!(operate_tool_blocker("write_file", &json!({}), false).is_some());
-        assert!(operate_tool_blocker("exec_shell", &json!({}), false).is_some());
-        assert!(operate_tool_blocker("mcp/write_customer", &json!({}), false).is_some());
-    }
+fn mode_blocks_write_capable_tool(mode: AppMode, tool_name: &str, read_only: bool) -> bool {
+    mode == AppMode::Plan
+        && (matches!(tool_name, "write_file" | "edit_file" | "apply_patch")
+            || (McpPool::is_mcp_tool(tool_name) && !read_only))
 }
 
 /// Synthesize the tool result recorded for a tool call that never executed
@@ -3159,21 +3104,51 @@ mod pre_tool_snapshot_gate_tests {
     }
 
     #[test]
-    fn plan_mode_blocks_file_and_mcp_write_tools() {
-        for tool in ["write_file", "edit_file", "apply_patch"] {
-            assert!(plan_mode_blocks_write_capable_tool(tool, false));
+    fn plan_blocks_write_capable_tools_without_narrowing_operate() {
+        for tool in [
+            "exec_shell",
+            "exec_shell_wait",
+            "exec_shell_interact",
+            CODE_EXECUTION_TOOL_NAME,
+            JS_EXECUTION_TOOL_NAME,
+        ] {
+            assert!(mode_blocks_command_execution(AppMode::Plan, tool));
+            assert!(
+                !mode_blocks_command_execution(AppMode::Operate, tool),
+                "Operate must not add a mode-only command denial for {tool}"
+            );
         }
 
-        assert!(plan_mode_blocks_write_capable_tool(
+        for tool in ["write_file", "edit_file", "apply_patch"] {
+            assert!(mode_blocks_write_capable_tool(AppMode::Plan, tool, false));
+            assert!(
+                !mode_blocks_write_capable_tool(AppMode::Operate, tool, false),
+                "Operate must not add a mode-only write denial for {tool}"
+            );
+        }
+
+        assert!(mode_blocks_write_capable_tool(
+            AppMode::Plan,
             "mcp_filesystem_write",
             false
         ));
-        assert!(!plan_mode_blocks_write_capable_tool(
+        assert!(!mode_blocks_write_capable_tool(
+            AppMode::Operate,
+            "mcp_filesystem_write",
+            false
+        ));
+        assert!(!mode_blocks_write_capable_tool(
+            AppMode::Plan,
             "mcp_filesystem_read",
             true
         ));
-        assert!(!plan_mode_blocks_write_capable_tool("read_file", true));
-        assert!(!plan_mode_blocks_write_capable_tool(
+        assert!(!mode_blocks_write_capable_tool(
+            AppMode::Plan,
+            "read_file",
+            true
+        ));
+        assert!(!mode_blocks_write_capable_tool(
+            AppMode::Plan,
             "request_user_input",
             false
         ));
