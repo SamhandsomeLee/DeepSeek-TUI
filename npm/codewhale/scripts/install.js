@@ -1159,6 +1159,7 @@ module.exports = {
     adoptExistingBinaryIfValid,
     shouldIgnoreInstallFailure,
     shouldSkipOptionalPostinstall,
+    httpRequest,
     defaultTimeoutMs,
     defaultStallMs,
     ensureBinary,

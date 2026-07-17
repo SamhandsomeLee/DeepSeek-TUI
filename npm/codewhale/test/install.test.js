@@ -263,3 +263,15 @@ test("resolvePackageVersion honors codewhaleBinaryVersion precedence (#3769)", (
     "8.8.8",
   );
 });
+
+test("httpRequest handles invalid URL parsing errors", async () => {
+  const { httpRequest } = _internal;
+  const invalidUrl = "not-a-valid-url";
+  try {
+    await httpRequest(invalidUrl);
+    assert.fail("httpRequest should throw for an invalid URL");
+  } catch (err) {
+    assert.equal(err.name, "NonRetryableError");
+    assert.match(err.message, /Invalid URL: not-a-valid-url/);
+  }
+});
