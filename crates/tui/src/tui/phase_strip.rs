@@ -216,6 +216,18 @@ pub fn render(area: Rect, buf: &mut Buffer, app: &mut App) {
         ));
     }
 
+    // Cache hit percentage right after cost, e.g. "(98%)"
+    let total = app.session.total_cache_hit_tokens
+        .saturating_add(app.session.total_cache_miss_tokens);
+    if total > 0 {
+        let pct = (app.session.total_cache_hit_tokens as f64 * 100.0
+            / total as f64).round() as u8;
+        left.push(Span::styled(
+            format!(" ({pct}%)"),
+            Style::default().fg(app.ui_theme.text_dim),
+        ));
+    }
+
     // Live phases keep the strip quiet: no detail-key chorus competing with
     // the ledger. Idle/typing may advertise keys on the quiet footer.
     // Hints come from shell_key_routing so advertised chords match handlers;
