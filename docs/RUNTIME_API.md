@@ -46,6 +46,7 @@ CLI/API surfaces are not implemented yet.
 
 | Entry | Transport | Use |
 |---|---|---|
+| `codewhale web [--port 7878]` | HTTP/SSE on `127.0.0.1:7878` + embedded client | First-class loopback-only browser client; opens the default browser |
 | `codewhale app-server --http` | HTTP/SSE on `127.0.0.1:7878` | Full `/v1/*` runtime API (canonical) |
 | `codewhale app-server --mobile` | HTTP/SSE on `0.0.0.0:7878` + `/mobile` | Runtime API + phone control page |
 | `codewhale app-server --stdio` | JSON-RPC 2.0 over stdio | Local SDK / control probe (no listener) |
@@ -230,6 +231,7 @@ codewhale doctor --json
 codewhale app-server --http [--host 127.0.0.1] [--port 7878] [--workers 2] [--auth-token TOKEN] [--insecure-no-auth]
 codewhale app-server --mobile [--host 0.0.0.0] [--port 7878] [--auth-token TOKEN]
 codewhale app-server --mobile --host 127.0.0.1 [--port 7878] [--insecure-no-auth]
+codewhale web [--port 7878]
 
 # Compatibility aliases — identical server, serve flag names:
 codewhale serve --http   [...] [--insecure]
@@ -247,27 +249,68 @@ no-auth mode with the `--mobile` default host `0.0.0.0`; use a token for LAN
 mobile access, or add `--host 127.0.0.1` for local-only no-auth testing. The
 `codewhale serve` compatibility aliases use `--insecure` for the same loopback
 escape hatch.
-Pass `--auth-token TOKEN` or set `DEEPSEEK_RUNTIME_TOKEN=TOKEN` before starting
-the server. If neither is set, the process generates a one-time token and prints
-it at startup. `/health` and `/v1/runtime/info` remain public for local
-supervision and bootstrap. `/mobile` returns 404 when mobile mode is disabled;
-when mobile mode is enabled and auth is enabled, `/mobile` returns 401 unless
-the request supplies the runtime token.
+Pass `--auth-token TOKEN` or set `CODEWHALE_RUNTIME_TOKEN=TOKEN` before starting
+the server; `DEEPSEEK_RUNTIME_TOKEN` remains a compatibility alias. If neither
+is set, the process generates a Runtime token for that process and does **not**
+print it. `/health`, `/v1/runtime/info`, and an enabled static client shell
+remain public; Runtime mutations and thread data stay behind `/v1/*`
+authentication. `/mobile` returns 404 when mobile mode is disabled and serves
+the unchanged static shell when it is enabled.
 
 Authenticated clients can provide the token as `Authorization: Bearer TOKEN`,
-`X-DeepSeek-Runtime-Token: TOKEN`, or `?token=TOKEN` for EventSource-style
-clients that cannot set custom headers.
+`X-Codewhale-Runtime-Token: TOKEN`, the legacy
+`X-DeepSeek-Runtime-Token: TOKEN`, or the `codewhale_runtime_token` cookie.
+Query-string authentication is not supported.
+
+### Local browser client
+
+`codewhale web` starts the canonical Runtime API on `127.0.0.1`, serves
+dependency-free assets embedded in the binary, and opens the default browser.
+It cannot bind to a non-loopback host and cannot run with Runtime auth disabled.
+
+The browser-launch URL contains a random, short-lived, one-time bootstrap
+capability, never the Runtime token. A loopback request exchanges that
+capability for a
+`codewhale_web_session=…; HttpOnly; SameSite=Strict; Path=/` cookie backed by a
+single process-local server session that expires after 12 hours, consumes the
+capability immediately, and redirects to `/`. Reused, expired, malformed, or
+non-loopback bootstrap attempts fail closed. The Runtime bearer token is not
+placed in rendered HTML, browser storage, logs, URL queries/fragments, or
+browser-launch arguments.
+Existing bearer/header/cookie authorization for `/v1/*` is unchanged outside
+web mode. In web mode, cookie-authenticated unsafe requests must also carry the
+exact local web origin, and Fetch Metadata identifying a cross-origin cookie
+request is rejected. Explicit bearer and Runtime-token header clients keep
+their existing behavior.
+
+The v0.9.1 client provides a responsive thread/search rail, Runtime-owned
+session facts, transcript and tool receipts, and a bottom composer. It can
+create, select, rename, and archive threads; start or steer turns; interrupt
+work; resolve approvals; and answer Runtime user-input requests. Selection
+loads `GET /v1/threads/{id}` first, then opens the replayable event stream with
+`since_seq=latest_seq`; reconnection advances from the newest accepted sequence
+and drops duplicates or events from a stale selection. The thread detail
+snapshot includes `pending_approvals` and `pending_user_inputs`; clients must
+hydrate those fields before subscribing so a reload cannot strand a prompt
+whose `*.required` event is at or before `latest_seq`. Resolution is also
+published as `approval.decided`, `user_input.answered`, or
+`user_input.canceled` for already-connected clients.
+
+Model, mode, permission posture, workspace, and branch are display-only in this
+client. Files/Changes, PTY/terminal, preview, artifacts, provider login/model
+selection, Fleet creation, and undo/retry/restore controls are intentionally
+absent until the Runtime publishes explicit contracts for them.
 
 ### Mobile control page
 
 `codewhale serve --mobile` starts the same HTTP/SSE runtime API and serves a
 phone-friendly control page at `/mobile`. When the bind host is left at the
 default, mobile mode binds to `0.0.0.0`, prints a warning, and prints local/LAN
-URLs. Pass `--host 127.0.0.1` to keep the mobile page loopback-only. If a
-runtime token is generated or supplied, the printed mobile URL includes it as a
-query parameter; the page stores it locally and removes it from the address bar.
-The static HTML page contains no secrets, but it is still token-gated when auth
-is enabled so unauthenticated LAN clients cannot fingerprint the mobile surface.
+URLs. Pass `--host 127.0.0.1` to keep the mobile page loopback-only. The static
+HTML page contains no secrets and is not itself token-gated. Its calls to
+`/v1/*` are authenticated: for LAN use, start with an explicit Runtime token
+and enter it in the page. Generated Runtime tokens are deliberately unprinted,
+so they cannot be copied into another device.
 
 The mobile page can list/create threads, send prompts, follow live SSE events,
 steer or interrupt an active turn, and resolve normal tool approvals through
@@ -362,6 +405,10 @@ accept an empty string to clear a previously-set value. Added in v0.8.10 (#562):
 **Approvals**
 - `POST /v1/approvals/{approval_id}` with body
   `{ "decision": "allow" | "deny", "remember": false }`
+
+**User input**
+- `POST /v1/user-input/{thread_id}/{input_id}` with body
+  `{ "answers": [{ "id": "question-id", "label": "Choice", "value": "Choice" }] }`
 
 **Events** (SSE replay + live stream)
 - `GET /v1/threads/{id}/events?since_seq=<u64>`
@@ -528,7 +575,8 @@ Common event names: `thread.started`, `thread.forked`, `turn.started`,
 `turn.lifecycle`, `turn.steered`, `turn.interrupt_requested`,
 `turn.completed`, `item.started`, `item.delta`, `item.completed`,
 `item.failed`, `item.interrupted`, `approval.required`, `approval.decided`,
-`approval.timeout`, `sandbox.denied`.
+`approval.timeout`, `user_input.required`, `user_input.answered`,
+`user_input.canceled`, `sandbox.denied`.
 
 `approval.required` events may include a `matched_rule` string when an
 execution-policy rule caused the prompt. This field is explanatory metadata for
@@ -571,7 +619,10 @@ when developing a UI on Vite's default `:5173`), use any of:
 
 User-supplied origins **stack on top of** the built-in defaults; they do not
 replace them. Wildcard origins are not supported — the explicit allow-list
-model is preserved. Added in v0.8.10 (#561).
+model is preserved. Cross-origin preflights advertise only `Authorization`,
+`Content-Type`, `Accept`, `X-Codewhale-Runtime-Token`, and the compatibility
+`X-DeepSeek-Runtime-Token` request header; custom request headers are not
+allowed. Added in v0.8.10 (#561), tightened in v0.9.1 (#4454).
 
 ## Runtime SDK Fleet Helpers
 
