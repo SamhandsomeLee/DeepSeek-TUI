@@ -39,13 +39,24 @@ Fleet state is stored under the workspace in `.codewhale/fleet.jsonl`. Worker
 logs and adapter logs are stored under `.codewhale/fleet/` and
 `.codewhale/fleet-host/`.
 
+### Interactive and persistent status
+
+CodeWhale has two similarly named status surfaces with different scopes:
+
+- In the TUI, `/fleet status` (or `/subagents`) shows the sub-agents attached
+  to the current interactive session. It does not read the persistent Fleet
+  ledger.
+- In a shell, `codewhale fleet status` reads durable Fleet run history from
+  the workspace's `.codewhale/fleet.jsonl` ledger.
+
 ## Authoring agent profiles (`/fleet setup`)
 
 `/fleet setup` (also `/fleet setup edit` / `new`) opens an in-TUI wizard for
 authoring a reusable agent-team profile. Bare `/fleet` and the
 `roster`/`roles`/`profiles`/`party` aliases open the roster (the saved profiles).
-`/fleet status` opens the worker-status view; `/subagents` is a
-compatibility shortcut for that status view.
+`/fleet status` opens the current-session worker view; `/subagents` is a
+compatibility shortcut for that view. For durable run history, use the shell
+command `codewhale fleet status` described above.
 
 The wizard is progressive: you make one focused choice at a time — a **role**,
 then a **model** (`inherit`, or a concrete model from *any configured

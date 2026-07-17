@@ -5285,6 +5285,62 @@ async fn subagent_registry_blocks_approval_tools_without_parent_auto_approve() {
     );
 }
 
+const MCP_ACTION_TOOL: &str = "mcp_github_create_pull_request";
+
+fn subagent_registry_with_mcp_action(auto_approve: bool) -> SubAgentToolRegistry {
+    let mut runtime = stub_runtime();
+    runtime.context.auto_approve = auto_approve;
+    let mut registry = SubAgentToolRegistry::new(
+        runtime,
+        SubAgentType::General,
+        Some(vec![MCP_ACTION_TOOL.to_string()]),
+        Arc::new(Mutex::new(TodoList::new())),
+        Arc::new(Mutex::new(PlanState::default())),
+    );
+    registry
+        .registry
+        .register(crate::tools::registry::mcp_tool_adapter_for_test(
+            MCP_ACTION_TOOL,
+        ));
+    registry
+}
+
+#[tokio::test]
+async fn subagent_blocks_mcp_action_without_parent_auto_approve() {
+    let registry = subagent_registry_with_mcp_action(false);
+
+    let err = registry
+        .execute("agent_test", MCP_ACTION_TOOL, json!({}))
+        .await
+        .expect_err("non-read MCP actions must require parent auto approval");
+
+    assert!(
+        err.to_string().contains(
+            "requires approval and cannot run inside this sub-agent unless the parent session is auto-approved"
+        ),
+        "unexpected MCP approval error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn auto_approved_subagent_passes_mcp_action_approval_gate() {
+    let registry = subagent_registry_with_mcp_action(true);
+
+    let err = registry
+        .execute("agent_test", MCP_ACTION_TOOL, json!({}))
+        .await
+        .expect_err("the empty test MCP pool should reject execution after the approval gate");
+    let message = err.to_string();
+    assert!(
+        message.contains("MCP tool failed"),
+        "auto approval should reach the MCP adapter, got: {message}"
+    );
+    assert!(
+        !message.contains("requires approval"),
+        "auto-approved MCP actions must not stop at the approval gate: {message}"
+    );
+}
+
 #[tokio::test]
 async fn implementer_delegation_allows_suggest_write_without_parent_auto_approve() {
     // Issue #1828: implementer agents could not write files even when their

@@ -1262,6 +1262,17 @@ struct McpToolAdapter {
     pool: std::sync::Arc<tokio::sync::Mutex<crate::mcp::McpPool>>,
 }
 
+fn is_mcp_read_helper(name: &str) -> bool {
+    matches!(
+        name,
+        "list_mcp_resources"
+            | "list_mcp_resource_templates"
+            | "mcp_read_resource"
+            | "read_mcp_resource"
+            | "mcp_get_prompt"
+    )
+}
+
 #[async_trait::async_trait]
 impl ToolSpec for McpToolAdapter {
     fn name(&self) -> &str {
@@ -1281,29 +1292,24 @@ impl ToolSpec for McpToolAdapter {
     fn capabilities(&self) -> Vec<ToolCapability> {
         // Conservatively treat MCP tools as requiring approval and
         // network access unless they're known discovery helpers.
-        let name_lower = self.name.to_lowercase();
-        if name_lower.contains("list_mcp")
-            || name_lower.contains("read_mcp")
-            || name_lower.contains("mcp_read")
-            || name_lower.contains("mcp_get_prompt")
-        {
+        if is_mcp_read_helper(&self.name) {
             vec![ToolCapability::ReadOnly]
         } else {
             vec![ToolCapability::Network, ToolCapability::RequiresApproval]
         }
     }
 
+    fn approval_requirement(&self) -> ApprovalRequirement {
+        if is_mcp_read_helper(&self.name) {
+            ApprovalRequirement::Auto
+        } else {
+            ApprovalRequirement::Required
+        }
+    }
+
     fn defer_loading(&self) -> bool {
         // Discovery helpers stay loaded; everything else is deferred.
-        let keep_loaded = matches!(
-            self.name.as_str(),
-            "list_mcp_resources"
-                | "list_mcp_resource_templates"
-                | "mcp_read_resource"
-                | "read_mcp_resource"
-                | "mcp_get_prompt"
-        );
-        !keep_loaded
+        !is_mcp_read_helper(&self.name)
     }
 
     async fn execute(&self, input: Value, _context: &ToolContext) -> Result<ToolResult, ToolError> {
@@ -1315,6 +1321,21 @@ impl ToolSpec for McpToolAdapter {
         let content = serde_json::to_string(&result).unwrap_or_else(|_| result.to_string());
         Ok(ToolResult::success(content))
     }
+}
+
+#[cfg(test)]
+pub(super) fn mcp_tool_adapter_for_test(name: &str) -> Arc<dyn ToolSpec> {
+    Arc::new(McpToolAdapter {
+        name: name.to_string(),
+        tool: crate::mcp::McpTool {
+            name: name.to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+        },
+        pool: Arc::new(tokio::sync::Mutex::new(crate::mcp::McpPool::new(
+            crate::mcp::McpConfig::default(),
+        ))),
+    })
 }
 
 // === Unit Tests ===
@@ -1330,10 +1351,11 @@ mod tests {
     use crate::config::ToolOverride;
     use crate::tools::ToolRegistryBuilder;
     use crate::tools::spec::{
-        ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec, required_str,
+        ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
+        required_str,
     };
 
-    use super::ToolRegistry;
+    use super::{ToolRegistry, mcp_tool_adapter_for_test};
 
     /// A simple test tool for unit testing
     struct TestTool {
@@ -1380,6 +1402,49 @@ mod tests {
             name: name.to_string(),
             description: "A test tool".to_string(),
         })
+    }
+
+    #[test]
+    fn mcp_read_helpers_remain_auto_and_eagerly_loaded() {
+        for name in [
+            "list_mcp_resources",
+            "list_mcp_resource_templates",
+            "mcp_read_resource",
+            "read_mcp_resource",
+            "mcp_get_prompt",
+        ] {
+            let adapter = mcp_tool_adapter_for_test(name);
+            assert_eq!(
+                adapter.approval_requirement(),
+                ApprovalRequirement::Auto,
+                "{name} should remain an automatic read helper"
+            );
+            assert!(adapter.is_read_only(), "{name} should remain read-only");
+            assert!(!adapter.defer_loading(), "{name} should remain loaded");
+        }
+    }
+
+    #[test]
+    fn mcp_actions_require_approval_with_exact_helper_matching() {
+        for name in [
+            "mcp_github_create_pull_request",
+            "mcp_github_list_mcp_resources_export",
+            "read_mcp_resource_and_delete",
+        ] {
+            let adapter = mcp_tool_adapter_for_test(name);
+            assert_eq!(
+                adapter.approval_requirement(),
+                ApprovalRequirement::Required,
+                "{name} must not inherit read-helper approval"
+            );
+            assert!(
+                adapter
+                    .capabilities()
+                    .contains(&ToolCapability::RequiresApproval),
+                "{name} should advertise approval gating"
+            );
+            assert!(adapter.defer_loading(), "{name} should remain deferred");
+        }
     }
 
     #[test]

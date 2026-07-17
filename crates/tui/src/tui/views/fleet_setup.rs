@@ -1116,14 +1116,7 @@ impl FleetSetupView {
                 codewhale_config::MAX_SPAWN_DEPTH_CEILING,
             ),
         );
-        section(
-            &mut lines,
-            "Review policy",
-            format!(
-                "Workers run without a token cap by default · {}s api, {}s heartbeat. Fleet -> exec runs the workers; /fleet status (or /subagents) inspects the ledger.",
-                self.snapshot.api_timeout_secs, self.snapshot.heartbeat_timeout_secs
-            ),
-        );
+        section(&mut lines, "Review policy", self.review_policy_summary());
         section(
             &mut lines,
             "Profile",
@@ -1148,6 +1141,13 @@ impl FleetSetupView {
             .wrap(Wrap { trim: true })
             .scroll((scroll as u16, 0))
             .render(area, buf);
+    }
+
+    fn review_policy_summary(&self) -> String {
+        format!(
+            "Workers run without a token cap by default · {}s api, {}s heartbeat. Fleet -> exec runs the workers. /fleet status (or /subagents) shows sub-agents in the current interactive session; codewhale fleet status reads the persistent .codewhale/fleet.jsonl ledger.",
+            self.snapshot.api_timeout_secs, self.snapshot.heartbeat_timeout_secs
+        )
     }
 }
 
@@ -2296,5 +2296,18 @@ mod tests {
         for needle in ["Workspace", "Review policy", "until you save"] {
             assert!(bottom.contains(needle), "scrolled review missing: {needle}");
         }
+
+        let policy = FleetSetupView::from_snapshot(snapshot()).review_policy_summary();
+        for truth in [
+            "current interactive session",
+            "codewhale fleet status",
+            ".codewhale/fleet.jsonl",
+        ] {
+            assert!(policy.contains(truth), "review policy missing: {truth}");
+        }
+        assert!(
+            !policy.contains("inspects the ledger"),
+            "the interactive status command must not claim to inspect the durable ledger: {policy}"
+        );
     }
 }

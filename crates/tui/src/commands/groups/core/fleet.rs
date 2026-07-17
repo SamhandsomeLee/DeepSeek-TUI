@@ -31,7 +31,7 @@ impl RegisterCommand for FleetCmd {
                 super::core::subagents(app)
             }
             Some("help" | "?") => CommandResult::message(
-                "Usage: /fleet [roster|setup|status]\n\n/fleet (or /fleet roster) opens Fleet workers and orchestration state — each member's posture, routing, and origin. Use Operate mode when managing delegated work. /fleet setup opens the authoring wizard for a new or overriding profile. /fleet status shows live Fleet worker status; /subagents is a compatibility shortcut for the same status view.",
+                "Usage: /fleet [roster|setup|status]\n\n/fleet (or /fleet roster) opens Fleet workers and orchestration state — each member's posture, routing, and origin. Use Operate mode when managing delegated work. /fleet setup opens the authoring wizard for a new or overriding profile. /fleet status shows sub-agents in the current TUI session; /subagents is a compatibility shortcut for that view. To inspect the persistent .codewhale/fleet.jsonl ledger, run codewhale fleet status in your shell.",
             ),
             Some(other) => CommandResult::error(format!(
                 "Unknown /fleet target '{other}'. Use `/fleet roster`, `/fleet setup`, or `/fleet status`."
@@ -131,6 +131,13 @@ mod tests {
         let message = result.message.as_deref().unwrap_or_default();
         for surface in ["/fleet roster", "/fleet setup", "/fleet status"] {
             assert!(message.contains(surface), "help must describe {surface}");
+        }
+        for truth in [
+            "current TUI session",
+            "codewhale fleet status",
+            ".codewhale/fleet.jsonl",
+        ] {
+            assert!(message.contains(truth), "help must distinguish {truth}");
         }
     }
 
