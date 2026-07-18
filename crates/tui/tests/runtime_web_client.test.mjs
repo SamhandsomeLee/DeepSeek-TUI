@@ -45,6 +45,32 @@ function runtimeEvent(sequence, event, payload = {}, overrides = {}) {
   };
 }
 
+test("embedded web client uses the Blue Stage semantic palette", async () => {
+  const [styles, html] = await Promise.all([
+    readFile(new URL("../src/runtime_web/styles.css", import.meta.url), "utf8"),
+    readFile(new URL("../src/runtime_web/index.html", import.meta.url), "utf8"),
+  ]);
+
+  for (const token of [
+    "--ink-0: #03070d",
+    "--ink-1: #08111c",
+    "--ink-2: #0e1729",
+    "--text: #f6f2e8",
+    "--action: #6aaef2",
+    "--human: #f6c453",
+    "--live: #4fd1c5",
+    "--warning: #ff7a59",
+    "--danger: #ff86b2",
+  ]) {
+    assert.match(styles, new RegExp(token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  }
+  assert.match(styles, /\.primary-button,[\s\S]*background: var\(--action\)/);
+  assert.match(styles, /\.status-pip\.running[\s\S]*background: var\(--live\)/);
+  assert.match(styles, /\.message\.user \.message-body[\s\S]*rgba\(246, 196, 83/);
+  assert.match(styles, /\.attention-card[\s\S]*rgba\(246, 196, 83/);
+  assert.match(html, /name="theme-color" content="#03070d"/);
+});
+
 test("loads a consistent snapshot before subscribing from latest_seq", async () => {
   const state = createThreadState("thread-a");
   const order = [];

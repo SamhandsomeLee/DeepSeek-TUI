@@ -1,20 +1,24 @@
 :root {
   color-scheme: dark;
-  --ink-0: #061012;
-  --ink-1: #081619;
-  --ink-2: #0d1d20;
-  --ink-3: #14282b;
-  --line: rgba(184, 218, 215, 0.14);
-  --line-strong: rgba(184, 218, 215, 0.25);
-  --text: #edf5f2;
-  --text-soft: #adc0bd;
-  --text-dim: #718985;
-  --gold: #e6b84f;
-  --gold-strong: #f1c768;
-  --gold-wash: rgba(230, 184, 79, 0.11);
-  --aqua: #72c7be;
-  --danger: #f08b83;
-  --ok: #75c49a;
+  --ink-0: #03070d;
+  --ink-1: #08111c;
+  --ink-2: #0e1729;
+  --ink-3: #182742;
+  --line: rgba(106, 174, 242, 0.18);
+  --line-strong: rgba(106, 174, 242, 0.32);
+  --text: #f6f2e8;
+  --text-soft: #b6c0d4;
+  --text-dim: #93a0b8;
+  --action: #6aaef2;
+  --action-strong: #4f8fe8;
+  --action-wash: rgba(106, 174, 242, 0.11);
+  --human: #f6c453;
+  --human-wash: rgba(246, 196, 83, 0.11);
+  --live: #4fd1c5;
+  --live-wash: rgba(79, 209, 197, 0.12);
+  --warning: #ff7a59;
+  --danger: #ff86b2;
+  --ok: #9bd66f;
   --rail: 248px;
   font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-synthesis: none;
@@ -57,7 +61,7 @@ button:focus-visible,
 input:focus-visible,
 textarea:focus-visible,
 summary:focus-visible {
-  outline: 2px solid var(--gold-strong);
+  outline: 2px solid var(--action);
   outline-offset: 2px;
 }
 
@@ -67,7 +71,7 @@ summary:focus-visible {
   width: 100%;
   height: 100%;
   background:
-    radial-gradient(circle at 73% -20%, rgba(53, 126, 124, 0.12), transparent 42%),
+    radial-gradient(circle at 73% -20%, rgba(49, 95, 216, 0.14), transparent 42%),
     var(--ink-0);
 }
 
@@ -81,7 +85,7 @@ summary:focus-visible {
   min-height: 0;
   padding: 18px 14px 12px;
   border-right: 1px solid var(--line);
-  background: rgba(8, 22, 25, 0.96);
+  background: rgba(8, 17, 28, 0.96);
 }
 
 .rail-brand,
@@ -109,10 +113,10 @@ summary:focus-visible {
   width: 34px;
   height: 34px;
   place-items: center;
-  border: 1px solid rgba(230, 184, 79, 0.42);
+  border: 1px solid rgba(246, 196, 83, 0.42);
   border-radius: 10px;
-  background: var(--gold-wash);
-  color: var(--gold-strong);
+  background: var(--human-wash);
+  color: var(--human);
   font-size: 11px;
   font-weight: 800;
   letter-spacing: 0.05em;
@@ -150,14 +154,14 @@ summary:focus-visible {
 
 .primary-button,
 .send-button {
-  border-color: rgba(230, 184, 79, 0.4);
-  background: var(--gold);
-  color: #171204;
+  border-color: rgba(106, 174, 242, 0.46);
+  background: var(--action);
+  color: var(--ink-0);
 }
 
 .primary-button:hover,
 .send-button:hover {
-  background: var(--gold-strong);
+  background: var(--action-strong);
 }
 
 .quiet-button {
@@ -172,7 +176,7 @@ summary:focus-visible {
 }
 
 .quiet-button.danger:hover {
-  border-color: rgba(240, 139, 131, 0.42);
+  border-color: rgba(255, 134, 178, 0.42);
   color: var(--danger);
 }
 
@@ -201,12 +205,12 @@ summary:focus-visible {
   padding: 0 10px;
   border: 1px solid var(--line);
   border-radius: 9px;
-  background: rgba(5, 14, 16, 0.55);
+  background: rgba(3, 7, 13, 0.55);
   color: var(--text-dim);
 }
 
 .search-field:focus-within {
-  border-color: rgba(230, 184, 79, 0.42);
+  border-color: rgba(106, 174, 242, 0.46);
 }
 
 .search-field input {
@@ -247,13 +251,13 @@ textarea::placeholder {
 }
 
 .thread-row:hover {
-  background: rgba(20, 40, 43, 0.62);
+  background: rgba(24, 39, 66, 0.62);
   color: var(--text);
 }
 
 .thread-row[aria-current="true"] {
-  border-color: rgba(230, 184, 79, 0.24);
-  background: var(--gold-wash);
+  border-color: rgba(106, 174, 242, 0.32);
+  background: var(--action-wash);
   color: var(--text);
 }
 
@@ -301,8 +305,8 @@ textarea::placeholder {
 }
 
 .status-pip.running {
-  background: var(--gold-strong);
-  box-shadow: 0 0 0 3px var(--gold-wash);
+  background: var(--live);
+  box-shadow: 0 0 0 3px var(--live-wash);
 }
 
 .status-pip.failed {
@@ -323,11 +327,11 @@ textarea::placeholder {
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: var(--gold);
+  background: var(--action);
 }
 
 .connection-dot.ready {
-  background: var(--ok);
+  background: var(--live);
 }
 
 .connection-dot.error {
@@ -424,10 +428,10 @@ textarea::placeholder {
   margin: 12px auto 0;
   width: min(760px, calc(100% - 32px));
   padding: 9px 12px;
-  border: 1px solid rgba(240, 139, 131, 0.28);
+  border: 1px solid rgba(255, 134, 178, 0.28);
   border-radius: 9px;
-  background: rgba(91, 31, 28, 0.24);
-  color: #ffc0bb;
+  background: rgba(43, 21, 34, 0.42);
+  color: #ffdbe8;
   font-size: 11px;
   line-height: 1.45;
 }
@@ -468,7 +472,7 @@ textarea::placeholder {
 }
 
 .empty-orbit {
-  color: var(--gold);
+  color: var(--human);
   font-size: 34px;
 }
 
@@ -494,7 +498,7 @@ textarea::placeholder {
   padding: 13px 15px;
   border: 1px solid var(--line);
   border-radius: 12px;
-  background: rgba(13, 29, 32, 0.74);
+  background: rgba(14, 23, 41, 0.74);
   color: var(--text);
   font-size: 13px;
   line-height: 1.65;
@@ -504,8 +508,8 @@ textarea::placeholder {
 
 .message.user .message-body {
   margin-left: clamp(0px, 8vw, 72px);
-  border-color: rgba(230, 184, 79, 0.19);
-  background: rgba(230, 184, 79, 0.07);
+  border-color: rgba(246, 196, 83, 0.22);
+  background: rgba(246, 196, 83, 0.07);
 }
 
 .message.in-progress .message-body::after {
@@ -514,7 +518,7 @@ textarea::placeholder {
   width: 5px;
   height: 12px;
   margin-left: 4px;
-  background: var(--gold);
+  background: var(--live);
   vertical-align: -1px;
   animation: cursor-pulse 1s steps(2, end) infinite;
 }
@@ -527,11 +531,11 @@ textarea::placeholder {
   padding: 10px 12px;
   border: 1px solid var(--line);
   border-radius: 10px;
-  background: rgba(8, 22, 25, 0.54);
+  background: rgba(8, 17, 28, 0.54);
 }
 
 .receipt.failed {
-  border-color: rgba(240, 139, 131, 0.28);
+  border-color: rgba(255, 134, 178, 0.28);
 }
 
 .receipt-summary {
@@ -585,9 +589,9 @@ textarea::placeholder {
 .attention-card {
   margin-top: 8px;
   padding: 13px;
-  border: 1px solid rgba(230, 184, 79, 0.31);
+  border: 1px solid rgba(246, 196, 83, 0.34);
   border-radius: 11px;
-  background: rgba(45, 36, 13, 0.42);
+  background: rgba(42, 34, 24, 0.56);
 }
 
 .attention-card h2 {
@@ -664,12 +668,12 @@ textarea::placeholder {
   overflow: hidden;
   border: 1px solid var(--line-strong);
   border-radius: 13px;
-  background: rgba(13, 29, 32, 0.96);
+  background: rgba(14, 23, 41, 0.96);
   box-shadow: 0 18px 60px rgba(0, 0, 0, 0.3);
 }
 
 .composer:focus-within {
-  border-color: rgba(230, 184, 79, 0.42);
+  border-color: rgba(106, 174, 242, 0.46);
 }
 
 .composer textarea {
@@ -719,7 +723,7 @@ textarea::placeholder {
 }
 
 .rename-dialog::backdrop {
-  background: rgba(2, 8, 9, 0.74);
+  background: rgba(3, 7, 13, 0.74);
 }
 
 .rename-dialog form {
@@ -801,7 +805,7 @@ noscript {
     padding: 0;
     border: 0;
     opacity: 0;
-    background: rgba(2, 8, 9, 0.64);
+    background: rgba(3, 7, 13, 0.64);
     transition: opacity 160ms ease-out, visibility 160ms step-end;
   }
 
