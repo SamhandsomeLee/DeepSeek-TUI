@@ -114,6 +114,51 @@ node scripts/release/npm-wrapper-smoke.js
 Set `DEEPSEEK_TUI_KEEP_SMOKE_DIR=1` to keep the temporary pack/install
 directory for inspection.
 
+## Exact-head GitHub proof before publication
+
+Two manual workflows provide exact-head evidence without crossing the public
+release boundary. Run them only after the intended source is on a named ref
+(normally the frozen `main`), and pass the full commit SHA as an independent
+guard against that ref moving between inspection and dispatch:
+
+```bash
+git fetch origin main
+candidate_sha="$(git rev-parse origin/main)"
+
+gh workflow run ci.yml --ref main \
+  -f expected_sha="${candidate_sha}"
+gh workflow run release-candidate.yml --ref main \
+  -f expected_sha="${candidate_sha}"
+```
+
+The manual `ci.yml` path verifies that the dispatch resolved to
+`expected_sha`, disables light-change shortcuts, and forces the heavy Rust,
+workflow, mobile, Actions, Linux, macOS, Windows, npm-wrapper, and documentation
+gates. A mismatch fails before those gates start; it never silently tests a
+different head.
+
+`release-candidate.yml` also fails unless the selected ref resolves to the
+exact requested SHA. It invokes the same reusable artifact workflow as the
+public release, building all seven targets (including Android arm64 and native
+Windows arm64), staging `codewhale`, `codew`, and `codewhale-tui`, building the
+NSIS installer and nine platform archives, and validating the authoritative
+34-file inventory from `npm/codewhale/scripts/artifacts.js`. It then installs
+the packed npm wrapper against those assembled local assets and exercises its
+delegated entrypoints. The resulting `codewhale-release-assets` bundle is a
+short-lived GitHub Actions artifact only.
+
+This candidate workflow does not create a tag or GitHub Release, publish a
+crate or npm package, push a container, update Homebrew, deploy anything, or
+write repository contents. Its green result is evidence, not publication
+authorization. The stop line remains explicit Hunter approval: do not create
+the `vX.Y.Z` tag, dispatch `release.yml`, or run any registry publication step
+until that approval is given.
+
+The Android target is cross-built and included in the checksum/bundle gates,
+but GitHub's Linux runner cannot execute the Android binary as a real Termux
+user. Keep the real-device limitation in the release packet unless separate
+device evidence exists.
+
 To exercise `npm run release:check` locally as well, regenerate the local asset
 directory with a full asset matrix fixture before starting the server:
 
