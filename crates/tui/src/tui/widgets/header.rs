@@ -502,7 +502,7 @@ impl<'a> HeaderWidget<'a> {
         let mode_width = 3 + mode_label.width();
         let full_effort_width = 3 + effort.width();
         let compact_effort = Self::compact_effort_label(effort);
-        let compact_effort_width = 4;
+        let compact_effort_width = 3 + compact_effort.width();
         let effort = if effort.is_empty() {
             String::new()
         } else if used + mode_width + full_effort_width <= max_width {
