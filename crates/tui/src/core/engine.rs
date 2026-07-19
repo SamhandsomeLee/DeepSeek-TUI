@@ -3513,6 +3513,11 @@ impl Engine {
             authority.auto_approve,
         )
         .with_state_namespace(self.session.id.clone())
+        .with_route_context_window(crate::route_budget::route_context_window_tokens(
+            self.api_provider,
+            &self.session.model,
+            self.config.active_route_limits,
+        ))
         .with_review_plan_changes(matches!(mode, AppMode::Plan))
         .with_features(self.config.features.clone())
         .with_shell_manager(self.shell_manager.clone())

@@ -80,9 +80,11 @@ tiny_http = "0.12"
 globset = "0.4"
 ignore = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
+htmd = "0.5.4"
 lru = "0.18"
 parking_lot = "0.12"
 pdf-extract = { version = "0.12", optional = true }
+readability = { version = "0.3.0", default-features = false }
 tar = "0.4"
 flate2 = "1.1"
 sha2.workspace = true

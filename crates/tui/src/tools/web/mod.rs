@@ -4,6 +4,10 @@
 //! module so security and parsing behavior cannot drift between tools.
 
 pub(crate) mod backend;
+pub(crate) mod cache;
 pub(crate) mod contract;
+pub(crate) mod extract;
+pub(crate) mod fetch;
 pub(crate) mod guard;
+pub(crate) mod overflow;
 pub mod scrape;

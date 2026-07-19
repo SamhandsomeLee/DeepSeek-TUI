@@ -7,14 +7,20 @@ use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
     optional_u64, required_str,
 };
-use super::web::guard::{DnsPin, guarded_reqwest_client_builder, validate_fetch_target};
+use super::web::extract::{DocumentKind, extract_document};
+#[cfg(test)]
+use super::web::fetch::fetch_with_initial_pin;
+use super::web::fetch::{FetchOptions, HARD_MAX_BYTES, fetch};
+#[cfg(test)]
+use super::web::guard::DnsPin;
+use super::web::overflow::bound_text as bound_web_text;
+#[cfg(test)]
+use super::web::overflow::inline_char_budget;
 use async_trait::async_trait;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
-#[cfg(feature = "pdf")]
-use std::fmt::Display;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -27,10 +33,9 @@ use super::web::contract::{
 use super::web_search::{domain_matches, execute_search};
 
 const DEFAULT_TIMEOUT_MS: u64 = 15_000;
-const DEFAULT_OPEN_TIMEOUT_MS: u64 = 20_000;
+const DEFAULT_OPEN_TIMEOUT_MS: u64 = 15_000;
 const MAX_WEB_RUN_SESSIONS: usize = 64;
 const MAX_PAGES_PER_SESSION: usize = 256;
-const MAX_REDIRECTS: usize = 5;
 const WEB_RUN_SESSION_TTL: Duration = Duration::from_secs(30 * 60);
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
 
@@ -186,6 +191,7 @@ struct WebPage {
     lines: Vec<String>,
     links: Vec<WebLink>,
     pdf_pages: Option<Vec<Vec<String>>>,
+    truncated: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -261,6 +267,8 @@ struct PageViewResult {
     line_start: usize,
     line_end: usize,
     total_lines: usize,
+    #[serde(default, skip_serializing_if = "is_false")]
+    truncated: bool,
     content: String,
     links: Vec<WebLink>,
 }
@@ -269,6 +277,10 @@ struct PageViewResult {
 struct FindMatch {
     line: usize,
     text: String,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -653,7 +665,7 @@ impl ToolSpec for WebRunTool {
             }
         }
 
-        ToolResult::json(&output).map_err(|e| ToolError::execution_failed(e.to_string()))
+        bounded_web_run_result(&output, context)
     }
 }
 
@@ -970,6 +982,7 @@ fn page_from_search(query: &str, results: &[NormalizedSearchResult]) -> WebPage 
         lines,
         links,
         pdf_pages: None,
+        truncated: false,
     }
 }
 
@@ -978,187 +991,162 @@ async fn fetch_page(
     timeout_ms: u64,
     context: &ToolContext,
 ) -> Result<WebPage, ToolError> {
-    fetch_page_with_initial_pin(url, timeout_ms, context, None).await
+    let payload = fetch(
+        url,
+        &FetchOptions::new(
+            Duration::from_millis(timeout_ms),
+            HARD_MAX_BYTES,
+            "text/html,text/markdown,text/plain,application/xhtml+xml,application/pdf,image/*,audio/*,video/*,*/*;q=0.5",
+        ),
+        context,
+        "web_run",
+    )
+    .await?;
+    page_from_fetched(payload, context)
 }
 
+#[cfg(test)]
 async fn fetch_page_with_initial_pin(
     url: &str,
     timeout_ms: u64,
     context: &ToolContext,
-    mut initial_pin: Option<DnsPin>,
+    initial_pin: Option<DnsPin>,
 ) -> Result<WebPage, ToolError> {
-    let mut current_url = reqwest::Url::parse(url)
-        .map_err(|e| ToolError::invalid_input(format!("invalid URL: {e}")))?;
-    let mut redirects_followed = 0usize;
+    let payload = fetch_with_initial_pin(
+        url,
+        &FetchOptions::new(
+            Duration::from_millis(timeout_ms),
+            HARD_MAX_BYTES,
+            "text/html,text/markdown,text/plain,application/xhtml+xml,application/pdf,image/*,audio/*,video/*,*/*;q=0.5",
+        ),
+        context,
+        "web_run",
+        initial_pin.flatten(),
+    )
+    .await?;
+    page_from_fetched(payload, context)
+}
 
-    let resp = loop {
-        let dns_pinning = if redirects_followed == 0 {
-            match initial_pin.take() {
-                Some(pin) => pin,
-                None => validate_fetch_target(&current_url, context, "web_run").await?,
-            }
-        } else {
-            validate_fetch_target(&current_url, context, "web_run").await?
-        };
-        let mut client_builder = guarded_reqwest_client_builder()
-            .timeout(Duration::from_millis(timeout_ms))
-            .user_agent(USER_AGENT)
-            .redirect(reqwest::redirect::Policy::none());
-
-        // Pin validated IP to prevent DNS rebinding (TOCTOU) — reqwest will
-        // connect to the validated IP directly instead of re-resolving.
-        if let Some((hostname, validated_ip)) = dns_pinning {
-            client_builder =
-                client_builder.resolve(&hostname, std::net::SocketAddr::new(validated_ip, 0));
-        }
-
-        let client = client_builder.build().map_err(|e| {
-            ToolError::execution_failed(format!("Failed to build HTTP client: {e}"))
-        })?;
-
-        let resp = client
-            .get(current_url.clone())
-            .header(
-                "Accept",
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            )
-            .header("Accept-Language", "en-US,en;q=0.5")
-            .send()
-            .await
-            .map_err(|e| ToolError::execution_failed(format!("Web request failed: {e}")))?;
-
-        if !resp.status().is_redirection() || redirects_followed >= MAX_REDIRECTS {
-            break resp;
-        }
-
-        let Some(location) = resp
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|value| value.to_str().ok())
-        else {
-            break resp;
-        };
-
-        current_url = resp
-            .url()
-            .join(location)
-            .map_err(|e| ToolError::execution_failed(format!("invalid redirect location: {e}")))?;
-        redirects_followed += 1;
-    };
-
-    let final_url = resp.url().to_string();
-    let status = resp.status();
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| ToolError::execution_failed(format!("Failed to read response: {e}")))?;
-
-    if !status.is_success() {
+fn page_from_fetched(
+    payload: super::web::fetch::FetchedPayload,
+    context: &ToolContext,
+) -> Result<WebPage, ToolError> {
+    if !(200..300).contains(&payload.status) {
         return Err(ToolError::execution_failed(format!(
             "Web request failed: HTTP {}",
-            status.as_u16()
+            payload.status
         )));
     }
-
-    #[cfg(feature = "pdf")]
-    if is_pdf(&content_type, &final_url) {
-        return parse_pdf_page(&final_url, content_type, &bytes);
-    }
-
-    let body = String::from_utf8_lossy(&bytes).to_string();
-    let (lines, links, title) = parse_html(&body, &final_url);
-
-    Ok(WebPage {
-        url: final_url,
-        title,
-        content_type,
-        lines,
-        links,
-        pdf_pages: None,
-    })
-}
-
-#[cfg(feature = "pdf")]
-fn is_pdf(content_type: &Option<String>, url: &str) -> bool {
-    if let Some(ct) = content_type
-        && ct.to_lowercase().contains("application/pdf")
-    {
-        return true;
-    }
-    url.to_lowercase().ends_with(".pdf")
-}
-
-#[cfg(feature = "pdf")]
-fn parse_pdf_page(
-    url: &str,
-    content_type: Option<String>,
-    bytes: &[u8],
-) -> Result<WebPage, ToolError> {
-    let text = pdf_extract_text(bytes)?;
-    let pages = split_pdf_pages(&text);
-    let lines = pages.first().cloned().unwrap_or_default();
-
-    Ok(WebPage {
-        url: url.to_string(),
-        title: Some("PDF Document".to_string()),
-        content_type,
-        lines,
-        links: Vec::new(),
-        pdf_pages: Some(pages),
-    })
-}
-
-#[cfg(feature = "pdf")]
-fn pdf_extract_text(bytes: &[u8]) -> Result<String, ToolError> {
-    guard_pdf_extract(|| pdf_extract::extract_text_from_mem(bytes))
-        .map_err(|e| ToolError::execution_failed(format!("PDF extract failed: {e}")))
-}
-
-#[cfg(feature = "pdf")]
-fn guard_pdf_extract<T, E, F>(extract: F) -> Result<T, String>
-where
-    E: Display,
-    F: FnOnce() -> Result<T, E>,
-{
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(extract)) {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(err)) => Err(err.to_string()),
-        Err(payload) => Err(format!(
-            "extractor panicked: {}",
-            panic_payload_message(payload.as_ref())
-        )),
-    }
-}
-
-#[cfg(feature = "pdf")]
-fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        (*message).to_string()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "unknown panic".to_string()
+    let document = extract_document(&payload.url, Some(&payload.content_type), &payload.bytes)?;
+    let content_type = Some(payload.content_type);
+    match document.kind {
+        DocumentKind::Html => {
+            let html = document.cleaned_html.ok_or_else(|| {
+                ToolError::execution_failed("Readable HTML extraction returned no document")
+            })?;
+            let (lines, links, parsed_title) = parse_html(&html, &payload.url);
+            Ok(WebPage {
+                url: payload.url,
+                title: document.title.or(parsed_title),
+                content_type,
+                lines,
+                links,
+                pdf_pages: None,
+                truncated: payload.truncated,
+            })
+        }
+        DocumentKind::Markdown => {
+            let (lines, links) = parse_markdown(&document.markdown, &payload.url);
+            Ok(WebPage {
+                url: payload.url,
+                title: document.title,
+                content_type,
+                lines,
+                links,
+                pdf_pages: None,
+                truncated: payload.truncated,
+            })
+        }
+        DocumentKind::Text => Ok(WebPage {
+            url: payload.url,
+            title: document.title,
+            content_type,
+            lines: readable_lines(&document.text),
+            links: Vec::new(),
+            pdf_pages: None,
+            truncated: payload.truncated,
+        }),
+        DocumentKind::Pdf => {
+            let pages = document.pdf_pages.unwrap_or_default();
+            Ok(WebPage {
+                url: payload.url,
+                title: document.title,
+                content_type,
+                lines: pages.first().cloned().unwrap_or_default(),
+                links: Vec::new(),
+                pdf_pages: Some(pages),
+                truncated: payload.truncated,
+            })
+        }
+        DocumentKind::Media => {
+            let extension = document.media_extension.unwrap_or("bin");
+            let digest = crate::hashing::sha256_hex(&*payload.bytes);
+            let artifact_id = format!("web_media_{}", &digest[..16]);
+            let (_absolute, relative) = crate::artifacts::write_session_artifact_bytes(
+                &context.state_namespace,
+                &artifact_id,
+                extension,
+                &payload.bytes,
+            )
+            .map_err(|error| {
+                ToolError::execution_failed(format!(
+                    "failed to preserve fetched media artifact: {error}"
+                ))
+            })?;
+            let path = crate::artifacts::format_artifact_relative_path(&relative);
+            Ok(WebPage {
+                url: payload.url,
+                title: Some("Media artifact".to_string()),
+                content_type,
+                lines: vec![format!("Fetched media saved to {path}")],
+                links: Vec::new(),
+                pdf_pages: None,
+                truncated: payload.truncated,
+            })
+        }
     }
 }
 
-#[cfg(feature = "pdf")]
-fn split_pdf_pages(text: &str) -> Vec<Vec<String>> {
-    let raw_pages: Vec<&str> = text.split('\x0C').collect();
-    raw_pages
-        .iter()
-        .map(|page| {
-            page.lines()
-                .map(|line| line.trim())
-                .filter(|line| !line.is_empty())
-                .map(|line| line.to_string())
-                .collect::<Vec<_>>()
+fn bounded_web_run_result(
+    output: &WebRunOutput,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    let full = serde_json::to_string_pretty(output)
+        .map_err(|error| ToolError::execution_failed(error.to_string()))?;
+    let bounded = bound_web_text(
+        full,
+        context,
+        |body| {
+            let digest = crate::hashing::sha256_hex(body.as_bytes());
+            format!("web_run_{}", &digest[..16])
+        },
+        "web.run result",
+    )?;
+    let metadata = bounded.artifact.map(|artifact| {
+        json!({
+            "spillover_path": artifact.absolute_path.display().to_string(),
+            "artifact_session_id": artifact.session_id,
+            "artifact_relative_path": crate::artifacts::format_artifact_relative_path(&artifact.relative_path),
+            "artifact_byte_size": artifact.byte_size,
+            "artifact_preview": artifact.preview,
         })
-        .collect()
+    });
+
+    Ok(ToolResult {
+        content: bounded.content,
+        success: true,
+        metadata,
+    })
 }
 
 fn render_view(
@@ -1196,6 +1184,7 @@ fn render_view(
         line_start: start,
         line_end: end,
         total_lines: total,
+        truncated: page.truncated,
         content,
         links: page.links.clone(),
     }
@@ -1279,6 +1268,7 @@ static BLOCK_RE: OnceLock<Regex> = OnceLock::new();
 static SCRIPT_RE: OnceLock<Regex> = OnceLock::new();
 static STYLE_RE: OnceLock<Regex> = OnceLock::new();
 static TITLE_RE: OnceLock<Regex> = OnceLock::new();
+static MARKDOWN_LINK_RE: OnceLock<Regex> = OnceLock::new();
 
 fn get_anchor_re() -> &'static Regex {
     ANCHOR_RE.get_or_init(|| {
@@ -1332,6 +1322,45 @@ fn parse_html(html: &str, base_url: &str) -> (Vec<String>, Vec<WebLink>, Option<
     }
 
     (lines, links, title)
+}
+
+fn parse_markdown(markdown: &str, base_url: &str) -> (Vec<String>, Vec<WebLink>) {
+    let re = MARKDOWN_LINK_RE.get_or_init(|| {
+        Regex::new(r#"\[([^\]]+)\]\(([^\s)]+)(?:\s+"[^"]*")?\)"#).expect("markdown link regex")
+    });
+    let mut links = Vec::new();
+    let mut replaced = String::with_capacity(markdown.len());
+    let mut last = 0;
+    for capture in re.captures_iter(markdown) {
+        let Some(full) = capture.get(0) else { continue };
+        let Some(text) = capture.get(1) else { continue };
+        let Some(target) = capture.get(2) else {
+            continue;
+        };
+        replaced.push_str(&markdown[last..full.start()]);
+        let id = links.len() + 1;
+        let text = normalize_whitespace(text.as_str());
+        let url = resolve_url(base_url, target.as_str());
+        links.push(WebLink {
+            id,
+            url,
+            text: text.clone(),
+        });
+        replaced.push_str(&format!("[{id}] {text}"));
+        last = full.end();
+    }
+    replaced.push_str(&markdown[last..]);
+    (readable_lines(&replaced), links)
+}
+
+fn readable_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .flat_map(|line| {
+            let line = normalize_whitespace(line);
+            wrap_line(&line, ResponseLength::Medium.wrap_width())
+        })
+        .filter(|line| !line.is_empty())
+        .collect()
 }
 
 fn extract_title(html: &str) -> Option<String> {
@@ -1451,6 +1480,14 @@ mod tests {
 
     static WEB_RUN_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
+    struct ArtifactRootRestore(Option<PathBuf>);
+
+    impl Drop for ArtifactRootRestore {
+        fn drop(&mut self) {
+            crate::artifacts::set_test_artifact_sessions_root(self.0.take());
+        }
+    }
+
     fn lock_web_run_test_state() -> MutexGuard<'static, ()> {
         WEB_RUN_TEST_LOCK.blocking_lock()
     }
@@ -1463,6 +1500,7 @@ mod tests {
             lines: vec!["example line".to_string()],
             links: Vec::new(),
             pdf_pages: None,
+            truncated: false,
         }
     }
 
@@ -1488,6 +1526,48 @@ mod tests {
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].url, "https://example.com");
         assert!(lines.iter().any(|line| line.contains("Example")));
+    }
+
+    #[test]
+    fn markdown_link_parsing_preserves_click_targets() {
+        let (lines, links) = parse_markdown(
+            "## Guide\n\nRead [the proof](/proof) before shipping.",
+            "https://example.com/docs/start",
+        );
+
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].url, "https://example.com/proof");
+        assert!(lines.iter().any(|line| line.contains("[1] the proof")));
+    }
+
+    #[test]
+    fn oversized_web_run_output_round_trips_through_session_artifact() {
+        let _lock = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let prior =
+            crate::artifacts::set_test_artifact_sessions_root(Some(tmp.path().join("sessions")));
+        let _restore = ArtifactRootRestore(prior);
+        let context = ToolContext::new(".")
+            .with_state_namespace("web-run-overflow")
+            .with_route_context_window(10_000);
+        let output = WebRunOutput {
+            warnings: vec!["large receipt ".repeat(200)],
+            ..WebRunOutput::default()
+        };
+
+        let result = bounded_web_run_result(&output, &context).unwrap();
+        let metadata = result.metadata.expect("artifact metadata");
+        let path = metadata["spillover_path"].as_str().unwrap();
+        let full = std::fs::read_to_string(path).unwrap();
+
+        assert!(result.content.contains("retrieve_tool_result"));
+        assert!(result.content.chars().count() <= inline_char_budget(&context));
+        assert_eq!(
+            serde_json::from_str::<Value>(&full).unwrap()["warnings"][0],
+            output.warnings[0]
+        );
     }
 
     #[test]
@@ -1640,18 +1720,6 @@ mod tests {
                 .iter()
                 .all(|entry| entry.url.contains("docs.example.co.uk"))
         );
-    }
-
-    #[cfg(feature = "pdf")]
-    #[test]
-    fn pdf_extract_panic_is_returned_as_tool_error_text() {
-        let err = guard_pdf_extract(|| -> Result<String, &'static str> {
-            panic!("assertion failed: name == \"Identity-H\"");
-        })
-        .expect_err("panic should become an error");
-
-        assert!(err.contains("extractor panicked"));
-        assert!(err.contains("Identity-H"));
     }
 
     #[test]

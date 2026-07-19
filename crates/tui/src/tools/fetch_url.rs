@@ -11,40 +11,20 @@ use super::handle::query_jsonpath;
 use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec, optional_u64,
 };
-use super::web::guard::{guarded_reqwest_client_builder, validate_fetch_target};
+use super::web::extract::{DocumentKind, ExtractedDocument, extract_document};
+use super::web::fetch::{
+    DEFAULT_MAX_BYTES, DEFAULT_TIMEOUT, FetchOptions, HARD_MAX_BYTES, HARD_MAX_TIMEOUT, fetch,
+};
+use super::web::overflow::bound_text as bound_web_text;
+#[cfg(test)]
+use super::web::overflow::inline_char_budget;
 use async_trait::async_trait;
-use regex::Regex;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
 use std::time::Duration;
 
-const DEFAULT_MAX_BYTES: u64 = 1_000_000;
-const HARD_MAX_BYTES: u64 = 10 * 1024 * 1024;
-const DEFAULT_TIMEOUT_MS: u64 = 15_000;
-const HARD_MAX_TIMEOUT_MS: u64 = 60_000;
-const MAX_REDIRECTS: usize = 5;
-const USER_AGENT: &str =
-    "Mozilla/5.0 (compatible; codewhale/0.5; +https://github.com/Hmbown/CodeWhale)";
-
-static SCRIPT_RE: OnceLock<Regex> = OnceLock::new();
-static STYLE_RE: OnceLock<Regex> = OnceLock::new();
-static TAG_RE: OnceLock<Regex> = OnceLock::new();
-static WHITESPACE_RE: OnceLock<Regex> = OnceLock::new();
-
-fn script_re() -> &'static Regex {
-    SCRIPT_RE.get_or_init(|| Regex::new(r"(?is)<script[^>]*>.*?</script>").expect("script re"))
-}
-fn style_re() -> &'static Regex {
-    STYLE_RE.get_or_init(|| Regex::new(r"(?is)<style[^>]*>.*?</style>").expect("style re"))
-}
-fn tag_re() -> &'static Regex {
-    TAG_RE.get_or_init(|| Regex::new(r"<[^>]+>").expect("tag re"))
-}
-fn whitespace_re() -> &'static Regex {
-    WHITESPACE_RE.get_or_init(|| Regex::new(r"\s+").expect("ws re"))
-}
+const FETCH_ACCEPT: &str = "text/html,text/markdown,text/plain,application/json,application/pdf,image/*,audio/*,video/*,*/*;q=0.5";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Format {
@@ -79,8 +59,27 @@ struct FetchResponse {
     content_type: String,
     content: String,
     truncated: bool,
+    receipt: FetchReceipt,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    artifact: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     fields: Option<BTreeMap<String, Vec<Value>>>,
+}
+
+#[derive(Debug, Serialize)]
+struct FetchReceipt {
+    cache_hit: bool,
+    retries: usize,
+    redirects: usize,
+}
+
+#[derive(Debug)]
+struct ArtifactWrite {
+    session_id: String,
+    absolute_path: std::path::PathBuf,
+    relative_path: std::path::PathBuf,
+    byte_size: u64,
+    preview: String,
 }
 
 pub struct FetchUrlTool;
@@ -106,7 +105,7 @@ impl ToolSpec for FetchUrlTool {
                 "format": {
                     "type": "string",
                     "enum": ["text", "markdown", "raw"],
-                    "description": "Post-processing for the response body. `markdown` (default) and `text` strip HTML tags to readable text; `raw` returns the body bytes as-is."
+                    "description": "Post-processing for the response body. `markdown` (default) uses readability extraction and real HTML-to-Markdown conversion; `text` returns readable plain text; `raw` preserves textual response bytes. Binary media is saved as a session artifact."
                 },
                 "max_bytes": {
                     "type": "integer",
@@ -153,119 +152,239 @@ impl ToolSpec for FetchUrlTool {
         }
 
         let format = Format::parse(input.get("format").and_then(Value::as_str))?;
-        let max_bytes = optional_u64(&input, "max_bytes", DEFAULT_MAX_BYTES).min(HARD_MAX_BYTES);
-        let timeout_ms =
-            optional_u64(&input, "timeout_ms", DEFAULT_TIMEOUT_MS).min(HARD_MAX_TIMEOUT_MS);
+        let max_bytes =
+            usize::try_from(optional_u64(&input, "max_bytes", DEFAULT_MAX_BYTES as u64))
+                .unwrap_or(HARD_MAX_BYTES)
+                .clamp(1, HARD_MAX_BYTES);
+        let timeout_ms = optional_u64(&input, "timeout_ms", DEFAULT_TIMEOUT.as_millis() as u64)
+            .clamp(1, HARD_MAX_TIMEOUT.as_millis() as u64);
         let requested_fields = parse_fields(&input)?;
-        let mut current_url = reqwest::Url::parse(&url)
-            .map_err(|e| ToolError::invalid_input(format!("invalid URL: {e}")))?;
-        let mut redirects_followed = 0usize;
-
-        let resp = loop {
-            let dns_pinning = validate_fetch_target(&current_url, context, "fetch_url").await?;
-            let mut client_builder = guarded_reqwest_client_builder()
-                .timeout(Duration::from_millis(timeout_ms))
-                .user_agent(USER_AGENT)
-                .redirect(reqwest::redirect::Policy::none());
-
-            // Pin validated IP to prevent DNS rebinding (TOCTOU) — reqwest will
-            // connect to the validated IP directly instead of re-resolving.
-            if let Some((hostname, validated_ip)) = dns_pinning {
-                client_builder =
-                    client_builder.resolve(&hostname, std::net::SocketAddr::new(validated_ip, 0));
-            }
-
-            let client = client_builder.build().map_err(|e| {
-                ToolError::execution_failed(format!("failed to build HTTP client: {e}"))
-            })?;
-
-            let resp = client
-                .get(current_url.clone())
-                .header("Accept", "text/html,text/plain,application/json,*/*;q=0.5")
-                .header("Accept-Language", "en-US,en;q=0.5")
-                .send()
-                .await
-                .map_err(|e| ToolError::execution_failed(format!("request failed: {e}")))?;
-
-            if !resp.status().is_redirection() || redirects_followed >= MAX_REDIRECTS {
-                break resp;
-            }
-
-            let Some(location) = resp
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|value| value.to_str().ok())
-            else {
-                break resp;
+        let fetched = fetch(
+            &url,
+            &FetchOptions::new(Duration::from_millis(timeout_ms), max_bytes, FETCH_ACCEPT),
+            context,
+            "fetch_url",
+        )
+        .await?;
+        let is_success = (200..300).contains(&fetched.status);
+        let mut body_text = (!requested_fields.is_empty())
+            .then(|| String::from_utf8_lossy(&fetched.bytes).into_owned());
+        let fields = match body_text.as_deref() {
+            Some(body) => project_json_fields(body, &fetched.content_type, &requested_fields)?,
+            None => None,
+        };
+        let extracted =
+            match extract_document(&fetched.url, Some(&fetched.content_type), &fetched.bytes) {
+                Ok(document) => document,
+                Err(_error)
+                    if format == Format::Raw && is_declared_textual(&fetched.content_type) =>
+                {
+                    let body_text = body_text
+                        .get_or_insert_with(|| String::from_utf8_lossy(&fetched.bytes).into_owned())
+                        .clone();
+                    ExtractedDocument {
+                        kind: DocumentKind::Text,
+                        title: None,
+                        text: body_text.clone(),
+                        markdown: body_text,
+                        cleaned_html: None,
+                        pdf_pages: None,
+                        media_extension: None,
+                    }
+                }
+                Err(_error) if !is_success => {
+                    let body_text = body_text
+                        .get_or_insert_with(|| String::from_utf8_lossy(&fetched.bytes).into_owned())
+                        .clone();
+                    ExtractedDocument {
+                        kind: DocumentKind::Text,
+                        title: None,
+                        text: body_text.clone(),
+                        markdown: body_text,
+                        cleaned_html: None,
+                        pdf_pages: None,
+                        media_extension: None,
+                    }
+                }
+                Err(error) => return Err(error),
             };
 
-            current_url = resp.url().join(location).map_err(|e| {
-                ToolError::execution_failed(format!("invalid redirect location: {e}"))
-            })?;
-            redirects_followed += 1;
-        };
-
-        let final_url = resp.url().to_string();
-        let status = resp.status();
-        let content_type = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("application/octet-stream")
-            .to_string();
-        let headers = response_headers(resp.headers());
-
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| ToolError::execution_failed(format!("failed to read body: {e}")))?;
-        let total_bytes = bytes.len() as u64;
-        let truncated = total_bytes > max_bytes;
-        let usable = if truncated {
-            &bytes[..max_bytes as usize]
-        } else {
-            &bytes[..]
-        };
-
-        let body_text = String::from_utf8_lossy(usable).to_string();
-        let fields = project_json_fields(&body_text, &content_type, &requested_fields)?;
-        let processed = match format {
-            Format::Raw => body_text,
-            Format::Text | Format::Markdown => {
-                if content_type.contains("text/html") || body_text.contains("<html") {
-                    html_to_text(&body_text)
-                } else {
-                    body_text
-                }
-            }
-        };
+        let (processed, artifact_write) = render_extracted(
+            &fetched.url,
+            &fetched.content_type,
+            format,
+            extracted,
+            &fetched.bytes,
+            context,
+        )?;
+        let artifact = artifact_write
+            .as_ref()
+            .map(|write| crate::artifacts::format_artifact_relative_path(&write.relative_path));
 
         let response = FetchResponse {
-            url: final_url,
-            status: status.as_u16(),
-            headers,
-            content_type,
+            url: fetched.url,
+            status: fetched.status,
+            headers: fetched.headers,
+            content_type: fetched.content_type,
             content: processed,
-            truncated,
+            truncated: fetched.truncated,
+            receipt: FetchReceipt {
+                cache_hit: fetched.cache_hit,
+                retries: fetched.retries,
+                redirects: fetched.redirects,
+            },
+            artifact,
             fields,
         };
 
-        if !status.is_success() {
+        let content = serde_json::to_string_pretty(&response).map_err(|error| {
+            ToolError::execution_failed(format!("failed to serialize response: {error}"))
+        })?;
+        let metadata = artifact_write.map(artifact_metadata);
+
+        if !is_success {
             // Don't `Err` on 4xx/5xx — the caller often wants to see the body
             // (e.g. a JSON error envelope). Mark the result as a failure so the
             // engine renders it as such.
             return Ok(ToolResult {
-                content: serde_json::to_string_pretty(&response).map_err(|e| {
-                    ToolError::execution_failed(format!("failed to serialize response: {e}"))
-                })?,
+                content,
                 success: false,
-                metadata: None,
+                metadata,
             });
         }
 
-        ToolResult::json(&response)
-            .map_err(|e| ToolError::execution_failed(format!("failed to serialize response: {e}")))
+        Ok(ToolResult {
+            content,
+            success: true,
+            metadata,
+        })
     }
+}
+
+fn is_declared_textual(content_type: &str) -> bool {
+    let content_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim()
+        .to_ascii_lowercase();
+    content_type.starts_with("text/")
+        || content_type.contains("html")
+        || content_type.contains("json")
+        || content_type.contains("xml")
+        || content_type.contains("yaml")
+        || content_type.contains("javascript")
+}
+
+fn render_extracted(
+    url: &str,
+    content_type: &str,
+    format: Format,
+    document: ExtractedDocument,
+    bytes: &[u8],
+    context: &ToolContext,
+) -> Result<(String, Option<ArtifactWrite>), ToolError> {
+    if document.kind == DocumentKind::Pdf && format != Format::Raw {
+        let extracted = match format {
+            Format::Text => document.text,
+            Format::Markdown => document.markdown,
+            Format::Raw => unreachable!("raw PDF handled below"),
+        };
+        return bound_text(url, extracted, context);
+    }
+
+    if document.kind == DocumentKind::Media || document.kind == DocumentKind::Pdf {
+        let extension = document
+            .media_extension
+            .unwrap_or(if document.kind == DocumentKind::Pdf {
+                "pdf"
+            } else {
+                "bin"
+            });
+        let artifact = write_binary_artifact(url, extension, bytes, context)?;
+        let relative = crate::artifacts::format_artifact_relative_path(&artifact.relative_path);
+        let label = if document.kind == DocumentKind::Pdf {
+            "PDF"
+        } else {
+            "media"
+        };
+        let content =
+            format!("[{label} response saved to {relative}; content type: {content_type}.]");
+        return Ok((content, Some(artifact)));
+    }
+
+    let content = match format {
+        Format::Raw => String::from_utf8_lossy(bytes).into_owned(),
+        Format::Text => document.text,
+        Format::Markdown => document.markdown,
+    };
+    bound_text(url, content, context)
+}
+
+fn bound_text(
+    url: &str,
+    content: String,
+    context: &ToolContext,
+) -> Result<(String, Option<ArtifactWrite>), ToolError> {
+    let bounded = bound_web_text(
+        content,
+        context,
+        |body| fetch_artifact_id(url, body.as_bytes()),
+        "page",
+    )?;
+    let artifact = bounded.artifact.map(|artifact| ArtifactWrite {
+        session_id: artifact.session_id,
+        absolute_path: artifact.absolute_path,
+        relative_path: artifact.relative_path,
+        byte_size: artifact.byte_size,
+        preview: artifact.preview,
+    });
+    Ok((bounded.content, artifact))
+}
+
+fn write_binary_artifact(
+    url: &str,
+    extension: &str,
+    bytes: &[u8],
+    context: &ToolContext,
+) -> Result<ArtifactWrite, ToolError> {
+    let artifact_id = fetch_artifact_id(url, bytes);
+    let (absolute_path, relative_path) = crate::artifacts::write_session_artifact_bytes(
+        &context.state_namespace,
+        &artifact_id,
+        extension,
+        bytes,
+    )
+    .map_err(|error| {
+        ToolError::execution_failed(format!(
+            "failed to preserve fetched media artifact: {error}"
+        ))
+    })?;
+    Ok(ArtifactWrite {
+        session_id: context.state_namespace.clone(),
+        absolute_path,
+        relative_path,
+        byte_size: bytes.len() as u64,
+        preview: format!("Fetched {extension} artifact from {url}"),
+    })
+}
+
+fn fetch_artifact_id(url: &str, bytes: &[u8]) -> String {
+    let mut identity = Vec::with_capacity(url.len() + bytes.len());
+    identity.extend_from_slice(url.as_bytes());
+    identity.extend_from_slice(bytes);
+    let digest = crate::hashing::sha256_hex(&identity);
+    format!("fetch_{}", &digest[..16])
+}
+
+fn artifact_metadata(write: ArtifactWrite) -> Value {
+    json!({
+        "spillover_path": write.absolute_path.display().to_string(),
+        "artifact_session_id": write.session_id,
+        "artifact_relative_path": crate::artifacts::format_artifact_relative_path(&write.relative_path),
+        "artifact_byte_size": write.byte_size,
+        "artifact_preview": write.preview,
+    })
 }
 
 fn parse_fields(input: &Value) -> Result<Vec<String>, ToolError> {
@@ -288,18 +407,6 @@ fn parse_fields(input: &Value) -> Result<Vec<String>, ToolError> {
         }
     }
     Ok(fields)
-}
-
-fn response_headers(headers: &reqwest::header::HeaderMap) -> BTreeMap<String, String> {
-    headers
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|value| (name.as_str().to_ascii_lowercase(), value.to_string()))
-        })
-        .collect()
 }
 
 fn project_json_fields(
@@ -328,61 +435,22 @@ fn project_json_fields(
     Ok(Some(out))
 }
 
-/// Strip `<script>` / `<style>` blocks, drop remaining tags, and collapse
-/// whitespace. Good enough for "let the model read this page" — not a full
-/// HTML-to-Markdown converter.
-fn html_to_text(html: &str) -> String {
-    let no_script = script_re().replace_all(html, "");
-    let no_style = style_re().replace_all(&no_script, "");
-    let no_tags = tag_re().replace_all(&no_style, " ");
-    let decoded = decode_entities(&no_tags);
-    whitespace_re()
-        .replace_all(&decoded, " ")
-        .trim()
-        .to_string()
-}
-
-/// Decode the handful of HTML entities we expect to hit in stripped text.
-/// Pulling in `html-escape` for the long tail isn't worth the dep weight.
-fn decode_entities(s: &str) -> String {
-    s.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&apos;", "'")
-        .replace("&nbsp;", " ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tools::spec::ToolContext;
     use std::path::PathBuf;
 
-    fn ctx() -> ToolContext {
-        ToolContext::new(PathBuf::from("."))
+    struct ArtifactRootRestore(Option<PathBuf>);
+
+    impl Drop for ArtifactRootRestore {
+        fn drop(&mut self) {
+            crate::artifacts::set_test_artifact_sessions_root(self.0.take());
+        }
     }
 
-    #[test]
-    fn html_to_text_strips_scripts_styles_and_tags() {
-        let html = r#"
-            <html>
-              <head>
-                <style>body { color: red; }</style>
-                <script>alert("nope");</script>
-              </head>
-              <body>
-                <h1>Hello &amp; welcome</h1>
-                <p>This is <b>important</b>.</p>
-              </body>
-            </html>
-        "#;
-        let text = html_to_text(html);
-        assert!(text.contains("Hello & welcome"));
-        assert!(text.contains("This is important"));
-        assert!(!text.contains("alert"));
-        assert!(!text.contains("color: red"));
+    fn ctx() -> ToolContext {
+        ToolContext::new(PathBuf::from("."))
     }
 
     #[test]
@@ -393,6 +461,32 @@ mod tests {
         assert_eq!(Format::parse(Some("raw")).unwrap(), Format::Raw);
         assert_eq!(Format::parse(None).unwrap(), Format::Markdown);
         assert!(Format::parse(Some("yaml")).is_err());
+    }
+
+    #[test]
+    fn route_budget_overflow_round_trips_through_session_artifact() {
+        let _lock = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let prior =
+            crate::artifacts::set_test_artifact_sessions_root(Some(tmp.path().join("sessions")));
+        let _restore = ArtifactRootRestore(prior);
+        let context = ToolContext::new(".")
+            .with_state_namespace("fetch-overflow")
+            .with_route_context_window(10_000);
+        let full = "Whale content. ".repeat(200);
+
+        let (inline, artifact) =
+            bound_text("https://example.com/large", full.clone(), &context).unwrap();
+        let artifact = artifact.expect("overflow artifact");
+
+        assert!(inline.contains("retrieve_tool_result"));
+        assert!(inline.chars().count() <= inline_char_budget(&context));
+        assert_eq!(
+            std::fs::read_to_string(artifact.absolute_path).unwrap(),
+            full
+        );
     }
 
     #[test]

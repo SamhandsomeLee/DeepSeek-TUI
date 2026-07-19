@@ -195,6 +195,9 @@ pub struct ToolContext {
     pub features: Features,
     /// Namespace for tool state that should be scoped to the current session/thread.
     pub state_namespace: String,
+    /// Effective context window for the active provider/model route. Web tools
+    /// use this to keep inline page content below three percent of the route.
+    pub route_context_window: Option<u32>,
     /// User-trusted external paths the agent may read/write even when they
     /// fall outside `workspace`. Loaded from `~/.deepseek/workspace-trust.json`
     /// and refreshed when the user runs `/trust add <path>`. Distinct from
@@ -292,6 +295,7 @@ impl ToolContext {
             shell_policy: ShellPolicy::Full,
             features: Features::with_defaults(),
             state_namespace: "workspace".to_string(),
+            route_context_window: None,
             trusted_external_paths: Vec::new(),
             follow_symlinks: false,
             network_policy: None,
@@ -339,6 +343,7 @@ impl ToolContext {
             shell_policy: ShellPolicy::Full,
             features: Features::with_defaults(),
             state_namespace: "workspace".to_string(),
+            route_context_window: None,
             trusted_external_paths: Vec::new(),
             follow_symlinks: false,
             network_policy: None,
@@ -386,6 +391,7 @@ impl ToolContext {
             shell_policy: ShellPolicy::Full,
             features: Features::with_defaults(),
             state_namespace: "workspace".to_string(),
+            route_context_window: None,
             trusted_external_paths: Vec::new(),
             follow_symlinks: false,
             network_policy: None,
@@ -801,6 +807,13 @@ impl ToolContext {
     /// Set the namespace used for session-scoped tool state.
     pub fn with_state_namespace(mut self, namespace: impl Into<String>) -> Self {
         self.state_namespace = namespace.into();
+        self
+    }
+
+    /// Attach the active route's effective context window.
+    #[must_use]
+    pub fn with_route_context_window(mut self, context_window: u32) -> Self {
+        self.route_context_window = (context_window > 0).then_some(context_window);
         self
     }
 
