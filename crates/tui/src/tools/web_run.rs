@@ -1605,14 +1605,12 @@ fn url_encode(input: &str) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::sync::{Mutex, MutexGuard};
+    use tokio::sync::{Mutex, MutexGuard};
 
-    static WEB_RUN_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static WEB_RUN_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
     fn lock_web_run_test_state() -> MutexGuard<'static, ()> {
-        WEB_RUN_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        WEB_RUN_TEST_LOCK.blocking_lock()
     }
 
     fn sample_page(url: &str) -> WebPage {
@@ -1790,7 +1788,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn execute_open_rejects_exact_foreign_session_ref() {
-        let _lock = lock_web_run_test_state();
+        let _lock = WEB_RUN_TEST_LOCK.lock().await;
         reset_web_run_state();
         let ref_id = format!("{}turn0search1", scoped_ref_prefix("foreign-open-owner"));
         store_page(
@@ -1811,7 +1809,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn execute_click_rejects_exact_foreign_session_ref() {
-        let _lock = lock_web_run_test_state();
+        let _lock = WEB_RUN_TEST_LOCK.lock().await;
         reset_web_run_state();
         let ref_id = format!("{}turn0search1", scoped_ref_prefix("foreign-click-owner"));
         store_page(
@@ -1835,7 +1833,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn execute_click_routes_target_through_shared_ssrf_guard() {
-        let _lock = lock_web_run_test_state();
+        let _lock = WEB_RUN_TEST_LOCK.lock().await;
         reset_web_run_state();
         let namespace = "guarded-click-session";
         let ref_id = format!("{}turn0search1", scoped_ref_prefix(namespace));

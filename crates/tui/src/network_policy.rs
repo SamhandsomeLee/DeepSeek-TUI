@@ -759,12 +759,14 @@ mod tests {
 
     #[test]
     fn configured_fakeip_cidrs_are_loaded_but_unsafe_ranges_are_ignored() {
-        let mut policy = NetworkPolicy::default();
-        policy.proxy_fake_ip_cidrs = vec![
-            "198.18.0.0/15".to_string(),
-            "127.0.0.0/8".to_string(),
-            "10.0.0.0/8".to_string(),
-        ];
+        let policy = NetworkPolicy {
+            proxy_fake_ip_cidrs: vec![
+                "198.18.0.0/15".to_string(),
+                "127.0.0.0/8".to_string(),
+                "10.0.0.0/8".to_string(),
+            ],
+            ..NetworkPolicy::default()
+        };
         let decider = NetworkPolicyDecider::new(policy, None);
 
         assert!(decider.is_trusted_fakeip_addr(&"198.19.0.5".parse().unwrap()));
