@@ -41,7 +41,7 @@ impl BackendId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Recency {
     Day,
@@ -65,7 +65,7 @@ impl Recency {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct SearchQuery {
     pub(crate) query: String,
     pub(crate) max_results: u8,
@@ -168,6 +168,9 @@ impl QueryKnob {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum DegradedReason {
+    BackendUnavailable { backend: BackendId },
+    NoUsableResults { backend: BackendId },
+    BackendFallback { from: BackendId, to: BackendId },
     ChallengeDetected { backend: BackendId },
     ScrapeFallback { from: BackendId, to: BackendId },
     KnobIgnored { knob: QueryKnob },
@@ -179,6 +182,17 @@ impl DegradedReason {
     #[must_use]
     pub(crate) fn message(&self) -> String {
         match self {
+            Self::BackendUnavailable { backend } => {
+                format!("{} was unavailable", backend.as_str())
+            }
+            Self::NoUsableResults { backend } => {
+                format!("{} returned no usable results", backend.as_str())
+            }
+            Self::BackendFallback { from, to } => format!(
+                "{} did not answer; tried {} next",
+                from.as_str(),
+                to.as_str()
+            ),
             Self::ChallengeDetected { backend } => {
                 format!("{} returned a bot challenge", backend.as_str())
             }

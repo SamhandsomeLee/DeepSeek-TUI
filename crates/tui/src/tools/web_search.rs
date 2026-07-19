@@ -1,5 +1,7 @@
-//! Web search tool backed by multiple providers: Bing HTML scrape, DuckDuckGo
-//! (HTML scrape with Bing fallback), Tavily API, Bocha (博查) API,
+//! Web search tool backed by a bounded backend chain: configured API search,
+//! then DuckDuckGo HTML scrape with a one-way Bing fallback. Explicit Bing and
+//! private DuckDuckGo-compatible routes remain single-provider. API adapters
+//! include Tavily, Bocha (博查),
 //! Metaso API (<https://metaso.cn>), SearXNG JSON API, Baidu AI Search,
 //! Volcengine Ark, and Sofya (<https://sofya.co>).
 //!
@@ -23,7 +25,8 @@ use serde_json::{Value, json};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use super::web::backend::{ConfiguredSearchBackend, SearchBackend};
+use super::web::backend::SearchBackendChain;
+use super::web::cache;
 use super::web::contract::{
     BackendId, BackendSearch, DegradedReason, HonoredQueryCapabilities, MAX_SEARCH_RESULTS,
     QueryKnob, Recency, SearchQuery, SearchReceipt, SearchResponse, SearchResult,
@@ -46,6 +49,7 @@ const SOFYA_ENDPOINT: &str = "https://sofya.co/v1/search";
 /// Last-resort fallback after config and env var. Rate-limited to ~100 searches/day.
 const METASO_DEFAULT_API_KEY: &str = "mk-E384C1DD5E8501BB7EFE27C949AFDE5B";
 const ERROR_BODY_PREVIEW_BYTES: usize = 512;
+const VOLCENGINE_MIN_TIMEOUT_MS: u64 = 90_000;
 
 /// Returns `Ok(())` if the policy allows the call, or a `ToolError` otherwise.
 /// Falls through silently when no policy is attached (back-compat).
@@ -95,7 +99,7 @@ impl ToolSpec for WebSearchTool {
     }
 
     fn description(&self) -> &'static str {
-        "Search the web and return ranked results with URLs and snippets. Default backend is DuckDuckGo with Bing fallback; set `[search] provider = \"bing\" | \"tavily\" | \"bocha\" | \"metaso\" | \"searxng\" | \"baidu\" | \"volcengine\" | \"sofya\"` in config.toml to switch backends, or `[search] base_url` for a DuckDuckGo-compatible endpoint or trusted SearXNG instance. Use this instead of scraping search engines with `curl` in `exec_shell`. For a known canonical URL, prefer `fetch_url` directly."
+        "Search the web and return ranked results with URLs, snippets, and an execution receipt. Default backend is DuckDuckGo with Bing fallback. Configured API backends are tried first and visibly degrade through DuckDuckGo then Bing when unavailable; configuration and network-policy errors fail closed. Explicit Bing and private DuckDuckGo-compatible routes do not cross providers. Set `[search] provider = \"bing\" | \"tavily\" | \"bocha\" | \"metaso\" | \"searxng\" | \"baidu\" | \"volcengine\" | \"sofya\"` in config.toml, or `[search] base_url` for a private DuckDuckGo-compatible endpoint or trusted SearXNG instance. For a known canonical URL, prefer `fetch_url` directly."
     }
 
     fn input_schema(&self) -> Value {
@@ -719,24 +723,123 @@ pub(crate) async fn execute_search(
         )));
     }
 
-    let backend = ConfiguredSearchBackend::from_context(context);
-    debug_assert_eq!(backend.id().as_str(), context.search_provider.as_str());
-    let capabilities = backend.capabilities();
-    let started = Instant::now();
-    let effective_timeout_ms = if backend.id() == BackendId::Volcengine {
-        timeout_ms.max(90_000)
-    } else {
-        timeout_ms.max(1)
-    };
-    let timeout = Duration::from_millis(effective_timeout_ms);
-    let deadline = started + timeout;
-    let raw = tokio::time::timeout(timeout, backend.search(&query, deadline))
-        .await
-        .map_err(|_| ToolError::Timeout {
-            seconds: effective_timeout_ms.div_ceil(1_000),
-        })??;
+    preflight_search_provider(context)?;
+    let chain = SearchBackendChain::from_context(context);
+    debug_assert_eq!(
+        chain.initial_backend().as_str(),
+        context.search_provider.as_str()
+    );
+    let initial_backend = chain.initial_backend();
+    let normalized_base_url = normalized_search_base_url(context.search_base_url.as_deref());
 
-    Ok(finalize_search_response(query, capabilities, raw, started))
+    if let Some(mut cached) = cache::get_search(
+        &context.state_namespace,
+        initial_backend,
+        normalized_base_url.as_deref(),
+        &query,
+    ) {
+        validate_cached_search_policy(&cached, context)?;
+        cached.receipt.cache_hit = true;
+        cached.receipt.latency_ms = 0;
+        return Ok(cached);
+    }
+
+    let started = Instant::now();
+    let requested_timeout = Duration::from_millis(timeout_ms.max(1));
+    let (total_timeout, first_attempt_budget) = if initial_backend == BackendId::Volcengine {
+        let provider_budget = Duration::from_millis(VOLCENGINE_MIN_TIMEOUT_MS);
+        (provider_budget + requested_timeout, Some(provider_budget))
+    } else {
+        (requested_timeout, None)
+    };
+    let deadline = started + total_timeout;
+    let chained = chain.search(&query, deadline, first_attempt_budget).await?;
+    let response =
+        finalize_search_response(query.clone(), chained.capabilities, chained.raw, started);
+    cache::insert_search(
+        &context.state_namespace,
+        initial_backend,
+        normalized_base_url.as_deref(),
+        &query,
+        response.clone(),
+    );
+    Ok(response)
+}
+
+fn preflight_search_provider(context: &ToolContext) -> Result<(), ToolError> {
+    let configured_key = context
+        .search_api_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty());
+    let env_key = |name: &str| std::env::var_os(name).is_some_and(|value| !value.is_empty());
+
+    match context.search_provider {
+        SearchProvider::Tavily if !configured_key => Err(ToolError::execution_failed(
+            "Tavily search requires an API key. Set `[search] api_key = \"tvly-...\"` in config.toml.",
+        )),
+        SearchProvider::Bocha if !configured_key => Err(ToolError::execution_failed(
+            "Bocha search requires an API key. Set `[search] api_key = \"sk-...\"` in config.toml.",
+        )),
+        SearchProvider::Baidu if !configured_key && !env_key("BAIDU_SEARCH_API_KEY") => {
+            Err(ToolError::execution_failed(
+                "Baidu search requires an API key. Set `BAIDU_SEARCH_API_KEY` or `[search] api_key` in config.toml.",
+            ))
+        }
+        SearchProvider::Volcengine
+            if !configured_key
+                && !env_key("VOLCENGINE_API_KEY")
+                && !env_key("VOLCENGINE_ARK_API_KEY")
+                && !env_key("ARK_API_KEY") =>
+        {
+            Err(ToolError::execution_failed(
+                "Volcengine search requires an API key. Set `[search] api_key`, or VOLCENGINE_API_KEY / VOLCENGINE_ARK_API_KEY / ARK_API_KEY env var.",
+            ))
+        }
+        SearchProvider::Sofya if !configured_key && !env_key("SOFYA_API_KEY") => {
+            Err(ToolError::execution_failed(
+                "Sofya search requires an API key. Set `[search] api_key = \"ay_live_...\"` in config.toml or the SOFYA_API_KEY env var.",
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn normalized_search_base_url(base_url: Option<&str>) -> Option<String> {
+    let raw = configured_search_base_url(base_url)?;
+    let Ok(mut url) = reqwest::Url::parse(raw) else {
+        return Some(raw.to_string());
+    };
+    url.set_fragment(None);
+    Some(url.to_string())
+}
+
+fn validate_cached_search_policy(
+    response: &SearchResponse,
+    context: &ToolContext,
+) -> Result<(), ToolError> {
+    let host = response
+        .receipt
+        .backend_detail
+        .as_deref()
+        .or_else(|| default_backend_host(response.receipt.backend))
+        .ok_or_else(|| {
+            ToolError::execution_failed("cached search receipt did not identify its backend host")
+        })?;
+    check_policy(context.network_policy.as_ref(), host)
+}
+
+const fn default_backend_host(backend: BackendId) -> Option<&'static str> {
+    match backend {
+        BackendId::Bing => Some(BING_HOST),
+        BackendId::DuckDuckGo => Some("html.duckduckgo.com"),
+        BackendId::Tavily => Some("api.tavily.com"),
+        BackendId::Bocha => Some("api.bochaai.com"),
+        BackendId::Metaso => Some("metaso.cn"),
+        BackendId::Searxng => None,
+        BackendId::Baidu => Some("qianfan.baidubce.com"),
+        BackendId::Volcengine => Some("ark.cn-beijing.volces.com"),
+        BackendId::Sofya => Some("sofya.co"),
+    }
 }
 
 fn finalize_search_response(
@@ -917,6 +1020,17 @@ async fn run_scrape_search(
     timeout_ms: u64,
     context: &ToolContext,
 ) -> Result<BackendSearch, ToolError> {
+    // A configured API backend may carry a provider-specific base URL (most
+    // notably SearXNG). The public scrape fallback must never reinterpret
+    // that endpoint as DuckDuckGo-compatible HTML.
+    let fallback_context = (provider == SearchProvider::DuckDuckGo
+        && context.search_provider != SearchProvider::DuckDuckGo)
+        .then(|| {
+            let mut cloned = context.clone();
+            cloned.search_base_url = None;
+            cloned
+        });
+    let context = fallback_context.as_ref().unwrap_or(context);
     run_scrape_search_with_endpoints(
         provider,
         query,
@@ -948,19 +1062,13 @@ async fn run_scrape_search_with_endpoints(
     if provider == SearchProvider::Bing {
         check_policy(decider, BING_HOST)?;
         let results = run_bing_search(&client, &query.query, max_results, endpoints.bing).await?;
-        if !results.is_empty() {
-            return Ok(BackendSearch {
-                backend: BackendId::Bing,
-                source: "bing".to_string(),
-                backend_detail: None,
-                results: normalize_entries(results),
-                degraded,
-                note: None,
-            });
-        }
-        degraded.push(DegradedReason::ScrapeFallback {
-            from: BackendId::Bing,
-            to: BackendId::DuckDuckGo,
+        return Ok(BackendSearch {
+            backend: BackendId::Bing,
+            source: "bing".to_string(),
+            backend_detail: None,
+            results: normalize_entries(results),
+            degraded,
+            note: None,
         });
     }
 
@@ -996,8 +1104,6 @@ async fn run_scrape_search_with_endpoints(
     let results = parse_duckduckgo_results(&body, max_results);
     let blocked = is_duckduckgo_challenge(&body);
     if !results.is_empty() {
-        let note = (provider == SearchProvider::Bing)
-            .then(|| "Bing returned no results; used DuckDuckGo fallback".to_string());
         return Ok(BackendSearch {
             backend: BackendId::DuckDuckGo,
             source: if allow_bing_fallback {
@@ -1008,7 +1114,7 @@ async fn run_scrape_search_with_endpoints(
             backend_detail: (!allow_bing_fallback).then_some(duckduckgo_host),
             results: normalize_entries(results),
             degraded,
-            note,
+            note: None,
         });
     }
     if blocked {
@@ -1712,7 +1818,7 @@ mod tests {
         parse_volcengine_results, run_scrape_search_with_endpoints, sanitize_error_body,
         searxng_search_url, truncate_error_body, volcengine_extract_text,
     };
-    use crate::tools::web::contract::{QueryCapabilities, SearchQuery};
+    use crate::tools::web::contract::{BackendId, QueryCapabilities, SearchQuery};
     use crate::tools::web::scrape::{decode_html_entities, normalize_bing_url};
     use serde_json::json;
 
@@ -2593,7 +2699,7 @@ mod tests {
     #[tokio::test]
     async fn searxng_empty_results_report_backend() {
         use crate::config::SearchProvider;
-        use crate::tools::spec::{ToolContext, ToolSpec};
+        use crate::tools::spec::ToolContext;
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2611,26 +2717,24 @@ mod tests {
         ctx.search_provider = SearchProvider::Searxng;
         ctx.search_base_url = Some(server.uri());
 
-        let result = WebSearchTool
-            .execute(json!({"query": "empty"}), &ctx)
+        let (results, host) = WebSearchTool
+            .run_searxng_search("empty", 5, 5_000, &ctx)
             .await
-            .expect("empty searxng response should still be structured");
-        let value: serde_json::Value =
-            serde_json::from_str(&result.content).expect("web search json response");
+            .expect("empty SearXNG adapter response should be successful");
+        let expected_host = reqwest::Url::parse(&server.uri())
+            .expect("mock URL")
+            .host_str()
+            .expect("mock host")
+            .to_string();
 
-        assert_eq!(value["count"].as_u64(), Some(0));
-        assert!(
-            value["message"]
-                .as_str()
-                .expect("message")
-                .contains("Backend: searxng at")
-        );
+        assert!(results.is_empty());
+        assert_eq!(host, expected_host);
     }
 
     #[tokio::test]
     async fn searxng_http_errors_are_actionable() {
         use crate::config::SearchProvider;
-        use crate::tools::spec::{ToolContext, ToolSpec};
+        use crate::tools::spec::ToolContext;
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2649,7 +2753,7 @@ mod tests {
         ctx.search_base_url = Some(server.uri());
 
         let err = WebSearchTool
-            .execute(json!({"query": "blocked"}), &ctx)
+            .run_searxng_search("blocked", 5, 5_000, &ctx)
             .await
             .expect_err("403 should be actionable");
         let msg = err.to_string();
@@ -2664,7 +2768,7 @@ mod tests {
     #[tokio::test]
     async fn searxng_rate_limit_error_mentions_configured_instance() {
         use crate::config::SearchProvider;
-        use crate::tools::spec::{ToolContext, ToolSpec};
+        use crate::tools::spec::ToolContext;
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2683,7 +2787,7 @@ mod tests {
         ctx.search_base_url = Some(server.uri());
 
         let err = WebSearchTool
-            .execute(json!({"query": "later"}), &ctx)
+            .run_searxng_search("later", 5, 5_000, &ctx)
             .await
             .expect_err("429 should be actionable");
         let msg = err.to_string();
@@ -2698,7 +2802,7 @@ mod tests {
     #[tokio::test]
     async fn searxng_invalid_json_is_actionable() {
         use crate::config::SearchProvider;
-        use crate::tools::spec::{ToolContext, ToolSpec};
+        use crate::tools::spec::ToolContext;
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2717,7 +2821,7 @@ mod tests {
         ctx.search_base_url = Some(server.uri());
 
         let err = WebSearchTool
-            .execute(json!({"query": "html"}), &ctx)
+            .run_searxng_search("html", 5, 5_000, &ctx)
             .await
             .expect_err("invalid JSON should be actionable");
         let msg = err.to_string();
@@ -2771,6 +2875,129 @@ mod tests {
 
         assert_eq!(value["source"].as_str(), Some(expected_host.as_str()));
         assert_eq!(value["count"].as_u64(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn repeated_search_uses_session_cache_and_marks_receipt() {
+        use crate::config::SearchProvider;
+        use crate::tools::spec::{ToolContext, ToolSpec};
+        use crate::tools::web::cache;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        cache::reset_search();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/html/"))
+            .and(query_param("q", "session cache receipt"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"
+                <html><body>
+                  <a class="result__a" href="https://example.com/cached">Cached result</a>
+                  <div class="result__snippet">Fetched once.</div>
+                </body></html>
+                "#,
+            ))
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut context = ToolContext::new(tmp.path().to_path_buf())
+            .with_state_namespace("web-search-query-cache");
+        context.search_provider = SearchProvider::DuckDuckGo;
+        context.search_base_url = Some(format!("{}/html/", server.uri()));
+
+        let first = WebSearchTool
+            .execute(json!({"query": "session cache receipt"}), &context)
+            .await
+            .expect("first search should succeed");
+        let second = WebSearchTool
+            .execute(json!({"query": "session cache receipt"}), &context)
+            .await
+            .expect("second search should hit cache");
+        let first: serde_json::Value =
+            serde_json::from_str(&first.content).expect("first response json");
+        let second: serde_json::Value =
+            serde_json::from_str(&second.content).expect("second response json");
+        let requests = server.received_requests().await.expect("recorded requests");
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(first["receipt"]["cache_hit"], false);
+        assert_eq!(second["receipt"]["cache_hit"], true);
+        assert_eq!(second["receipt"]["latency_ms"], 0);
+        assert_eq!(second["results"], first["results"]);
+
+        use crate::network_policy::{Decision, NetworkPolicy, NetworkPolicyDecider};
+        let denied_host = reqwest::Url::parse(&server.uri())
+            .expect("mock server URL")
+            .host_str()
+            .expect("mock server host")
+            .to_string();
+        let policy = NetworkPolicy {
+            default: Decision::Allow.into(),
+            allow: Vec::new(),
+            deny: vec![denied_host],
+            proxy: Vec::new(),
+            proxy_fake_ip_cidrs: Vec::new(),
+            audit: false,
+        };
+        let blocked = context
+            .clone()
+            .with_network_policy(NetworkPolicyDecider::new(policy, None));
+        let error = WebSearchTool
+            .execute(json!({"query": "session cache receipt"}), &blocked)
+            .await
+            .expect_err("tightened policy must win over the query cache");
+        assert!(error.to_string().contains("blocked by network policy"));
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_bing_does_not_fall_back_to_duckduckgo() {
+        use crate::config::SearchProvider;
+        use crate::tools::spec::ToolContext;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/bing"))
+            .and(query_param("q", "one way fallback"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html></html>"))
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut context = ToolContext::new(tmp.path().to_path_buf());
+        context.search_provider = SearchProvider::Bing;
+        context.search_base_url = Some(format!("{}/must-not-be-used", server.uri()));
+        let query = SearchQuery::new("one way fallback".to_string(), 5, None, Vec::new(), None);
+        let raw = run_scrape_search_with_endpoints(
+            SearchProvider::Bing,
+            &query,
+            5_000,
+            &context,
+            ScrapeEndpoints {
+                bing: &format!("{}/bing", server.uri()),
+                allow_bing_fallback: Some(true),
+            },
+        )
+        .await
+        .expect("empty Bing response is a successful empty search");
+        let requests = server.received_requests().await.expect("recorded requests");
+
+        assert_eq!(raw.backend, BackendId::Bing);
+        assert!(raw.results.is_empty());
+        assert!(raw.degraded.is_empty());
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url.path(), "/bing");
     }
 
     #[tokio::test]

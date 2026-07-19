@@ -1,15 +1,15 @@
 //! Search backend selection and the shared async adapter contract.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
-use super::contract::{BackendId, BackendSearch, QueryCapabilities, SearchQuery};
+use super::contract::{BackendId, BackendSearch, DegradedReason, QueryCapabilities, SearchQuery};
 use crate::config::SearchProvider;
 use crate::tools::spec::{ToolContext, ToolError};
 
 #[async_trait]
-pub(crate) trait SearchBackend {
+pub(crate) trait SearchBackend: Send + Sync {
     fn id(&self) -> BackendId;
     fn capabilities(&self) -> QueryCapabilities;
     async fn search(
@@ -38,11 +38,11 @@ pub(crate) enum ConfiguredSearchBackend<'a> {
 
 impl<'a> ConfiguredSearchBackend<'a> {
     #[must_use]
-    pub(crate) fn from_context(context: &'a ToolContext) -> Self {
+    pub(crate) fn from_provider(context: &'a ToolContext, provider: SearchProvider) -> Self {
         let backend = BackendContext {
             tool_context: context,
         };
-        match context.search_provider {
+        match provider {
             SearchProvider::Bing => Self::Bing(backend),
             SearchProvider::DuckDuckGo => Self::DuckDuckGo(backend),
             SearchProvider::Tavily => Self::Tavily(backend),
@@ -84,6 +84,152 @@ impl<'a> ConfiguredSearchBackend<'a> {
     }
 }
 
+pub(crate) struct SearchBackendChain<'a> {
+    backends: Vec<ConfiguredSearchBackend<'a>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ChainedSearch {
+    pub(crate) raw: BackendSearch,
+    pub(crate) capabilities: QueryCapabilities,
+}
+
+impl<'a> SearchBackendChain<'a> {
+    #[must_use]
+    pub(crate) fn from_context(context: &'a ToolContext) -> Self {
+        let selected = context.search_provider;
+        let mut backends = vec![ConfiguredSearchBackend::from_provider(context, selected)];
+        if !matches!(selected, SearchProvider::Bing | SearchProvider::DuckDuckGo) {
+            backends.push(ConfiguredSearchBackend::from_provider(
+                context,
+                SearchProvider::DuckDuckGo,
+            ));
+        }
+        Self { backends }
+    }
+
+    #[must_use]
+    pub(crate) fn initial_backend(&self) -> BackendId {
+        self.backends
+            .first()
+            .expect("a search chain always has a configured backend")
+            .id()
+    }
+
+    pub(crate) async fn search(
+        &self,
+        query: &SearchQuery,
+        deadline: Instant,
+        first_attempt_budget: Option<Duration>,
+    ) -> Result<ChainedSearch, ToolError> {
+        let backends = self
+            .backends
+            .iter()
+            .map(|backend| backend as &dyn SearchBackend)
+            .collect::<Vec<_>>();
+        run_backend_chain(&backends, query, deadline, first_attempt_budget).await
+    }
+}
+
+async fn run_backend_chain(
+    backends: &[&dyn SearchBackend],
+    query: &SearchQuery,
+    deadline: Instant,
+    first_attempt_budget: Option<Duration>,
+) -> Result<ChainedSearch, ToolError> {
+    let mut degraded = Vec::new();
+    let mut last_empty = None;
+    let mut attempted = Vec::new();
+
+    for (index, backend) in backends.iter().enumerate() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let backend_id = backend.id();
+        if let Some(previous) = attempted.last() {
+            degraded.push(DegradedReason::BackendFallback {
+                from: *previous,
+                to: backend_id,
+            });
+        }
+        attempted.push(backend_id);
+
+        let attempts_left = u32::try_from(backends.len() - index).unwrap_or(u32::MAX);
+        let fair_share = remaining / attempts_left;
+        let attempt_budget = if index == 0 {
+            first_attempt_budget
+                .map(|budget| budget.min(remaining))
+                .unwrap_or(fair_share)
+        } else {
+            fair_share
+        }
+        .max(Duration::from_millis(1));
+        let attempt_deadline = Instant::now() + attempt_budget;
+
+        let result = tokio::time::timeout(attempt_budget, backend.search(query, attempt_deadline))
+            .await
+            .map_err(|_| ToolError::Timeout {
+                seconds: u64::try_from(attempt_budget.as_millis())
+                    .unwrap_or(u64::MAX)
+                    .div_ceil(1_000),
+            })
+            .and_then(std::convert::identity);
+
+        match result {
+            Ok(mut raw) if !raw.results.is_empty() => {
+                degraded.append(&mut raw.degraded);
+                raw.degraded = degraded;
+                return Ok(ChainedSearch {
+                    raw,
+                    capabilities: backend.capabilities(),
+                });
+            }
+            Ok(mut raw) => {
+                degraded.push(DegradedReason::NoUsableResults {
+                    backend: backend_id,
+                });
+                degraded.append(&mut raw.degraded);
+                last_empty = Some((raw, backend.capabilities()));
+            }
+            Err(error) if is_fail_closed(&error) => return Err(error),
+            Err(error) if backends.len() == 1 => return Err(error),
+            Err(_) => degraded.push(DegradedReason::BackendUnavailable {
+                backend: backend_id,
+            }),
+        }
+    }
+
+    if let Some((mut raw, capabilities)) = last_empty {
+        raw.degraded = degraded;
+        return Ok(ChainedSearch { raw, capabilities });
+    }
+
+    if attempted.is_empty() {
+        return Err(ToolError::Timeout { seconds: 1 });
+    }
+
+    let backend_ids = attempted
+        .into_iter()
+        .map(BackendId::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(ToolError::not_available(format!(
+        "web search backends unavailable: {backend_ids}"
+    )))
+}
+
+const fn is_fail_closed(error: &ToolError) -> bool {
+    matches!(
+        error,
+        ToolError::InvalidInput { .. }
+            | ToolError::MissingField { .. }
+            | ToolError::PathEscape { .. }
+            | ToolError::Cancelled { .. }
+            | ToolError::PermissionDenied { .. }
+    )
+}
+
 #[async_trait]
 impl SearchBackend for ConfiguredSearchBackend<'_> {
     fn id(&self) -> BackendId {
@@ -123,7 +269,54 @@ impl SearchBackend for ConfiguredSearchBackend<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+
+    struct FakeBackend {
+        id: BackendId,
+        result: Result<Vec<super::super::contract::SearchResult>, ToolError>,
+    }
+
+    #[async_trait]
+    impl SearchBackend for FakeBackend {
+        fn id(&self) -> BackendId {
+            self.id
+        }
+
+        fn capabilities(&self) -> QueryCapabilities {
+            QueryCapabilities::count_only()
+        }
+
+        async fn search(
+            &self,
+            _query: &SearchQuery,
+            _deadline: Instant,
+        ) -> Result<BackendSearch, ToolError> {
+            Ok(BackendSearch {
+                backend: self.id,
+                source: self.id.as_str().to_string(),
+                backend_detail: None,
+                results: self.result.clone()?,
+                degraded: Vec::new(),
+                note: None,
+            })
+        }
+    }
+
+    fn query() -> SearchQuery {
+        SearchQuery::new("bounded chain".to_string(), 5, None, Vec::new(), None)
+    }
+
+    fn result() -> super::super::contract::SearchResult {
+        super::super::contract::SearchResult::new(
+            1,
+            "Fallback result".to_string(),
+            "https://example.com/result".to_string(),
+            None,
+            None,
+        )
+    }
 
     #[test]
     fn every_configured_provider_maps_to_one_explicit_backend_adapter() {
@@ -142,12 +335,154 @@ mod tests {
         for (provider, expected) in cases {
             let mut context = ToolContext::new(std::path::PathBuf::from("."));
             context.search_provider = provider;
-            let backend = ConfiguredSearchBackend::from_context(&context);
+            let backend = ConfiguredSearchBackend::from_provider(&context, provider);
             assert_eq!(backend.id(), expected);
             assert_eq!(
                 backend.capabilities().max_results,
                 super::super::contract::CapabilityState::Supported
             );
         }
+    }
+
+    #[tokio::test]
+    async fn unavailable_api_falls_back_with_explicit_receipts() {
+        let api = FakeBackend {
+            id: BackendId::Tavily,
+            result: Err(ToolError::execution_failed(
+                "provider detail must stay private",
+            )),
+        };
+        let scrape = FakeBackend {
+            id: BackendId::DuckDuckGo,
+            result: Ok(vec![result()]),
+        };
+        let response = run_backend_chain(
+            &[&api, &scrape],
+            &query(),
+            Instant::now() + Duration::from_secs(1),
+            None,
+        )
+        .await
+        .expect("fallback should succeed");
+
+        assert_eq!(response.raw.backend, BackendId::DuckDuckGo);
+        assert_eq!(
+            response.raw.degraded,
+            vec![
+                DegradedReason::BackendUnavailable {
+                    backend: BackendId::Tavily,
+                },
+                DegradedReason::BackendFallback {
+                    from: BackendId::Tavily,
+                    to: BackendId::DuckDuckGo,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn all_unavailable_returns_typed_error_with_backend_ids_only() {
+        let private_error = "secret provider response";
+        let api = FakeBackend {
+            id: BackendId::Bocha,
+            result: Err(ToolError::execution_failed(private_error)),
+        };
+        let scrape = FakeBackend {
+            id: BackendId::DuckDuckGo,
+            result: Err(ToolError::execution_failed("different private response")),
+        };
+        let error = run_backend_chain(
+            &[&api, &scrape],
+            &query(),
+            Instant::now() + Duration::from_secs(1),
+            None,
+        )
+        .await
+        .expect_err("all-down chain must fail");
+        let message = error.to_string();
+
+        assert!(matches!(error, ToolError::NotAvailable { .. }));
+        assert!(message.contains("bocha, duckduckgo"));
+        assert!(!message.contains(private_error));
+        assert!(!message.contains("different private response"));
+    }
+
+    #[tokio::test]
+    async fn policy_failure_does_not_leak_query_to_fallback() {
+        struct CountingBackend {
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        #[async_trait]
+        impl SearchBackend for CountingBackend {
+            fn id(&self) -> BackendId {
+                BackendId::DuckDuckGo
+            }
+
+            fn capabilities(&self) -> QueryCapabilities {
+                QueryCapabilities::count_only()
+            }
+
+            async fn search(
+                &self,
+                _query: &SearchQuery,
+                _deadline: Instant,
+            ) -> Result<BackendSearch, ToolError> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(ToolError::execution_failed("unexpected fallback"))
+            }
+        }
+
+        let api = FakeBackend {
+            id: BackendId::Searxng,
+            result: Err(ToolError::permission_denied("policy blocked")),
+        };
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let scrape = CountingBackend {
+            calls: Arc::clone(&calls),
+        };
+        let error = run_backend_chain(
+            &[&api, &scrape],
+            &query(),
+            Instant::now() + Duration::from_secs(1),
+            None,
+        )
+        .await
+        .expect_err("policy error must fail closed");
+
+        assert!(matches!(error, ToolError::PermissionDenied { .. }));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_api_falls_back_and_records_no_usable_results() {
+        let api = FakeBackend {
+            id: BackendId::Metaso,
+            result: Ok(Vec::new()),
+        };
+        let scrape = FakeBackend {
+            id: BackendId::DuckDuckGo,
+            result: Ok(vec![result()]),
+        };
+        let response = run_backend_chain(
+            &[&api, &scrape],
+            &query(),
+            Instant::now() + Duration::from_secs(1),
+            None,
+        )
+        .await
+        .expect("empty API response should fall back");
+
+        assert_eq!(
+            response.raw.degraded,
+            vec![
+                DegradedReason::NoUsableResults {
+                    backend: BackendId::Metaso,
+                },
+                DegradedReason::BackendFallback {
+                    from: BackendId::Metaso,
+                    to: BackendId::DuckDuckGo,
+                },
+            ]
+        );
     }
 }

@@ -395,7 +395,6 @@ mod tests {
 
     #[tokio::test]
     async fn transient_server_error_retries_once_then_caches() {
-        cache::reset();
         let server = MockServer::start().await;
         let calls = Arc::new(AtomicUsize::new(0));
         Mock::given(method("GET"))
@@ -426,7 +425,6 @@ mod tests {
 
     #[tokio::test]
     async fn truncated_cache_refetches_when_larger_body_is_requested() {
-        cache::reset();
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/large"))
@@ -487,7 +485,6 @@ mod tests {
     async fn tightened_network_policy_blocks_an_existing_cache_entry() {
         use crate::network_policy::{Decision, NetworkPolicy, NetworkPolicyDecider};
 
-        cache::reset();
         let url = reqwest::Url::parse("https://example.com/cached").unwrap();
         cache::insert(
             "policy-cache",
@@ -529,7 +526,6 @@ mod tests {
     async fn tightened_network_policy_checks_cached_redirect_destination() {
         use crate::network_policy::{Decision, NetworkPolicy, NetworkPolicyDecider};
 
-        cache::reset();
         let initial_url = reqwest::Url::parse("https://8.8.8.8/cached").unwrap();
         cache::insert(
             "redirect-policy-cache",

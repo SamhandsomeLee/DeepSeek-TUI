@@ -7,7 +7,10 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Search provider enumeration — selects which backend `web_search` uses.
+/// Search provider enumeration — selects the first backend `web_search` uses.
+/// API-backed providers may visibly degrade through the default DuckDuckGo →
+/// Bing chain after runtime failure or an empty result. Configuration and
+/// network-policy errors fail closed without crossing providers.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchProvider {

@@ -1,4 +1,4 @@
-//! Small session-scoped TTL cache for fetched response bodies.
+//! Small session-scoped TTL caches for web searches and fetched bodies.
 
 use std::num::NonZeroUsize;
 use std::sync::{Arc, OnceLock};
@@ -7,10 +7,15 @@ use std::time::{Duration, Instant};
 use lru::LruCache;
 use parking_lot::Mutex;
 
+use super::contract::{BackendId, SearchQuery, SearchResponse};
+
 const FETCH_CACHE_ENTRIES: usize = 256;
+const SEARCH_CACHE_ENTRIES: usize = 128;
 const FETCH_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
+const SEARCH_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 
 static FETCH_CACHE: OnceLock<Mutex<LruCache<FetchCacheKey, FetchCacheEntry>>> = OnceLock::new();
+static SEARCH_CACHE: OnceLock<Mutex<LruCache<SearchCacheKey, SearchCacheEntry>>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FetchCacheKey {
@@ -36,12 +41,48 @@ struct FetchCacheEntry {
     payload: CachedFetch,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SearchCacheKey {
+    namespace: String,
+    initial_backend: BackendId,
+    base_url: Option<String>,
+    query: SearchQuery,
+}
+
+#[derive(Debug, Clone)]
+struct SearchCacheEntry {
+    searched_at: Instant,
+    response: SearchResponse,
+}
+
 fn cache() -> &'static Mutex<LruCache<FetchCacheKey, FetchCacheEntry>> {
     FETCH_CACHE.get_or_init(|| {
         Mutex::new(LruCache::new(
             NonZeroUsize::new(FETCH_CACHE_ENTRIES).expect("non-zero cache capacity"),
         ))
     })
+}
+
+fn search_cache() -> &'static Mutex<LruCache<SearchCacheKey, SearchCacheEntry>> {
+    SEARCH_CACHE.get_or_init(|| {
+        Mutex::new(LruCache::new(
+            NonZeroUsize::new(SEARCH_CACHE_ENTRIES).expect("non-zero search cache capacity"),
+        ))
+    })
+}
+
+fn search_key(
+    namespace: &str,
+    initial_backend: BackendId,
+    base_url: Option<&str>,
+    query: &SearchQuery,
+) -> SearchCacheKey {
+    SearchCacheKey {
+        namespace: namespace.to_string(),
+        initial_backend,
+        base_url: base_url.map(str::to_string),
+        query: query.clone(),
+    }
 }
 
 fn key(namespace: &str, url: &reqwest::Url, accept: &str) -> FetchCacheKey {
@@ -93,9 +134,47 @@ pub(crate) fn insert(namespace: &str, url: &reqwest::Url, accept: &str, payload:
     );
 }
 
+pub(crate) fn get_search(
+    namespace: &str,
+    initial_backend: BackendId,
+    base_url: Option<&str>,
+    query: &SearchQuery,
+) -> Option<SearchResponse> {
+    let key = search_key(namespace, initial_backend, base_url, query);
+    let mut cache = search_cache().lock();
+    let entry = cache.get(&key)?.clone();
+    if entry.searched_at.elapsed() > SEARCH_CACHE_TTL {
+        cache.pop(&key);
+        return None;
+    }
+
+    Some(entry.response)
+}
+
+pub(crate) fn insert_search(
+    namespace: &str,
+    initial_backend: BackendId,
+    base_url: Option<&str>,
+    query: &SearchQuery,
+    response: SearchResponse,
+) {
+    search_cache().lock().put(
+        search_key(namespace, initial_backend, base_url, query),
+        SearchCacheEntry {
+            searched_at: Instant::now(),
+            response,
+        },
+    );
+}
+
 #[cfg(test)]
 pub(crate) fn reset() {
     cache().lock().clear();
+}
+
+#[cfg(test)]
+pub(crate) fn reset_search() {
+    search_cache().lock().clear();
 }
 
 #[cfg(test)]
@@ -111,6 +190,39 @@ mod tests {
             bytes: Arc::new(bytes.to_vec()),
             truncated,
             redirects: 0,
+        }
+    }
+
+    fn search_response(query: SearchQuery) -> SearchResponse {
+        use super::super::contract::{
+            HonoredQueryCapabilities, QueryCapabilities, SearchReceipt, SearchResult,
+        };
+
+        SearchResponse {
+            query: query.query.clone(),
+            source: "duckduckgo".to_string(),
+            count: 1,
+            message: "Found 1 result(s)".to_string(),
+            results: vec![SearchResult::new(
+                1,
+                "Cached result".to_string(),
+                "https://example.com/result".to_string(),
+                None,
+                None,
+            )],
+            receipt: SearchReceipt {
+                backend: BackendId::DuckDuckGo,
+                backend_detail: None,
+                requested: query,
+                capabilities: QueryCapabilities::count_only(),
+                honored: HonoredQueryCapabilities {
+                    max_results: true,
+                    ..HonoredQueryCapabilities::default()
+                },
+                degraded: Vec::new(),
+                latency_ms: 4,
+                cache_hit: false,
+            },
         }
     }
 
@@ -137,5 +249,34 @@ mod tests {
         assert!(get("session-a", &url, "text/html", 10).is_some());
         assert!(get("session-b", &url, "text/html", 10).is_none());
         assert!(get("session-a", &url, "application/json", 10).is_none());
+    }
+
+    #[test]
+    fn search_cache_is_scoped_by_session_backend_endpoint_and_query() {
+        reset_search();
+        let query = SearchQuery::new("cached query".to_string(), 5, None, Vec::new(), None);
+        insert_search(
+            "session-a",
+            BackendId::Tavily,
+            None,
+            &query,
+            search_response(query.clone()),
+        );
+
+        assert!(get_search("session-a", BackendId::Tavily, None, &query).is_some());
+        assert!(get_search("session-b", BackendId::Tavily, None, &query).is_none());
+        assert!(get_search("session-a", BackendId::DuckDuckGo, None, &query).is_none());
+        assert!(
+            get_search(
+                "session-a",
+                BackendId::Tavily,
+                Some("https://search.example/"),
+                &query,
+            )
+            .is_none()
+        );
+        let other_query =
+            SearchQuery::new("different query".to_string(), 5, None, Vec::new(), None);
+        assert!(get_search("session-a", BackendId::Tavily, None, &other_query).is_none());
     }
 }
