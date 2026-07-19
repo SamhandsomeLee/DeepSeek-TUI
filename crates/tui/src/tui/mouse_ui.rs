@@ -775,7 +775,12 @@ pub(crate) fn apply_sidebar_row_action(app: &mut App, action: SidebarRowAction) 
                 _ => None,
             });
             if let Some(event) = stop_event {
-                pager = pager.with_destructive_action('s', "stop", event);
+                pager = pager.with_destructive_action(
+                    's',
+                    app.tr(MessageId::SidebarStopControl),
+                    app.tr(MessageId::WorkSurfaceStopConfirmHint),
+                    event,
+                );
             }
             app.view_stack.push(pager);
             app.needs_redraw = true;

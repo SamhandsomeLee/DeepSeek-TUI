@@ -188,6 +188,7 @@ impl WorkRuntime {
         &self,
         session_id: Option<&str>,
         approval_reference: &str,
+        expected_proposal_id: Option<&ProposalId>,
     ) -> Result<usize, String> {
         let todos_guard = self.todos.lock().await;
         let plan_guard = self.plan.lock().await;
@@ -207,23 +208,26 @@ impl WorkRuntime {
             .map(|proposal| proposal.id.clone())
             .collect::<Vec<_>>();
         let mut accepted_existing_proposal = false;
-        if let Some((accepted_id, superseded_ids)) = proposal_ids.split_last() {
-            for proposal_id in superseded_ids {
-                apply_change(
-                    &mut graph,
-                    &session_id,
-                    "plan_acceptance",
-                    WorkGraphChange::WithdrawPlanDiff {
-                        proposal_id: proposal_id.clone(),
-                    },
-                )?;
+        if proposal_ids.is_empty() {
+            if expected_proposal_id.is_some() {
+                return Err("the reviewed Plan proposal is no longer pending".to_string());
+            }
+        } else {
+            let expected = expected_proposal_id.ok_or_else(|| {
+                "Plan acceptance is missing the proposal shown for review".to_string()
+            })?;
+            if proposal_ids.len() != 1 || proposal_ids.first() != Some(expected) {
+                return Err(
+                    "the pending Plan proposal changed after review; render it again before accepting"
+                        .to_string(),
+                );
             }
             apply_change(
                 &mut graph,
                 &session_id,
                 "plan_acceptance",
                 WorkGraphChange::AcceptPlanDiff {
-                    proposal_id: accepted_id.clone(),
+                    proposal_id: expected.clone(),
                     approval: ApprovalRef {
                         reference: approval_reference.to_string(),
                     },
@@ -427,6 +431,17 @@ impl WorkRuntime {
         &self,
         session_id: Option<&str>,
     ) -> Result<Option<PlanSnapshot>, String> {
+        self.plan_review_for_confirmation(session_id)
+            .map(|review| review.map(|(_, plan, _)| plan))
+    }
+
+    /// Return the exact proposal identity together with the preview and its
+    /// user-visible delta. The UI retains this id and must present it again at
+    /// acceptance, so a proposal replaced after rendering fails closed.
+    pub fn plan_review_for_confirmation(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<Option<(ProposalId, PlanSnapshot, String)>, String> {
         let active = lock_unpoisoned(&self.graph);
         if let (Some(expected), Some(actual)) = (session_id, active.session_id.as_deref())
             && expected != actual
@@ -449,7 +464,11 @@ impl WorkRuntime {
             },
         )
         .map_err(|err| err.to_string())?;
-        Ok(Some(project_plan(&preview)))
+        Ok(Some((
+            proposal.id.clone(),
+            project_plan(&preview),
+            format_plan_diff_summary(graph, proposal),
+        )))
     }
 
     /// Compact, user-visible receipt for the latest pending Plan diff.
@@ -1306,12 +1325,16 @@ mod tests {
             .await
             .expect("plan update");
         assert_eq!(
-            runtime.accept_plan(Some("session"), "accept_act").await,
+            runtime
+                .accept_plan(Some("session"), "accept_act", None)
+                .await,
             Ok(1)
         );
         assert_eq!(runtime.publish_pending().await, Ok(true));
         assert_eq!(
-            runtime.accept_plan(Some("session"), "accept_act").await,
+            runtime
+                .accept_plan(Some("session"), "accept_act", None)
+                .await,
             Ok(0),
             "already-aliased acceptance adds no duplicate To-do rows"
         );
@@ -1405,7 +1428,7 @@ mod tests {
         );
 
         runtime
-            .accept_plan(Some("session"), "accept_act")
+            .accept_plan(Some("session"), "accept_act", None)
             .await
             .expect("accept plan");
         let captured = runtime
@@ -1478,15 +1501,44 @@ mod tests {
             "accepted Plan projection must not move"
         );
         assert_eq!(staged.graph.proposals.len(), 1);
+        let reviewed_proposal_id = staged.graph.proposals[0].id.clone();
         assert!(staged.graph.proposals[0].added_nodes.len() >= 3);
         assert!(staged.graph.proposals[0].replacement_compat.is_some());
+        assert!(
+            runtime
+                .accept_plan(Some("session"), "accept_act", None)
+                .await
+                .expect_err("acceptance without the rendered proposal id must fail")
+                .contains("missing the proposal")
+        );
+        let unseen_proposal_id = ProposalId::derive("session", "unseen-proposal");
+        assert!(
+            runtime
+                .accept_plan(Some("session"), "accept_act", Some(&unseen_proposal_id),)
+                .await
+                .expect_err("a different proposal id must fail")
+                .contains("changed after review")
+        );
+        assert_eq!(
+            runtime
+                .capture(Some("session"))
+                .expect("capture rejected acceptance")
+                .expect("graph")
+                .graph
+                .proposals
+                .len(),
+            1,
+            "a mismatched acceptance must leave the reviewed proposal untouched"
+        );
 
         assert_eq!(runtime.publish_pending().await, Ok(true));
         assert!(plan.lock().await.snapshot().is_empty());
         assert!(todos.lock().await.snapshot().is_empty());
 
         assert_eq!(
-            runtime.accept_plan(Some("session"), "accept_act").await,
+            runtime
+                .accept_plan(Some("session"), "accept_act", Some(&reviewed_proposal_id),)
+                .await,
             Ok(2)
         );
         let accepted = runtime
@@ -1544,6 +1596,7 @@ mod tests {
             .expect("capture replacement")
             .expect("replacement graph");
         assert_eq!(replaced.graph.proposals.len(), 1);
+        let reviewed_replacement_id = replaced.graph.proposals[0].id.clone();
         assert_eq!(
             runtime.plan_for_review(Some("session")),
             Ok(Some(replacement.clone()))
@@ -1554,7 +1607,11 @@ mod tests {
         }));
 
         runtime
-            .accept_plan(Some("session"), "accept_act")
+            .accept_plan(
+                Some("session"),
+                "accept_act",
+                Some(&reviewed_replacement_id),
+            )
             .await
             .expect("accept replacement");
         runtime

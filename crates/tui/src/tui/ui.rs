@@ -3148,21 +3148,20 @@ async fn run_event_loop(
                             && app.queued_draft.is_none()
                         {
                             let review_plan = match app.runtime_services.work.as_ref().map(|work| {
-                                work.plan_for_review(app.current_session_id.as_deref())
-                                    .and_then(|plan| {
-                                        work.plan_diff_summary(app.current_session_id.as_deref())
-                                            .map(|summary| (plan, summary))
-                                    })
+                                work.plan_review_for_confirmation(app.current_session_id.as_deref())
                             }) {
-                                Some(Ok((Some(proposed), summary))) => Ok((proposed, summary)),
-                                None => Ok((app.plan_state.lock().await.snapshot(), None)),
-                                Some(Ok((None, _))) => {
-                                    Ok((app.plan_state.lock().await.snapshot(), None))
+                                Some(Ok(Some((proposal_id, proposed, summary)))) => {
+                                    Ok((Some(proposal_id), proposed, Some(summary)))
+                                }
+                                None => Ok((None, app.plan_state.lock().await.snapshot(), None)),
+                                Some(Ok(None)) => {
+                                    Ok((None, app.plan_state.lock().await.snapshot(), None))
                                 }
                                 Some(Err(err)) => Err(err),
                             };
                             match review_plan {
-                                Ok((plan, summary)) => {
+                                Ok((proposal_id, plan, summary)) => {
+                                    app.pending_plan_proposal_id = proposal_id;
                                     app.plan_prompt_pending = true;
                                     app.add_message(HistoryCell::System {
                                         content: plan_next_step_prompt(),
@@ -3182,6 +3181,7 @@ async fn run_event_loop(
                                         "validated Plan diff could not be rendered for review"
                                     );
                                     app.plan_prompt_pending = false;
+                                    app.pending_plan_proposal_id = None;
                                     let message = format!(
                                         "Plan review is unavailable; no proposal was accepted ({err})"
                                     );
@@ -10986,9 +10986,11 @@ async fn apply_plan_choice(
         app.runtime_services.work.as_ref(),
         app.current_session_id.as_deref(),
         acceptance,
+        app.pending_plan_proposal_id.as_ref(),
     )
     .await
     .map_err(|err| anyhow::anyhow!("failed to project accepted plan: {err}"))?;
+    app.pending_plan_proposal_id = None;
     persist_pending_work_checkpoint(app)
         .await
         .map_err(|err| anyhow::anyhow!("accepted plan was not checkpointed: {err}"))?;

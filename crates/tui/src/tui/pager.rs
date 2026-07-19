@@ -35,6 +35,7 @@ use crate::tui::views::{
 struct PagerDestructiveAction {
     key: char,
     label: String,
+    confirm_label: String,
     event: ViewEvent,
     armed: bool,
 }
@@ -108,11 +109,13 @@ impl PagerView {
         mut self,
         key: char,
         label: impl Into<String>,
+        confirm_label: impl Into<String>,
         event: ViewEvent,
     ) -> Self {
         self.destructive_action = Some(PagerDestructiveAction {
             key,
             label: label.into(),
+            confirm_label: confirm_label.into(),
             event,
             armed: false,
         });
@@ -482,7 +485,7 @@ impl ModalView for PagerView {
         if let Some(action) = self.destructive_action.as_ref() {
             let key = action.key.to_string();
             let label = if action.armed {
-                format!("confirm {} · Esc cancels", action.label)
+                action.confirm_label.clone()
             } else {
                 action.label.clone()
             };
@@ -674,6 +677,7 @@ mod tests {
         let mut pager = make_pager(2).with_destructive_action(
             's',
             "stop",
+            "confirm stop · Esc cancels",
             ViewEvent::SidebarAgentCancel {
                 agent_id: "agent_1".to_string(),
             },

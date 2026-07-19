@@ -247,6 +247,34 @@ mod tests {
     }
 
     #[test]
+    fn graph_error_without_an_active_session_stays_suppressed() {
+        let mut app = app();
+        let todos = app.todos.clone();
+        let _guard = todos.try_lock().expect("hold To-do authority lock");
+
+        let rows = super::model::project(&mut app);
+
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn waiting_operation_is_not_counted_as_running() {
+        let mut app = app();
+        let graph = operation_graph(NodeState::Waiting);
+        restore_graph(&mut app, &graph);
+
+        let rows = super::model::project(&mut app);
+
+        assert!(
+            rows[0]
+                .label
+                .starts_with("Work · 0 running · 1 waiting · 0 ready · 0 blocked"),
+            "{}",
+            rows[0].label
+        );
+    }
+
+    #[test]
     fn stale_operation_is_blocked_attention_with_bounded_output_section() {
         let mut app = app();
         let graph = operation_graph(NodeState::Stale);

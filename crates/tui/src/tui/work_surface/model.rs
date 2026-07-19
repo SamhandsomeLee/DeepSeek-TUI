@@ -191,7 +191,7 @@ pub(super) fn project(app: &mut App) -> Vec<WorkRow> {
         }
         Some(Err(error)) => (
             app.work_surface.cached_graph.clone(),
-            Some(WorkSourceState::Error(error)),
+            active_session.then_some(WorkSourceState::Error(error)),
         ),
         None => (
             app.work_surface.cached_graph.clone(),
@@ -231,7 +231,14 @@ fn graph_rows(
             )
         })
         .collect::<Vec<_>>();
-    let running = visible.iter().filter(|node| node.state.is_live()).count();
+    let running = visible
+        .iter()
+        .filter(|node| node.state == NodeState::Active)
+        .count();
+    let waiting = visible
+        .iter()
+        .filter(|node| node.state == NodeState::Waiting)
+        .count();
     let ready = visible
         .iter()
         .filter(|node| node.state == NodeState::Ready)
@@ -247,8 +254,11 @@ fn graph_rows(
         || format!("graph revision {}", snapshot.revision),
         |state| format!("graph revision {} · {}", snapshot.revision, state.detail()),
     );
+    let waiting = (waiting > 0)
+        .then(|| format!(" · {waiting} waiting"))
+        .unwrap_or_default();
     let mut rows = vec![heading(
-        &format!("Work · {running} running · {ready} ready · {blocked} blocked{status}"),
+        &format!("Work · {running} running{waiting} · {ready} ready · {blocked} blocked{status}"),
         &detail,
     )];
     rows.extend(
