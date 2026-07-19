@@ -447,11 +447,13 @@ fn push_file_backed_model_bound_secrets(values: &mut Vec<String>) {
         return;
     }
 
-    // Read the file backend directly. `Secrets::auto_detect()` could select
-    // the opt-in OS keychain, where probing every inactive provider would
-    // cause a burst of user-visible credential prompts. The active credential
-    // is already covered by `deepseek_api_key()` regardless of backend.
-    let secrets = codewhale_secrets::Secrets::file_backed();
+    // Redaction needs only a best-effort view of inactive file-backed
+    // credentials. It must not cause a legacy-store migration merely because a
+    // client is being constructed (notably for `doctor`'s live probe). Keep
+    // this file-only to avoid a burst of OS-keychain prompts for inactive
+    // providers; the active credential is already supplied by the route
+    // resolver.
+    let secrets = codewhale_secrets::Secrets::file_backed_read_only();
     let mut slots = Vec::new();
     for provider in ApiProvider::all()
         .iter()

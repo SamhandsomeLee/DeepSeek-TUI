@@ -498,6 +498,18 @@ impl Settings {
         Ok(settings)
     }
 
+    /// Load settings for a diagnostic without migrating a legacy file.
+    ///
+    /// This preserves the same candidate precedence, parser normalization, and
+    /// environment overlays as [`Settings::load`]. Unlike an interactive
+    /// startup, diagnostics must not create `~/.codewhale/settings.toml` just
+    /// because they inspected a legacy `~/.deepseek/settings.toml` file.
+    pub(crate) fn load_read_only() -> Result<Self> {
+        let mut settings = Self::load_persisted_read_only()?;
+        settings.apply_env_overrides();
+        Ok(settings)
+    }
+
     /// Load the normalized values stored on disk without terminal/runtime
     /// overlays. Configuration editors use this path so a value labelled
     /// "saved" never silently reports a tmux, SSH, or accessibility override.
@@ -506,10 +518,36 @@ impl Settings {
         Self::load_persisted_from_candidates(primary, legacy_home, legacy_config_dir)
     }
 
+    /// Load normalized disk values for a diagnostic without creating a
+    /// primary settings file from a legacy fallback.
+    fn load_persisted_read_only() -> Result<Self> {
+        let (primary, legacy_home, legacy_config_dir) = settings_path_candidates();
+        Self::load_persisted_from_candidates_with_migration(
+            primary,
+            legacy_home,
+            legacy_config_dir,
+            false,
+        )
+    }
+
     fn load_persisted_from_candidates(
         primary: Option<PathBuf>,
         legacy_home: Option<PathBuf>,
         legacy_config_dir: Option<PathBuf>,
+    ) -> Result<Self> {
+        Self::load_persisted_from_candidates_with_migration(
+            primary,
+            legacy_home,
+            legacy_config_dir,
+            true,
+        )
+    }
+
+    fn load_persisted_from_candidates_with_migration(
+        primary: Option<PathBuf>,
+        legacy_home: Option<PathBuf>,
+        legacy_config_dir: Option<PathBuf>,
+        migrate_legacy_file: bool,
     ) -> Result<Self> {
         let write_path = primary
             .as_ref()
@@ -585,7 +623,9 @@ impl Settings {
             }
             s
         };
-        migrate_settings_file_to_primary_if_needed(&write_path, &read_path);
+        if migrate_legacy_file {
+            migrate_settings_file_to_primary_if_needed(&write_path, &read_path);
+        }
         Ok(settings)
     }
 
@@ -3140,6 +3180,40 @@ mod tests {
         assert!(
             display.contains(&format!("Config file: {}", primary.display())),
             "settings display should surface the canonical codewhale path:\n{display}"
+        );
+    }
+
+    #[test]
+    fn settings_load_read_only_reads_legacy_home_without_creating_primary() {
+        let _g = config_path_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let primary = tmp.path().join(".codewhale").join("settings.toml");
+        let legacy = tmp.path().join(".deepseek").join("settings.toml");
+        let legacy_bytes =
+            b"default_mode = \"plan\"\nlow_motion = false\nfancy_animations = true\n";
+        std::fs::create_dir_all(legacy.parent().expect("legacy parent")).expect("legacy directory");
+        std::fs::write(&legacy, legacy_bytes).expect("legacy settings");
+        let _config_override = EnvVarRestore::remove("DEEPSEEK_CONFIG_PATH");
+        let _codewhale_home = EnvVarRestore::remove("CODEWHALE_HOME");
+        let _home = EnvVarRestore::set("HOME", tmp.path());
+        let _no_animations = EnvVarRestore::set("NO_ANIMATIONS", "1");
+
+        let loaded = Settings::load_read_only().expect("read-only settings load");
+
+        assert_eq!(loaded.default_mode, "plan");
+        assert!(loaded.low_motion, "environment overlays still apply");
+        assert!(
+            !loaded.fancy_animations,
+            "environment overlays still apply to parsed legacy settings"
+        );
+        assert!(
+            !primary.exists(),
+            "a diagnostic settings read must not create the primary settings path"
+        );
+        assert_eq!(
+            std::fs::read(&legacy).expect("legacy settings after read"),
+            legacy_bytes,
+            "a diagnostic settings read must not rewrite the legacy settings file"
         );
     }
 

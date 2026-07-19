@@ -4851,6 +4851,38 @@ impl Config {
     /// explicitly set the field (not the legacy `API_KEYRING_SENTINEL`
     /// placeholder, not empty whitespace).
     pub fn deepseek_api_key(&self) -> Result<String> {
+        self.deepseek_api_key_with_secret_store_mode(false)
+    }
+
+    /// Resolve an API key for a diagnostic without migrating a legacy secret
+    /// store or opening a write-capable secret backend.
+    ///
+    /// This retains ordinary credential precedence, including a legacy
+    /// file-backed secret as a fallback, but it must only be used by static
+    /// diagnostic/reporting paths. Normal runtime and authentication paths use
+    /// [`Self::deepseek_api_key`] and preserve their existing migration
+    /// behavior.
+    pub(crate) fn deepseek_api_key_read_only(&self) -> Result<String> {
+        self.deepseek_api_key_with_secret_store_mode(true)
+    }
+
+    /// Clone this route with a diagnostic-only credential in its in-memory
+    /// provider slot.
+    ///
+    /// A live `doctor` probe still needs to construct the ordinary client. By
+    /// materializing the credential on an isolated clone first, that client
+    /// never reaches the normal migrating secret-store resolver while it is
+    /// only checking connectivity. The clone is process-local and is never
+    /// persisted.
+    pub(crate) fn with_read_only_api_key_for_diagnostic(&self) -> Result<Self> {
+        let provider = self.api_provider();
+        let api_key = self.deepseek_api_key_read_only()?;
+        let mut diagnostic = self.clone();
+        diagnostic.set_provider_api_key_override(provider, Some(api_key));
+        Ok(diagnostic)
+    }
+
+    fn deepseek_api_key_with_secret_store_mode(&self, read_only: bool) -> Result<String> {
         let provider = self.api_provider();
         let auth_mode = self.auth_mode_for_provider(provider);
         if auth_mode_disables_api_key(auth_mode.as_deref()) {
@@ -4972,7 +5004,7 @@ impl Config {
         // default; the OS keyring is queried only when the user explicitly
         // selects the system backend.
         if !self.should_skip_secret_store_for_provider(provider)
-            && let Some(value) = provider_secret_store_api_key(self, provider)
+            && let Some(value) = provider_secret_store_api_key_with_mode(self, provider, read_only)
         {
             return Ok(value);
         }
@@ -8824,6 +8856,28 @@ pub(crate) fn provider_secret_store_api_key(
     config: &Config,
     provider: ApiProvider,
 ) -> Option<String> {
+    provider_secret_store_api_key_with_mode(config, provider, false)
+}
+
+/// Read the durable secret-store layer for a diagnostic without migration or
+/// any write-capable store handle.
+///
+/// Doctor and setup-status output need to report whether a saved credential is
+/// present, but must not turn that inspection into a legacy-store migration.
+/// Normal runtime and authentication paths use [`provider_secret_store_api_key`]
+/// and retain their existing migration behavior.
+pub(crate) fn provider_secret_store_api_key_read_only(
+    config: &Config,
+    provider: ApiProvider,
+) -> Option<String> {
+    provider_secret_store_api_key_with_mode(config, provider, true)
+}
+
+fn provider_secret_store_api_key_with_mode(
+    config: &Config,
+    provider: ApiProvider,
+    read_only: bool,
+) -> Option<String> {
     // Keep the named-custom exclusion at the credential boundary itself.
     // Callers also use this policy to avoid unnecessary keyring probes, but a
     // future caller must not be able to read the legacy `custom` slot for an
@@ -8842,7 +8896,12 @@ pub(crate) fn provider_secret_store_api_key(
         return None;
     }
 
-    codewhale_secrets::Secrets::auto_detect()
+    let secrets = if read_only {
+        codewhale_secrets::Secrets::auto_detect_read_only()
+    } else {
+        codewhale_secrets::Secrets::auto_detect()
+    };
+    secrets
         .get(provider_secret_store_slot(provider))
         .ok()
         .flatten()

@@ -1638,7 +1638,8 @@ fn run() -> Result<()> {
             delegate_to_tui(&cli, &resolved_runtime, args.args)
         }
         Some(Commands::Doctor(args)) => {
-            let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
+            let resolved_runtime =
+                resolve_runtime_for_diagnostic_dispatch(&store, &runtime_overrides);
             delegate_to_tui(&cli, &resolved_runtime, tui_args("doctor", args))
         }
         Some(Commands::Models(args)) => {
@@ -1666,7 +1667,11 @@ fn run() -> Result<()> {
             delegate_to_tui(&cli, &resolved_runtime, tui_args("init", args))
         }
         Some(Commands::Setup(args)) => {
-            let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
+            let resolved_runtime = if setup_is_status_report(&args) {
+                resolve_runtime_for_diagnostic_dispatch(&store, &runtime_overrides)
+            } else {
+                resolve_runtime_for_dispatch(&mut store, &runtime_overrides)
+            };
             delegate_to_tui(&cli, &resolved_runtime, tui_args("setup", args))
         }
         Some(Commands::RemoteSetup(args)) => {
@@ -1822,6 +1827,20 @@ fn resolve_runtime_for_dispatch(
     resolve_runtime_for_dispatch_with_secrets(store, runtime_overrides, &runtime_secrets)
 }
 
+/// Resolve enough routing state to delegate a static diagnostic without
+/// reading or migrating the durable secret store.
+///
+/// The TUI's doctor/setup-status path performs its own read-only source check,
+/// so this dispatcher must not recover and export a credential merely to start
+/// that report. Regular runtime and authentication commands keep using
+/// [`resolve_runtime_for_dispatch`].
+fn resolve_runtime_for_diagnostic_dispatch(
+    store: &ConfigStore,
+    runtime_overrides: &CliRuntimeOverrides,
+) -> ResolvedRuntimeOptions {
+    store.config.resolve_runtime_options(runtime_overrides)
+}
+
 fn resolve_runtime_for_dispatch_with_secrets(
     store: &mut ConfigStore,
     runtime_overrides: &CliRuntimeOverrides,
@@ -1837,6 +1856,10 @@ fn tui_args(command: &str, args: TuiPassthroughArgs) -> Vec<String> {
     forwarded.push(command.to_string());
     forwarded.extend(args.args);
     forwarded
+}
+
+fn setup_is_status_report(args: &TuiPassthroughArgs) -> bool {
+    args.args.iter().any(|arg| arg == "--status")
 }
 
 fn reject_exec_global_flags(args: &[String]) -> Result<()> {

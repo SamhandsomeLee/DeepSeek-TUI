@@ -3124,7 +3124,10 @@ fn report_write_status(label: &str, path: &Path, status: WriteStatus) {
     }
 }
 
-/// Source of the resolved DeepSeek API key, used in status reports.
+/// Source of the resolved API key, used only by static doctor/setup reports.
+///
+/// These reports must not migrate a legacy secret store or acquire a
+/// write-capable credential handle just to label a source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApiKeySource {
     Env,
@@ -3194,7 +3197,7 @@ fn resolve_api_key_source(config: &Config) -> ApiKeySource {
     } else if configured_provider_env_key_source(config).is_some() {
         ApiKeySource::Env
     } else if !config.should_skip_secret_store_for_provider(provider)
-        && crate::config::provider_secret_store_api_key(config, provider).is_some()
+        && crate::config::provider_secret_store_api_key_read_only(config, provider).is_some()
     {
         ApiKeySource::Keyring
     } else if provider_env_key_source_for_config(config).is_some() {
@@ -3352,6 +3355,8 @@ fn run_setup_status(
         .clone()
         .unwrap_or_else(|| DEFAULT_TEXT_MODEL.to_string());
     println!("  · default_text_model: {model}");
+    let (default_mode, default_mode_source) = doctor_runtime_default_mode();
+    println!("  · default_mode: {default_mode} ({default_mode_source})");
 
     let mcp_path = config.mcp_config_path();
     let project_mcp_path = crate::mcp::workspace_mcp_config_path(workspace);
@@ -3825,7 +3830,15 @@ async fn run_doctor(
         use std::io::Write;
         std::io::stdout().flush().ok();
 
-        match test_api_connectivity(config).await {
+        // Resolve a credential through the diagnostic-only store first, then
+        // probe with an in-memory clone. Constructing the normal client from
+        // the original config could otherwise trigger its legacy secret-store
+        // migration while a user merely asks doctor to test connectivity.
+        let connectivity_result = match config.with_read_only_api_key_for_diagnostic() {
+            Ok(diagnostic_config) => test_api_connectivity(&diagnostic_config).await,
+            Err(error) => Err(error),
+        };
+        match connectivity_result {
             Ok(()) => {
                 println!(
                     "\r  {} API connection successful",
@@ -4194,18 +4207,21 @@ async fn run_doctor(
             );
         }
     }
-    let stash_path = codewhale_config::codewhale_home()
-        .ok()
-        .map(|h| h.join("composer_stash.jsonl"));
-    if let Some(stash_path) = stash_path {
-        let stash_count = crate::composer_stash::load_stash().len();
-        if stash_path.exists() {
+    let stash = crate::composer_stash::diagnostic_stash_report();
+    if let Some(stash_path) = stash.path.as_ref() {
+        if let Some(error) = stash.error.as_deref() {
+            println!(
+                "  {} composer stash was not inspected at {}: {error}",
+                "!".truecolor(sky_r, sky_g, sky_b),
+                crate::utils::display_path(stash_path),
+            );
+        } else if stash.present {
             println!(
                 "  {} composer stash at {} ({} parked draft{})",
                 "✓".truecolor(aqua_r, aqua_g, aqua_b),
-                crate::utils::display_path(&stash_path),
-                stash_count,
-                if stash_count == 1 { "" } else { "s" }
+                crate::utils::display_path(stash_path),
+                stash.count,
+                if stash.count == 1 { "" } else { "s" }
             );
         } else {
             println!(
@@ -4213,6 +4229,11 @@ async fn run_doctor(
                 "·".dimmed()
             );
         }
+    } else if let Some(error) = stash.error.as_deref() {
+        println!(
+            "  {} composer stash was not inspected: {error}",
+            "!".truecolor(sky_r, sky_g, sky_b),
+        );
     }
 
     // Tool dependencies — probe external binaries that individual
@@ -4347,7 +4368,7 @@ async fn run_doctor(
     // know they can opt in via `prefer_external_pdftotext = true`, and
     // (b) so users who *did* opt in get a clean signal when the binary
     // is missing rather than discovering it on the next PDF read.
-    let prefer_external = crate::settings::Settings::load()
+    let prefer_external = crate::settings::Settings::load_read_only()
         .map(|s| s.prefer_external_pdftotext)
         .unwrap_or(false);
     match crate::dependencies::resolve_pdftotext() {
@@ -4628,8 +4649,12 @@ fn doctor_legacy_state_report(
 /// This is deliberately separate from `SessionManager::default_location()`:
 /// constructing the manager can trigger the additive legacy migration, while
 /// doctor must remain a read-only diagnostic. Session history is stored as
-/// top-level JSON files; directories (including `checkpoints`) and symlinks are
-/// ignored, so doctor neither traverses checkpoint internals nor follows links.
+/// top-level JSON files. Directories (including `checkpoints`) and symlinks
+/// observed during the scan are ignored, so the diagnostic does not
+/// intentionally traverse checkpoint internals or link targets. These checks
+/// are best-effort observations, not a race-free no-follow guarantee.
+/// A matching filename is only a regular-file counterpart check: doctor does
+/// not parse or compare session descriptors.
 fn doctor_session_recovery_report(
     primary_root: &Path,
     legacy_root: &Path,
@@ -4654,9 +4679,52 @@ fn doctor_session_recovery_report(
         return report;
     }
 
+    let legacy_root_is_present =
+        match doctor_session_directory_is_safe(legacy_root, "legacy state root") {
+            Ok(present) => present,
+            Err(error) => {
+                report.status = DoctorSessionRecoveryStatus::ScanFailed;
+                report.error = Some(error);
+                return report;
+            }
+        };
+    if !legacy_root_is_present {
+        return report;
+    }
+    if let Err(error) = doctor_session_directory_is_safe(primary_root, "primary state root") {
+        report.status = DoctorSessionRecoveryStatus::ScanFailed;
+        report.error = Some(error);
+        return report;
+    }
+
+    let legacy_sessions_are_present = match doctor_session_directory_is_safe(
+        &report.legacy_sessions_path,
+        "legacy sessions root",
+    ) {
+        Ok(present) => present,
+        Err(error) => {
+            report.status = DoctorSessionRecoveryStatus::ScanFailed;
+            report.error = Some(error);
+            return report;
+        }
+    };
+    if !legacy_sessions_are_present {
+        return report;
+    }
+    let primary_sessions_are_present = match doctor_session_directory_is_safe(
+        &report.primary_sessions_path,
+        "primary sessions root",
+    ) {
+        Ok(present) => present,
+        Err(error) => {
+            report.status = DoctorSessionRecoveryStatus::ScanFailed;
+            report.error = Some(error);
+            return report;
+        }
+    };
+
     let entries = match std::fs::read_dir(&report.legacy_sessions_path) {
         Ok(entries) => entries,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return report,
         Err(err) => {
             report.status = DoctorSessionRecoveryStatus::ScanFailed;
             report.error = Some(format!(
@@ -4698,16 +4766,32 @@ fn doctor_session_recovery_report(
         let name = PathBuf::from(entry.file_name());
         let destination_path = report.primary_sessions_path.join(&name);
         match std::fs::symlink_metadata(&destination_path) {
-            Ok(_) => report.already_present_file_count += 1,
+            Ok(metadata) if metadata.file_type().is_file() => {
+                report.already_present_file_count += 1;
+            }
+            Ok(metadata) => {
+                report.status = DoctorSessionRecoveryStatus::ScanFailed;
+                let shape = if metadata.file_type().is_symlink() {
+                    "destination session entry is a symlink"
+                } else {
+                    "destination session entry is not a regular file"
+                };
+                report.error = Some(format!(
+                    "could not inspect destination session metadata at {}: {shape}",
+                    crate::utils::display_path(&destination_path)
+                ));
+                return report;
+            }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 report.recoverable_file_count += 1;
-                if report.recoverable.len() < DOCTOR_SESSION_RECOVERY_JSON_SAMPLE_LIMIT {
-                    report.recoverable.push(DoctorRecoverableSessionEntry {
+                record_doctor_recoverable_session(
+                    &mut report.recoverable,
+                    DoctorRecoverableSessionEntry {
                         source_path: entry.path(),
                         destination_path,
                         name,
-                    });
-                }
+                    },
+                );
             }
             Err(err) => {
                 report.status = DoctorSessionRecoveryStatus::ScanFailed;
@@ -4720,19 +4804,70 @@ fn doctor_session_recovery_report(
         }
     }
 
-    report
-        .recoverable
-        .sort_by(|left, right| left.name.cmp(&right.name));
     report.status = if report.legacy_session_file_count == 0 {
         DoctorSessionRecoveryStatus::NoLegacySessions
     } else if report.recoverable_file_count == 0 {
         DoctorSessionRecoveryStatus::MigrationComplete
-    } else if report.primary_sessions_path.is_dir() {
+    } else if primary_sessions_are_present {
         DoctorSessionRecoveryStatus::MigrationIncomplete
     } else {
         DoctorSessionRecoveryStatus::MigrationPending
     };
     report
+}
+
+/// Validate a session-state directory from observed metadata.
+///
+/// `doctor` only compares top-level filenames. It rejects a state-root or
+/// sessions-root symlink observed during inspection rather than using it for a
+/// recovery suggestion. This is a best-effort observation, not a race-free
+/// no-follow guarantee. Missing paths are normal on a fresh install and are
+/// reported as `false`.
+fn doctor_session_directory_is_safe(path: &Path, label: &str) -> std::result::Result<bool, String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "could not inspect {label} at {}: {error}",
+                crate::utils::display_path(path)
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "could not inspect {label} at {}: path is a symlink",
+            crate::utils::display_path(path)
+        ));
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(format!(
+            "could not inspect {label} at {}: path is not a directory",
+            crate::utils::display_path(path)
+        ));
+    }
+    Ok(true)
+}
+
+/// Keep the report bounded while preserving a deterministic, lexical sample.
+/// `read_dir` order is platform- and filesystem-dependent, so retaining the
+/// first entries encountered would make the JSON and human receipts drift.
+fn record_doctor_recoverable_session(
+    recoverable: &mut Vec<DoctorRecoverableSessionEntry>,
+    entry: DoctorRecoverableSessionEntry,
+) {
+    let insert_at = recoverable
+        .binary_search_by(|existing| existing.name.cmp(&entry.name))
+        .unwrap_or_else(|index| index);
+    if recoverable.len() == DOCTOR_SESSION_RECOVERY_JSON_SAMPLE_LIMIT
+        && insert_at == recoverable.len()
+    {
+        return;
+    }
+    recoverable.insert(insert_at, entry);
+    if recoverable.len() > DOCTOR_SESSION_RECOVERY_JSON_SAMPLE_LIMIT {
+        recoverable.pop();
+    }
 }
 
 fn legacy_state_needs_attention(entry: &DoctorLegacyStateEntry) -> bool {
@@ -4822,7 +4957,7 @@ fn print_doctor_session_recovery_report(
         }
         DoctorSessionRecoveryStatus::MigrationComplete => {
             println!(
-                "  {} legacy sessions: all {} filename(s) already exist under {}; legacy originals remain preserved",
+                "  {} legacy sessions: all {} filename(s) have regular-file counterparts under {}; descriptor contents were not compared and legacy originals remain preserved",
                 "✓".truecolor(ok_rgb.0, ok_rgb.1, ok_rgb.2),
                 report.legacy_session_file_count,
                 crate::utils::display_path(&report.primary_sessions_path),
@@ -4914,6 +5049,8 @@ fn doctor_session_recovery_json(report: &DoctorSessionRecoveryReport) -> serde_j
         "read_only": true,
         "chat_contents_read": false,
         "checkpoint_internals_scanned": false,
+        "session_descriptors_compared": false,
+        "counterpart_check": "top_level_filename_and_regular_file_only",
         "codewhale_home_is_explicit": report.codewhale_home_is_explicit,
         "legacy_sessions_path": report.legacy_sessions_path.display().to_string(),
         "primary_sessions_path": report.primary_sessions_path.display().to_string(),
@@ -5209,7 +5346,7 @@ fn autonomy_preference_id(preference: codewhale_config::AutonomyPreference) -> &
 }
 
 fn doctor_runtime_default_mode() -> (String, &'static str) {
-    match crate::settings::Settings::load() {
+    match crate::settings::Settings::load_read_only() {
         Ok(settings) => (settings.default_mode, "settings"),
         Err(_) => (crate::settings::Settings::default().default_mode, "default"),
     }
@@ -5772,6 +5909,7 @@ fn run_doctor_json(
         codewhale_config::codewhale_home_is_explicit(),
     );
 
+    let stash = crate::composer_stash::diagnostic_stash_report();
     let report = json!({
         "version": env!("CARGO_PKG_VERSION"),
         "config_path": config_path.display().to_string(),
@@ -5859,15 +5997,14 @@ fn run_doctor_json(
                     .unwrap_or(0),
             },
             "stash": {
-                "path": codewhale_config::codewhale_home()
-                    .ok()
-                    .map(|h| h.join("composer_stash.jsonl").display().to_string())
+                "path": stash
+                    .path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
                     .unwrap_or_default(),
-                "present": codewhale_config::codewhale_home()
-                    .ok()
-                    .map(|h| h.join("composer_stash.jsonl"))
-                    .is_some_and(|p| p.exists()),
-                "count": crate::composer_stash::load_stash().len(),
+                "present": stash.present,
+                "count": stash.count,
+                "error": stash.error,
             },
         },
         "sandbox": match crate::sandbox::get_platform_sandbox() {
@@ -6011,7 +6148,7 @@ fn doctor_auth_scheme(config: &Config) -> &'static str {
     } else if provider == crate::config::ApiProvider::XiaomiMimo
         && (doctor_xiaomi_mimo_base_url_uses_token_plan(&config.deepseek_base_url())
             || config
-                .deepseek_api_key()
+                .deepseek_api_key_read_only()
                 .ok()
                 .is_some_and(|key| key.trim_start().starts_with("tp-")))
     {
@@ -6021,7 +6158,7 @@ fn doctor_auth_scheme(config: &Config) -> &'static str {
         crate::config::ApiProvider::Sglang
             | crate::config::ApiProvider::Vllm
             | crate::config::ApiProvider::Ollama
-    ) && config.deepseek_api_key().is_err()
+    ) && config.deepseek_api_key_read_only().is_err()
     {
         "none"
     } else {
@@ -10799,6 +10936,15 @@ mod doctor_legacy_state_tests {
         assert_eq!(json["recoverable_file_count"], 1);
         assert_eq!(json["recovery_command"], "codewhale sessions");
         assert_eq!(json["recoverable_files"][0]["name"], "recover-me.json");
+        let serialized = json.to_string();
+        assert!(
+            !serialized.contains("not parsed by doctor"),
+            "the report must not expose session contents"
+        );
+        assert!(
+            !serialized.contains("checkpoint not inspected"),
+            "the report must not expose checkpoint contents"
+        );
     }
 
     #[test]
@@ -10822,6 +10968,12 @@ mod doctor_legacy_state_tests {
         assert_eq!(report.recoverable_file_count, 0);
         assert!(report.recoverable.is_empty());
         assert_eq!(report.already_present_file_count, 1);
+        let json = doctor_session_recovery_json(&report);
+        assert_eq!(json["session_descriptors_compared"], false);
+        assert_eq!(
+            json["counterpart_check"],
+            "top_level_filename_and_regular_file_only"
+        );
     }
 
     #[test]
@@ -10830,14 +10982,18 @@ mod doctor_legacy_state_tests {
         let (primary_root, legacy_root) = roots(&tmp);
         let legacy_sessions = legacy_root.join("sessions");
         fs::create_dir_all(&legacy_sessions).expect("legacy sessions");
-        let total = DOCTOR_SESSION_RECOVERY_JSON_SAMPLE_LIMIT + 2;
-        for index in 0..total {
+        for index in 0..DOCTOR_SESSION_RECOVERY_JSON_SAMPLE_LIMIT {
             fs::write(
-                legacy_sessions.join(format!("session-{index:03}.json")),
+                legacy_sessions.join(format!("late-{index:03}.json")),
                 b"fixture",
             )
             .expect("legacy session fixture");
         }
+        fs::write(legacy_sessions.join("early-000.json"), b"fixture")
+            .expect("earliest legacy session fixture");
+        fs::write(legacy_sessions.join("early-001.json"), b"fixture")
+            .expect("second earliest legacy session fixture");
+        let total = DOCTOR_SESSION_RECOVERY_JSON_SAMPLE_LIMIT + 2;
 
         let report = doctor_session_recovery_report(&primary_root, &legacy_root, false);
         let json = doctor_session_recovery_json(&report);
@@ -10850,6 +11006,16 @@ mod doctor_legacy_state_tests {
         assert_eq!(
             json["recoverable_files"].as_array().map(Vec::len),
             Some(DOCTOR_SESSION_RECOVERY_JSON_SAMPLE_LIMIT)
+        );
+        assert_eq!(
+            report.recoverable.first().map(|entry| entry.name.as_path()),
+            Some(Path::new("early-000.json")),
+            "the bounded sample must not depend on read_dir order"
+        );
+        assert_eq!(
+            report.recoverable.last().map(|entry| entry.name.as_path()),
+            Some(Path::new("late-097.json")),
+            "the bounded sample must retain the lexical prefix"
         );
         assert_eq!(json["recoverable_files_truncated"], true);
     }
@@ -10866,12 +11032,121 @@ mod doctor_legacy_state_tests {
 
         assert_eq!(report.status, DoctorSessionRecoveryStatus::ScanFailed);
         assert!(report.needs_attention());
+        assert!(report.error.as_deref().is_some_and(|error| {
+            error.contains("legacy sessions root") && error.contains("not a directory")
+        }));
+    }
+
+    #[test]
+    fn doctor_session_recovery_rejects_a_non_directory_legacy_state_root() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (primary_root, legacy_root) = roots(&tmp);
+        fs::write(&legacy_root, b"not a state directory").expect("invalid legacy root");
+
+        let report = doctor_session_recovery_report(&primary_root, &legacy_root, false);
+
+        assert_eq!(report.status, DoctorSessionRecoveryStatus::ScanFailed);
+        assert!(report.error.as_deref().is_some_and(|error| {
+            error.contains("legacy state root") && error.contains("not a directory")
+        }));
+    }
+
+    #[test]
+    fn doctor_session_recovery_rejects_a_non_directory_primary_state_root() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (primary_root, legacy_root) = roots(&tmp);
+        fs::create_dir_all(legacy_root.join("sessions")).expect("legacy sessions");
+        fs::write(&primary_root, b"not a state directory").expect("invalid primary root");
+
+        let report = doctor_session_recovery_report(&primary_root, &legacy_root, false);
+
+        assert_eq!(report.status, DoctorSessionRecoveryStatus::ScanFailed);
+        assert!(report.error.as_deref().is_some_and(|error| {
+            error.contains("primary state root") && error.contains("not a directory")
+        }));
+    }
+
+    #[test]
+    fn doctor_session_recovery_rejects_a_non_directory_primary_sessions_root() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (primary_root, legacy_root) = roots(&tmp);
+        fs::create_dir_all(legacy_root.join("sessions")).expect("legacy sessions");
+        fs::create_dir_all(&primary_root).expect("primary root");
+        fs::write(primary_root.join("sessions"), b"not a sessions directory")
+            .expect("invalid primary sessions path");
+
+        let report = doctor_session_recovery_report(&primary_root, &legacy_root, false);
+
+        assert_eq!(report.status, DoctorSessionRecoveryStatus::ScanFailed);
+        assert!(report.error.as_deref().is_some_and(|error| {
+            error.contains("primary sessions root") && error.contains("not a directory")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_session_recovery_rejects_a_symlinked_legacy_sessions_root() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let (primary_root, legacy_root) = roots(&tmp);
+        let external_sessions = tmp.path().join("external-sessions");
+        fs::create_dir_all(&external_sessions).expect("external sessions");
+        fs::write(
+            external_sessions.join("must-not-be-enumerated.json"),
+            b"session contents must stay unread",
+        )
+        .expect("external session fixture");
+        fs::create_dir_all(&legacy_root).expect("legacy root");
+        symlink(&external_sessions, legacy_root.join("sessions"))
+            .expect("symlinked legacy sessions root");
+
+        let report = doctor_session_recovery_report(&primary_root, &legacy_root, false);
+
+        assert_eq!(report.status, DoctorSessionRecoveryStatus::ScanFailed);
+        assert!(report.needs_attention());
+        assert_eq!(report.legacy_session_file_count, 0);
+        assert!(report.recoverable.is_empty());
         assert!(
             report
                 .error
                 .as_deref()
-                .is_some_and(|error| error.contains("could not inspect legacy session filenames"))
+                .is_some_and(|error| error.contains("legacy sessions root")
+                    && error.contains("path is a symlink"))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_session_recovery_rejects_symlinked_primary_root_and_sessions_root() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let (primary_root, legacy_root) = roots(&tmp);
+        let external_primary = tmp.path().join("external-primary");
+        fs::create_dir_all(external_primary.join("sessions")).expect("external primary");
+        fs::create_dir_all(legacy_root.join("sessions")).expect("legacy sessions");
+        symlink(&external_primary, &primary_root).expect("symlinked primary root");
+
+        let root_report = doctor_session_recovery_report(&primary_root, &legacy_root, false);
+        assert_eq!(root_report.status, DoctorSessionRecoveryStatus::ScanFailed);
+        assert!(root_report.error.as_deref().is_some_and(|error| {
+            error.contains("primary state root") && error.contains("path is a symlink")
+        }));
+
+        fs::remove_file(&primary_root).expect("remove primary root symlink");
+        fs::create_dir_all(&primary_root).expect("primary root");
+        symlink(&external_primary, primary_root.join("sessions"))
+            .expect("symlinked primary sessions root");
+
+        let sessions_report = doctor_session_recovery_report(&primary_root, &legacy_root, false);
+        assert_eq!(
+            sessions_report.status,
+            DoctorSessionRecoveryStatus::ScanFailed
+        );
+        assert!(sessions_report.error.as_deref().is_some_and(|error| {
+            error.contains("primary sessions root") && error.contains("path is a symlink")
+        }));
     }
 
     #[test]
