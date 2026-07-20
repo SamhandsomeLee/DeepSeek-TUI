@@ -358,9 +358,11 @@ impl ReasoningEffort {
     }
 
     /// Resolve an effort against the exact provider route that will receive
-    /// the request.  Low/medium remain distinct only for the official Kimi
-    /// Code K3 endpoint; generic Moonshot and every other non-Codex route
-    /// retain the historic high coercion.  This intentionally does not change
+    /// the request. Both K3 routes are always-thinking, so `off` becomes the
+    /// lowest supported tier. The Kimi Code membership route otherwise keeps
+    /// its low/high/max mapping; direct Moonshot K3 additionally maps `medium`
+    /// to `high`. Generic Moonshot and every other non-Codex route retain the
+    /// historic high coercion. This intentionally does not change
     /// [`Self::normalize_for_provider`], whose generic wire semantics are used
     /// by older callers that do not yet have a route receipt.
     #[must_use]
@@ -372,7 +374,17 @@ impl ReasoningEffort {
     ) -> Self {
         let normalized = self.normalize_for_provider(provider);
         if crate::config::is_exact_kimi_code_k3_route(provider, base_url, wire_model) {
-            return normalized;
+            return match normalized {
+                Self::Off => Self::Low,
+                other => other,
+            };
+        }
+        if crate::config::is_exact_direct_moonshot_k3_route(provider, base_url, wire_model) {
+            return match normalized {
+                Self::Off => Self::Low,
+                Self::Medium => Self::High,
+                other => other,
+            };
         }
         if provider == ApiProvider::OpenaiCodex {
             return normalized;
@@ -3082,6 +3094,18 @@ impl App {
             )
         {
             reasoning_effort = ReasoningEffort::from_setting_for_provider(effort, provider);
+        }
+        if !auto_model
+            && crate::config::is_exact_direct_moonshot_k3_route(
+                provider,
+                &active_route_base_url,
+                &model,
+            )
+        {
+            // Keep the visible/effective tier truthful on first launch too;
+            // direct K3 cannot honor a persisted `off` setting.
+            reasoning_effort =
+                reasoning_effort.normalize_for_route(provider, &active_route_base_url, &model);
         }
 
         // Resolve the saved mode separately from the permission posture.

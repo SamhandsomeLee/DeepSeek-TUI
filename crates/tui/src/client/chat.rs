@@ -15,7 +15,8 @@ use serde_json::{Value, json};
 use tokio::time::timeout as tokio_timeout;
 
 use crate::config::{
-    TOGETHER_INKLING_MODEL, is_exact_kimi_code_k3_route, wire_model_for_provider_route,
+    TOGETHER_INKLING_MODEL, is_exact_direct_moonshot_k3_route, is_exact_kimi_code_k3_route,
+    wire_model_for_provider_route,
 };
 
 /// Default timeout for the initial streaming response headers.
@@ -67,11 +68,13 @@ use super::{
 fn apply_provider_token_limit(
     body: &mut Value,
     provider: ApiProvider,
+    base_url: &str,
     model: &str,
     max_tokens: u32,
 ) {
     let use_max_completion_tokens = provider == ApiProvider::XiaomiMimo
-        || (provider == ApiProvider::Openai && model_is_openai_reasoning_family(model));
+        || (provider == ApiProvider::Openai && model_is_openai_reasoning_family(model))
+        || is_exact_direct_moonshot_k3_route(provider, base_url, model);
     if !use_max_completion_tokens {
         return;
     }
@@ -157,8 +160,7 @@ fn apply_kimi_code_k3_reasoning_effort(
     };
 
     let thinking = match effort.trim().to_ascii_lowercase().as_str() {
-        "off" | "none" | "disabled" | "false" => json!({ "type": "disabled" }),
-        "low" | "minimum" | "minimal" | "light" => {
+        "off" | "none" | "disabled" | "false" | "low" | "minimum" | "minimal" | "light" => {
             json!({ "type": "enabled", "effort": "low" })
         }
         "medium" | "high" => json!({ "type": "enabled", "effort": "high" }),
@@ -173,6 +175,78 @@ fn apply_kimi_code_k3_reasoning_effort(
         object.remove("reasoning_effort");
     }
     body["thinking"] = thinking;
+}
+
+/// Apply Moonshot's direct K3 reasoning dialect.
+///
+/// The pay-as-you-go K3 endpoint is always-thinking and accepts only the
+/// top-level `reasoning_effort` values low/high/max. In particular, a generic
+/// Moonshot `thinking: {type: disabled}` payload is not truthful for this
+/// route. Treat a legacy raw `off` as the lowest supported tier defensively;
+/// route-aware callers normalize it before it reaches this layer.
+fn apply_direct_moonshot_k3_reasoning_effort(
+    body: &mut Value,
+    provider: ApiProvider,
+    base_url: &str,
+    model: &str,
+    effort: Option<&str>,
+) {
+    if !is_exact_direct_moonshot_k3_route(provider, base_url, model) {
+        return;
+    }
+
+    if let Some(object) = body.as_object_mut() {
+        object.remove("thinking");
+        object.remove("reasoning_effort");
+    }
+    let Some(effort) = effort else {
+        return;
+    };
+    let wire_effort = match effort.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" | "disabled" | "false" | "low" | "minimum" | "minimal" | "light" => "low",
+        "medium" | "mid" | "high" | "" => "high",
+        "xhigh" | "ultra" | "max" | "highest" | "ultracode" => "max",
+        // `auto` and unknown legacy values leave the field omitted so the
+        // direct API owns its documented default (`max`).
+        _ => return,
+    };
+    body["reasoning_effort"] = json!(wire_effort);
+}
+
+/// Final reasoning-control pass shared by streaming and non-streaming Chat
+/// Completions requests. Route-specific shapers run after the generic provider
+/// layer so they can remove fields that are invalid for their exact endpoint.
+fn apply_route_reasoning_controls(
+    body: &mut Value,
+    provider: ApiProvider,
+    base_url: &str,
+    model: &str,
+    effort: Option<&str>,
+) {
+    apply_reasoning_effort(body, effort, provider);
+    apply_inkling_reasoning_effort(body, provider, model, effort);
+    apply_openai_reasoning_effort(body, provider, model, effort);
+    apply_direct_moonshot_k3_reasoning_effort(body, provider, base_url, model, effort);
+    apply_kimi_code_k3_reasoning_effort(body, provider, base_url, model, effort);
+}
+
+/// The direct K3 Chat Completions schema exposes fixed sampling behavior and
+/// omits `temperature` and `top_p`. Strip legacy/generic values only from the
+/// exact first-party route so compatible gateways keep their own contract.
+/// Source: https://platform.kimi.ai/docs/guide/kimi-k3-quickstart (verified 2026-07-20).
+fn apply_direct_moonshot_k3_fixed_sampling(
+    body: &mut Value,
+    provider: ApiProvider,
+    base_url: &str,
+    model: &str,
+) {
+    if !is_exact_direct_moonshot_k3_route(provider, base_url, model) {
+        return;
+    }
+    if let Some(object) = body.as_object_mut() {
+        object.remove("temperature");
+        object.remove("top_p");
+    }
 }
 
 fn openai_compatible_reasoning_effort(
@@ -229,6 +303,40 @@ fn mirror_minimax_reasoning_details_for_body(body: &mut Value, provider: ApiProv
     mirror_minimax_reasoning_details_for_messages(messages);
 }
 
+fn sanitize_moonshot_chat_tools(chat_tools: &mut [Value]) -> Result<()> {
+    for tool in chat_tools {
+        let Some(function) = tool
+            .as_object_mut()
+            .and_then(|tool| tool.get_mut("function"))
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        let Some(parameters) = function.get_mut("parameters") else {
+            continue;
+        };
+        let note = crate::tools::schema_sanitize::sanitize_for_kimi_parameters(parameters)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Moonshot function parameters failed safe compatibility validation: {error}"
+                )
+            })?;
+        if let Some(note) = note {
+            let description = function
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let description = if description.is_empty() {
+                note
+            } else {
+                format!("{description} {note}")
+            };
+            function.insert("description".to_string(), json!(description));
+        }
+    }
+    Ok(())
+}
+
 impl DeepSeekClient {
     pub(super) async fn create_message_chat(
         &self,
@@ -247,7 +355,13 @@ impl DeepSeekClient {
             "messages": messages,
             "max_tokens": request.max_tokens,
         });
-        apply_provider_token_limit(&mut body, self.api_provider, &model, request.max_tokens);
+        apply_provider_token_limit(
+            &mut body,
+            self.api_provider,
+            &self.base_url,
+            &model,
+            request.max_tokens,
+        );
 
         if let Some(temperature) = request.temperature {
             body["temperature"] = json!(temperature);
@@ -260,18 +374,11 @@ impl DeepSeekClient {
                 .iter()
                 .map(|tool| tool_to_chat_for_base_url(tool, &self.base_url))
                 .collect();
-            // Kimi / Moonshot enforces stricter JSON Schema: `type` must be
-            // inside `anyOf` / `oneOf` items, not on the parent (#2438).
+            // Moonshot function parameters must end at a plain object root.
+            // Flatten root composition, preserve valid nested anyOf, and fail
+            // closed before transport when an internal root ref is unsafe.
             if matches!(self.api_provider, crate::config::ApiProvider::Moonshot) {
-                for t in &mut chat_tools {
-                    if let Some(fn_obj) = t
-                        .as_object_mut()
-                        .and_then(|t| t.get_mut("function"))
-                        .and_then(|f| f.get_mut("parameters"))
-                    {
-                        crate::tools::schema_sanitize::sanitize_for_kimi_parameters(fn_obj);
-                    }
-                }
+                sanitize_moonshot_chat_tools(&mut chat_tools)?;
             }
             // xAI rejects a parameters root that is not a plain object schema
             // (e.g. apply_patch's root `oneOf` required-groups) with a 400.
@@ -307,29 +414,18 @@ impl DeepSeekClient {
         {
             body["tool_choice"] = mapped;
         }
-        apply_reasoning_effort(
-            &mut body,
-            request.reasoning_effort.as_deref(),
-            self.api_provider,
-        );
-        apply_inkling_reasoning_effort(
-            &mut body,
-            self.api_provider,
-            &model,
-            request.reasoning_effort.as_deref(),
-        );
-        apply_openai_reasoning_effort(
-            &mut body,
-            self.api_provider,
-            &model,
-            request.reasoning_effort.as_deref(),
-        );
-        apply_kimi_code_k3_reasoning_effort(
+        apply_route_reasoning_controls(
             &mut body,
             self.api_provider,
             &self.base_url,
             &model,
             request.reasoning_effort.as_deref(),
+        );
+        apply_direct_moonshot_k3_fixed_sampling(
+            &mut body,
+            self.api_provider,
+            &self.base_url,
+            &model,
         );
         mirror_minimax_reasoning_details_for_body(&mut body, self.api_provider);
 
@@ -352,7 +448,7 @@ impl DeepSeekClient {
         };
 
         let url = api_url_with_suffix(
-            &self.base_url,
+            self.chat_transport_base_url(),
             "chat/completions",
             self.path_suffix.as_deref(),
         );
@@ -418,7 +514,13 @@ impl DeepSeekClient {
                 "include_usage": true
             },
         });
-        apply_provider_token_limit(&mut body, self.api_provider, &model, request.max_tokens);
+        apply_provider_token_limit(
+            &mut body,
+            self.api_provider,
+            &self.base_url,
+            &model,
+            request.max_tokens,
+        );
 
         if let Some(temperature) = request.temperature {
             body["temperature"] = json!(temperature);
@@ -431,18 +533,10 @@ impl DeepSeekClient {
                 .iter()
                 .map(|tool| tool_to_chat_for_base_url(tool, &self.base_url))
                 .collect();
-            // Kimi / Moonshot enforces stricter JSON Schema: `type` must be
-            // inside `anyOf` / `oneOf` items, not on the parent (#2438).
+            // Keep streaming and non-streaming Moonshot tool contracts
+            // identical; invalid refs fail before any request is sent.
             if matches!(self.api_provider, crate::config::ApiProvider::Moonshot) {
-                for t in &mut chat_tools {
-                    if let Some(fn_obj) = t
-                        .as_object_mut()
-                        .and_then(|t| t.get_mut("function"))
-                        .and_then(|f| f.get_mut("parameters"))
-                    {
-                        crate::tools::schema_sanitize::sanitize_for_kimi_parameters(fn_obj);
-                    }
-                }
+                sanitize_moonshot_chat_tools(&mut chat_tools)?;
             }
             // xAI rejects a parameters root that is not a plain object schema
             // (e.g. apply_patch's root `oneOf` required-groups) with a 400.
@@ -478,29 +572,18 @@ impl DeepSeekClient {
         {
             body["tool_choice"] = mapped;
         }
-        apply_reasoning_effort(
-            &mut body,
-            request.reasoning_effort.as_deref(),
-            self.api_provider,
-        );
-        apply_inkling_reasoning_effort(
-            &mut body,
-            self.api_provider,
-            &model,
-            request.reasoning_effort.as_deref(),
-        );
-        apply_openai_reasoning_effort(
-            &mut body,
-            self.api_provider,
-            &model,
-            request.reasoning_effort.as_deref(),
-        );
-        apply_kimi_code_k3_reasoning_effort(
+        apply_route_reasoning_controls(
             &mut body,
             self.api_provider,
             &self.base_url,
             &model,
             request.reasoning_effort.as_deref(),
+        );
+        apply_direct_moonshot_k3_fixed_sampling(
+            &mut body,
+            self.api_provider,
+            &self.base_url,
+            &model,
         );
 
         // Bulletproof final sanitizer: walk the wire payload and force
@@ -521,7 +604,7 @@ impl DeepSeekClient {
         mirror_minimax_reasoning_details_for_body(&mut body, self.api_provider);
 
         let url = api_url_with_suffix(
-            &self.base_url,
+            self.chat_transport_base_url(),
             "chat/completions",
             self.path_suffix.as_deref(),
         );
@@ -2377,6 +2460,14 @@ fn should_replay_reasoning_content_for_provider_on_route(
     model: &str,
     effort: Option<&str>,
 ) -> bool {
+    // Both exact K3 routes are always-thinking. A stale caller may still carry
+    // `off` before route normalization; retaining the assistant reasoning
+    // trace is required for multi-turn/tool-call continuity regardless.
+    if is_exact_direct_moonshot_k3_route(provider, base_url, model)
+        || is_exact_kimi_code_k3_route(provider, base_url, model)
+    {
+        return true;
+    }
     if effort
         .map(|value| {
             matches!(
@@ -2387,10 +2478,6 @@ fn should_replay_reasoning_content_for_provider_on_route(
         .unwrap_or(false)
     {
         return false;
-    }
-
-    if is_exact_kimi_code_k3_route(provider, base_url, model) {
-        return true;
     }
 
     if requires_reasoning_content(model) {
@@ -2428,7 +2515,9 @@ fn is_reasoning_model_for_stream_on_route(
     base_url: &str,
     model: &str,
 ) -> bool {
-    if is_exact_kimi_code_k3_route(provider, base_url, model) {
+    if is_exact_kimi_code_k3_route(provider, base_url, model)
+        || is_exact_direct_moonshot_k3_route(provider, base_url, model)
+    {
         return true;
     }
 
@@ -4760,11 +4849,13 @@ mod alias_thinking_detection_tests {
     //! turn. See upstream API docs:
     //! https://api-docs.deepseek.com/guides/thinking_mode
     use super::{
-        ReasoningStreamStyle, apply_inkling_reasoning_effort, apply_kimi_code_k3_reasoning_effort,
-        apply_openai_reasoning_effort, apply_provider_token_limit, is_reasoning_model_for_stream,
-        is_reasoning_model_for_stream_on_route, provider_accepts_reasoning_content,
-        reasoning_stream_style_for_route, requires_reasoning_content,
-        should_replay_reasoning_content, should_replay_reasoning_content_for_provider,
+        ReasoningStreamStyle, apply_direct_moonshot_k3_fixed_sampling,
+        apply_inkling_reasoning_effort, apply_kimi_code_k3_reasoning_effort,
+        apply_openai_reasoning_effort, apply_provider_token_limit, apply_route_reasoning_controls,
+        is_reasoning_model_for_stream, is_reasoning_model_for_stream_on_route,
+        provider_accepts_reasoning_content, reasoning_stream_style_for_route,
+        requires_reasoning_content, should_replay_reasoning_content,
+        should_replay_reasoning_content_for_provider,
         should_replay_reasoning_content_for_provider_on_route,
     };
     use crate::config::ApiProvider;
@@ -4931,12 +5022,34 @@ mod alias_thinking_detection_tests {
             ),
             ReasoningStreamStyle::None
         );
-        assert!(!should_replay_reasoning_content_for_provider_on_route(
-            ApiProvider::Moonshot,
-            kimi_code,
-            crate::config::KIMI_CODE_K3_MODEL,
-            Some("off"),
-        ));
+        assert!(
+            should_replay_reasoning_content_for_provider_on_route(
+                ApiProvider::Moonshot,
+                kimi_code,
+                crate::config::KIMI_CODE_K3_MODEL,
+                Some("off"),
+            ),
+            "exact membership K3 stays always-thinking even for a stale raw Off caller"
+        );
+    }
+
+    #[test]
+    fn direct_moonshot_k3_is_always_thinking_and_replays_reasoning() {
+        let direct = crate::config::DEFAULT_MOONSHOT_BASE_URL;
+        let model = crate::config::MOONSHOT_KIMI_K3_MODEL;
+
+        for effort in [Some("off"), Some("low"), Some("high"), Some("max"), None] {
+            assert!(should_replay_reasoning_content_for_provider_on_route(
+                ApiProvider::Moonshot,
+                direct,
+                model,
+                effort,
+            ));
+        }
+        assert_eq!(
+            reasoning_stream_style_for_route(ApiProvider::Moonshot, direct, model, None),
+            ReasoningStreamStyle::SeparateField
+        );
     }
 
     #[test]
@@ -4947,7 +5060,13 @@ mod alias_thinking_detection_tests {
             "max_tokens": 8192,
         });
 
-        apply_provider_token_limit(&mut body, ApiProvider::XiaomiMimo, "mimo-v2.5-pro", 8192);
+        apply_provider_token_limit(
+            &mut body,
+            ApiProvider::XiaomiMimo,
+            "https://api.xiaomimimo.com/v1",
+            "mimo-v2.5-pro",
+            8192,
+        );
 
         assert!(body.get("max_tokens").is_none());
         assert_eq!(
@@ -4965,7 +5084,13 @@ mod alias_thinking_detection_tests {
             "max_tokens": 4096,
         });
 
-        apply_provider_token_limit(&mut body, ApiProvider::Openai, "gpt-5.5", 4096);
+        apply_provider_token_limit(
+            &mut body,
+            ApiProvider::Openai,
+            "https://api.openai.com/v1",
+            "gpt-5.5",
+            4096,
+        );
         apply_openai_reasoning_effort(&mut body, ApiProvider::Openai, "gpt-5.5", Some("high"));
 
         assert!(body.get("max_tokens").is_none());
@@ -4989,7 +5114,13 @@ mod alias_thinking_detection_tests {
             "max_tokens": 8192,
         });
 
-        apply_provider_token_limit(&mut body, ApiProvider::Openai, "gpt-5.6-sol", 8192);
+        apply_provider_token_limit(
+            &mut body,
+            ApiProvider::Openai,
+            "https://api.openai.com/v1",
+            "gpt-5.6-sol",
+            8192,
+        );
         apply_openai_reasoning_effort(&mut body, ApiProvider::Openai, "gpt-5.6-sol", Some("max"));
 
         assert!(body.get("max_tokens").is_none());
@@ -5059,8 +5190,8 @@ mod alias_thinking_detection_tests {
             ("xhigh", json!({ "type": "enabled", "effort": "max" })),
             ("ultra", json!({ "type": "enabled", "effort": "max" })),
             ("max", json!({ "type": "enabled", "effort": "max" })),
-            ("none", json!({ "type": "disabled" })),
-            ("off", json!({ "type": "disabled" })),
+            ("none", json!({ "type": "enabled", "effort": "low" })),
+            ("off", json!({ "type": "enabled", "effort": "low" })),
         ] {
             let mut body = json!({ "reasoning_effort": "stale" });
             apply_kimi_code_k3_reasoning_effort(
@@ -5073,6 +5204,142 @@ mod alias_thinking_detection_tests {
 
             assert_eq!(body["thinking"], expected, "requested {requested}");
             assert!(body.get("reasoning_effort").is_none());
+        }
+    }
+
+    #[test]
+    fn direct_moonshot_k3_uses_top_level_effort_and_never_disables_thinking() {
+        for (requested, expected) in [
+            ("off", "low"),
+            ("none", "low"),
+            ("low", "low"),
+            ("medium", "high"),
+            ("high", "high"),
+            ("xhigh", "max"),
+            ("max", "max"),
+        ] {
+            let mut body = json!({
+                "model": crate::config::MOONSHOT_KIMI_K3_MODEL,
+                "thinking": { "type": "disabled" },
+            });
+            apply_route_reasoning_controls(
+                &mut body,
+                ApiProvider::Moonshot,
+                crate::config::DEFAULT_MOONSHOT_BASE_URL,
+                crate::config::MOONSHOT_KIMI_K3_MODEL,
+                Some(requested),
+            );
+
+            assert_eq!(body["reasoning_effort"], json!(expected), "{requested}");
+            assert!(body.get("thinking").is_none(), "{requested}: {body}");
+        }
+
+        let mut provider_default = json!({ "thinking": { "type": "enabled" } });
+        apply_route_reasoning_controls(
+            &mut provider_default,
+            ApiProvider::Moonshot,
+            crate::config::DEFAULT_MOONSHOT_BASE_URL,
+            crate::config::MOONSHOT_KIMI_K3_MODEL,
+            Some("auto"),
+        );
+        assert!(provider_default.get("thinking").is_none());
+        assert!(provider_default.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn direct_moonshot_k3_uses_modern_token_field_and_fixed_sampling_only_on_exact_route() {
+        let mut direct = json!({
+            "max_tokens": 64,
+            "temperature": 0.2,
+            "top_p": 0.9,
+        });
+        apply_provider_token_limit(
+            &mut direct,
+            ApiProvider::Moonshot,
+            crate::config::DEFAULT_MOONSHOT_BASE_URL,
+            crate::config::MOONSHOT_KIMI_K3_MODEL,
+            64,
+        );
+        apply_direct_moonshot_k3_fixed_sampling(
+            &mut direct,
+            ApiProvider::Moonshot,
+            crate::config::DEFAULT_MOONSHOT_BASE_URL,
+            crate::config::MOONSHOT_KIMI_K3_MODEL,
+        );
+        assert_eq!(direct["max_completion_tokens"], json!(64));
+        assert!(direct.get("max_tokens").is_none());
+        assert!(direct.get("temperature").is_none());
+        assert!(direct.get("top_p").is_none());
+
+        let mut neighbor = json!({
+            "max_tokens": 64,
+            "temperature": 0.2,
+            "top_p": 0.9,
+        });
+        apply_provider_token_limit(
+            &mut neighbor,
+            ApiProvider::Moonshot,
+            "https://proxy.example/v1",
+            crate::config::MOONSHOT_KIMI_K3_MODEL,
+            64,
+        );
+        apply_direct_moonshot_k3_fixed_sampling(
+            &mut neighbor,
+            ApiProvider::Moonshot,
+            "https://proxy.example/v1",
+            crate::config::MOONSHOT_KIMI_K3_MODEL,
+        );
+        assert_eq!(neighbor["max_tokens"], json!(64));
+        assert!(neighbor.get("max_completion_tokens").is_none());
+        assert_eq!(neighbor["temperature"], json!(0.2));
+        assert_eq!(neighbor["top_p"], json!(0.9));
+    }
+
+    #[test]
+    fn direct_and_membership_k3_reasoning_dialects_do_not_cross_routes() {
+        let mut membership = json!({});
+        apply_route_reasoning_controls(
+            &mut membership,
+            ApiProvider::Moonshot,
+            crate::config::DEFAULT_KIMI_CODE_BASE_URL,
+            crate::config::KIMI_CODE_K3_MODEL,
+            Some("max"),
+        );
+        assert_eq!(
+            membership["thinking"],
+            json!({ "type": "enabled", "effort": "max" })
+        );
+        assert!(membership.get("reasoning_effort").is_none());
+
+        for (base_url, model) in [
+            (
+                crate::config::DEFAULT_KIMI_CODE_BASE_URL,
+                crate::config::MOONSHOT_KIMI_K3_MODEL,
+            ),
+            (
+                crate::config::DEFAULT_MOONSHOT_BASE_URL,
+                crate::config::KIMI_CODE_K3_MODEL,
+            ),
+            (
+                "https://proxy.example/v1",
+                crate::config::MOONSHOT_KIMI_K3_MODEL,
+            ),
+        ] {
+            let mut neighbor = json!({});
+            apply_route_reasoning_controls(
+                &mut neighbor,
+                ApiProvider::Moonshot,
+                base_url,
+                model,
+                Some("max"),
+            );
+            assert_eq!(
+                neighbor["thinking"],
+                json!({ "type": "enabled" }),
+                "{base_url} / {model}"
+            );
+            assert!(neighbor.get("reasoning_effort").is_none());
+            assert!(neighbor.pointer("/thinking/effort").is_none());
         }
     }
 
@@ -5112,7 +5379,13 @@ mod alias_thinking_detection_tests {
             "max_tokens": 8192,
         });
 
-        apply_provider_token_limit(&mut body, ApiProvider::Meta, "muse-spark-1.1", 8192);
+        apply_provider_token_limit(
+            &mut body,
+            ApiProvider::Meta,
+            "https://api.meta.ai/v1",
+            "muse-spark-1.1",
+            8192,
+        );
         apply_openai_reasoning_effort(&mut body, ApiProvider::Meta, "muse-spark-1.1", Some("max"));
 
         assert_eq!(body["max_tokens"], json!(8192));
@@ -5128,7 +5401,13 @@ mod alias_thinking_detection_tests {
             "max_tokens": 4096,
         });
 
-        apply_provider_token_limit(&mut body, ApiProvider::Openai, "gpt-4o", 4096);
+        apply_provider_token_limit(
+            &mut body,
+            ApiProvider::Openai,
+            "https://api.openai.com/v1",
+            "gpt-4o",
+            4096,
+        );
         apply_openai_reasoning_effort(&mut body, ApiProvider::Openai, "gpt-4o", Some("high"));
 
         assert_eq!(
@@ -5147,7 +5426,13 @@ mod alias_thinking_detection_tests {
             "max_tokens": 4096,
         });
 
-        apply_provider_token_limit(&mut body, ApiProvider::Openai, "deepseek-v4-pro", 4096);
+        apply_provider_token_limit(
+            &mut body,
+            ApiProvider::Openai,
+            "https://api.openai.com/v1",
+            "deepseek-v4-pro",
+            4096,
+        );
         apply_openai_reasoning_effort(
             &mut body,
             ApiProvider::Openai,

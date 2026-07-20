@@ -10144,3 +10144,6 @@ const VERIFIER_AGENT_INTRO: &str = concat!(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) use tests::kimi_general_child_request_tools_fixture;

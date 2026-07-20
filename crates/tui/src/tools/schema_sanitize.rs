@@ -11,6 +11,8 @@
 //! Provider-specific helpers below add stricter DeepSeek and OpenAI Responses
 //! compatibility passes where their request shapes need it.
 
+use std::collections::HashSet;
+
 use serde_json::{Map, Value};
 
 use crate::models::Tool;
@@ -159,6 +161,18 @@ fn collapse_nullable_unions(schema: &mut Value) {
         };
         let (nulls, nons): (Vec<_>, Vec<_>) = members.into_iter().partition(is_null_type);
         if nulls.len() == 1 && nons.len() == 1 {
+            // `nullable` is only meaningful when it annotates a concrete
+            // schema type. Collapsing `$ref | null` or another untyped branch
+            // would manufacture an annotation-only schema and lose the
+            // terminating union needed by MFJS reference validation.
+            let has_concrete_non_null_type = nons[0]
+                .as_object()
+                .and_then(|branch| branch.get("type"))
+                .and_then(Value::as_str)
+                .is_some_and(|schema_type| schema_type != "null");
+            if !has_concrete_non_null_type {
+                continue;
+            }
             obj.remove(key);
             if let Value::Object(non_obj) = nons.into_iter().next().unwrap() {
                 for (k, v) in non_obj {
@@ -553,7 +567,7 @@ mod tests {
     }
 
     #[test]
-    fn nested_anyof_in_anyof_collapses() {
+    fn nested_anyof_in_nullable_union_stays_structural() {
         // Pydantic can nest unions: Optional[Union[str, int]].
         let mut schema = json!({
             "anyOf": [
@@ -567,10 +581,15 @@ mod tests {
             ]
         });
         sanitize(&mut schema);
-        // Outer anyOf is single non-null → collapsed. Inner anyOf is
-        // multi-typed → preserved, but the outer null is handled.
-        assert_eq!(schema["nullable"], true);
-        assert!(schema.get("anyOf").is_some());
+        // The non-null branch has no concrete type of its own. Collapsing the
+        // outer union would manufacture an annotation-only `nullable` schema,
+        // so retain both levels and their explicit null termination.
+        assert!(schema.get("nullable").is_none());
+        assert_eq!(schema["anyOf"][1], json!({"type": "null"}));
+        assert_eq!(
+            schema["anyOf"][0]["anyOf"],
+            json!([{"type": "string"}, {"type": "integer"}])
+        );
     }
 
     #[test]
@@ -1023,8 +1042,27 @@ pub fn sanitize_for_kimi(schema: &mut serde_json::Value) {
     if let Some(obj) = schema.as_object_mut() {
         // Recurse first so a type injected into this object's alternatives is
         // not immediately removed again by processing that freshly-mutated item.
-        for (_, v) in obj.iter_mut() {
-            sanitize_for_kimi(v);
+        for map_key in ["properties", "$defs"] {
+            if let Some(children) = obj.get_mut(map_key).and_then(Value::as_object_mut) {
+                for child in children.values_mut() {
+                    sanitize_for_kimi(child);
+                }
+            }
+        }
+        if let Some(items) = obj.get_mut("items") {
+            sanitize_for_kimi(items);
+        }
+        if let Some(additional) = obj.get_mut("additionalProperties")
+            && additional.is_object()
+        {
+            sanitize_for_kimi(additional);
+        }
+        for union_key in ["anyOf", "oneOf"] {
+            if let Some(branches) = obj.get_mut(union_key).and_then(Value::as_array_mut) {
+                for branch in branches {
+                    sanitize_for_kimi(branch);
+                }
+            }
         }
 
         // If this object has `type` + `anyOf`/`oneOf`, push `type` into
@@ -1043,75 +1081,903 @@ pub fn sanitize_for_kimi(schema: &mut serde_json::Value) {
                     }
                 }
             }
-        }
-    } else if let Some(arr) = schema.as_array_mut() {
-        for v in arr.iter_mut() {
-            sanitize_for_kimi(v);
+            // The provider-neutral sanitizer injects an empty `properties`
+            // map on every bare object before this provider pass. MFJS permits
+            // only annotations beside `anyOf`, so remove that semantic no-op
+            // after moving the object type into each branch.
+            if obj
+                .get("properties")
+                .and_then(Value::as_object)
+                .is_some_and(Map::is_empty)
+            {
+                obj.remove("properties");
+            }
         }
     }
 }
 
+/// A safe, provider-facing reason that Kimi parameters could not be emitted.
+///
+/// These diagnostics deliberately never include the schema or `$ref` value:
+/// tool schemas can be supplied by MCP servers and may contain private data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum KimiParameterSchemaError {
+    #[error("Moonshot function parameters root must be a JSON object schema")]
+    RootMustBeObject,
+    #[error("Moonshot function parameters contain an unsupported root reference")]
+    UnsupportedRootReference,
+    #[error("Moonshot function parameters contain an unresolved internal root reference")]
+    UnresolvedRootReference,
+    #[error("Moonshot function parameters contain a cyclic internal root reference")]
+    CyclicRootReference,
+    #[error("Moonshot function parameters root reference must resolve to an object schema")]
+    ReferencedRootMustBeObject,
+    #[error("Moonshot function parameters contain unsupported nested allOf composition")]
+    UnsupportedNestedAllOf,
+    #[error("Moonshot function parameters contain conflicting nested union composition")]
+    ConflictingNestedUnion,
+    #[error("Moonshot function parameters contain an unsupported const literal")]
+    UnsupportedConstLiteral,
+    #[error("Moonshot function parameters contain conflicting literal constraints")]
+    ConflictingLiteralConstraint,
+    #[error("Moonshot function parameters contain an invalid nullable marker")]
+    InvalidNullable,
+    #[error("Moonshot function parameters contain an unsupported MFJS keyword")]
+    UnsupportedKeyword,
+    #[error("Moonshot function parameters contain an invalid MFJS schema node")]
+    InvalidSchemaNode,
+    #[error("Moonshot function parameters contain an invalid MFJS keyword value")]
+    InvalidKeywordValue,
+    #[error("Moonshot function parameters contain an invalid MFJS reference")]
+    InvalidReference,
+    #[error("Moonshot function parameters contain an MFJS schema without a concrete type")]
+    MissingType,
+    #[error("Moonshot function parameters exceed an MFJS resource limit")]
+    ResourceLimitExceeded,
+    #[error("Moonshot function parameters contain a non-terminating MFJS reference")]
+    NonTerminatingReference,
+    #[error("Moonshot function parameters contain an invalid MFJS default")]
+    InvalidDefault,
+    #[error("Moonshot function parameters contain an invalid MFJS range")]
+    InvalidRange,
+}
+
 /// Normalize a complete Kimi / Moonshot `function.parameters` object.
 ///
-/// Kimi / Moonshot requires `"type": "object"` on the parameters root
-/// regardless of whether the schema uses `properties`, `$ref`, `anyOf`,
-/// `allOf`, or `oneOf`.  We run `sanitize_for_kimi` first so nested
-/// `anyOf` / `oneOf` handling is correct, then unconditionally ensure
-/// `type: object` is present at the root (#3281).
+/// Function parameters have an additional MFJS constraint: the root must end
+/// as a plain `type: "object"` schema. Root composition is flattened using the
+/// same compatibility pass as Responses and xAI, while supported nested
+/// `anyOf` branches remain nested. Internal root `$ref` values are resolved and
+/// inlined before normalization so we never manufacture the invalid
+/// `type + allOf($ref)` shape rejected by MFJS.
 ///
-/// This is root-only because recursively injecting `type: object` into
-/// every empty object would corrupt JSON Schema maps such as
-/// `"properties": {}`.
-pub fn sanitize_for_kimi_parameters(parameters: &mut serde_json::Value) {
-    if !parameters.is_object() {
-        *parameters = serde_json::Value::Object(Map::new());
+/// Unsupported, unresolved, cyclic, and non-object root references fail
+/// closed with a non-secret diagnostic instead of being sent to Moonshot.
+///
+/// MFJS differences from JSON Schema:
+/// https://github.com/MoonshotAI/walle/blob/main/docs/mfjs-walle-vs-draft-2020-12.md
+pub fn sanitize_for_kimi_parameters(
+    parameters: &mut Value,
+) -> Result<Option<String>, KimiParameterSchemaError> {
+    // Work on a clone so a rejected schema remains byte-for-byte unchanged for
+    // callers that retain the catalog and retry against another provider.
+    let mut candidate = parameters.clone();
+    let constraint_note = sanitize_kimi_parameters_candidate(&mut candidate)?;
+    validate_mfjs_parameters(&candidate)?;
+    *parameters = candidate;
+    Ok(constraint_note)
+}
+
+fn sanitize_kimi_parameters_candidate(
+    parameters: &mut Value,
+) -> Result<Option<String>, KimiParameterSchemaError> {
+    let Some(root) = parameters.as_object() else {
+        return Err(KimiParameterSchemaError::RootMustBeObject);
+    };
+    if root
+        .get("type")
+        .is_some_and(|schema_type| schema_type != "object")
+    {
+        return Err(KimiParameterSchemaError::RootMustBeObject);
     }
 
-    // Run the generic Kimi pass first so nested `anyOf` / `oneOf` receive
-    // their `type` from the parent *before* we re-add it at the root.
+    inline_internal_kimi_root_ref(parameters)?;
+
+    // A function schema's root cannot carry MFJS composition because it must
+    // simultaneously be `type: object`. Flatten the actual root shape used by
+    // apply_patch and retain its dropped required-group contract as a prompt
+    // note for the model.
+    let constraint_note = sanitize_for_responses(parameters);
+
+    // Restore nullable unions collapsed by the registry's provider-neutral
+    // sanitizer, translate MFJS-safe scalar const values, and normalize nested
+    // composition. Codewhale still validates tool input before execution, so
+    // widening oneOf to MFJS's anyOf remains safe; allOf fails closed.
+    normalize_kimi_compatibility(parameters, true)?;
+
+    // MFJS requires `type` to live inside each anyOf branch, never alongside
+    // the union keyword. The root is composition-free at this point, so this
+    // only adjusts valid nested unions.
     sanitize_for_kimi(parameters);
 
-    // Always ensure `type: object` at the parameters root.  Kimi/Moonshot
-    // rejects any parameters schema missing it (#3265, #3281).
-    //
-    // For bare `$ref` schemas (e.g. `{"$ref": "#/definitions/FileArgs"}`),
-    // we cannot add a sibling `type` because JSON Schema forbids sibling
-    // keywords alongside `$ref`.  Instead we wrap the $ref in an `allOf`
-    // array and inject `type: object` at the root — a standard JSON Schema
-    // pattern that preserves the $ref semantics.
-    if let Some(obj) = parameters.as_object_mut()
-        && !obj.contains_key("type")
+    let Some(root) = parameters.as_object() else {
+        return Err(KimiParameterSchemaError::RootMustBeObject);
+    };
+    if root.get("type").and_then(Value::as_str) != Some("object")
+        || root.contains_key("anyOf")
+        || root.contains_key("oneOf")
+        || root.contains_key("allOf")
+        || root.contains_key("$ref")
     {
-        if let Some(ref_val) = obj.remove("$ref") {
-            let mut new_root = serde_json::Map::new();
-            new_root.insert(
-                "type".to_string(),
-                serde_json::Value::String("object".to_string()),
-            );
-            new_root.insert(
-                "allOf".to_string(),
-                serde_json::Value::Array(vec![serde_json::json!({"$ref": ref_val})]),
-            );
-            // Preserve any other keys the original object may have had
-            // (e.g. "description") in the new root.
-            for (k, v) in obj.iter() {
-                if k != "$ref" {
-                    new_root.insert(k.clone(), v.clone());
-                }
-            }
-            *obj = new_root;
-        } else {
-            obj.insert(
-                "type".to_string(),
-                serde_json::Value::String("object".to_string()),
-            );
+        return Err(KimiParameterSchemaError::RootMustBeObject);
+    }
+
+    Ok(constraint_note)
+}
+
+fn inline_internal_kimi_root_ref(parameters: &mut Value) -> Result<(), KimiParameterSchemaError> {
+    let document = parameters.clone();
+    let Some(document_root) = document.as_object() else {
+        return Err(KimiParameterSchemaError::RootMustBeObject);
+    };
+    let Some(root_ref) = document_root.get("$ref") else {
+        return Ok(());
+    };
+    let Some(mut reference) = root_ref.as_str() else {
+        return Err(KimiParameterSchemaError::UnsupportedRootReference);
+    };
+
+    let mut visited = HashSet::new();
+    let resolved = loop {
+        if !reference.starts_with("#/") {
+            return Err(KimiParameterSchemaError::UnsupportedRootReference);
+        }
+        if !visited.insert(reference.to_string()) {
+            return Err(KimiParameterSchemaError::CyclicRootReference);
+        }
+        let target = document
+            .pointer(&reference[1..])
+            .ok_or(KimiParameterSchemaError::UnresolvedRootReference)?;
+        let target = target
+            .as_object()
+            .ok_or(KimiParameterSchemaError::ReferencedRootMustBeObject)?;
+        if let Some(next_ref) = target.get("$ref") {
+            reference = next_ref
+                .as_str()
+                .ok_or(KimiParameterSchemaError::UnsupportedRootReference)?;
+            continue;
+        }
+        if target.get("type").and_then(Value::as_str) != Some("object") {
+            return Err(KimiParameterSchemaError::ReferencedRootMustBeObject);
+        }
+        break target.clone();
+    };
+
+    let mut inlined = resolved;
+    for (key, value) in document_root {
+        if key != "$ref" {
+            inlined.insert(key.clone(), value.clone());
         }
     }
+    *parameters = Value::Object(inlined);
+    Ok(())
+}
+
+fn normalize_kimi_compatibility(
+    schema: &mut Value,
+    is_root: bool,
+) -> Result<(), KimiParameterSchemaError> {
+    let Some(obj) = schema.as_object_mut() else {
+        return Err(KimiParameterSchemaError::InvalidSchemaNode);
+    };
+
+    if !is_root {
+        if obj.contains_key("allOf") {
+            return Err(KimiParameterSchemaError::UnsupportedNestedAllOf);
+        }
+        if let Some(one_of) = obj.remove("oneOf") {
+            if obj.contains_key("anyOf") {
+                return Err(KimiParameterSchemaError::ConflictingNestedUnion);
+            }
+            obj.insert("anyOf".to_string(), one_of);
+        }
+    }
+
+    if let Some(constant) = obj.remove("const") {
+        if !is_mfjs_enum_literal(&constant) {
+            return Err(KimiParameterSchemaError::UnsupportedConstLiteral);
+        }
+        if !obj.contains_key("type") {
+            let inferred = mfjs_literal_kind(&constant)
+                .ok_or(KimiParameterSchemaError::UnsupportedConstLiteral)?;
+            let schema_type = match inferred {
+                MfjsLiteralKind::Integer => "integer",
+                MfjsLiteralKind::Number => "number",
+                MfjsLiteralKind::String => "string",
+            };
+            obj.insert("type".to_string(), Value::String(schema_type.to_string()));
+        }
+        if let Some(existing) = obj.get("enum") {
+            let agrees = existing
+                .as_array()
+                .is_some_and(|values| values.as_slice() == [constant.clone()]);
+            if !agrees {
+                return Err(KimiParameterSchemaError::ConflictingLiteralConstraint);
+            }
+        } else {
+            obj.insert("enum".to_string(), Value::Array(vec![constant]));
+        }
+    }
+
+    let nullable = obj.remove("nullable");
+    if nullable.is_some()
+        && !obj
+            .get("type")
+            .is_some_and(|schema_type| schema_type.as_str().is_some_and(is_mfjs_concrete_type))
+    {
+        return Err(KimiParameterSchemaError::InvalidNullable);
+    }
+    match nullable.as_ref().map(Value::as_bool) {
+        None => {}
+        Some(Some(false)) => {}
+        Some(Some(true)) if is_root => {
+            // Function parameters are required to be an object at the root;
+            // null was never a valid wire instance there.
+        }
+        Some(Some(true)) => {
+            let non_null = Value::Object(std::mem::take(obj));
+            *schema = serde_json::json!({
+                "anyOf": [non_null, {"type": "null"}]
+            });
+        }
+        Some(None) => return Err(KimiParameterSchemaError::InvalidNullable),
+    }
+
+    normalize_kimi_child_schemas(schema)?;
+    Ok(())
+}
+
+fn normalize_kimi_child_schemas(schema: &mut Value) -> Result<(), KimiParameterSchemaError> {
+    let Some(obj) = schema.as_object_mut() else {
+        return Err(KimiParameterSchemaError::InvalidSchemaNode);
+    };
+
+    for map_key in ["properties", "$defs"] {
+        if let Some(children) = obj.get_mut(map_key).and_then(Value::as_object_mut) {
+            for child in children.values_mut() {
+                normalize_kimi_compatibility(child, false)?;
+            }
+        }
+    }
+
+    if let Some(items) = obj.get_mut("items") {
+        normalize_kimi_compatibility(items, false)?;
+    }
+    if let Some(additional) = obj.get_mut("additionalProperties")
+        && additional.is_object()
+    {
+        normalize_kimi_compatibility(additional, false)?;
+    }
+    if let Some(branches) = obj.get_mut("anyOf").and_then(Value::as_array_mut) {
+        for branch in branches {
+            normalize_kimi_compatibility(branch, false)?;
+        }
+    }
+    Ok(())
+}
+
+fn is_mfjs_enum_literal(value: &Value) -> bool {
+    value.is_string() || value.is_number()
+}
+
+/// Validate one fully normalized MFJS function-parameters schema.
+///
+/// Every error is a fixed enum variant: schemas can originate in MCP or
+/// runtime tools and may contain private names or values, so diagnostics must
+/// never echo a keyword, property, reference, or literal from the document.
+pub fn validate_mfjs_parameters(parameters: &Value) -> Result<(), KimiParameterSchemaError> {
+    let root = parameters
+        .as_object()
+        .ok_or(KimiParameterSchemaError::RootMustBeObject)?;
+    if root.get("type").and_then(Value::as_str) != Some("object")
+        || root.contains_key("anyOf")
+        || root.contains_key("oneOf")
+        || root.contains_key("allOf")
+        || root.contains_key("$ref")
+    {
+        return Err(KimiParameterSchemaError::RootMustBeObject);
+    }
+    if serde_json::to_vec(parameters)
+        .map(|encoded| encoded.len() > MFJS_MAX_SCHEMA_BYTES)
+        .unwrap_or(true)
+    {
+        return Err(KimiParameterSchemaError::ResourceLimitExceeded);
+    }
+
+    let mut state = MfjsValidationState::new(parameters);
+    state.validate_schema(parameters, true, false, 0, 0)?;
+
+    let mut visiting_refs = HashSet::new();
+    if !mfjs_schema_can_terminate(parameters, parameters, &mut visiting_refs, 0)? {
+        return Err(KimiParameterSchemaError::NonTerminatingReference);
+    }
+
+    validate_mfjs_expanded_depth(parameters, parameters, 0, &mut HashSet::new(), 0)?;
+    if let Some(definitions) = root.get("$defs").and_then(Value::as_object) {
+        for definition in definitions.values() {
+            validate_mfjs_expanded_depth(definition, parameters, 0, &mut HashSet::new(), 0)?;
+        }
+    }
+    Ok(())
+}
+
+const MFJS_MAX_ANY_OF_ITEMS: usize = 10;
+const MFJS_MAX_OBJECT_DEPTH: usize = 5;
+const MFJS_MAX_TOTAL_PROPERTIES: usize = 100;
+const MFJS_MAX_TOTAL_ENUM_VALUES: usize = 500;
+const MFJS_ENUM_LENGTH_CHECK_THRESHOLD: usize = 250;
+const MFJS_MAX_ENUM_STRING_LENGTH: usize = 7_500;
+const MFJS_MAX_SCHEMA_BYTES: usize = 120_000;
+const MFJS_MAX_STRUCTURAL_DEPTH: usize = 64;
+const MFJS_MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+struct MfjsValidationState<'a> {
+    document: &'a Value,
+    total_properties: usize,
+    total_enum_values: usize,
+}
+
+impl<'a> MfjsValidationState<'a> {
+    fn new(document: &'a Value) -> Self {
+        Self {
+            document,
+            total_properties: 0,
+            total_enum_values: 0,
+        }
+    }
+
+    fn validate_schema(
+        &mut self,
+        schema: &Value,
+        is_root: bool,
+        allow_empty: bool,
+        property_depth: usize,
+        structural_depth: usize,
+    ) -> Result<(), KimiParameterSchemaError> {
+        if structural_depth > MFJS_MAX_STRUCTURAL_DEPTH {
+            return Err(KimiParameterSchemaError::ResourceLimitExceeded);
+        }
+        let obj = schema
+            .as_object()
+            .ok_or(KimiParameterSchemaError::InvalidSchemaNode)?;
+        if obj.is_empty() {
+            return if allow_empty {
+                Ok(())
+            } else {
+                Err(KimiParameterSchemaError::MissingType)
+            };
+        }
+
+        const ALLOWED_KEYWORDS: &[&str] = &[
+            "$id",
+            "$ref",
+            "$defs",
+            "anyOf",
+            "properties",
+            "additionalProperties",
+            "items",
+            "type",
+            "enum",
+            "required",
+            "maxLength",
+            "minLength",
+            "maximum",
+            "minimum",
+            "maxItems",
+            "minItems",
+            "title",
+            "description",
+            "default",
+        ];
+        if obj
+            .keys()
+            .any(|keyword| !ALLOWED_KEYWORDS.contains(&keyword.as_str()))
+        {
+            return Err(KimiParameterSchemaError::UnsupportedKeyword);
+        }
+
+        for annotation in ["title", "description"] {
+            if obj.get(annotation).is_some_and(|value| !value.is_string()) {
+                return Err(KimiParameterSchemaError::InvalidKeywordValue);
+            }
+        }
+        if obj.get("$id").is_some_and(|value| !value.is_string())
+            || (!is_root && obj.contains_key("$id"))
+        {
+            return Err(KimiParameterSchemaError::InvalidKeywordValue);
+        }
+
+        if let Some(definitions) = obj.get("$defs") {
+            if !is_root {
+                return Err(KimiParameterSchemaError::InvalidKeywordValue);
+            }
+            let definitions = definitions
+                .as_object()
+                .ok_or(KimiParameterSchemaError::InvalidKeywordValue)?;
+            for (name, definition) in definitions {
+                if name.is_empty() || name.contains('/') {
+                    return Err(KimiParameterSchemaError::InvalidKeywordValue);
+                }
+                self.validate_schema(definition, false, false, 0, structural_depth + 1)?;
+            }
+        }
+
+        if let Some(reference) = obj.get("$ref") {
+            let reference = reference
+                .as_str()
+                .ok_or(KimiParameterSchemaError::InvalidReference)?;
+            if resolve_mfjs_reference(self.document, reference).is_none() {
+                return Err(KimiParameterSchemaError::InvalidReference);
+            }
+            let allowed_ref_sibling = |key: &str| {
+                matches!(key, "$ref" | "title" | "description")
+                    || (is_root && matches!(key, "$defs" | "$id"))
+            };
+            if obj.keys().any(|key| !allowed_ref_sibling(key)) {
+                return Err(KimiParameterSchemaError::InvalidReference);
+            }
+            return Ok(());
+        }
+
+        if let Some(any_of) = obj.get("anyOf") {
+            let branches = any_of
+                .as_array()
+                .filter(|branches| !branches.is_empty() && branches.len() <= MFJS_MAX_ANY_OF_ITEMS)
+                .ok_or(KimiParameterSchemaError::ResourceLimitExceeded)?;
+            let allowed_union_sibling = |key: &str| {
+                matches!(key, "anyOf" | "title" | "description")
+                    || (is_root && matches!(key, "$defs" | "$id"))
+            };
+            if obj.keys().any(|key| !allowed_union_sibling(key)) {
+                return Err(KimiParameterSchemaError::InvalidKeywordValue);
+            }
+            for branch in branches {
+                self.validate_schema(branch, false, false, property_depth, structural_depth + 1)?;
+            }
+            return Ok(());
+        }
+
+        let schema_type = obj
+            .get("type")
+            .and_then(Value::as_str)
+            .filter(|schema_type| is_mfjs_concrete_type(schema_type))
+            .ok_or(KimiParameterSchemaError::MissingType)?;
+        if obj
+            .keys()
+            .any(|keyword| !mfjs_keyword_allowed_for_type(keyword, schema_type, is_root))
+        {
+            return Err(KimiParameterSchemaError::InvalidKeywordValue);
+        }
+
+        if let Some(values) = obj.get("enum") {
+            validate_mfjs_enum(values, schema_type, self)?;
+        }
+        if let Some(default) = obj.get("default") {
+            validate_mfjs_default(default, schema_type)?;
+        }
+
+        if let Some(properties) = obj.get("properties") {
+            let properties = properties
+                .as_object()
+                .ok_or(KimiParameterSchemaError::InvalidKeywordValue)?;
+            self.total_properties = self
+                .total_properties
+                .checked_add(properties.len())
+                .ok_or(KimiParameterSchemaError::ResourceLimitExceeded)?;
+            if self.total_properties > MFJS_MAX_TOTAL_PROPERTIES {
+                return Err(KimiParameterSchemaError::ResourceLimitExceeded);
+            }
+            for (name, property) in properties {
+                if name.is_empty()
+                    || matches!(
+                        name.as_str(),
+                        "$defs" | "$ref" | "anyOf" | "required" | "additionalProperties"
+                    )
+                {
+                    return Err(KimiParameterSchemaError::InvalidKeywordValue);
+                }
+                let child_depth = property_depth
+                    .checked_add(1)
+                    .ok_or(KimiParameterSchemaError::ResourceLimitExceeded)?;
+                if child_depth > MFJS_MAX_OBJECT_DEPTH {
+                    return Err(KimiParameterSchemaError::ResourceLimitExceeded);
+                }
+                self.validate_schema(property, false, false, child_depth, structural_depth + 1)?;
+            }
+        }
+
+        if let Some(required) = obj.get("required") {
+            let required = required
+                .as_array()
+                .ok_or(KimiParameterSchemaError::InvalidKeywordValue)?;
+            let properties = obj
+                .get("properties")
+                .and_then(Value::as_object)
+                .ok_or(KimiParameterSchemaError::InvalidKeywordValue)?;
+            let mut seen = HashSet::new();
+            for name in required {
+                let name = name
+                    .as_str()
+                    .ok_or(KimiParameterSchemaError::InvalidKeywordValue)?;
+                if name.is_empty() || !properties.contains_key(name) || !seen.insert(name) {
+                    return Err(KimiParameterSchemaError::InvalidKeywordValue);
+                }
+            }
+        }
+
+        if let Some(additional) = obj.get("additionalProperties") {
+            match additional {
+                Value::Bool(_) => {}
+                Value::Object(_) => self.validate_schema(
+                    additional,
+                    false,
+                    true,
+                    property_depth,
+                    structural_depth + 1,
+                )?,
+                _ => return Err(KimiParameterSchemaError::InvalidKeywordValue),
+            }
+        }
+
+        if let Some(items) = obj.get("items") {
+            self.validate_schema(items, false, false, property_depth, structural_depth + 1)?;
+        }
+
+        validate_mfjs_bounds(obj, schema_type)?;
+        Ok(())
+    }
+}
+
+fn is_mfjs_concrete_type(schema_type: &str) -> bool {
+    matches!(
+        schema_type,
+        "null" | "boolean" | "object" | "array" | "number" | "integer" | "string"
+    )
+}
+
+fn mfjs_keyword_allowed_for_type(keyword: &str, schema_type: &str, is_root: bool) -> bool {
+    if is_root && matches!(keyword, "$defs" | "$id") {
+        return true;
+    }
+    if matches!(keyword, "type" | "title" | "description") {
+        return true;
+    }
+    match schema_type {
+        "object" => matches!(keyword, "properties" | "required" | "additionalProperties"),
+        "array" => matches!(keyword, "items" | "minItems" | "maxItems"),
+        "string" => matches!(keyword, "enum" | "default" | "minLength" | "maxLength"),
+        "number" | "integer" => {
+            matches!(keyword, "enum" | "default" | "minimum" | "maximum")
+        }
+        "boolean" | "null" => keyword == "default",
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MfjsLiteralKind {
+    Integer,
+    Number,
+    String,
+}
+
+fn mfjs_literal_kind(value: &Value) -> Option<MfjsLiteralKind> {
+    if value.is_string() {
+        return Some(MfjsLiteralKind::String);
+    }
+    let number = value.as_number()?;
+    if number.is_i64() || number.is_u64() {
+        Some(MfjsLiteralKind::Integer)
+    } else {
+        Some(MfjsLiteralKind::Number)
+    }
+}
+
+fn validate_mfjs_enum(
+    value: &Value,
+    schema_type: &str,
+    state: &mut MfjsValidationState<'_>,
+) -> Result<(), KimiParameterSchemaError> {
+    let values = value
+        .as_array()
+        .filter(|values| !values.is_empty())
+        .ok_or(KimiParameterSchemaError::InvalidKeywordValue)?;
+    state.total_enum_values = state
+        .total_enum_values
+        .checked_add(values.len())
+        .ok_or(KimiParameterSchemaError::ResourceLimitExceeded)?;
+    if state.total_enum_values > MFJS_MAX_TOTAL_ENUM_VALUES {
+        return Err(KimiParameterSchemaError::ResourceLimitExceeded);
+    }
+
+    let values_match_type = match schema_type {
+        "string" => values.iter().all(Value::is_string),
+        "integer" => values
+            .iter()
+            .all(|value| mfjs_integer_value(value).is_some()),
+        "number" => values.iter().all(Value::is_number),
+        _ => false,
+    };
+    if !values_match_type {
+        return Err(KimiParameterSchemaError::InvalidKeywordValue);
+    }
+
+    if values.len() > MFJS_ENUM_LENGTH_CHECK_THRESHOLD {
+        let encoded_length = values.iter().try_fold(0usize, |total, value| {
+            let literal_length = value
+                .as_str()
+                .map(str::len)
+                .unwrap_or_else(|| value.to_string().len());
+            total.checked_add(literal_length)
+        });
+        if encoded_length.is_none_or(|length| length > MFJS_MAX_ENUM_STRING_LENGTH) {
+            return Err(KimiParameterSchemaError::ResourceLimitExceeded);
+        }
+    }
+    Ok(())
+}
+
+fn validate_mfjs_default(value: &Value, schema_type: &str) -> Result<(), KimiParameterSchemaError> {
+    let valid = match schema_type {
+        "boolean" => value.is_boolean(),
+        "number" => value.is_number(),
+        "integer" => mfjs_integer_value(value).is_some(),
+        "string" => value.is_string(),
+        "null" => value.is_null(),
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(KimiParameterSchemaError::InvalidDefault)
+    }
+}
+
+fn mfjs_integer_value(value: &Value) -> Option<f64> {
+    let value = value.as_number()?.as_f64()?;
+    (value.is_finite() && value.fract() == 0.0 && value.abs() <= MFJS_MAX_SAFE_INTEGER)
+        .then_some(value)
+}
+
+fn validate_mfjs_bounds(
+    obj: &Map<String, Value>,
+    schema_type: &str,
+) -> Result<(), KimiParameterSchemaError> {
+    validate_mfjs_unsigned_range(obj, schema_type, "string", "minLength", "maxLength")?;
+    validate_mfjs_unsigned_range(obj, schema_type, "array", "minItems", "maxItems")?;
+
+    let minimum = obj.get("minimum");
+    let maximum = obj.get("maximum");
+    if minimum.is_some() || maximum.is_some() {
+        let parse_bound = |value: &Value| match schema_type {
+            "integer" => mfjs_integer_value(value),
+            "number" => value.as_number().and_then(serde_json::Number::as_f64),
+            _ => None,
+        };
+        let minimum = minimum
+            .map(|value| parse_bound(value).ok_or(KimiParameterSchemaError::InvalidRange))
+            .transpose()?;
+        let maximum = maximum
+            .map(|value| parse_bound(value).ok_or(KimiParameterSchemaError::InvalidRange))
+            .transpose()?;
+        if minimum.zip(maximum).is_some_and(|(min, max)| min > max) {
+            return Err(KimiParameterSchemaError::InvalidRange);
+        }
+    }
+    Ok(())
+}
+
+fn validate_mfjs_unsigned_range(
+    obj: &Map<String, Value>,
+    schema_type: &str,
+    expected_type: &str,
+    minimum_keyword: &str,
+    maximum_keyword: &str,
+) -> Result<(), KimiParameterSchemaError> {
+    let minimum = obj.get(minimum_keyword);
+    let maximum = obj.get(maximum_keyword);
+    if minimum.is_none() && maximum.is_none() {
+        return Ok(());
+    }
+    if schema_type != expected_type {
+        return Err(KimiParameterSchemaError::InvalidRange);
+    }
+    let minimum = minimum
+        .map(|value| value.as_u64().ok_or(KimiParameterSchemaError::InvalidRange))
+        .transpose()?;
+    let maximum = maximum
+        .map(|value| value.as_u64().ok_or(KimiParameterSchemaError::InvalidRange))
+        .transpose()?;
+    if minimum.zip(maximum).is_some_and(|(min, max)| min > max) {
+        return Err(KimiParameterSchemaError::InvalidRange);
+    }
+    Ok(())
+}
+
+fn resolve_mfjs_reference<'a>(document: &'a Value, reference: &str) -> Option<&'a Value> {
+    if reference == "#" {
+        return Some(document);
+    }
+    let name = reference.strip_prefix("#/$defs/")?;
+    if name.is_empty() || name.contains('/') {
+        return None;
+    }
+    document
+        .pointer(&reference[1..])
+        .filter(|target| target.is_object())
+}
+
+fn mfjs_schema_can_terminate(
+    schema: &Value,
+    document: &Value,
+    visiting_refs: &mut HashSet<String>,
+    structural_depth: usize,
+) -> Result<bool, KimiParameterSchemaError> {
+    if structural_depth > MFJS_MAX_STRUCTURAL_DEPTH {
+        return Err(KimiParameterSchemaError::ResourceLimitExceeded);
+    }
+    let obj = schema
+        .as_object()
+        .ok_or(KimiParameterSchemaError::InvalidSchemaNode)?;
+
+    if let Some(reference) = obj.get("$ref").and_then(Value::as_str) {
+        if !visiting_refs.insert(reference.to_string()) {
+            return Ok(false);
+        }
+        let target = resolve_mfjs_reference(document, reference)
+            .ok_or(KimiParameterSchemaError::InvalidReference)?;
+        let terminates =
+            mfjs_schema_can_terminate(target, document, visiting_refs, structural_depth + 1)?;
+        visiting_refs.remove(reference);
+        return Ok(terminates);
+    }
+
+    if let Some(branches) = obj.get("anyOf").and_then(Value::as_array) {
+        for branch in branches {
+            let mut branch_refs = visiting_refs.clone();
+            if mfjs_schema_can_terminate(branch, document, &mut branch_refs, structural_depth + 1)?
+            {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+
+    match obj.get("type").and_then(Value::as_str) {
+        Some("object") => {
+            let Some(required) = obj.get("required").and_then(Value::as_array) else {
+                return Ok(true);
+            };
+            if required.is_empty() {
+                return Ok(true);
+            }
+            let properties = obj
+                .get("properties")
+                .and_then(Value::as_object)
+                .ok_or(KimiParameterSchemaError::InvalidKeywordValue)?;
+            for name in required {
+                let property = name
+                    .as_str()
+                    .and_then(|name| properties.get(name))
+                    .ok_or(KimiParameterSchemaError::InvalidKeywordValue)?;
+                let mut property_refs = visiting_refs.clone();
+                if !mfjs_schema_can_terminate(
+                    property,
+                    document,
+                    &mut property_refs,
+                    structural_depth + 1,
+                )? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Some("array") => {
+            if obj.get("minItems").and_then(Value::as_u64).unwrap_or(0) == 0 {
+                return Ok(true);
+            }
+            let items = obj
+                .get("items")
+                .ok_or(KimiParameterSchemaError::InvalidSchemaNode)?;
+            mfjs_schema_can_terminate(items, document, visiting_refs, structural_depth + 1)
+        }
+        Some(schema_type) if is_mfjs_concrete_type(schema_type) => Ok(true),
+        _ => Err(KimiParameterSchemaError::MissingType),
+    }
+}
+
+fn validate_mfjs_expanded_depth(
+    schema: &Value,
+    document: &Value,
+    property_depth: usize,
+    visiting_refs: &mut HashSet<String>,
+    structural_depth: usize,
+) -> Result<(), KimiParameterSchemaError> {
+    if property_depth > MFJS_MAX_OBJECT_DEPTH || structural_depth > MFJS_MAX_STRUCTURAL_DEPTH {
+        return Err(KimiParameterSchemaError::ResourceLimitExceeded);
+    }
+    let obj = schema
+        .as_object()
+        .ok_or(KimiParameterSchemaError::InvalidSchemaNode)?;
+
+    if let Some(reference) = obj.get("$ref").and_then(Value::as_str) {
+        if !visiting_refs.insert(reference.to_string()) {
+            return Ok(());
+        }
+        let target = resolve_mfjs_reference(document, reference)
+            .ok_or(KimiParameterSchemaError::InvalidReference)?;
+        let result = validate_mfjs_expanded_depth(
+            target,
+            document,
+            property_depth,
+            visiting_refs,
+            structural_depth + 1,
+        );
+        visiting_refs.remove(reference);
+        return result;
+    }
+
+    if let Some(properties) = obj.get("properties").and_then(Value::as_object) {
+        for property in properties.values() {
+            validate_mfjs_expanded_depth(
+                property,
+                document,
+                property_depth + 1,
+                visiting_refs,
+                structural_depth + 1,
+            )?;
+        }
+    }
+    if let Some(items) = obj.get("items") {
+        validate_mfjs_expanded_depth(
+            items,
+            document,
+            property_depth,
+            visiting_refs,
+            structural_depth + 1,
+        )?;
+    }
+    if let Some(additional) = obj
+        .get("additionalProperties")
+        .filter(|additional| additional.is_object())
+    {
+        validate_mfjs_expanded_depth(
+            additional,
+            document,
+            property_depth,
+            visiting_refs,
+            structural_depth + 1,
+        )?;
+    }
+    if let Some(branches) = obj.get("anyOf").and_then(Value::as_array) {
+        for branch in branches {
+            validate_mfjs_expanded_depth(
+                branch,
+                document,
+                property_depth,
+                visiting_refs,
+                structural_depth + 1,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod kimi_tests {
     use super::*;
+    use crate::tools::apply_patch::ApplyPatchTool;
+    use crate::tools::spec::ToolSpec;
     use serde_json::json;
 
     #[test]
@@ -1198,8 +2064,8 @@ mod kimi_tests {
     #[test]
     fn kimi_parameters_add_type_to_empty_root() {
         let mut schema = json!({});
-        sanitize_for_kimi_parameters(&mut schema);
-        assert_eq!(schema, json!({"type": "object"}));
+        sanitize_for_kimi_parameters(&mut schema).unwrap();
+        assert_eq!(schema, json!({"type": "object", "properties": {}}));
     }
 
     #[test]
@@ -1211,15 +2077,15 @@ mod kimi_tests {
             "required": ["path"]
         });
 
-        sanitize_for_kimi_parameters(&mut schema);
+        sanitize_for_kimi_parameters(&mut schema).unwrap();
 
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["properties"]["path"]["type"], "string");
         assert!(schema["properties"].get("type").is_none());
     }
 
-    // #3281: root schemas using $ref, allOf, anyOf, oneOf must also
-    // receive type: object so Kimi/Moonshot does not reject them.
+    // Function parameters must end as a plain object root. Composition stays
+    // available only in valid nested anyOf positions.
 
     #[test]
     fn kimi_parameters_add_type_to_anyof_root() {
@@ -1229,9 +2095,10 @@ mod kimi_tests {
                 {"type": "null"}
             ]
         });
-        sanitize_for_kimi_parameters(&mut schema);
+        sanitize_for_kimi_parameters(&mut schema).unwrap();
         assert_eq!(schema["type"], "object");
-        assert!(schema["anyOf"].is_array());
+        assert!(schema.get("anyOf").is_none());
+        assert_eq!(schema["properties"]["path"]["type"], "string");
     }
 
     #[test]
@@ -1241,9 +2108,10 @@ mod kimi_tests {
                 {"type": "object", "properties": {"name": {"type": "string"}}}
             ]
         });
-        sanitize_for_kimi_parameters(&mut schema);
+        sanitize_for_kimi_parameters(&mut schema).unwrap();
         assert_eq!(schema["type"], "object");
-        assert!(schema["allOf"].is_array());
+        assert!(schema.get("allOf").is_none());
+        assert_eq!(schema["properties"]["name"]["type"], "string");
     }
 
     #[test]
@@ -1254,20 +2122,609 @@ mod kimi_tests {
                 {"type": "object", "properties": {"name": {"type": "string"}}}
             ]
         });
-        sanitize_for_kimi_parameters(&mut schema);
+        sanitize_for_kimi_parameters(&mut schema).unwrap();
         assert_eq!(schema["type"], "object");
-        assert!(schema["oneOf"].is_array());
+        assert!(schema.get("oneOf").is_none());
+        assert_eq!(schema["properties"]["id"]["type"], "integer");
+        assert_eq!(schema["properties"]["name"]["type"], "string");
     }
 
     #[test]
-    fn kimi_parameters_wraps_ref_in_allof_with_type_object() {
-        let mut schema = json!({"$ref": "#/definitions/FileArgs"});
-        sanitize_for_kimi_parameters(&mut schema);
-        // $ref cannot have sibling keywords per JSON Schema, so we wrap
-        // it in allOf and inject type: object at the root (#3281).
+    fn kimi_parameters_flattens_actual_apply_patch_root_and_returns_constraint_note() {
+        let mut schema = ApplyPatchTool.input_schema();
+
+        let note = sanitize_for_kimi_parameters(&mut schema).unwrap();
+
         assert_eq!(schema["type"], "object");
-        assert!(schema["allOf"].is_array());
-        assert_eq!(schema["allOf"][0]["$ref"], "#/definitions/FileArgs");
+        assert!(schema.get("oneOf").is_none());
+        assert!(schema.get("anyOf").is_none());
+        assert!(schema.get("allOf").is_none());
+        assert_eq!(schema["properties"]["patch"]["type"], "string");
+        assert_eq!(schema["properties"]["replace"]["type"], "array");
+        assert_eq!(schema["properties"]["changes"]["type"], "array");
+        assert_eq!(
+            note.as_deref(),
+            Some(
+                "Exactly one of these parameter groups must be provided: `changes` | `patch` | `replace`."
+            )
+        );
+    }
+
+    #[test]
+    fn kimi_parameters_preserves_nested_anyof_branches() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "selector": {
+                    "type": "object",
+                    "anyOf": [
+                        {"properties": {"path": {"type": "string"}}},
+                        {"properties": {"id": {"type": "integer"}}}
+                    ]
+                }
+            }
+        });
+
+        sanitize_for_kimi_parameters(&mut schema).unwrap();
+
+        assert_eq!(schema["type"], "object");
+        let selector = &schema["properties"]["selector"];
+        assert!(selector.get("type").is_none());
+        let branches = selector["anyOf"].as_array().unwrap();
+        assert_eq!(branches.len(), 2);
+        assert!(branches.iter().all(|branch| branch["type"] == "object"));
+    }
+
+    #[test]
+    fn kimi_parameters_converts_nested_oneof_to_supported_anyof() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "selector": {
+                    "type": "object",
+                    "oneOf": [
+                        {"properties": {"path": {"type": "string"}}},
+                        {"properties": {"id": {"type": "integer"}}}
+                    ]
+                }
+            }
+        });
+
+        sanitize_for_kimi_parameters(&mut schema).unwrap();
+
+        let selector = &schema["properties"]["selector"];
+        assert!(selector.get("oneOf").is_none());
+        assert!(selector["anyOf"].is_array());
+        assert!(selector.get("type").is_none());
+    }
+
+    #[test]
+    fn kimi_parameters_restores_registry_collapsed_nullable_anyof() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "null"}
+                    ]
+                }
+            }
+        });
+
+        // Exercise the exact two-stage production path: ToolRegistry applies
+        // the provider-neutral pass before the Moonshot request adapter sees
+        // the schema.
+        sanitize(&mut schema);
+        assert_eq!(schema["properties"]["query"]["nullable"], true);
+        assert!(schema["properties"]["query"].get("anyOf").is_none());
+
+        sanitize_for_kimi_parameters(&mut schema).unwrap();
+
+        let query = &schema["properties"]["query"];
+        assert!(query.get("nullable").is_none(), "{query}");
+        assert_eq!(
+            query["anyOf"],
+            json!([{"type": "string"}, {"type": "null"}])
+        );
+        validate_mfjs_parameters(&schema).unwrap();
+    }
+
+    #[test]
+    fn kimi_parameters_recursively_translates_safe_const_to_enum() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "envelope": {
+                    "type": "object",
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "kind": {"type": "string", "const": "var_handle"}
+                                },
+                                "required": ["kind"]
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        sanitize_for_kimi_parameters(&mut schema).unwrap();
+
+        let kind = schema
+            .pointer("/properties/envelope/properties/items/items/properties/kind")
+            .expect("nested kind schema");
+        assert!(kind.get("const").is_none(), "{kind}");
+        assert_eq!(kind["enum"], json!(["var_handle"]));
+    }
+
+    #[test]
+    fn kimi_parameters_rejects_unsafe_const_without_mutating_or_leaking() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "private-toggle-8172": {"type": "boolean", "const": true}
+            }
+        });
+        let original = schema.clone();
+
+        let error = sanitize_for_kimi_parameters(&mut schema).unwrap_err();
+
+        assert_eq!(error, KimiParameterSchemaError::UnsupportedConstLiteral);
+        assert!(!error.to_string().contains("private-toggle-8172"));
+        assert_eq!(schema, original, "a rejected schema must remain reusable");
+    }
+
+    #[test]
+    fn kimi_parameters_validator_fails_closed_without_echoing_schema_values() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "private-field-4921": {
+                    "type": "string",
+                    "pattern": "private-pattern-value-7395"
+                }
+            }
+        });
+        let original = schema.clone();
+
+        let error = sanitize_for_kimi_parameters(&mut schema).unwrap_err();
+        let diagnostic = error.to_string();
+
+        assert_eq!(error, KimiParameterSchemaError::UnsupportedKeyword);
+        assert!(!diagnostic.contains("private-field-4921"));
+        assert!(!diagnostic.contains("private-pattern-value-7395"));
+        assert_eq!(schema, original, "failed validation must be transactional");
+    }
+
+    #[test]
+    fn kimi_parameters_rejects_untyped_schema_and_nullable_transactionally() {
+        for (mut schema, expected, sentinels) in [
+            (
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "private-missing-type-1207": {
+                            "description": "private-description-1208"
+                        }
+                    }
+                }),
+                KimiParameterSchemaError::MissingType,
+                ["private-missing-type-1207", "private-description-1208"],
+            ),
+            (
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "private-nullable-1209": {
+                            "nullable": true,
+                            "description": "private-nullable-description-1210"
+                        }
+                    }
+                }),
+                KimiParameterSchemaError::InvalidNullable,
+                ["private-nullable-1209", "private-nullable-description-1210"],
+            ),
+        ] {
+            let original = schema.clone();
+            let error = sanitize_for_kimi_parameters(&mut schema).unwrap_err();
+            assert_eq!(error, expected);
+            for sentinel in sentinels {
+                assert!(!error.to_string().contains(sentinel));
+            }
+            assert_eq!(schema, original, "rejection must be transactional");
+        }
+    }
+
+    #[test]
+    fn kimi_parameters_infers_safe_types_for_untyped_const() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "kind": {"const": "var_handle"},
+                "count": {"const": 7},
+                "ratio": {"const": 1.25}
+            }
+        });
+
+        sanitize_for_kimi_parameters(&mut schema).unwrap();
+
+        assert_eq!(schema["properties"]["kind"]["type"], "string");
+        assert_eq!(schema["properties"]["kind"]["enum"], json!(["var_handle"]));
+        assert_eq!(schema["properties"]["count"]["type"], "integer");
+        assert_eq!(schema["properties"]["count"]["enum"], json!([7]));
+        assert_eq!(schema["properties"]["ratio"]["type"], "number");
+        assert_eq!(schema["properties"]["ratio"]["enum"], json!([1.25]));
+    }
+
+    #[test]
+    fn kimi_parameters_allows_only_the_documented_empty_schema_exception() {
+        let mut schema = json!({
+            "type": "object",
+            "additionalProperties": {}
+        });
+        sanitize_for_kimi_parameters(&mut schema).unwrap();
+        assert_eq!(schema["additionalProperties"], json!({}));
+
+        let mut invalid = json!({
+            "type": "object",
+            "properties": {"value": {}}
+        });
+        assert_eq!(
+            sanitize_for_kimi_parameters(&mut invalid).unwrap_err(),
+            KimiParameterSchemaError::MissingType
+        );
+    }
+
+    #[test]
+    fn kimi_parameters_rejects_required_direct_and_mutual_recursion() {
+        let fixtures = [
+            json!({
+                "type": "object",
+                "properties": {
+                    "private-root-node-2201": {"$ref": "#/$defs/private-node-2202"}
+                },
+                "required": ["private-root-node-2201"],
+                "$defs": {
+                    "private-node-2202": {
+                        "type": "object",
+                        "properties": {
+                            "private-next-2203": {"$ref": "#/$defs/private-node-2202"}
+                        },
+                        "required": ["private-next-2203"]
+                    }
+                }
+            }),
+            json!({
+                "type": "object",
+                "properties": {
+                    "private-root-a-2204": {"$ref": "#/$defs/private-a-2205"}
+                },
+                "required": ["private-root-a-2204"],
+                "$defs": {
+                    "private-a-2205": {
+                        "type": "object",
+                        "properties": {
+                            "private-to-b-2206": {"$ref": "#/$defs/private-b-2207"}
+                        },
+                        "required": ["private-to-b-2206"]
+                    },
+                    "private-b-2207": {
+                        "type": "object",
+                        "properties": {
+                            "private-to-a-2208": {"$ref": "#/$defs/private-a-2205"}
+                        },
+                        "required": ["private-to-a-2208"]
+                    }
+                }
+            }),
+        ];
+
+        for mut schema in fixtures {
+            let original = schema.clone();
+            let error = sanitize_for_kimi_parameters(&mut schema).unwrap_err();
+            assert_eq!(error, KimiParameterSchemaError::NonTerminatingReference);
+            for sentinel in ["private-root", "private-node", "private-to"] {
+                assert!(!error.to_string().contains(sentinel));
+            }
+            assert_eq!(schema, original, "recursive rejection must be atomic");
+        }
+    }
+
+    #[test]
+    fn kimi_parameters_preserves_optional_and_nullable_recursive_termination() {
+        let mut optional = json!({
+            "type": "object",
+            "properties": {
+                "node": {"$ref": "#/$defs/Node"}
+            },
+            "$defs": {
+                "Node": {
+                    "type": "object",
+                    "properties": {
+                        "next": {"$ref": "#/$defs/Node"}
+                    },
+                    "required": ["next"]
+                }
+            }
+        });
+        sanitize_for_kimi_parameters(&mut optional).unwrap();
+
+        let mut nullable = json!({
+            "type": "object",
+            "properties": {
+                "node": {
+                    "anyOf": [
+                        {"$ref": "#/$defs/Node"},
+                        {"type": "null"}
+                    ]
+                }
+            },
+            "required": ["node"],
+            "$defs": {
+                "Node": {
+                    "type": "object",
+                    "properties": {
+                        "next": {
+                            "anyOf": [
+                                {"$ref": "#/$defs/Node"},
+                                {"type": "null"}
+                            ]
+                        }
+                    },
+                    "required": ["next"]
+                }
+            }
+        });
+        sanitize_for_kimi_parameters(&mut nullable).unwrap();
+    }
+
+    #[test]
+    fn kimi_parameters_enforces_anyof_and_aggregate_resource_limits() {
+        let mut too_many_branches = json!({
+            "type": "object",
+            "properties": {
+                "choice": {
+                    "anyOf": (0..11)
+                        .map(|_| json!({"type": "string"}))
+                        .collect::<Vec<_>>()
+                }
+            }
+        });
+        assert_eq!(
+            sanitize_for_kimi_parameters(&mut too_many_branches).unwrap_err(),
+            KimiParameterSchemaError::ResourceLimitExceeded
+        );
+
+        let string_property = || json!({"type": "string"});
+        let mut root_properties = Map::new();
+        for index in 0..51 {
+            root_properties.insert(format!("root_{index}"), string_property());
+        }
+        let mut definition_properties = Map::new();
+        for index in 0..50 {
+            definition_properties.insert(format!("definition_{index}"), string_property());
+        }
+        let mut too_many_properties = json!({
+            "type": "object",
+            "properties": Value::Object(root_properties),
+            "$defs": {
+                "Holder": {
+                    "type": "object",
+                    "properties": Value::Object(definition_properties)
+                }
+            }
+        });
+        assert_eq!(
+            sanitize_for_kimi_parameters(&mut too_many_properties).unwrap_err(),
+            KimiParameterSchemaError::ResourceLimitExceeded
+        );
+
+        let enum_values = |start: usize, count: usize| {
+            Value::Array((start..start + count).map(|value| json!(value)).collect())
+        };
+        let mut too_many_enum_values = json!({
+            "type": "object",
+            "properties": {
+                "first": {"type": "integer", "enum": enum_values(0, 250)},
+                "second": {"type": "integer", "enum": enum_values(250, 251)}
+            }
+        });
+        assert_eq!(
+            sanitize_for_kimi_parameters(&mut too_many_enum_values).unwrap_err(),
+            KimiParameterSchemaError::ResourceLimitExceeded
+        );
+    }
+
+    #[test]
+    fn kimi_parameters_enforces_depth_and_enum_text_limits() {
+        let mut too_deep = json!({"type": "string"});
+        for index in (0..6).rev() {
+            let mut properties = Map::new();
+            properties.insert(format!("level_{index}"), too_deep);
+            too_deep = json!({
+                "type": "object",
+                "properties": Value::Object(properties)
+            });
+        }
+        assert_eq!(
+            sanitize_for_kimi_parameters(&mut too_deep).unwrap_err(),
+            KimiParameterSchemaError::ResourceLimitExceeded
+        );
+
+        let long_values = Value::Array(
+            (0..251)
+                .map(|index| Value::String(format!("private-enum-{index:04}-xxxxxxxxxxxxxx")))
+                .collect(),
+        );
+        let mut too_much_enum_text = json!({
+            "type": "object",
+            "properties": {
+                "choice": {"type": "string", "enum": long_values}
+            }
+        });
+        assert_eq!(
+            sanitize_for_kimi_parameters(&mut too_much_enum_text).unwrap_err(),
+            KimiParameterSchemaError::ResourceLimitExceeded
+        );
+    }
+
+    #[test]
+    fn kimi_parameters_validates_default_type_and_placement_without_leaks() {
+        let mut valid = json!({
+            "type": "object",
+            "properties": {
+                "enabled": {"type": "boolean", "default": true},
+                "count": {"type": "integer", "default": 3},
+                "ratio": {"type": "number", "default": 1.5},
+                "label": {"type": "string", "default": "default-label"},
+                "empty": {"type": "null", "default": null}
+            }
+        });
+        sanitize_for_kimi_parameters(&mut valid).unwrap();
+
+        for (mut invalid, expected) in [
+            (
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "private-default-3301": {
+                            "type": "integer",
+                            "default": "private-default-value-3302"
+                        }
+                    }
+                }),
+                KimiParameterSchemaError::InvalidDefault,
+            ),
+            (
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "private-untyped-default-3303": {"default": 1}
+                    }
+                }),
+                KimiParameterSchemaError::MissingType,
+            ),
+            (
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "private-object-default-3304": {
+                            "type": "object",
+                            "default": {}
+                        }
+                    }
+                }),
+                KimiParameterSchemaError::InvalidKeywordValue,
+            ),
+        ] {
+            let original = invalid.clone();
+            let error = sanitize_for_kimi_parameters(&mut invalid).unwrap_err();
+            assert_eq!(error, expected);
+            assert!(!error.to_string().contains("private-default"));
+            assert_eq!(invalid, original);
+        }
+    }
+
+    #[test]
+    fn kimi_parameters_rejects_inverted_and_fractional_integer_bounds() {
+        for mut schema in [
+            json!({
+                "type": "object",
+                "properties": {
+                    "value": {"type": "string", "minLength": 5, "maxLength": 4}
+                }
+            }),
+            json!({
+                "type": "object",
+                "properties": {
+                    "value": {"type": "array", "minItems": 3, "maxItems": 2}
+                }
+            }),
+            json!({
+                "type": "object",
+                "properties": {
+                    "value": {"type": "number", "minimum": 10, "maximum": 9}
+                }
+            }),
+            json!({
+                "type": "object",
+                "properties": {
+                    "value": {"type": "integer", "minimum": 1.5}
+                }
+            }),
+            json!({
+                "type": "object",
+                "properties": {
+                    "value": {"type": "integer", "maximum": 2.5}
+                }
+            }),
+        ] {
+            assert_eq!(
+                sanitize_for_kimi_parameters(&mut schema).unwrap_err(),
+                KimiParameterSchemaError::InvalidRange
+            );
+        }
+    }
+
+    #[test]
+    fn kimi_parameters_inlines_valid_internal_object_root_ref() {
+        let mut schema = json!({
+            "$ref": "#/$defs/FileArgs",
+            "$defs": {
+                "FileArgs": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }
+            },
+            "description": "File arguments"
+        });
+
+        sanitize_for_kimi_parameters(&mut schema).unwrap();
+
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["path"]["type"], "string");
+        assert_eq!(schema["required"], json!(["path"]));
+        assert_eq!(schema["description"], "File arguments");
+        assert!(schema["$defs"].is_object());
         assert!(schema.get("$ref").is_none());
+        assert!(schema.get("allOf").is_none());
+    }
+
+    #[test]
+    fn kimi_parameters_rejects_unresolved_root_ref_without_leaking_it() {
+        let mut schema = json!({
+            "$ref": "#/$defs/private-schema-name-9217",
+            "$defs": {}
+        });
+        let original = schema.clone();
+
+        let error = sanitize_for_kimi_parameters(&mut schema).unwrap_err();
+
+        assert_eq!(error, KimiParameterSchemaError::UnresolvedRootReference);
+        assert!(!error.to_string().contains("private-schema-name-9217"));
+        assert_eq!(schema, original, "a rejected schema must never be emitted");
+    }
+
+    #[test]
+    fn kimi_parameters_rejects_non_object_root_ref_without_leaking_it() {
+        let mut schema = json!({
+            "$ref": "#/$defs/private-scalar-name-4831",
+            "$defs": {
+                "private-scalar-name-4831": {"type": "string"}
+            }
+        });
+        let original = schema.clone();
+
+        let error = sanitize_for_kimi_parameters(&mut schema).unwrap_err();
+
+        assert_eq!(error, KimiParameterSchemaError::ReferencedRootMustBeObject);
+        assert!(!error.to_string().contains("private-scalar-name-4831"));
+        assert_eq!(schema, original, "a rejected schema must never be emitted");
     }
 }

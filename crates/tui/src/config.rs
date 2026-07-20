@@ -424,10 +424,12 @@ pub struct ProviderCapability {
     pub resolved_model: String,
     /// Context window in tokens (the maximum input the model can accept).
     pub context_window: u32,
-    /// Official maximum output tokens for this combo.
+    /// Known output ceiling for this provider/model metadata path.
     ///
-    /// This is model metadata for diagnostics and CI policy. Normal turns use
-    /// a separate, more conservative request cap in the engine.
+    /// This may be a documented exact-route maximum or a conservative/default
+    /// ceiling when the route does not publish a maximum. It is metadata for
+    /// diagnostics and CI policy; normal turns use a separate, more
+    /// conservative request cap in the engine.
     pub max_output: u32,
     /// Whether the provider+model supports thinking/reasoning mode.
     pub thinking_supported: bool,
@@ -3560,6 +3562,13 @@ impl Config {
                 ApiProvider::names_hint()
             );
         }
+        let active_provider = self.api_provider();
+        validate_kimi_code_api_model_id(
+            active_provider,
+            &self.deepseek_base_url(),
+            &self.default_model(),
+        )
+        .map_err(anyhow::Error::msg)?;
         if let Some(ref key) = self.api_key
             && key.trim().is_empty()
         {
@@ -7217,6 +7226,27 @@ pub(crate) fn moonshot_base_url_is_exact_kimi_code(base_url: &str) -> bool {
     )
 }
 
+/// The exact Moonshot direct-API endpoint, normalized only for an
+/// insignificant trailing slash. Custom gateways must retain their own wire
+/// contract even when they expose a `kimi-k3` model id.
+pub(crate) fn moonshot_base_url_is_exact_direct_platform(base_url: &str) -> bool {
+    codewhale_config::provider::is_exact_moonshot_platform_route(
+        codewhale_config::ProviderKind::Moonshot,
+        base_url,
+    )
+}
+
+/// Whether a route is exactly Moonshot's direct pay-as-you-go K3 route.
+pub(crate) fn is_exact_direct_moonshot_k3_route(
+    provider: ApiProvider,
+    base_url: &str,
+    model: &str,
+) -> bool {
+    provider == ApiProvider::Moonshot
+        && moonshot_base_url_is_exact_direct_platform(base_url)
+        && model.trim().eq_ignore_ascii_case(MOONSHOT_KIMI_K3_MODEL)
+}
+
 /// Whether a route is exactly the Kimi Code K3 membership-plan route.
 ///
 /// Keep the bare `k3` identifier route-owned. In particular, do not infer a
@@ -7230,6 +7260,27 @@ pub(crate) fn is_exact_kimi_code_k3_route(
     provider == ApiProvider::Moonshot
         && moonshot_base_url_is_exact_kimi_code(base_url)
         && model.trim().eq_ignore_ascii_case(KIMI_CODE_K3_MODEL)
+}
+
+/// Reject the Claude Code-only `k3[1m]` context hint when it is supplied as a
+/// Kimi Code API model id. Codewhale has a first-class context-window field,
+/// so silently rewriting this value would both send the wrong wire id and
+/// claim a plan entitlement the user may not have.
+pub(crate) fn validate_kimi_code_api_model_id(
+    provider: ApiProvider,
+    base_url: &str,
+    model: &str,
+) -> std::result::Result<(), String> {
+    if provider == ApiProvider::Moonshot
+        && moonshot_base_url_is_exact_kimi_code(base_url)
+        && model.trim().eq_ignore_ascii_case("k3[1m]")
+    {
+        return Err(
+            "Kimi Code model `k3[1m]` is a Claude Code environment convention, not an API model id. Use model = \"k3\". If your Kimi Code plan includes 1M context, also set context_window = 1048576; otherwise keep the 262144 safe default."
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Credential help for a concrete provider route.

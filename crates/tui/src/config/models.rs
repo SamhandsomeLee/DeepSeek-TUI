@@ -98,6 +98,8 @@ pub const ARCEE_TRINITY_LARGE_PREVIEW_MODEL: &str = "trinity-large-preview";
 pub const ARCEE_TRINITY_MINI_MODEL: &str = "trinity-mini";
 pub const DEFAULT_ARCEE_BASE_URL: &str = "https://api.arcee.ai/api/v1";
 pub const DEFAULT_MOONSHOT_MODEL: &str = "kimi-k2.7-code";
+/// Moonshot's direct pay-as-you-go K3 wire model id.
+pub const MOONSHOT_KIMI_K3_MODEL: &str = "kimi-k3";
 pub const MOONSHOT_KIMI_K2_6_MODEL: &str = "kimi-k2.6";
 pub const DEFAULT_MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";
 pub const DEFAULT_KIMI_CODE_MODEL: &str = "kimi-for-coding";
@@ -108,10 +110,11 @@ pub const KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL: &str =
 /// Moonshot's pay-as-you-go `kimi-k3` catalog id.
 pub const KIMI_CODE_K3_MODEL: &str = "k3";
 // The K3 contract constants (`KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS`,
-// `KIMI_K3_CONTEXT_WINDOW_TOKENS`, `KIMI_K3_MAX_OUTPUT_TOKENS`) live in
-// `crate::models` — the model-facts table, which also compiles standalone in
-// integration tests — so the facts have exactly one home. Re-export only the
-// route-owned floor, which existing `crate::config` call sites import.
+// `KIMI_K3_CONTEXT_WINDOW_TOKENS`, and the distinct default/direct output
+// limits) live in `crate::models` — the model-facts table, which also compiles
+// standalone in integration tests — so the facts have exactly one home.
+// Re-export only the route-owned floor, which existing `crate::config` call
+// sites import.
 pub use crate::models::KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS;
 pub const DEFAULT_SGLANG_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
 pub const DEFAULT_SGLANG_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";

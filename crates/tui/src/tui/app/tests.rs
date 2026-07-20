@@ -422,9 +422,19 @@ fn reasoning_effort_uses_one_strict_alias_table_and_legacy_fallback() {
 }
 
 #[test]
-fn reasoning_effort_preserves_kimi_code_low_and_medium_only_on_exact_route() {
+fn reasoning_effort_normalizes_each_exact_k3_route_without_neighbor_leakage() {
     let kimi_base = crate::config::DEFAULT_KIMI_CODE_BASE_URL;
     let moonshot_base = crate::config::DEFAULT_MOONSHOT_BASE_URL;
+    assert_eq!(
+        ReasoningEffort::Off.normalize_for_route(ApiProvider::Moonshot, kimi_base, "k3"),
+        ReasoningEffort::Low,
+        "membership K3 stays on K3 by mapping off to its lowest thinking tier"
+    );
+    assert_eq!(
+        ReasoningEffort::Auto.normalize_for_route(ApiProvider::Moonshot, kimi_base, "k3"),
+        ReasoningEffort::Auto,
+        "route normalization preserves the Auto sentinel until dispatch selects a concrete tier"
+    );
     assert_eq!(
         ReasoningEffort::Low.normalize_for_route(ApiProvider::Moonshot, kimi_base, "k3"),
         ReasoningEffort::Low
@@ -444,6 +454,41 @@ fn reasoning_effort_preserves_kimi_code_low_and_medium_only_on_exact_route() {
             "kimi-for-coding",
         ),
         ReasoningEffort::High
+    );
+
+    assert_eq!(
+        ReasoningEffort::Off.normalize_for_route(
+            ApiProvider::Moonshot,
+            moonshot_base,
+            crate::config::MOONSHOT_KIMI_K3_MODEL,
+        ),
+        ReasoningEffort::Low,
+        "direct K3 is always-thinking, so off becomes its lowest supported tier"
+    );
+    assert_eq!(
+        ReasoningEffort::Low.normalize_for_route(
+            ApiProvider::Moonshot,
+            moonshot_base,
+            crate::config::MOONSHOT_KIMI_K3_MODEL,
+        ),
+        ReasoningEffort::Low
+    );
+    assert_eq!(
+        ReasoningEffort::Medium.normalize_for_route(
+            ApiProvider::Moonshot,
+            moonshot_base,
+            crate::config::MOONSHOT_KIMI_K3_MODEL,
+        ),
+        ReasoningEffort::High
+    );
+    assert_eq!(
+        ReasoningEffort::Off.normalize_for_route(
+            ApiProvider::Moonshot,
+            "https://proxy.example/v1",
+            crate::config::MOONSHOT_KIMI_K3_MODEL,
+        ),
+        ReasoningEffort::Off,
+        "a neighboring gateway must not inherit direct-platform always-thinking semantics"
     );
 }
 
@@ -496,6 +541,45 @@ fn app_new_normalizes_saved_codex_reasoning_effort() {
         assert_eq!(app.reasoning_effort, expected, "raw setting {raw}");
         assert_eq!(app.reasoning_effort_display_label(), display);
     }
+}
+
+#[test]
+fn app_new_exposes_direct_moonshot_k3_off_as_effective_low() {
+    let _lock = lock_test_env();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+    let _config_path = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
+    std::fs::write(
+        tmp.path().join("settings.toml"),
+        "reasoning_effort = \"off\"\n",
+    )
+    .expect("settings");
+    let config = Config {
+        provider: Some("moonshot".to_string()),
+        providers: Some(ProvidersConfig {
+            moonshot: ProviderConfig {
+                api_key: Some("moonshot-startup-test-key".to_string()),
+                base_url: Some(crate::config::DEFAULT_MOONSHOT_BASE_URL.to_string()),
+                model: Some(crate::config::MOONSHOT_KIMI_K3_MODEL.to_string()),
+                ..ProviderConfig::default()
+            },
+            ..ProvidersConfig::default()
+        }),
+        ..Config::default()
+    };
+
+    let mut options = test_options(false);
+    options.model = crate::config::MOONSHOT_KIMI_K3_MODEL.to_string();
+    let app = App::new(options, &config);
+
+    assert_eq!(app.api_provider, ApiProvider::Moonshot);
+    assert_eq!(app.model, crate::config::MOONSHOT_KIMI_K3_MODEL);
+    assert_eq!(
+        app.active_route_base_url,
+        crate::config::DEFAULT_MOONSHOT_BASE_URL
+    );
+    assert_eq!(app.reasoning_effort, ReasoningEffort::Low);
+    assert_eq!(app.reasoning_effort_display_label(), "low");
 }
 
 #[test]

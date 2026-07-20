@@ -3229,6 +3229,34 @@ fn enabled_agent_surface_options() -> AgentToolSurfaceOptions {
     options
 }
 
+/// Return the exact model-visible catalog built for a default General child.
+///
+/// Request-boundary tests use this fixture so Moonshot compatibility coverage
+/// cannot drift into a hand-maintained approximation of the child surface.
+pub(crate) fn kimi_general_child_request_tools_fixture() -> Vec<Tool> {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime =
+        stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    let registry = SubAgentToolRegistry::new(
+        runtime,
+        SubAgentType::General,
+        None,
+        crate::tools::todo::new_shared_todo_list(),
+        crate::tools::plan::new_shared_plan_state(),
+    );
+    let tools = registry.tools_for_model(&SubAgentType::General);
+    let names = tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<HashSet<_>>();
+
+    assert!(names.contains("get_goal"));
+    assert!(!names.contains("create_goal"));
+    assert!(!names.contains("update_goal"));
+    tools
+}
+
 fn disabled_feature_agent_surface_options() -> AgentToolSurfaceOptions {
     let mut options = AgentToolSurfaceOptions::new(ShellPolicy::Full);
     options.goal_state = Some(crate::tools::goal::new_shared_goal_state());

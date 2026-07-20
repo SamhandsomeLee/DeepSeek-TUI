@@ -1434,7 +1434,11 @@ async fn run_async_main(
     if let Some(command) = command {
         return match command {
             Commands::Doctor(args) => {
-                let config = load_config_from_cli(&cli)?;
+                let config = match load_config_from_cli(&cli) {
+                    Ok(config) => config,
+                    Err(error) if args.json => return run_doctor_json_config_error(&error),
+                    Err(error) => return Err(error),
+                };
                 let workspace = resolve_workspace(&cli);
                 if args.context_json {
                     run_doctor_context_json(&config, &workspace)
@@ -5778,6 +5782,29 @@ fn runtime_posture_source_id(source: codewhale_config::RuntimePostureSource) -> 
     }
 }
 
+/// Emit a bounded, secret-redacted JSON failure when configuration cannot be
+/// loaded or validated. Invalid configuration must not be forced through the
+/// normal doctor report because its route/capability facts would be misleading.
+fn run_doctor_json_config_error(error: &anyhow::Error) -> Result<()> {
+    const MAX_ERROR_CHARS: usize = 2_000;
+
+    let redacted = codewhale_config::persistence::redact_secrets(&format!("{error:#}"));
+    let message =
+        crate::utils::truncate_with_ellipsis(&redacted, MAX_ERROR_CHARS, "...[truncated]");
+    let report = serde_json::json!({
+        "status": "error",
+        "error": {
+            "kind": "config_validation",
+            "message": message,
+        },
+    });
+    println!("{}", serde_json::to_string_pretty(&report)?);
+
+    // Keep stderr generic: the actionable, redacted error is already on
+    // stdout, and Rust's Result termination must never redisclose a secret.
+    bail!("doctor configuration validation failed; see JSON output")
+}
+
 /// Machine-readable counterpart to `run_doctor`. Skips the live API call so it
 /// is safe to run in CI and from non-interactive scripts.
 fn run_doctor_json(
@@ -6055,19 +6082,69 @@ fn provider_capability_report(config: &Config) -> serde_json::Value {
     use serde_json::json;
 
     let provider = config.api_provider();
-    let model = config.default_model();
-
-    let cap = crate::config::provider_capability(provider, &model);
+    let configured_model = config.default_model();
+    let route_result =
+        crate::route_runtime::resolve_runtime_route(config, provider, Some(&configured_model));
+    let route_error = route_result.as_ref().err().cloned();
+    let route = route_result.ok();
+    let resolved_model = route
+        .as_ref()
+        .map_or(configured_model.as_str(), |route| route.model.as_str());
+    let cap = crate::config::provider_capability(provider, resolved_model);
+    let route_profile = route.as_ref().map(|route| {
+        crate::model_profile::resolved_capability_profile_for_route(
+            provider,
+            resolved_model,
+            route.candidate.capabilities(),
+            route.candidate.limits(),
+        )
+    });
+    let context_window = route
+        .as_ref()
+        .map_or(cap.context_window, |route| route.context_window.tokens);
+    let context_window_source = route.as_ref().map_or(
+        crate::route_runtime::ContextWindowSource::Fallback.label(),
+        |route| route.context_window.source.label(),
+    );
+    let max_output = route_profile
+        .as_ref()
+        .and_then(|profile| profile.max_output)
+        .unwrap_or(cap.max_output);
+    let is_exact_kimi_code_k3 = route.as_ref().is_some_and(|route| {
+        crate::config::is_exact_kimi_code_k3_route(
+            provider,
+            &route.candidate.endpoint().base_url,
+            route.candidate.wire_model_id().as_str(),
+        )
+    });
+    let thinking_supported = is_exact_kimi_code_k3
+        || route_profile
+            .as_ref()
+            .map_or(cap.thinking_supported, |profile| {
+                profile.supports_reasoning()
+            });
+    let cache_telemetry_supported = route_profile
+        .as_ref()
+        .map_or(cap.cache_telemetry_supported, |profile| {
+            profile.prompt_caching.is_supported()
+        });
+    let request_payload_mode = route_profile
+        .as_ref()
+        .map_or(cap.request_payload_mode, |profile| {
+            profile.request_payload_mode
+        });
     let alias_deprecation = config.active_deepseek_alias_deprecation();
 
     json!({
         "resolved_provider": config.provider_identity_for(provider),
-        "resolved_model": cap.resolved_model,
-        "context_window": cap.context_window,
-        "max_output": cap.max_output,
-        "thinking_supported": cap.thinking_supported,
-        "cache_telemetry_supported": cap.cache_telemetry_supported,
-        "request_payload_mode": serde_json::to_value(cap.request_payload_mode).unwrap_or_default(),
+        "resolved_model": resolved_model,
+        "context_window": context_window,
+        "context_window_source": context_window_source,
+        "max_output": max_output,
+        "thinking_supported": thinking_supported,
+        "cache_telemetry_supported": cache_telemetry_supported,
+        "request_payload_mode": serde_json::to_value(request_payload_mode).unwrap_or_default(),
+        "route_error": route_error,
         "alias_deprecation": alias_deprecation,
     })
 }
@@ -6078,13 +6155,12 @@ fn doctor_route_report(config: &Config) -> serde_json::Value {
     let target = doctor_api_target(config);
     let provider = config.api_provider();
     let redacted_base_url = crate::client::redact_url_for_display(&target.base_url);
-    let context_window = crate::route_runtime::resolve_runtime_route(
-        config,
-        provider,
-        Some(&target.model),
-    )
-    .ok()
-    .map(|route| {
+    let route_result =
+        crate::route_runtime::resolve_runtime_route(config, provider, Some(&target.model));
+    let route_error = route_result.as_ref().err().cloned();
+    let context_window = route_result
+        .ok()
+        .map(|route| {
         json!({
             "tokens": route.context_window.tokens,
             "source": route.context_window.source.label(),
@@ -6113,6 +6189,7 @@ fn doctor_route_report(config: &Config) -> serde_json::Value {
             "source": doctor_api_key_source_label(resolve_api_key_source(config)),
         },
         "context_window": context_window,
+        "route_error": route_error,
     })
 }
 
@@ -7025,18 +7102,17 @@ async fn run_review(config: &Config, args: ReviewArgs) -> Result<()> {
     let execution_config = config_for_cli_route(config, &route);
     let route_provider = execution_config.provider_identity_for(route.provider);
     let model = route.model.clone();
-    let reasoning_effort = route
-        .reasoning_effort
-        .and_then(|effort| cli_reasoning_effort_value(&execution_config, &model, effort));
+    let user_prompt =
+        format!("Review the following diff and provide feedback:\n\n{diff}\n\nEnd of diff.");
+    let reasoning_effort = route.reasoning_effort.and_then(|effort| {
+        cli_reasoning_effort_value_for_prompt(&execution_config, &model, effort, &user_prompt)
+    });
 
     let system = SystemPrompt::Text(
         "You are a senior code reviewer. Focus on bugs, risks, behavioral regressions, and missing tests. \
 Provide findings ordered by severity with file references, then open questions, then a brief summary."
             .to_string(),
     );
-    let user_prompt =
-        format!("Review the following diff and provide feedback:\n\n{diff}\n\nEnd of diff.");
-
     let client = DeepSeekClient::new(&execution_config)?;
     let request = MessageRequest {
         model: model.clone(),
@@ -8931,6 +9007,20 @@ fn cli_reasoning_effort_value(
         .map(str::to_string)
 }
 
+fn cli_reasoning_effort_value_for_prompt(
+    config: &Config,
+    model: &str,
+    effort: crate::tui::app::ReasoningEffort,
+    prompt: &str,
+) -> Option<String> {
+    let resolved = if effort == crate::tui::app::ReasoningEffort::Auto {
+        crate::auto_reasoning::select(false, prompt)
+    } else {
+        effort
+    };
+    cli_reasoning_effort_value(config, model, resolved)
+}
+
 fn normalize_cli_reasoning_effort(value: &str) -> Result<Option<String>> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -9061,9 +9151,9 @@ async fn run_one_shot(
     let route = resolve_cli_exec_route(config, model, prompt, force_configured_route).await?;
     let execution_config = config_for_cli_route(config, &route);
     let client = DeepSeekClient::new(&execution_config)?;
-    let reasoning_effort = route
-        .reasoning_effort
-        .and_then(|effort| cli_reasoning_effort_value(&execution_config, &route.model, effort));
+    let reasoning_effort = route.reasoning_effort.and_then(|effort| {
+        cli_reasoning_effort_value_for_prompt(&execution_config, &route.model, effort, prompt)
+    });
 
     let request = MessageRequest {
         model: route.model,
@@ -9111,9 +9201,9 @@ async fn run_one_shot_json(
     let provider = execution_config.provider_identity_for(route.provider);
     let client = DeepSeekClient::new(&execution_config)?;
     let model = route.model.clone();
-    let reasoning_effort = route
-        .reasoning_effort
-        .and_then(|effort| cli_reasoning_effort_value(&execution_config, &model, effort));
+    let reasoning_effort = route.reasoning_effort.and_then(|effort| {
+        cli_reasoning_effort_value_for_prompt(&execution_config, &model, effort, prompt)
+    });
     let request = MessageRequest {
         model: model.clone(),
         messages: vec![Message {
@@ -12191,6 +12281,87 @@ mod doctor_endpoint_tests {
     }
 
     #[test]
+    fn provider_capability_report_uses_exact_kimi_code_route_facts() {
+        let config = Config {
+            provider: Some("moonshot".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                moonshot: crate::config::ProviderConfig {
+                    api_key: Some("kimi-plan-secret".to_string()),
+                    base_url: Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string()),
+                    model: Some(crate::config::KIMI_CODE_K3_MODEL.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let report = provider_capability_report(&config);
+
+        assert_eq!(report["resolved_model"], crate::config::KIMI_CODE_K3_MODEL);
+        assert_eq!(report["context_window"], 262_144);
+        assert_eq!(
+            report["context_window_source"],
+            "static Kimi Code safe floor"
+        );
+        assert_eq!(report["thinking_supported"], true);
+    }
+
+    #[test]
+    fn provider_capability_report_honors_kimi_code_context_override() {
+        let config = Config {
+            provider: Some("moonshot".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                moonshot: crate::config::ProviderConfig {
+                    api_key: Some("kimi-plan-secret".to_string()),
+                    base_url: Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string()),
+                    model: Some(crate::config::KIMI_CODE_K3_MODEL.to_string()),
+                    context_window: Some(1_048_576),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let report = provider_capability_report(&config);
+
+        assert_eq!(
+            report["resolved_model"],
+            crate::config::KIMI_CODE_K3_MODEL,
+            "the configured window must preserve Kimi Code's bare wire id"
+        );
+        assert_eq!(report["context_window"], 1_048_576);
+        assert_eq!(report["context_window_source"], "configured");
+        assert_eq!(report["thinking_supported"], true);
+    }
+
+    #[test]
+    fn provider_capability_report_uses_direct_moonshot_k3_route_facts() {
+        let config = Config {
+            provider: Some("moonshot".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                moonshot: crate::config::ProviderConfig {
+                    api_key: Some("moonshot-secret".to_string()),
+                    base_url: Some(crate::config::DEFAULT_MOONSHOT_BASE_URL.to_string()),
+                    model: Some("kimi-k3".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let report = provider_capability_report(&config);
+
+        assert_eq!(report["resolved_model"], "kimi-k3");
+        assert_eq!(report["context_window"], 1_048_576);
+        assert_eq!(report["context_window_source"], "catalog");
+        assert_eq!(report["max_output"], 1_048_576);
+        assert_eq!(report["thinking_supported"], true);
+    }
+
+    #[test]
     fn doctor_search_provider_line_includes_duckduckgo_default_source_and_switch_hint() {
         let _guard = crate::test_support::lock_test_env();
         let prev = std::env::var_os("DEEPSEEK_SEARCH_PROVIDER");
@@ -13230,6 +13401,52 @@ mod terminal_mode_tests {
         );
         assert_eq!(normalize_cli_reasoning_effort("default").unwrap(), None);
         assert!(normalize_cli_reasoning_effort("expensive").is_err());
+    }
+
+    #[test]
+    fn cli_prompt_paths_resolve_auto_before_k3_route_normalization() {
+        let config = Config {
+            provider: Some("moonshot".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                moonshot: crate::config::ProviderConfig {
+                    base_url: Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string()),
+                    model: Some(crate::config::KIMI_CODE_K3_MODEL.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        for (prompt, expected) in [
+            ("lookup the public docs", "low"),
+            ("debug this error", "max"),
+            ("review this ordinary change", "high"),
+        ] {
+            assert_eq!(
+                cli_reasoning_effort_value_for_prompt(
+                    &config,
+                    crate::config::KIMI_CODE_K3_MODEL,
+                    crate::tui::app::ReasoningEffort::Auto,
+                    prompt,
+                )
+                .as_deref(),
+                Some(expected),
+                "prompt selector must resolve Auto for `{prompt}`"
+            );
+        }
+
+        assert_eq!(
+            cli_reasoning_effort_value_for_prompt(
+                &config,
+                crate::config::KIMI_CODE_K3_MODEL,
+                crate::tui::app::ReasoningEffort::Off,
+                "debug must not override an explicit effort",
+            )
+            .as_deref(),
+            Some("low"),
+            "membership K3 still applies its exact-route always-thinking floor"
+        );
     }
 
     #[test]

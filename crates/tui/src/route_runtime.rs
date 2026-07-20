@@ -9,8 +9,10 @@ use crate::client::DeepSeekClient;
 use crate::codex_model_cache::{CodexModelCacheFreshness, model_roster};
 use crate::config::{
     ApiProvider, Config, DEFAULT_NVIDIA_NIM_BASE_URL, KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS,
-    ProviderIdentity, is_exact_kimi_code_k3_route,
+    ProviderIdentity, is_exact_direct_moonshot_k3_route, is_exact_kimi_code_k3_route,
+    validate_kimi_code_api_model_id,
 };
+use crate::models::DIRECT_KIMI_K3_MAX_OUTPUT_TOKENS;
 
 /// Why a route is using its effective context-window value.  Keep this
 /// receipt separate from the numeric route limits so every consumer can state
@@ -197,6 +199,12 @@ pub(crate) fn resolve_route_candidate_with_context_metadata(
     context_window_override: Option<u32>,
     provider_reported_context: Option<ProviderReportedKimiCodeContext>,
 ) -> Result<RouteCandidateResolution, String> {
+    let effective_base_url = base_url_override
+        .as_deref()
+        .unwrap_or_else(|| provider.default_base_url());
+    if let Some(model) = model_selector.or(saved_provider_model) {
+        validate_kimi_code_api_model_id(provider, effective_base_url, model)?;
+    }
     let resolver = RouteResolver::new();
     let base_request = RouteRequest {
         explicit_provider: provider.kind(),
@@ -247,10 +255,10 @@ struct LimitOverridePlan {
 /// Plan the limit overrides for a resolved route.
 ///
 /// Precedence (unchanged from the previous post-hoc mutation order):
-/// provider-scoped roster/API corrections first, then operator-configured
-/// context, then fresh route-scoped provider-reported context, then the
-/// membership-plan safe floor, then catalog data, then the conservative
-/// fallback.
+/// provider-scoped roster/API corrections and exact-route documented output
+/// facts first, then operator-configured context, then fresh route-scoped
+/// provider-reported context, then the membership-plan safe floor, then
+/// catalog data, then the conservative fallback.
 fn plan_limit_overrides(
     provider: ApiProvider,
     resolved: &ReadyRouteCandidate,
@@ -260,6 +268,17 @@ fn plan_limit_overrides(
     let mut overrides = Vec::new();
     let configured = context_window_override.filter(|window| *window > 0);
     let mut effective_context = resolved.limits().context_tokens;
+    if is_exact_direct_moonshot_k3_route(
+        provider,
+        &resolved.endpoint().base_url,
+        resolved.wire_model_id().as_str(),
+    ) {
+        overrides.push(SourcedLimitOverride {
+            field: LimitField::OutputTokens,
+            value: Some(u64::from(DIRECT_KIMI_K3_MAX_OUTPUT_TOKENS)),
+            source: OverrideSource::DocumentedRouteOutputMaximum,
+        });
+    }
     if provider == ApiProvider::OpenaiCodex {
         // Models.dev describes the public API offering, not the account-scoped
         // ChatGPT OAuth route. Strip API-only limits, then carry the fresh
@@ -585,14 +604,21 @@ mod tests {
     }
 
     #[test]
-    fn moonshot_k3_route_uses_bundled_1m_context() {
+    fn direct_moonshot_k3_route_uses_documented_1m_limits_with_provenance() {
         let candidate =
             resolve_route_candidate(ApiProvider::Moonshot, Some("kimi-k3"), None, None, None)
                 .expect("Moonshot Kimi K3 route");
 
         assert_eq!(candidate.wire_model_id().as_str(), "kimi-k3");
         assert_eq!(candidate.limits().context_tokens, Some(1_048_576));
-        assert_eq!(candidate.limits().output_tokens, Some(131_072));
+        assert_eq!(candidate.limits().output_tokens, Some(1_048_576));
+        assert!(candidate.applied_limit_overrides().contains(
+            &codewhale_config::route::SourcedLimitOverride {
+                field: codewhale_config::route::LimitField::OutputTokens,
+                value: Some(1_048_576),
+                source: codewhale_config::route::OverrideSource::DocumentedRouteOutputMaximum,
+            }
+        ));
         assert_eq!(
             crate::route_budget::route_context_window_tokens(
                 ApiProvider::Moonshot,
@@ -601,6 +627,15 @@ mod tests {
             ),
             1_048_576
         );
+        assert_eq!(
+            crate::route_budget::effective_max_output_tokens_for_route(
+                ApiProvider::Moonshot,
+                "kimi-k3",
+                Some(candidate.limits()),
+            ),
+            65_536,
+            "route metadata must not raise the ordinary request cap"
+        );
     }
 
     #[test]
@@ -608,8 +643,8 @@ mod tests {
         // Bare `k3` membership context is plan-tier dependent (256K on lower
         // tiers, up to 1M on higher ones), so the static route baseline stays
         // the safe floor. Higher entitlements come from an explicit provider
-        // `context_window` override or the documented `k3[1m]` id — never
-        // from assuming the top tier, and never from the 128K legacy default.
+        // `context_window` override — never from assuming the top tier, and
+        // never from the 128K legacy default.
         let candidate = resolve_route_candidate(
             ApiProvider::Moonshot,
             Some("k3"),
@@ -621,7 +656,9 @@ mod tests {
 
         assert_eq!(candidate.wire_model_id().as_str(), "k3");
         assert_eq!(candidate.limits().context_tokens, Some(262_144));
-        // Output is catalog-owned; never project the 131K max-output as context.
+        // Output remains a conservative generic default because the
+        // membership API does not publish a distinct maximum. Never project
+        // it as context or inherit the direct-platform 1M maximum.
         assert_ne!(
             candidate.limits().context_tokens,
             candidate.limits().output_tokens
@@ -634,14 +671,7 @@ mod tests {
             .context_window,
             262_144
         );
-        assert_eq!(
-            crate::config::provider_capability(
-                ApiProvider::Moonshot,
-                crate::config::KIMI_CODE_K3_MODEL
-            )
-            .max_output,
-            131_072
-        );
+        assert_ne!(candidate.limits().output_tokens, Some(1_048_576));
     }
 
     #[test]
@@ -745,17 +775,46 @@ mod tests {
         )
         .expect("Kimi Code K3 route");
 
+        assert_eq!(
+            candidate.wire_model_id().as_str(),
+            crate::config::KIMI_CODE_K3_MODEL,
+            "the 1M entitlement changes limits, never the provider wire id"
+        );
+        assert!(crate::config::is_exact_kimi_code_k3_route(
+            ApiProvider::Moonshot,
+            &candidate.endpoint().base_url,
+            candidate.wire_model_id().as_str(),
+        ));
         assert_eq!(candidate.limits().context_tokens, Some(1_048_576));
     }
 
     #[test]
+    fn kimi_code_rejects_claude_only_k3_1m_alias_for_selected_and_saved_models() {
+        for (selected, saved) in [(Some("k3[1m]"), None), (None, Some("k3[1m]"))] {
+            let error = resolve_route_candidate(
+                ApiProvider::Moonshot,
+                selected,
+                saved,
+                Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string()),
+                None,
+            )
+            .expect_err("Claude Code's context hint is not a Kimi Code API model id");
+
+            assert!(error.contains("model = \"k3\""), "{error}");
+            assert!(error.contains("context_window = 1048576"), "{error}");
+            assert!(error.contains("plan includes 1M context"), "{error}");
+            assert!(error.contains("262144 safe default"), "{error}");
+        }
+    }
+
+    #[test]
     fn kimi_code_k3_baseline_does_not_leak_to_other_moonshot_routes() {
-        let exact_endpoint = Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string());
+        let kimi_code_endpoint = Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string());
         let direct_moonshot = resolve_route_candidate(
             ApiProvider::Moonshot,
-            Some("kimi-k3"),
+            Some(crate::config::MOONSHOT_KIMI_K3_MODEL),
             None,
-            exact_endpoint.clone(),
+            Some(crate::config::DEFAULT_MOONSHOT_BASE_URL.to_string()),
             None,
         )
         .expect("direct Moonshot K3 route");
@@ -775,7 +834,7 @@ mod tests {
             ApiProvider::Moonshot,
             Some(crate::config::DEFAULT_KIMI_CODE_MODEL),
             None,
-            exact_endpoint,
+            kimi_code_endpoint,
             None,
         )
         .expect("Kimi Code default route");

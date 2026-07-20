@@ -183,6 +183,11 @@ pub struct DeepSeekClient {
     rate_limiter: Arc<AsyncMutex<TokenBucket>>,
     request_concurrency: Option<ProviderConcurrencyLimiter>,
     path_suffix: Option<String>,
+    /// Unit tests keep the semantic route exact while sending the actual
+    /// production request through a local capture server. This field is
+    /// compiled out of release builds.
+    #[cfg(test)]
+    test_chat_transport_base_url: Option<String>,
     pub(super) reasoning_stream_style: Option<String>,
     pub(super) stream_idle_timeout: Duration,
 }
@@ -430,6 +435,8 @@ impl Clone for DeepSeekClient {
             rate_limiter: self.rate_limiter.clone(),
             request_concurrency: self.request_concurrency.clone(),
             path_suffix: self.path_suffix.clone(),
+            #[cfg(test)]
+            test_chat_transport_base_url: self.test_chat_transport_base_url.clone(),
             reasoning_stream_style: self.reasoning_stream_style.clone(),
             stream_idle_timeout: self.stream_idle_timeout,
         }
@@ -1004,9 +1011,24 @@ impl DeepSeekClient {
             rate_limiter: Arc::new(AsyncMutex::new(TokenBucket::from_env())),
             request_concurrency: request_concurrency_limit.map(ProviderConcurrencyLimiter::new),
             path_suffix,
+            #[cfg(test)]
+            test_chat_transport_base_url: None,
             reasoning_stream_style,
             stream_idle_timeout,
         })
+    }
+
+    /// Transport destination for Chat Completions requests.
+    ///
+    /// Production always uses the semantic route base URL. Unit tests may
+    /// substitute a local capture server without changing the endpoint/model
+    /// identity used by exact-route request shaping.
+    pub(super) fn chat_transport_base_url(&self) -> &str {
+        #[cfg(test)]
+        if let Some(base_url) = self.test_chat_transport_base_url.as_deref() {
+            return base_url;
+        }
+        &self.base_url
     }
 
     /// Return a request whose tool results are safe to send to an upstream
@@ -2670,6 +2692,10 @@ mod tests {
     use crate::models::{
         ContentBlock, ContentBlockStart, Delta, Message, MessageRequest, StreamEvent, Tool,
     };
+    use crate::tools::apply_patch::ApplyPatchTool;
+    use crate::tools::spec::ToolSpec;
+    use crate::tools::{ToolContext, ToolRegistryBuilder};
+    use codewhale_protocol::runtime::DynamicToolSpec;
     use serde_json::json;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2689,6 +2715,614 @@ mod tests {
             strict: Some(true),
             cache_control: None,
         }
+    }
+
+    fn apply_patch_request_tool() -> Tool {
+        let spec = ApplyPatchTool;
+        Tool {
+            tool_type: None,
+            name: spec.name().to_string(),
+            description: spec.description().to_string(),
+            input_schema: spec.input_schema(),
+            allowed_callers: None,
+            defer_loading: Some(false),
+            input_examples: None,
+            strict: None,
+            cache_control: None,
+        }
+    }
+
+    fn deferred_dynamic_request_tool() -> Tool {
+        let registry = ToolRegistryBuilder::new()
+            .with_dynamic_tools(&[DynamicToolSpec {
+                namespace: Some("capture".to_string()),
+                name: "deferred_lookup".to_string(),
+                description: "Look up a record after deferred loading".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "mode": {"type": "string", "const": "fast"},
+                        "query": {
+                            "anyOf": [
+                                {"type": "string"},
+                                {"type": "null"}
+                            ]
+                        }
+                    },
+                    "required": ["mode"]
+                }),
+                defer_loading: true,
+            }])
+            .build(ToolContext::new(
+                std::env::temp_dir().join("codewhale-k3-deferred-capture"),
+            ));
+        registry
+            .to_api_tools()
+            .into_iter()
+            .find(|tool| tool.name == "deferred_lookup")
+            .expect("dynamic tool remains model-visible")
+    }
+
+    fn value_contains_key(value: &Value, needle: &str) -> bool {
+        match value {
+            Value::Object(object) => {
+                object.contains_key(needle)
+                    || object
+                        .values()
+                        .any(|child| value_contains_key(child, needle))
+            }
+            Value::Array(values) => values.iter().any(|child| value_contains_key(child, needle)),
+            _ => false,
+        }
+    }
+
+    fn captured_function<'a>(body: &'a Value, name: &str) -> &'a Value {
+        body["tools"]
+            .as_array()
+            .and_then(|tools| tools.iter().find(|tool| tool["function"]["name"] == name))
+            .map(|tool| &tool["function"])
+            .unwrap_or_else(|| panic!("captured tool catalog is missing {name}: {body}"))
+    }
+
+    fn moonshot_request_boundary_client(
+        route_base_url: &str,
+        model: &str,
+        transport_base_url: String,
+    ) -> DeepSeekClient {
+        let mut client = DeepSeekClient::new(&Config {
+            provider: Some("moonshot".to_string()),
+            providers: Some(ProvidersConfig {
+                moonshot: ProviderConfig {
+                    api_key: Some("moonshot-request-boundary-key".to_string()),
+                    base_url: Some(route_base_url.to_string()),
+                    model: Some(model.to_string()),
+                    ..ProviderConfig::default()
+                },
+                ..ProvidersConfig::default()
+            }),
+            ..Config::default()
+        })
+        .expect("Moonshot request-boundary client");
+        assert_eq!(client.base_url, route_base_url);
+        client.test_chat_transport_base_url = Some(transport_base_url);
+        client
+    }
+
+    fn k3_request_fixture(model: &str, effort: Option<&str>, stream: bool) -> MessageRequest {
+        MessageRequest {
+            model: model.to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "request-boundary fixture".to_string(),
+                    cache_control: None,
+                }],
+            }],
+            max_tokens: 64,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            thinking: None,
+            reasoning_effort: effort.map(str::to_string),
+            stream: Some(stream),
+            temperature: Some(0.25),
+            top_p: Some(0.75),
+        }
+    }
+
+    async fn capture_moonshot_chat_request(
+        route_base_url: &str,
+        model: &str,
+        effort: Option<&str>,
+        streaming: bool,
+    ) -> Value {
+        let request = k3_request_fixture(model, effort, streaming);
+        capture_moonshot_chat_request_body(route_base_url, model, request).await
+    }
+
+    async fn capture_moonshot_chat_request_body(
+        route_base_url: &str,
+        model: &str,
+        request: MessageRequest,
+    ) -> Value {
+        let streaming = request.stream == Some(true);
+        let server = MockServer::start().await;
+        let response = if streaming {
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string("data: [DONE]\n\n")
+        } else {
+            ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-k3-request-boundary",
+                "object": "chat.completion",
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2
+                }
+            }))
+        };
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(response)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = moonshot_request_boundary_client(route_base_url, model, server.uri());
+
+        if streaming {
+            let mut stream = client
+                .create_message_stream(request)
+                .await
+                .expect("streaming request succeeds");
+            while let Some(event) = stream.next().await {
+                event.expect("captured SSE response remains valid");
+            }
+        } else {
+            client
+                .create_message(request)
+                .await
+                .expect("non-streaming request succeeds");
+        }
+
+        let requests = server.received_requests().await.expect("recorded request");
+        assert_eq!(requests.len(), 1);
+        serde_json::from_slice(&requests[0].body).expect("captured request JSON")
+    }
+
+    async fn assert_k3_request_json_route_boundaries(streaming: bool) {
+        for (requested, expected) in [("off", "low"), ("high", "high"), ("max", "max")] {
+            let body = capture_moonshot_chat_request(
+                crate::config::DEFAULT_MOONSHOT_BASE_URL,
+                crate::config::MOONSHOT_KIMI_K3_MODEL,
+                Some(requested),
+                streaming,
+            )
+            .await;
+            assert_eq!(body["reasoning_effort"], json!(expected), "{body}");
+            assert!(body.get("thinking").is_none(), "{body}");
+            assert_eq!(body["max_completion_tokens"], json!(64), "{body}");
+            assert!(body.get("max_tokens").is_none(), "{body}");
+            assert!(body.get("temperature").is_none(), "{body}");
+            assert!(body.get("top_p").is_none(), "{body}");
+            assert_eq!(
+                body.get("stream").and_then(Value::as_bool),
+                streaming.then_some(true)
+            );
+        }
+
+        for (requested, expected) in [
+            ("off", Some(json!({"type": "enabled", "effort": "low"}))),
+            ("max", Some(json!({"type": "enabled", "effort": "max"}))),
+        ] {
+            let membership = capture_moonshot_chat_request(
+                crate::config::DEFAULT_KIMI_CODE_BASE_URL,
+                crate::config::KIMI_CODE_K3_MODEL,
+                Some(requested),
+                streaming,
+            )
+            .await;
+            match expected {
+                Some(thinking) => assert_eq!(membership["thinking"], thinking, "{membership}"),
+                None => assert!(membership.get("thinking").is_none(), "{membership}"),
+            }
+            assert!(membership.get("reasoning_effort").is_none(), "{membership}");
+            assert_eq!(membership["max_tokens"], json!(64), "{membership}");
+            assert!(
+                membership.get("max_completion_tokens").is_none(),
+                "{membership}"
+            );
+            assert_eq!(membership["temperature"], json!(0.25), "{membership}");
+            assert_eq!(membership["top_p"], json!(0.75), "{membership}");
+        }
+
+        let provider_default = capture_moonshot_chat_request(
+            crate::config::DEFAULT_KIMI_CODE_BASE_URL,
+            crate::config::KIMI_CODE_K3_MODEL,
+            None,
+            streaming,
+        )
+        .await;
+        assert!(
+            provider_default.get("thinking").is_none(),
+            "only a genuinely omitted effort leaves the provider default in control: {provider_default}"
+        );
+        assert!(provider_default.get("reasoning_effort").is_none());
+
+        let neighbor = capture_moonshot_chat_request(
+            "https://proxy.example/v1",
+            crate::config::MOONSHOT_KIMI_K3_MODEL,
+            Some("max"),
+            streaming,
+        )
+        .await;
+        assert_eq!(
+            neighbor["thinking"],
+            json!({"type": "enabled"}),
+            "{neighbor}"
+        );
+        assert!(neighbor.get("reasoning_effort").is_none(), "{neighbor}");
+        assert!(neighbor.pointer("/thinking/effort").is_none(), "{neighbor}");
+        assert_eq!(neighbor["max_tokens"], json!(64), "{neighbor}");
+        assert!(
+            neighbor.get("max_completion_tokens").is_none(),
+            "{neighbor}"
+        );
+        assert_eq!(neighbor["temperature"], json!(0.25), "{neighbor}");
+        assert_eq!(neighbor["top_p"], json!(0.75), "{neighbor}");
+    }
+
+    async fn assert_kimi_code_raw_off_replays_tool_history(streaming: bool) {
+        let mut request =
+            k3_request_fixture(crate::config::KIMI_CODE_K3_MODEL, Some("off"), streaming);
+        request.messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: "Inspect the saved tool state".to_string(),
+                        signature: None,
+                    },
+                    ContentBlock::ToolUse {
+                        id: "call-k3-replay".to_string(),
+                        name: "read_file".to_string(),
+                        input: json!({"path": "src/lib.rs"}),
+                        caller: None,
+                    },
+                ],
+            },
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call-k3-replay".to_string(),
+                    content: "file contents".to_string(),
+                    is_error: None,
+                    content_blocks: None,
+                }],
+            },
+        ];
+
+        let body = capture_moonshot_chat_request_body(
+            crate::config::DEFAULT_KIMI_CODE_BASE_URL,
+            crate::config::KIMI_CODE_K3_MODEL,
+            request,
+        )
+        .await;
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "enabled", "effort": "low"}),
+            "raw Off must still normalize to K3's always-thinking low tier: {body}"
+        );
+        let assistant = body["messages"]
+            .as_array()
+            .and_then(|messages| {
+                messages
+                    .iter()
+                    .find(|message| message["role"] == "assistant")
+            })
+            .expect("captured assistant tool-call history");
+        assert_eq!(
+            assistant["reasoning_content"],
+            json!("Inspect the saved tool state"),
+            "exact membership K3 must replay reasoning even for a stale raw Off caller: {body}"
+        );
+        assert!(assistant["tool_calls"].is_array(), "{assistant}");
+    }
+
+    async fn assert_kimi_code_apply_patch_schema_is_mfjs_compatible(streaming: bool) {
+        let mut request =
+            k3_request_fixture(crate::config::KIMI_CODE_K3_MODEL, Some("low"), streaming);
+        request.tools = Some(vec![apply_patch_request_tool()]);
+
+        let body = capture_moonshot_chat_request_body(
+            crate::config::DEFAULT_KIMI_CODE_BASE_URL,
+            crate::config::KIMI_CODE_K3_MODEL,
+            request,
+        )
+        .await;
+        let function = &body["tools"][0]["function"];
+        let parameters = &function["parameters"];
+        assert_eq!(parameters["type"], "object", "{parameters}");
+        assert!(parameters.get("oneOf").is_none(), "{parameters}");
+        assert!(parameters.get("anyOf").is_none(), "{parameters}");
+        assert!(parameters.get("allOf").is_none(), "{parameters}");
+        assert_eq!(parameters["properties"]["patch"]["type"], "string");
+        assert_eq!(parameters["properties"]["replace"]["type"], "array");
+        assert_eq!(parameters["properties"]["changes"]["type"], "array");
+        assert!(
+            function["description"]
+                .as_str()
+                .is_some_and(|description| description
+                    .contains("Exactly one of these parameter groups must be provided")),
+            "the relaxed wire schema must preserve the runtime constraint in its description: {function}"
+        );
+    }
+
+    async fn assert_kimi_code_invalid_root_ref_fails_before_transport(streaming: bool) {
+        let server = MockServer::start().await;
+        let client = moonshot_request_boundary_client(
+            crate::config::DEFAULT_KIMI_CODE_BASE_URL,
+            crate::config::KIMI_CODE_K3_MODEL,
+            server.uri(),
+        );
+        let mut request =
+            k3_request_fixture(crate::config::KIMI_CODE_K3_MODEL, Some("low"), streaming);
+        let mut tool = test_tool("private_schema_tool");
+        tool.input_schema = json!({
+            "$ref": "#/$defs/private-root-name-3158",
+            "$defs": {}
+        });
+        request.tools = Some(vec![tool]);
+
+        let error = if streaming {
+            match client.create_message_stream(request).await {
+                Ok(_) => panic!("invalid streaming parameters reached transport"),
+                Err(error) => error,
+            }
+        } else {
+            match client.create_message(request).await {
+                Ok(_) => panic!("invalid non-streaming parameters reached transport"),
+                Err(error) => error,
+            }
+        };
+        let diagnostic = error.to_string();
+        assert!(
+            diagnostic.contains("failed safe compatibility validation"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("unresolved internal root reference"),
+            "{diagnostic}"
+        );
+        assert!(!diagnostic.contains("private-root-name-3158"));
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("request log")
+                .is_empty(),
+            "invalid parameters must fail before transport"
+        );
+    }
+
+    async fn assert_kimi_code_untyped_default_fails_before_transport(streaming: bool) {
+        let server = MockServer::start().await;
+        let client = moonshot_request_boundary_client(
+            crate::config::DEFAULT_KIMI_CODE_BASE_URL,
+            crate::config::KIMI_CODE_K3_MODEL,
+            server.uri(),
+        );
+        let mut request =
+            k3_request_fixture(crate::config::KIMI_CODE_K3_MODEL, Some("low"), streaming);
+        let mut tool = test_tool("private_default_tool");
+        tool.input_schema = json!({
+            "type": "object",
+            "properties": {
+                "private-field-4401": {
+                    "default": "private-default-value-4402"
+                }
+            }
+        });
+        request.tools = Some(vec![tool]);
+
+        let error = if streaming {
+            match client.create_message_stream(request).await {
+                Ok(_) => panic!("untyped streaming parameters reached transport"),
+                Err(error) => error,
+            }
+        } else {
+            match client.create_message(request).await {
+                Ok(_) => panic!("untyped non-streaming parameters reached transport"),
+                Err(error) => error,
+            }
+        };
+        let diagnostic = error.to_string();
+        assert!(
+            diagnostic.contains("failed safe compatibility validation"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("without a concrete type"),
+            "{diagnostic}"
+        );
+        assert!(!diagnostic.contains("private-field-4401"));
+        assert!(!diagnostic.contains("private-default-value-4402"));
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("request log")
+                .is_empty(),
+            "untyped parameters must fail before transport"
+        );
+    }
+
+    async fn assert_kimi_code_streams_mfjs_safe_deferred_dynamic_tool() {
+        let tool = deferred_dynamic_request_tool();
+        assert_eq!(tool.defer_loading, Some(true));
+        assert_eq!(
+            tool.input_schema["properties"]["query"]["nullable"], true,
+            "ToolRegistry must exercise the provider-neutral nullable collapse"
+        );
+        assert!(
+            tool.input_schema["properties"]["query"]
+                .get("anyOf")
+                .is_none()
+        );
+        assert_eq!(tool.input_schema["properties"]["mode"]["const"], "fast");
+
+        let mut request = k3_request_fixture(crate::config::KIMI_CODE_K3_MODEL, Some("low"), true);
+        request.tools = Some(vec![tool]);
+        let body = capture_moonshot_chat_request_body(
+            crate::config::DEFAULT_KIMI_CODE_BASE_URL,
+            crate::config::KIMI_CODE_K3_MODEL,
+            request,
+        )
+        .await;
+
+        assert_eq!(
+            body["stream"], true,
+            "this must exercise the SSE path: {body}"
+        );
+        let parameters = &captured_function(&body, "deferred_lookup")["parameters"];
+        assert_eq!(parameters["properties"]["mode"]["enum"], json!(["fast"]));
+        assert!(
+            parameters["properties"]["mode"].get("const").is_none(),
+            "{parameters}"
+        );
+        assert_eq!(
+            parameters["properties"]["query"]["anyOf"],
+            json!([{"type": "string"}, {"type": "null"}])
+        );
+        assert!(
+            parameters["properties"]["query"].get("nullable").is_none(),
+            "{parameters}"
+        );
+        crate::tools::schema_sanitize::validate_mfjs_parameters(parameters).unwrap();
+    }
+
+    async fn assert_kimi_code_captures_exact_general_child_catalog() {
+        let tools = crate::tools::subagent::kimi_general_child_request_tools_fixture();
+        let source_len = tools.len();
+        assert!(source_len > 20, "expected a real General child catalog");
+
+        // Name the offending first-party tool in test-only diagnostics while
+        // production errors remain fixed and non-secret.
+        for tool in &tools {
+            let mut parameters = tool.input_schema.clone();
+            crate::tools::schema_sanitize::sanitize_for_kimi_parameters(&mut parameters)
+                .unwrap_or_else(|error| panic!("General child tool {}: {error}", tool.name));
+        }
+
+        let mut request = k3_request_fixture(crate::config::KIMI_CODE_K3_MODEL, Some("low"), false);
+        request.tools = Some(tools);
+        let body = capture_moonshot_chat_request_body(
+            crate::config::DEFAULT_KIMI_CODE_BASE_URL,
+            crate::config::KIMI_CODE_K3_MODEL,
+            request,
+        )
+        .await;
+
+        let captured = body["tools"].as_array().expect("captured tool catalog");
+        assert_eq!(captured.len(), source_len);
+        assert!(captured_function(&body, "get_goal").is_object());
+        assert!(
+            captured
+                .iter()
+                .all(|tool| tool["function"]["name"] != "create_goal")
+        );
+        assert!(
+            captured
+                .iter()
+                .all(|tool| tool["function"]["name"] != "update_goal")
+        );
+
+        for tool in captured {
+            let parameters = &tool["function"]["parameters"];
+            for unsupported in ["const", "nullable", "oneOf", "allOf"] {
+                assert!(
+                    !value_contains_key(parameters, unsupported),
+                    "captured {} still contains {unsupported}: {parameters}",
+                    tool["function"]["name"]
+                );
+            }
+            crate::tools::schema_sanitize::validate_mfjs_parameters(parameters).unwrap();
+        }
+
+        let handle_read = &captured_function(&body, "handle_read")["parameters"];
+        assert!(
+            handle_read.to_string().contains("var_handle"),
+            "real nested const fixture must survive as an enum: {handle_read}"
+        );
+        assert!(value_contains_key(handle_read, "enum"), "{handle_read}");
+    }
+
+    #[tokio::test]
+    async fn create_message_request_json_honors_exact_k3_route_boundaries() {
+        assert_k3_request_json_route_boundaries(false).await;
+    }
+
+    #[tokio::test]
+    async fn create_message_stream_request_json_honors_exact_k3_route_boundaries() {
+        assert_k3_request_json_route_boundaries(true).await;
+    }
+
+    #[tokio::test]
+    async fn create_message_request_replays_kimi_code_history_for_raw_off() {
+        assert_kimi_code_raw_off_replays_tool_history(false).await;
+    }
+
+    #[tokio::test]
+    async fn create_message_stream_replays_kimi_code_history_for_raw_off() {
+        assert_kimi_code_raw_off_replays_tool_history(true).await;
+    }
+
+    #[tokio::test]
+    async fn create_message_request_sends_mfjs_compatible_apply_patch_schema() {
+        assert_kimi_code_apply_patch_schema_is_mfjs_compatible(false).await;
+    }
+
+    #[tokio::test]
+    async fn create_message_stream_sends_mfjs_compatible_apply_patch_schema() {
+        assert_kimi_code_apply_patch_schema_is_mfjs_compatible(true).await;
+    }
+
+    #[tokio::test]
+    async fn create_message_request_rejects_invalid_kimi_root_ref_before_transport() {
+        assert_kimi_code_invalid_root_ref_fails_before_transport(false).await;
+    }
+
+    #[tokio::test]
+    async fn create_message_stream_rejects_invalid_kimi_root_ref_before_transport() {
+        assert_kimi_code_invalid_root_ref_fails_before_transport(true).await;
+    }
+
+    #[tokio::test]
+    async fn create_message_request_rejects_untyped_kimi_default_before_transport() {
+        assert_kimi_code_untyped_default_fails_before_transport(false).await;
+    }
+
+    #[tokio::test]
+    async fn create_message_stream_rejects_untyped_kimi_default_before_transport() {
+        assert_kimi_code_untyped_default_fails_before_transport(true).await;
+    }
+
+    #[tokio::test]
+    async fn create_message_stream_sends_mfjs_safe_deferred_dynamic_tool() {
+        assert_kimi_code_streams_mfjs_safe_deferred_dynamic_tool().await;
+    }
+
+    #[tokio::test]
+    async fn create_message_captures_exact_mfjs_safe_general_child_catalog() {
+        assert_kimi_code_captures_exact_general_child_catalog().await;
     }
 
     const CONFIG_SECRET_SENTINELS: [&str; 8] = [

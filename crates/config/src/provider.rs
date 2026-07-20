@@ -353,19 +353,10 @@ pub const fn credential_help(kind: ProviderKind) -> CredentialHelp {
     }
 }
 
-/// Whether a configured route is exactly the official Kimi Code endpoint.
-///
-/// A trailing slash is insignificant, but neighboring Kimi-hosted paths must
-/// not inherit membership-plan credentials merely because they share a host.
-#[must_use]
-pub fn is_exact_kimi_code_route(kind: ProviderKind, base_url: &str) -> bool {
-    if kind != ProviderKind::Moonshot {
-        return false;
-    }
-
+fn is_exact_https_route(base_url: &str, expected_authority: &str, expected_path: &str) -> bool {
     // URL schemes and host names are ASCII case-insensitive; paths are not.
-    // Do not lowercase the whole URL here: `/CODING/v1` is a neighboring
-    // route, not the membership-plan endpoint. Keep this intentionally
+    // Do not lowercase the whole URL here: a differently-cased path is a
+    // neighboring route, not the official endpoint. Keep this intentionally
     // dependency-free because provider metadata is used by low-level config
     // callers that should not need URL parsing machinery just for this guard.
     let trimmed = base_url.trim();
@@ -378,8 +369,31 @@ pub fn is_exact_kimi_code_route(kind: ProviderKind, base_url: &str) -> bool {
     };
 
     scheme.eq_ignore_ascii_case("https")
-        && authority.eq_ignore_ascii_case("api.kimi.com")
-        && path == "coding/v1"
+        && authority.eq_ignore_ascii_case(expected_authority)
+        && path == expected_path
+}
+
+/// Whether a configured route is exactly the official Kimi Code endpoint.
+///
+/// A trailing slash is insignificant, but neighboring Kimi-hosted paths must
+/// not inherit membership-plan credentials merely because they share a host.
+#[must_use]
+pub fn is_exact_kimi_code_route(kind: ProviderKind, base_url: &str) -> bool {
+    if kind != ProviderKind::Moonshot {
+        return false;
+    }
+
+    is_exact_https_route(base_url, "api.kimi.com", "coding/v1")
+}
+
+/// Whether a configured route is exactly Moonshot's direct API endpoint.
+///
+/// Direct K3 owns a different reasoning-control dialect from the Kimi Code
+/// membership endpoint. Keep this route guard exact so custom gateways and
+/// neighboring Moonshot paths do not inherit direct-K3 wire semantics.
+#[must_use]
+pub fn is_exact_moonshot_platform_route(kind: ProviderKind, base_url: &str) -> bool {
+    kind == ProviderKind::Moonshot && is_exact_https_route(base_url, "api.moonshot.ai", "v1")
 }
 
 /// Return credential help for one concrete provider route.
@@ -1316,6 +1330,33 @@ mod tests {
                 "{neighboring_route} must not inherit Kimi Code membership semantics"
             );
         }
+    }
+
+    #[test]
+    fn direct_moonshot_route_matching_is_exact() {
+        assert!(is_exact_moonshot_platform_route(
+            ProviderKind::Moonshot,
+            "HTTPS://API.MOONSHOT.AI/v1/"
+        ));
+        for neighboring_route in [
+            "https://api.moonshot.ai/V1",
+            "http://api.moonshot.ai/v1",
+            "https://api.moonshot.ai:443/v1",
+            "https://api.moonshot.ai/v1?preview=1",
+            "https://api.moonshot.ai/v1#fragment",
+            "https://api.moonshot.ai/v1//",
+            "https://api.moonshot.ai/v1/chat/completions",
+            "https://api.kimi.com/coding/v1",
+        ] {
+            assert!(
+                !is_exact_moonshot_platform_route(ProviderKind::Moonshot, neighboring_route),
+                "{neighboring_route} must not inherit direct Moonshot semantics"
+            );
+        }
+        assert!(!is_exact_moonshot_platform_route(
+            ProviderKind::Openai,
+            DEFAULT_MOONSHOT_BASE_URL
+        ));
     }
 
     #[test]
