@@ -820,7 +820,7 @@ pub(crate) fn discover_for_workspace_and_dir_with_home_and_mode(
 #[must_use]
 pub fn render_available_skills_context_for_workspace(workspace: &Path) -> Option<String> {
     let registry = discover_in_workspace(workspace);
-    render_skills_block(&registry, "en")
+    render_skills_block(&registry, "en", workspace)
 }
 
 #[must_use]
@@ -830,7 +830,7 @@ pub fn render_available_skills_context_for_workspace_with_mode(
     locale: &str,
 ) -> Option<String> {
     let registry = discover_in_workspace_with_mode(workspace, mode);
-    render_skills_block(&registry, locale)
+    render_skills_block(&registry, locale, workspace)
 }
 
 /// Codex's progressive-disclosure contract: the model sees skill names,
@@ -844,7 +844,7 @@ pub fn render_available_skills_context_for_workspace_with_mode(
 #[must_use]
 fn render_available_skills_context(skills_dir: &Path) -> Option<String> {
     let registry = SkillRegistry::discover(skills_dir);
-    render_skills_block(&registry, "en")
+    render_skills_block(&registry, "en", skills_dir)
 }
 
 /// Union variant: merge skills discovered in the `workspace` (cross-tool skill
@@ -870,10 +870,51 @@ pub fn render_available_skills_context_for_workspace_and_dir_with_mode(
     locale: &str,
 ) -> Option<String> {
     let registry = discover_for_workspace_and_dir_with_mode(workspace, skills_dir, mode);
-    render_skills_block(&registry, locale)
+    render_skills_block(&registry, locale, workspace)
 }
 
-fn render_skills_block(registry: &SkillRegistry, locale: &str) -> Option<String> {
+/// Replace absolute path prefixes in free-form text (skill load warnings)
+/// with privacy-safe stand-ins before the text enters the system-prompt
+/// prefix (#4632). Workspace paths become `.`, home-dir paths become `~`.
+fn sanitize_prompt_path_text(text: &str, workspace: &Path) -> String {
+    let mut out = text.to_string();
+    if let Some(ws) = workspace.to_str()
+        && !ws.is_empty()
+    {
+        out = out.replace(ws, ".");
+    }
+    if let Some(home) = dirs::home_dir()
+        && let Some(home_str) = home.to_str()
+        && !home_str.is_empty()
+    {
+        out = out.replace(&home_str, "~");
+    }
+    out
+}
+
+/// Render a skill path without leaking private absolute paths into the
+/// system-prompt prefix (#4632): workspace skills become workspace-relative,
+/// home-dir skills become `~/…`, and anything else is reduced to its trailing
+/// components so the prefix stays free of user-identifying absolute paths.
+fn privacy_safe_skill_path(path: &Path, workspace: &Path) -> String {
+    if let Ok(rel) = path.strip_prefix(workspace) {
+        return rel.display().to_string();
+    }
+    if let Some(home) = dirs::home_dir()
+        && let Ok(rel) = path.strip_prefix(&home)
+    {
+        return format!("~/{}", rel.display());
+    }
+    match (path.parent().and_then(Path::file_name), path.file_name()) {
+        (Some(dir), Some(file)) => format!("…/{}/{}", dir.to_string_lossy(), file.to_string_lossy()),
+        _ => path
+            .file_name()
+            .map(|file| file.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "SKILL.md".to_string()),
+    }
+}
+
+fn render_skills_block(registry: &SkillRegistry, locale: &str, workspace: &Path) -> Option<String> {
     if registry.is_empty() {
         return None;
     }
@@ -893,19 +934,20 @@ instructions when using a specific skill.\n\n",
         // Use the real on-disk path captured at discovery — the directory
         // name can differ from the frontmatter `name` for community
         // installs, in which case `<dir>/<name>/SKILL.md` would not exist
-        // and the model would fail to open it.
+        // and the model would fail to open it. Rendered privacy-safe
+        // (workspace-relative or ~/…) so the prompt prefix never embeds
+        // absolute user paths (#4632).
+        let display_path = privacy_safe_skill_path(&skill.path, workspace);
         let description = truncate_for_prompt(
             skill.description_for_locale(locale),
             MAX_SKILL_DESCRIPTION_CHARS,
         );
         let line = if description.is_empty() {
-            format!("- {}: (file: {})\n", skill.name, skill.path.display())
+            format!("- {}: (file: {})\n", skill.name, display_path)
         } else {
             format!(
                 "- {}: {} (file: {})\n",
-                skill.name,
-                description,
-                skill.path.display()
+                skill.name, description, display_path
             )
         };
 
@@ -926,7 +968,10 @@ instructions when using a specific skill.\n\n",
         out.push_str("\n### Skill load warnings\n");
         for warning in registry.warnings().iter().take(8) {
             out.push_str("- ");
-            out.push_str(&truncate_for_prompt(warning, MAX_SKILL_DESCRIPTION_CHARS));
+            out.push_str(&truncate_for_prompt(
+                &sanitize_prompt_path_text(warning, workspace),
+                MAX_SKILL_DESCRIPTION_CHARS,
+            ));
             out.push('\n');
         }
     }
@@ -979,10 +1024,9 @@ mod tests {
             crate::skills::render_available_skills_context(&tmpdir.path().join("skills"))
                 .expect("skill context");
 
-        let expected_path = tmpdir
-            .path()
-            .join("skills")
-            .join("test-skill")
+        // #4632: paths render relative to the skills base dir (privacy-safe),
+        // so the assertion checks the workspace-relative form.
+        let expected_path = std::path::Path::new("test-skill")
             .join("SKILL.md")
             .display()
             .to_string();
@@ -993,6 +1037,7 @@ mod tests {
             rendered.contains(&expected_path),
             "expected path {expected_path:?} not in rendered output"
         );
+        assert!(!rendered.contains(tmpdir.path().to_str().unwrap_or("/nonexistent")));
         assert!(rendered.contains("### How to use skills"));
     }
 
@@ -1014,17 +1059,13 @@ mod tests {
             crate::skills::render_available_skills_context(&tmpdir.path().join("skills"))
                 .expect("skill context");
 
-        let real_path = tmpdir
-            .path()
-            .join("skills")
-            .join("weird-dir-name")
+        // #4632: rendered relative to the skills base dir; the regression
+        // intent (real dir name, not frontmatter name) is unchanged.
+        let real_path = std::path::Path::new("weird-dir-name")
             .join("SKILL.md")
             .display()
             .to_string();
-        let stale_path = tmpdir
-            .path()
-            .join("skills")
-            .join("friendly-name")
+        let stale_path = std::path::Path::new("friendly-name")
             .join("SKILL.md")
             .display()
             .to_string();
@@ -1145,7 +1186,8 @@ mod tests {
             });
         }
 
-        let rendered = super::render_skills_block(&registry, "en").expect("skill context");
+        let rendered =
+            super::render_skills_block(&registry, "en", tmpdir.path()).expect("skill context");
         assert!(
             rendered.contains("workspace-priority"),
             "higher-precedence workspace skills must not be reordered behind globals:\n{rendered}"
@@ -1259,14 +1301,16 @@ body";
             path: std::path::PathBuf::from("/skills/compress/SKILL.md"),
         });
 
-        let zh = super::render_skills_block(&registry, "zh-Hans").expect("zh block");
+        let zh = super::render_skills_block(&registry, "zh-Hans", std::path::Path::new("/"))
+            .expect("zh block");
         assert!(
             zh.contains("压缩日志的技能"),
             "zh session should get the zh description:\n{zh}"
         );
         assert!(!zh.contains("Compress logs to save space"));
 
-        let en = super::render_skills_block(&registry, "en").expect("en block");
+        let en = super::render_skills_block(&registry, "en", std::path::Path::new("/"))
+            .expect("en block");
         assert!(
             en.contains("Compress logs to save space"),
             "en session keeps default:\n{en}"

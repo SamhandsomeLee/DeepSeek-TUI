@@ -1410,7 +1410,7 @@ mod tests {
     use crate::tools::file::{EditFileTool, WriteFileTool};
     use crate::tools::handle::HandleReadTool;
     use crate::tools::rlm::{RlmCloseTool, RlmConfigureTool, RlmEvalTool, RlmOpenTool};
-    use crate::tools::shell::ExecShellTool;
+    use crate::tools::shell::BashTool;
     use crate::tools::spec::ToolSpec;
     use tempfile::tempdir;
 
@@ -1841,9 +1841,9 @@ mod tests {
         let patch = ApplyPatchTool.description();
         assert!(patch.contains("unified-diff") && patch.contains("transactional"));
 
-        let shell = ExecShellTool.description();
+        let shell_tool = BashTool::new("Bash");
+        let shell = shell_tool.description();
         assert!(shell.contains("background=true"));
-        assert!(shell.contains("task_shell_start"));
         assert!(shell.contains(">5 seconds"));
     }
 
@@ -3534,6 +3534,41 @@ mod tests {
     fn render_instructions_block_returns_none_for_empty_input() {
         let empty: &[super::InstructionSource] = &[];
         assert!(super::render_instructions_block(empty).is_none());
+    }
+
+    /// #4632 — The system prompt prefix (the byte-stable part cached by
+    /// inference servers) must never contain private content: absolute
+    /// filesystem paths, API keys, or home-directory references.
+    #[test]
+    fn system_prompt_prefix_never_leaks_private_content() {
+        let tmp = tempdir().expect("tempdir");
+        let workspace = tmp.path();
+        let prompt = match system_prompt_for_mode_with_context(workspace, None) {
+            SystemPrompt::Text(text) => text,
+            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
+        };
+
+        // No absolute paths (Unix or Windows).
+        let offending: Vec<&str> = prompt
+            .lines()
+            .filter(|line| {
+                line.contains("/Users/") || line.contains("/home/") || line.contains("C:\\")
+            })
+            .collect();
+        assert!(
+            offending.is_empty(),
+            "system prompt must not contain absolute user paths, found: {offending:?}"
+        );
+        // No API key patterns.
+        assert!(
+            !prompt.contains("sk-") && !prompt.contains("api_key") && !prompt.contains("API_KEY"),
+            "system prompt must not contain API key material"
+        );
+        // The workspace path itself must not appear.
+        assert!(
+            !prompt.contains(workspace.to_str().unwrap_or("/nonexistent")),
+            "system prompt must not embed the workspace path"
+        );
     }
 
     #[test]
