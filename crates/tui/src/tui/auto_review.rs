@@ -99,22 +99,41 @@ impl ToolActionKind {
     pub fn from_tool_call(tool_name: &str, params: &Value, category: ToolCategory) -> Self {
         let normalized = tool_name.to_ascii_lowercase();
 
-        if contains_any(&normalized, &["push", "publish", "release", "tag"]) {
+        // Unified action-parameterized tools (piagent phase B): classify on
+        // the action-qualified name so a destructive action keeps the stakes
+        // its legacy per-action name produced (e.g. `automation` with
+        // action=delete classifies like the old `automation_delete`).
+        let action_qualified;
+        let normalized = match normalized.as_str() {
+            "automation" | "tasks" | "github" | "rlm" => {
+                match params.get("action").and_then(Value::as_str) {
+                    Some(action) => {
+                        action_qualified = format!("{normalized}_{action}");
+                        &action_qualified
+                    }
+                    None => &normalized,
+                }
+            }
+            _ => &normalized,
+        };
+        let normalized = normalized.as_str();
+
+        if contains_any(normalized, &["push", "publish", "release", "tag"]) {
             return Self::Publish;
         }
-        if contains_any(&normalized, &["secret", "token", "credential", "password"]) {
+        if contains_any(normalized, &["secret", "token", "credential", "password"]) {
             return Self::Secret;
         }
         if contains_any(
-            &normalized,
+            normalized,
             &["delete", "destroy", "remove", "drop", "reset"],
         ) {
             return Self::Destructive;
         }
-        if contains_any(&normalized, &["git_"]) {
+        if contains_any(normalized, &["git_"]) {
             return Self::Git;
         }
-        if contains_any(&normalized, &["browser", "chrome", "playwright"]) {
+        if contains_any(normalized, &["browser", "chrome", "playwright"]) {
             return Self::Browser;
         }
 

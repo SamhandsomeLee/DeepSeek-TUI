@@ -383,7 +383,12 @@ fn compact_structured_tool_result_for_context(tool_name: &str, raw: &str) -> Opt
     match tool_name {
         "run_tests" => compact_run_tests_result_for_context(raw),
         "run_verifiers" => compact_run_verifiers_result_for_context(raw),
-        "task_gate_run" => compact_task_gate_run_result_for_context(raw),
+        // `tasks` is the unified durable-task tool (piagent phase B); its
+        // gate_run action emits the same gate payload as the legacy
+        // `task_gate_run` alias. The compactor returns None unless the
+        // content actually parses as a gate result, so non-gate `tasks`
+        // results fall through to the generic limits unchanged.
+        "task_gate_run" | "tasks" => compact_task_gate_run_result_for_context(raw),
         _ => None,
     }
 }

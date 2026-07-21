@@ -1,4 +1,10 @@
 //! Model-visible automation tools over `AutomationManager`.
+//!
+//! Unified surface (piagent phase B): the model sees one tool, `automation`,
+//! with an `action` parameter routing to the per-action logic. The legacy
+//! `automation_*` names stay registered as hidden compat aliases that force
+//! the action so saved transcripts replay correctly — the same pattern
+//! `BashTool` established for `exec_shell*` in #4625.
 
 use std::path::PathBuf;
 
@@ -13,56 +19,239 @@ use crate::tools::spec::{
     optional_str, optional_u64, required_str,
 };
 
-pub struct AutomationCreateTool;
-pub struct AutomationListTool;
-pub struct AutomationReadTool;
-pub struct AutomationUpdateTool;
-pub struct AutomationPauseTool;
-pub struct AutomationResumeTool;
-pub struct AutomationDeleteTool;
-pub struct AutomationRunTool;
+/// Read-only actions — these are the only ones the Plan-mode surface exposes.
+const READ_ACTIONS: &[&str] = &["list", "read"];
+const ALL_ACTIONS: &[&str] = &[
+    "create", "list", "read", "update", "pause", "resume", "delete", "run",
+];
+
+/// Unified automation tool.
+///
+/// One struct, one input schema per surface: the canonical `automation`
+/// tool (all actions, or the read-only subset via [`AutomationTool::read_only`])
+/// plus hidden legacy aliases carrying a `forced_action`.
+pub struct AutomationTool {
+    name: &'static str,
+    forced_action: Option<&'static str>,
+    read_only: bool,
+}
+
+impl AutomationTool {
+    pub const fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            forced_action: None,
+            read_only: false,
+        }
+    }
+
+    /// Plan-mode variant: only the read-only actions are advertised and routed.
+    pub const fn read_only(name: &'static str) -> Self {
+        Self {
+            name,
+            forced_action: None,
+            read_only: true,
+        }
+    }
+
+    pub const fn alias(name: &'static str, action: &'static str) -> Self {
+        Self {
+            name,
+            forced_action: Some(action),
+            read_only: false,
+        }
+    }
+
+    fn allowed_actions(&self) -> &'static [&'static str] {
+        if self.read_only { READ_ACTIONS } else { ALL_ACTIONS }
+    }
+
+    fn resolve_action<'a>(&'a self, input: &'a Value) -> Result<&'a str, ToolError> {
+        let action = match self.forced_action {
+            Some(action) => action,
+            None => input
+                .get("action")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ToolError::invalid_input(format!(
+                        "automation: missing `action` (one of: {})",
+                        self.allowed_actions().join(", ")
+                    ))
+                })?,
+        };
+        if self.allowed_actions().contains(&action) {
+            Ok(action)
+        } else {
+            Err(ToolError::invalid_input(format!(
+                "automation: invalid action `{action}` (one of: {})",
+                self.allowed_actions().join(", ")
+            )))
+        }
+    }
+
+    fn action_is_read(action: &str) -> bool {
+        READ_ACTIONS.contains(&action)
+    }
+}
 
 #[async_trait]
-impl ToolSpec for AutomationCreateTool {
+impl ToolSpec for AutomationTool {
     fn name(&self) -> &'static str {
-        "automation_create"
+        self.name
+    }
+
+    fn model_visible(&self) -> bool {
+        self.forced_action.is_none()
     }
 
     fn description(&self) -> &'static str {
-        "Create a durable scheduled automation. Creation requires approval and recurrence is constrained to supported HOURLY/WEEKLY RRULE forms. Runs enqueue normal durable tasks."
+        match self.forced_action {
+            Some("create") => "Create a durable scheduled automation. Creation requires approval and recurrence is constrained to supported HOURLY/WEEKLY RRULE forms. Runs enqueue normal durable tasks.",
+            Some("list") => {
+                "List durable automations with status, next run, and last run timestamps."
+            }
+            Some("read") => "Read one durable automation plus recent run records.",
+            Some("update") => "Update a durable automation. Requires approval; recurrence remains constrained to supported RRULE forms.",
+            Some("pause") => "Pause a durable automation. Requires approval.",
+            Some("resume") => "Resume a paused durable automation. Requires approval.",
+            Some("delete") => {
+                "Delete a durable automation and its run history. Requires approval."
+            }
+            Some("run") => "Run an automation now. The run enqueues a normal durable task and returns linked task/thread/turn ids as they become available.",
+            _ if self.read_only => "Inspect durable scheduled automations. Actions: \"list\" (status, next run, last run) and \"read\" (one automation plus recent run records).",
+            _ => "Manage durable scheduled automations. Actions: \"create\" (approval; recurrence constrained to supported HOURLY/WEEKLY RRULE forms; runs enqueue normal durable tasks), \"list\", \"read\", \"update\" (approval), \"pause\" (approval), \"resume\" (approval), \"delete\" (approval), \"run\" (approval).",
+        }
     }
 
     fn input_schema(&self) -> Value {
+        if let Some(action) = self.forced_action {
+            return legacy_action_schema(action);
+        }
+        let actions: Vec<&str> = self.allowed_actions().to_vec();
+        let mut properties = serde_json::Map::new();
+        properties.insert(
+            "action".to_string(),
+            json!({
+                "type": "string",
+                "enum": actions,
+                "description": "Action to perform."
+            }),
+        );
+        if !self.read_only {
+            properties.insert(
+                "name".to_string(),
+                json!({ "type": "string", "description": "Automation name (action=create/update)." }),
+            );
+            properties.insert(
+                "prompt".to_string(),
+                json!({ "type": "string", "description": "Prompt for scheduled runs (action=create/update)." }),
+            );
+            properties.insert(
+                "rrule".to_string(),
+                json!({
+                    "type": "string",
+                    "description": "Supported: FREQ=HOURLY;INTERVAL=N[;BYDAY=MO,TU][;BYHOUR=9][;BYMINUTE=30] or FREQ=WEEKLY;BYDAY=MO;BYHOUR=9;BYMINUTE=30. For HOURLY, BYHOUR/BYMINUTE choose the initial local wall-clock anchor and INTERVAL advances from that anchor; BYHOUR is not a daily-only filter. Anchored wall times skip nonexistent clock times and use the first occurrence of ambiguous clock times. (action=create/update)"
+                }),
+            );
+            properties.insert(
+                "cwds".to_string(),
+                json!({ "type": "array", "items": { "type": "string" }, "description": "Working directories for scheduled runs (action=create/update)." }),
+            );
+            properties.insert(
+                "mode".to_string(),
+                json!({ "type": "string", "description": "Task mode for scheduled runs. Defaults to agent when omitted. (action=create/update)" }),
+            );
+            properties.insert(
+                "allow_shell".to_string(),
+                json!({ "type": "boolean", "default": false, "description": "(action=create/update)" }),
+            );
+            properties.insert(
+                "trust_mode".to_string(),
+                json!({ "type": "boolean", "default": false, "description": "(action=create/update)" }),
+            );
+            properties.insert(
+                "auto_approve".to_string(),
+                json!({ "type": "boolean", "default": false, "description": "(action=create/update)" }),
+            );
+            properties.insert(
+                "paused".to_string(),
+                json!({ "type": "boolean", "default": false, "description": "Create the automation paused (action=create)." }),
+            );
+            properties.insert(
+                "status".to_string(),
+                json!({ "type": "string", "enum": ["active", "paused"], "description": "(action=update)" }),
+            );
+        }
+        properties.insert(
+            "automation_id".to_string(),
+            json!({ "type": "string", "description": "Target automation id (action=read/update/pause/resume/delete/run)." }),
+        );
+        properties.insert(
+            "limit".to_string(),
+            json!({ "type": "integer", "minimum": 1, "maximum": 100, "default": 50, "description": "(action=list)" }),
+        );
         json!({
             "type": "object",
-            "properties": {
-                "name": { "type": "string" },
-                "prompt": { "type": "string" },
-                "rrule": {
-                    "type": "string",
-                    "description": "Supported: FREQ=HOURLY;INTERVAL=N[;BYDAY=MO,TU][;BYHOUR=9][;BYMINUTE=30] or FREQ=WEEKLY;BYDAY=MO;BYHOUR=9;BYMINUTE=30. For HOURLY, BYHOUR/BYMINUTE choose the initial local wall-clock anchor and INTERVAL advances from that anchor; BYHOUR is not a daily-only filter. Anchored wall times skip nonexistent clock times and use the first occurrence of ambiguous clock times."
-                },
-                "cwds": { "type": "array", "items": { "type": "string" } },
-                "mode": { "type": "string", "description": "Task mode for scheduled runs. Defaults to agent when omitted." },
-                "allow_shell": { "type": "boolean", "default": false },
-                "trust_mode": { "type": "boolean", "default": false },
-                "auto_approve": { "type": "boolean", "default": false },
-                "paused": { "type": "boolean", "default": false }
-            },
-            "required": ["name", "prompt", "rrule"],
+            "properties": properties,
             "additionalProperties": false
         })
     }
 
     fn capabilities(&self) -> Vec<ToolCapability> {
-        vec![ToolCapability::RequiresApproval]
+        match self.forced_action {
+            Some(action) if Self::action_is_read(action) => vec![ToolCapability::ReadOnly],
+            Some(_) => vec![ToolCapability::RequiresApproval],
+            None if self.read_only => vec![ToolCapability::ReadOnly],
+            None => vec![ToolCapability::RequiresApproval],
+        }
     }
 
     fn approval_requirement(&self) -> ApprovalRequirement {
-        ApprovalRequirement::Required
+        match self.forced_action {
+            Some(action) if Self::action_is_read(action) => ApprovalRequirement::Auto,
+            Some(_) => ApprovalRequirement::Required,
+            None if self.read_only => ApprovalRequirement::Auto,
+            None => ApprovalRequirement::Required,
+        }
+    }
+
+    fn approval_requirement_for(&self, input: &Value) -> ApprovalRequirement {
+        match self.resolve_action(input) {
+            Ok(action) if Self::action_is_read(action) => ApprovalRequirement::Auto,
+            _ => ApprovalRequirement::Required,
+        }
+    }
+
+    fn is_read_only_for(&self, input: &Value) -> bool {
+        match self.resolve_action(input) {
+            Ok(action) => Self::action_is_read(action),
+            Err(_) => self.is_read_only(),
+        }
     }
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+        match self.resolve_action(&input)? {
+            "create" => self.execute_create(&input, context).await,
+            "list" => self.execute_list(&input, context).await,
+            "read" => self.execute_read(&input, context).await,
+            "update" => self.execute_update(&input, context).await,
+            "pause" => self.execute_simple(context, &input, "pause").await,
+            "resume" => self.execute_simple(context, &input, "resume").await,
+            "delete" => self.execute_simple(context, &input, "delete").await,
+            "run" => self.execute_run(&input, context).await,
+            action => Err(ToolError::invalid_input(format!(
+                "automation: invalid action `{action}`"
+            ))),
+        }
+    }
+}
+
+impl AutomationTool {
+    async fn execute_create(
+        &self,
+        input: &Value,
+        context: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
         let manager = context
             .runtime
             .automations
@@ -70,17 +259,17 @@ impl ToolSpec for AutomationCreateTool {
             .ok_or_else(|| ToolError::not_available("AutomationManager is not attached"))?;
         let manager = manager.lock().await;
         let req = CreateAutomationRequest {
-            name: required_str(&input, "name")?.to_string(),
-            prompt: required_str(&input, "prompt")?.to_string(),
-            rrule: required_str(&input, "rrule")?.to_string(),
-            cwds: string_array(&input, "cwds")?
+            name: required_str(input, "name")?.to_string(),
+            prompt: required_str(input, "prompt")?.to_string(),
+            rrule: required_str(input, "rrule")?.to_string(),
+            cwds: string_array(input, "cwds")?
                 .into_iter()
                 .map(PathBuf::from)
                 .collect(),
-            mode: optional_str(&input, "mode").map(ToString::to_string),
-            allow_shell: optional_bool_value(&input, "allow_shell"),
-            trust_mode: optional_bool_value(&input, "trust_mode"),
-            auto_approve: optional_bool_value(&input, "auto_approve"),
+            mode: optional_str(input, "mode").map(ToString::to_string),
+            allow_shell: optional_bool_value(input, "allow_shell"),
+            trust_mode: optional_bool_value(input, "trust_mode"),
+            auto_approve: optional_bool_value(input, "auto_approve"),
             status: Some(
                 if input
                     .get("paused")
@@ -98,33 +287,12 @@ impl ToolSpec for AutomationCreateTool {
             .map_err(|e| ToolError::execution_failed(e.to_string()))?;
         ToolResult::json(&automation).map_err(|e| ToolError::execution_failed(e.to_string()))
     }
-}
 
-#[async_trait]
-impl ToolSpec for AutomationListTool {
-    fn name(&self) -> &'static str {
-        "automation_list"
-    }
-
-    fn description(&self) -> &'static str {
-        "List durable automations with status, next run, and last run timestamps."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 50 }
-            },
-            "additionalProperties": false
-        })
-    }
-
-    fn capabilities(&self) -> Vec<ToolCapability> {
-        vec![ToolCapability::ReadOnly]
-    }
-
-    async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+    async fn execute_list(
+        &self,
+        input: &Value,
+        context: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
         let manager = context
             .runtime
             .automations
@@ -134,41 +302,22 @@ impl ToolSpec for AutomationListTool {
         let mut automations = manager
             .list_automations()
             .map_err(|e| ToolError::execution_failed(e.to_string()))?;
-        automations.truncate(optional_u64(&input, "limit", 50).clamp(1, 100) as usize);
+        automations.truncate(optional_u64(input, "limit", 50).clamp(1, 100) as usize);
         ToolResult::json(&automations).map_err(|e| ToolError::execution_failed(e.to_string()))
     }
-}
 
-#[async_trait]
-impl ToolSpec for AutomationReadTool {
-    fn name(&self) -> &'static str {
-        "automation_read"
-    }
-
-    fn description(&self) -> &'static str {
-        "Read one durable automation plus recent run records."
-    }
-
-    fn input_schema(&self) -> Value {
-        automation_id_schema(true)
-    }
-
-    fn capabilities(&self) -> Vec<ToolCapability> {
-        vec![ToolCapability::ReadOnly]
-    }
-
-    fn approval_requirement(&self) -> ApprovalRequirement {
-        ApprovalRequirement::Auto
-    }
-
-    async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+    async fn execute_read(
+        &self,
+        input: &Value,
+        context: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
         let manager = context
             .runtime
             .automations
             .as_ref()
             .ok_or_else(|| ToolError::not_available("AutomationManager is not attached"))?;
         let manager = manager.lock().await;
-        let id = required_str(&input, "automation_id")?;
+        let id = required_str(input, "automation_id")?;
         let automation = manager
             .get_automation(id)
             .map_err(|e| ToolError::execution_failed(e.to_string()))?;
@@ -178,20 +327,130 @@ impl ToolSpec for AutomationReadTool {
         ToolResult::json(&json!({ "automation": automation, "recent_runs": runs }))
             .map_err(|e| ToolError::execution_failed(e.to_string()))
     }
+
+    async fn execute_update(
+        &self,
+        input: &Value,
+        context: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        let manager = context
+            .runtime
+            .automations
+            .as_ref()
+            .ok_or_else(|| ToolError::not_available("AutomationManager is not attached"))?;
+        let manager = manager.lock().await;
+        let status = optional_str(input, "status").map(|value| match value {
+            "paused" => AutomationStatus::Paused,
+            _ => AutomationStatus::Active,
+        });
+        let req = UpdateAutomationRequest {
+            name: optional_str(input, "name").map(ToString::to_string),
+            prompt: optional_str(input, "prompt").map(ToString::to_string),
+            rrule: optional_str(input, "rrule").map(ToString::to_string),
+            cwds: if input.get("cwds").is_some() {
+                Some(
+                    string_array(input, "cwds")?
+                        .into_iter()
+                        .map(PathBuf::from)
+                        .collect(),
+                )
+            } else {
+                None
+            },
+            mode: optional_str(input, "mode").map(ToString::to_string),
+            allow_shell: optional_bool_value(input, "allow_shell"),
+            trust_mode: optional_bool_value(input, "trust_mode"),
+            auto_approve: optional_bool_value(input, "auto_approve"),
+            status,
+        };
+        let automation = manager
+            .update_automation(required_str(input, "automation_id")?, req)
+            .map_err(|e| ToolError::execution_failed(e.to_string()))?;
+        ToolResult::json(&automation).map_err(|e| ToolError::execution_failed(e.to_string()))
+    }
+
+    /// pause / resume / delete share the same shape: one id in, automation out.
+    async fn execute_simple(
+        &self,
+        context: &ToolContext,
+        input: &Value,
+        action: &str,
+    ) -> Result<ToolResult, ToolError> {
+        let manager = context
+            .runtime
+            .automations
+            .as_ref()
+            .ok_or_else(|| ToolError::not_available("AutomationManager is not attached"))?;
+        let manager = manager.lock().await;
+        let automation = match action {
+            "pause" => manager.pause_automation(required_str(input, "automation_id")?),
+            "resume" => manager.resume_automation(required_str(input, "automation_id")?),
+            "delete" => manager.delete_automation(required_str(input, "automation_id")?),
+            _ => unreachable!("execute_simple only routes pause/resume/delete"),
+        }
+        .map_err(|e| ToolError::execution_failed(e.to_string()))?;
+        ToolResult::json(&automation).map_err(|e| ToolError::execution_failed(e.to_string()))
+    }
+
+    async fn execute_run(
+        &self,
+        input: &Value,
+        context: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        let manager = context
+            .runtime
+            .automations
+            .as_ref()
+            .ok_or_else(|| ToolError::not_available("AutomationManager is not attached"))?;
+        let task_manager = context
+            .runtime
+            .task_manager
+            .as_ref()
+            .ok_or_else(|| ToolError::not_available("TaskManager is not attached"))?;
+        // run_now_shared handles its own lock phases so the manager mutex is
+        // never held across the task-manager await.
+        let run = run_now_shared(
+            manager,
+            required_str(input, "automation_id")?,
+            task_manager,
+        )
+        .await
+        .map_err(|e| ToolError::execution_failed(e.to_string()))?;
+        ToolResult::json(&run).map_err(|e| ToolError::execution_failed(e.to_string()))
+    }
 }
 
-#[async_trait]
-impl ToolSpec for AutomationUpdateTool {
-    fn name(&self) -> &'static str {
-        "automation_update"
-    }
-
-    fn description(&self) -> &'static str {
-        "Update a durable automation. Requires approval; recurrence remains constrained to supported RRULE forms."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
+/// The exact schema the legacy per-action tool exposed, kept so hidden alias
+/// registrations report an identical contract to the pre-unification tools.
+fn legacy_action_schema(action: &str) -> Value {
+    match action {
+        "create" => json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" },
+                "prompt": { "type": "string" },
+                "rrule": {
+                    "type": "string",
+                    "description": "Supported: FREQ=HOURLY;INTERVAL=N[;BYDAY=MO,TU][;BYHOUR=9][;BYMINUTE=30] or FREQ=WEEKLY;BYDAY=MO;BYHOUR=9;BYMINUTE=30. For HOURLY, BYHOUR/BYMINUTE choose the initial local wall-clock anchor and INTERVAL advances from that anchor; BYHOUR is not a daily-only filter. Anchored wall times skip nonexistent clock times and use the first occurrence of ambiguous clock times."
+                },
+                "cwds": { "type": "array", "items": { "type": "string" } },
+                "mode": { "type": "string", "description": "Task mode for scheduled runs. Defaults to agent when omitted." },
+                "allow_shell": { "type": "boolean", "default": false },
+                "trust_mode": { "type": "boolean", "default": false },
+                "auto_approve": { "type": "boolean", "default": false },
+                "paused": { "type": "boolean", "default": false }
+            },
+            "required": ["name", "prompt", "rrule"],
+            "additionalProperties": false
+        }),
+        "list" => json!({
+            "type": "object",
+            "properties": {
+                "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 50 }
+            },
+            "additionalProperties": false
+        }),
+        "update" => json!({
             "type": "object",
             "properties": {
                 "automation_id": { "type": "string" },
@@ -207,156 +466,9 @@ impl ToolSpec for AutomationUpdateTool {
             },
             "required": ["automation_id"],
             "additionalProperties": false
-        })
-    }
-
-    fn capabilities(&self) -> Vec<ToolCapability> {
-        vec![ToolCapability::RequiresApproval]
-    }
-
-    fn approval_requirement(&self) -> ApprovalRequirement {
-        ApprovalRequirement::Required
-    }
-
-    async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
-        let manager = context
-            .runtime
-            .automations
-            .as_ref()
-            .ok_or_else(|| ToolError::not_available("AutomationManager is not attached"))?;
-        let manager = manager.lock().await;
-        let status = optional_str(&input, "status").map(|value| match value {
-            "paused" => AutomationStatus::Paused,
-            _ => AutomationStatus::Active,
-        });
-        let req = UpdateAutomationRequest {
-            name: optional_str(&input, "name").map(ToString::to_string),
-            prompt: optional_str(&input, "prompt").map(ToString::to_string),
-            rrule: optional_str(&input, "rrule").map(ToString::to_string),
-            cwds: if input.get("cwds").is_some() {
-                Some(
-                    string_array(&input, "cwds")?
-                        .into_iter()
-                        .map(PathBuf::from)
-                        .collect(),
-                )
-            } else {
-                None
-            },
-            mode: optional_str(&input, "mode").map(ToString::to_string),
-            allow_shell: optional_bool_value(&input, "allow_shell"),
-            trust_mode: optional_bool_value(&input, "trust_mode"),
-            auto_approve: optional_bool_value(&input, "auto_approve"),
-            status,
-        };
-        let automation = manager
-            .update_automation(required_str(&input, "automation_id")?, req)
-            .map_err(|e| ToolError::execution_failed(e.to_string()))?;
-        ToolResult::json(&automation).map_err(|e| ToolError::execution_failed(e.to_string()))
-    }
-}
-
-macro_rules! write_automation_tool {
-    ($ty:ident, $name:literal, $desc:literal, $method:ident) => {
-        #[async_trait]
-        impl ToolSpec for $ty {
-            fn name(&self) -> &'static str {
-                $name
-            }
-            fn description(&self) -> &'static str {
-                $desc
-            }
-            fn input_schema(&self) -> Value {
-                automation_id_schema(true)
-            }
-            fn capabilities(&self) -> Vec<ToolCapability> {
-                vec![ToolCapability::RequiresApproval]
-            }
-            fn approval_requirement(&self) -> ApprovalRequirement {
-                ApprovalRequirement::Required
-            }
-            async fn execute(
-                &self,
-                input: Value,
-                context: &ToolContext,
-            ) -> Result<ToolResult, ToolError> {
-                let manager =
-                    context.runtime.automations.as_ref().ok_or_else(|| {
-                        ToolError::not_available("AutomationManager is not attached")
-                    })?;
-                let manager = manager.lock().await;
-                let automation = manager
-                    .$method(required_str(&input, "automation_id")?)
-                    .map_err(|e| ToolError::execution_failed(e.to_string()))?;
-                ToolResult::json(&automation)
-                    .map_err(|e| ToolError::execution_failed(e.to_string()))
-            }
-        }
-    };
-}
-
-write_automation_tool!(
-    AutomationPauseTool,
-    "automation_pause",
-    "Pause a durable automation. Requires approval.",
-    pause_automation
-);
-write_automation_tool!(
-    AutomationResumeTool,
-    "automation_resume",
-    "Resume a paused durable automation. Requires approval.",
-    resume_automation
-);
-write_automation_tool!(
-    AutomationDeleteTool,
-    "automation_delete",
-    "Delete a durable automation and its run history. Requires approval.",
-    delete_automation
-);
-
-#[async_trait]
-impl ToolSpec for AutomationRunTool {
-    fn name(&self) -> &'static str {
-        "automation_run"
-    }
-
-    fn description(&self) -> &'static str {
-        "Run an automation now. The run enqueues a normal durable task and returns linked task/thread/turn ids as they become available."
-    }
-
-    fn input_schema(&self) -> Value {
-        automation_id_schema(true)
-    }
-
-    fn capabilities(&self) -> Vec<ToolCapability> {
-        vec![ToolCapability::RequiresApproval]
-    }
-
-    fn approval_requirement(&self) -> ApprovalRequirement {
-        ApprovalRequirement::Required
-    }
-
-    async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
-        let manager = context
-            .runtime
-            .automations
-            .as_ref()
-            .ok_or_else(|| ToolError::not_available("AutomationManager is not attached"))?;
-        let task_manager = context
-            .runtime
-            .task_manager
-            .as_ref()
-            .ok_or_else(|| ToolError::not_available("TaskManager is not attached"))?;
-        // run_now_shared handles its own lock phases so the manager mutex is
-        // never held across the task-manager await.
-        let run = run_now_shared(
-            manager,
-            required_str(&input, "automation_id")?,
-            task_manager,
-        )
-        .await
-        .map_err(|e| ToolError::execution_failed(e.to_string()))?;
-        ToolResult::json(&run).map_err(|e| ToolError::execution_failed(e.to_string()))
+        }),
+        // read / pause / resume / delete / run share the id-only schema.
+        _ => automation_id_schema(true),
     }
 }
 
@@ -399,16 +511,98 @@ mod tests {
 
     #[test]
     fn create_schema_exposes_rrule() {
-        let schema = AutomationCreateTool.input_schema();
+        let schema = AutomationTool::alias("automation_create", "create").input_schema();
         assert!(schema["properties"]["rrule"].is_object());
         assert_eq!(schema["required"][0], "name");
     }
 
     #[test]
     fn create_schema_auto_approve_defaults_to_false() {
-        let schema = AutomationCreateTool.input_schema();
+        let schema = AutomationTool::alias("automation_create", "create").input_schema();
         let auto_approve = &schema["properties"]["auto_approve"];
         assert_eq!(auto_approve["type"], "boolean");
         assert_eq!(auto_approve["default"], false);
+    }
+
+    #[test]
+    fn canonical_schema_lists_all_actions_and_union_fields() {
+        let schema = AutomationTool::new("automation").input_schema();
+        let actions = schema["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action enum");
+        for action in [
+            "create", "list", "read", "update", "pause", "resume", "delete", "run",
+        ] {
+            assert!(
+                actions.iter().any(|value| value.as_str() == Some(action)),
+                "canonical schema must offer action {action}"
+            );
+        }
+        for field in ["name", "prompt", "rrule", "automation_id", "limit"] {
+            assert!(
+                schema["properties"][field].is_object(),
+                "canonical schema must carry union field {field}"
+            );
+        }
+        assert_eq!(schema["additionalProperties"], json!(false));
+    }
+
+    #[test]
+    fn read_only_variant_only_offers_read_actions() {
+        let tool = AutomationTool::read_only("automation");
+        let schema = tool.input_schema();
+        let actions = schema["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action enum");
+        assert_eq!(actions, &vec![json!("list"), json!("read")]);
+        assert!(!schema["properties"]["rrule"].is_object());
+        assert_eq!(tool.approval_requirement(), ApprovalRequirement::Auto);
+        assert!(tool.is_read_only());
+    }
+
+    #[test]
+    fn aliases_hide_from_model_and_force_action() {
+        let create = AutomationTool::alias("automation_create", "create");
+        assert!(!create.model_visible());
+        assert_eq!(create.name(), "automation_create");
+        assert_eq!(create.approval_requirement(), ApprovalRequirement::Required);
+
+        let list = AutomationTool::alias("automation_list", "list");
+        assert!(!list.model_visible());
+        assert_eq!(list.approval_requirement(), ApprovalRequirement::Auto);
+        assert!(list.is_read_only_for(&json!({})));
+
+        let canonical = AutomationTool::new("automation");
+        assert!(canonical.model_visible());
+        // Approval routing stays per action: read actions auto, writes required.
+        assert_eq!(
+            canonical.approval_requirement_for(&json!({"action": "list"})),
+            ApprovalRequirement::Auto
+        );
+        assert_eq!(
+            canonical.approval_requirement_for(&json!({"action": "delete"})),
+            ApprovalRequirement::Required
+        );
+        assert!(canonical.is_read_only_for(&json!({"action": "read"})));
+        assert!(!canonical.is_read_only_for(&json!({"action": "create"})));
+    }
+
+    #[test]
+    fn canonical_rejects_unknown_or_missing_action() {
+        let tool = AutomationTool::new("automation");
+        let err = tool
+            .resolve_action(&json!({}))
+            .expect_err("missing action must fail");
+        assert!(err.to_string().contains("missing `action`"));
+        let err = tool
+            .resolve_action(&json!({"action": "explode"}))
+            .expect_err("unknown action must fail");
+        assert!(err.to_string().contains("invalid action"));
+
+        let read_only = AutomationTool::read_only("automation");
+        let err = read_only
+            .resolve_action(&json!({"action": "delete"}))
+            .expect_err("read-only surface must reject write actions");
+        assert!(err.to_string().contains("invalid action"));
     }
 }

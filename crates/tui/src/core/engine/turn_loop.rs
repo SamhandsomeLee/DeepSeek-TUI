@@ -215,7 +215,9 @@ fn normalize_domain_candidate(value: &str) -> Option<String> {
 }
 
 fn registered_tool_requires_non_bypassable_approval(tool_name: &str) -> bool {
-    matches!(tool_name, "rlm_eval" | "start_mcp_server")
+    // `rlm_eval` (and the unified `rlm` tool whose eval action inherits the
+    // same Required approval) must never bypass explicit approval (#3866).
+    matches!(tool_name, "rlm_eval" | "rlm" | "start_mcp_server")
 }
 
 impl Engine {

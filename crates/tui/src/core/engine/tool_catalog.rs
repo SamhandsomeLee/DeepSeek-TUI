@@ -58,9 +58,10 @@ pub(super) const DEFAULT_ACTIVE_NATIVE_TOOLS: &[&str] = &[
     "remember",
     "run_tests",
     "run_verifiers",
-    "task_create",
-    "task_list",
-    "task_read",
+    // Piagent phase B: the model-facing durable-task tool is `tasks`; the
+    // legacy `task_create`/`task_list`/`task_read` names it replaces are
+    // hidden compat aliases and must not be default-active.
+    "tasks",
     "update_plan",
     "wait_for_dev_server",
     "web_search",
@@ -254,7 +255,7 @@ fn apply_tool_surface_budget(
         }
         if matches!(
             tool.name.as_str(),
-            "agent" | "run_tests" | "run_verifiers" | "task_create" | "web_search"
+            "agent" | "run_tests" | "run_verifiers" | "tasks" | "web_search"
         ) {
             tool.defer_loading = Some(true);
         }
@@ -948,8 +949,9 @@ fn likely_field_corrections(
     }
     // RLM source fields are easy to misname (#2659). rlm_open takes exactly one
     // of file_path / content / url / session_object; nudge common wrong names
-    // toward those.
-    if tool_name == "rlm_open" {
+    // toward those. The unified `rlm` tool carries the same fields for
+    // action=open, so it gets the same correction.
+    if matches!(tool_name, "rlm_open" | "rlm") {
         for wrong in [
             "prompt",
             "resident_file",

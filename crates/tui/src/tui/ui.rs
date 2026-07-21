@@ -2831,6 +2831,10 @@ async fn run_event_loop(
                                 | "exec_shell_cancel"
                                 | "exec_shell_wait"
                                 | "task_cancel"
+                                // Unified durable-task tool (piagent phase B):
+                                // create/cancel actions mutate task state, so
+                                // any `tasks` completion refreshes the panel.
+                                | "tasks"
                         ) {
                             refresh_active_task_panel(app, &task_manager).await;
                             last_task_refresh = Instant::now();
@@ -7153,6 +7157,9 @@ fn is_work_graph_mutation_tool(name: &str) -> bool {
             | "todo_update"
             | "task_create"
             | "task_cancel"
+            // Unified durable-task tool (piagent phase B): covers the
+            // create/cancel actions the legacy names above carried.
+            | "tasks"
             | "exec_shell"
             | "exec_shell_wait"
             | "exec_shell_cancel"
@@ -7967,7 +7974,7 @@ async fn tool_result_content_for_api_message(
         return String::new();
     }
 
-    if matches!(name, "run_tests" | "run_verifiers" | "task_gate_run") {
+    if matches!(name, "run_tests" | "run_verifiers" | "task_gate_run" | "tasks") {
         return crate::core::engine::compact_tool_result_for_route(
             app.api_provider,
             &app.model,

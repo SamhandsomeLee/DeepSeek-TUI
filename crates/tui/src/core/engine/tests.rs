@@ -5684,17 +5684,24 @@ fn deferred_tool_preflight_guides_rlm_open_misnamed_source_fields() {
         AppMode::Agent,
         &always_load,
     );
+    // Piagent phase B: the model-facing tool is the unified `rlm`; legacy
+    // `rlm_open` is a hidden compat alias and must not appear in the catalog.
+    assert!(
+        !catalog.iter().any(|tool| tool.name == "rlm_open"),
+        "rlm_open must stay a hidden alias outside the model catalog"
+    );
     catalog
         .iter_mut()
-        .find(|tool| tool.name == "rlm_open")
-        .expect("rlm_open registered")
+        .find(|tool| tool.name == "rlm")
+        .expect("rlm registered")
         .defer_loading = Some(true);
     let mut active = initial_active_tools(&catalog);
-    assert!(!active.contains("rlm_open"));
+    assert!(!active.contains("rlm"));
 
     let result = preflight_requested_deferred_tool(
-        "rlm_open",
+        "rlm",
         &json!({
+            "action": "open",
             "name": "active_prompt",
             "prompt": "inspect this",
             "path": "src/lib.rs"
@@ -5702,11 +5709,11 @@ fn deferred_tool_preflight_guides_rlm_open_misnamed_source_fields() {
         &catalog,
         &mut active,
     )
-    .expect("deferred rlm_open should preflight");
+    .expect("deferred rlm should preflight");
 
-    assert!(active.contains("rlm_open"));
+    assert!(active.contains("rlm"));
     assert!(result.success);
-    assert!(result.content.contains("Tool `rlm_open` was deferred"));
+    assert!(result.content.contains("Tool `rlm` was deferred"));
     assert!(result.content.contains("The tool was not executed"));
     assert!(result.content.contains("session_object: string"));
     assert!(

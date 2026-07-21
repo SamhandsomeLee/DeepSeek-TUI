@@ -707,46 +707,69 @@ impl ToolRegistryBuilder {
 
     /// Include durable task, gate, PR-attempt, GitHub, and automation tools.
     ///
+    /// Each family is one model-visible tool with an `action` parameter
+    /// (`tasks`, `github`, `automation`); the legacy per-action names stay
+    /// registered as hidden compat aliases so saved transcripts replay
+    /// (#4625 pattern, piagent phase B).
+    ///
     /// Shell-related task tools (`task_shell_start`, `task_shell_wait`) are
     /// *not* included here — use [`with_runtime_task_shell_tools`] to register
     /// them when `allow_shell` is true.
     #[must_use]
     pub fn with_runtime_task_tools(self) -> Self {
-        use super::automation::{
-            AutomationCreateTool, AutomationDeleteTool, AutomationListTool, AutomationPauseTool,
-            AutomationReadTool, AutomationResumeTool, AutomationRunTool, AutomationUpdateTool,
-        };
-        use super::github::{
-            GithubCloseIssueTool, GithubClosePrTool, GithubCommentTool, GithubIssueContextTool,
-            GithubPrContextTool,
-        };
-        use super::tasks::{
-            PrAttemptListTool, PrAttemptPreflightTool, PrAttemptReadTool, PrAttemptRecordTool,
-            TaskCancelTool, TaskCreateTool, TaskGateRunTool, TaskListTool, TaskReadTool,
-        };
+        use super::automation::AutomationTool;
+        use super::github::GithubTool;
+        use super::tasks::TasksTool;
 
-        self.with_tool(Arc::new(TaskCreateTool))
-            .with_tool(Arc::new(TaskListTool))
-            .with_tool(Arc::new(TaskReadTool))
-            .with_tool(Arc::new(TaskCancelTool))
-            .with_tool(Arc::new(TaskGateRunTool))
-            .with_tool(Arc::new(GithubIssueContextTool))
-            .with_tool(Arc::new(GithubPrContextTool))
-            .with_tool(Arc::new(PrAttemptRecordTool))
-            .with_tool(Arc::new(PrAttemptListTool))
-            .with_tool(Arc::new(PrAttemptReadTool))
-            .with_tool(Arc::new(PrAttemptPreflightTool))
-            .with_tool(Arc::new(AutomationCreateTool))
-            .with_tool(Arc::new(AutomationListTool))
-            .with_tool(Arc::new(AutomationReadTool))
-            .with_tool(Arc::new(AutomationUpdateTool))
-            .with_tool(Arc::new(AutomationPauseTool))
-            .with_tool(Arc::new(AutomationResumeTool))
-            .with_tool(Arc::new(AutomationDeleteTool))
-            .with_tool(Arc::new(AutomationRunTool))
-            .with_tool(Arc::new(GithubCommentTool))
-            .with_tool(Arc::new(GithubCloseIssueTool))
-            .with_tool(Arc::new(GithubClosePrTool))
+        self.with_tool(Arc::new(TasksTool::new("tasks")))
+            .with_tool(Arc::new(TasksTool::alias("task_create", "create")))
+            .with_tool(Arc::new(TasksTool::alias("task_list", "list")))
+            .with_tool(Arc::new(TasksTool::alias("task_read", "read")))
+            .with_tool(Arc::new(TasksTool::alias("task_cancel", "cancel")))
+            .with_tool(Arc::new(TasksTool::alias("task_gate_run", "gate_run")))
+            .with_tool(Arc::new(TasksTool::alias(
+                "pr_attempt_record",
+                "pr_attempt_record",
+            )))
+            .with_tool(Arc::new(TasksTool::alias("pr_attempt_list", "pr_attempt_list")))
+            .with_tool(Arc::new(TasksTool::alias("pr_attempt_read", "pr_attempt_read")))
+            .with_tool(Arc::new(TasksTool::alias(
+                "pr_attempt_preflight",
+                "pr_attempt_preflight",
+            )))
+            .with_tool(Arc::new(GithubTool::new("github")))
+            .with_tool(Arc::new(GithubTool::alias(
+                "github_issue_context",
+                "issue_context",
+            )))
+            .with_tool(Arc::new(GithubTool::alias("github_pr_context", "pr_context")))
+            .with_tool(Arc::new(GithubTool::alias("github_comment", "comment")))
+            .with_tool(Arc::new(GithubTool::alias(
+                "github_close_issue",
+                "close_issue",
+            )))
+            .with_tool(Arc::new(GithubTool::alias("github_close_pr", "close_pr")))
+            .with_tool(Arc::new(AutomationTool::new("automation")))
+            .with_tool(Arc::new(AutomationTool::alias(
+                "automation_create",
+                "create",
+            )))
+            .with_tool(Arc::new(AutomationTool::alias("automation_list", "list")))
+            .with_tool(Arc::new(AutomationTool::alias("automation_read", "read")))
+            .with_tool(Arc::new(AutomationTool::alias(
+                "automation_update",
+                "update",
+            )))
+            .with_tool(Arc::new(AutomationTool::alias("automation_pause", "pause")))
+            .with_tool(Arc::new(AutomationTool::alias(
+                "automation_resume",
+                "resume",
+            )))
+            .with_tool(Arc::new(AutomationTool::alias(
+                "automation_delete",
+                "delete",
+            )))
+            .with_tool(Arc::new(AutomationTool::alias("automation_run", "run")))
     }
 
     /// Include shell-related task tools (`task_shell_start`, `task_shell_wait`).
@@ -764,20 +787,30 @@ impl ToolRegistryBuilder {
     /// Include only read-only durable task, PR-attempt, GitHub, and automation
     /// inspection tools. Plan mode uses this surface so it can observe state
     /// without starting work, changing remotes, or mutating automation config.
+    ///
+    /// The model sees the same canonical `tasks` / `github` / `automation`
+    /// tools as the full surface, restricted to their read-only actions;
+    /// the legacy read-only names stay registered as hidden aliases.
     #[must_use]
     pub fn with_runtime_read_only_task_tools(self) -> Self {
-        use super::automation::{AutomationListTool, AutomationReadTool};
-        use super::github::{GithubIssueContextTool, GithubPrContextTool};
-        use super::tasks::{PrAttemptListTool, PrAttemptReadTool, TaskListTool, TaskReadTool};
+        use super::automation::AutomationTool;
+        use super::github::GithubTool;
+        use super::tasks::TasksTool;
 
-        self.with_tool(Arc::new(TaskListTool))
-            .with_tool(Arc::new(TaskReadTool))
-            .with_tool(Arc::new(GithubIssueContextTool))
-            .with_tool(Arc::new(GithubPrContextTool))
-            .with_tool(Arc::new(PrAttemptListTool))
-            .with_tool(Arc::new(PrAttemptReadTool))
-            .with_tool(Arc::new(AutomationListTool))
-            .with_tool(Arc::new(AutomationReadTool))
+        self.with_tool(Arc::new(TasksTool::read_only("tasks")))
+            .with_tool(Arc::new(TasksTool::alias("task_list", "list")))
+            .with_tool(Arc::new(TasksTool::alias("task_read", "read")))
+            .with_tool(Arc::new(TasksTool::alias("pr_attempt_list", "pr_attempt_list")))
+            .with_tool(Arc::new(TasksTool::alias("pr_attempt_read", "pr_attempt_read")))
+            .with_tool(Arc::new(GithubTool::read_only("github")))
+            .with_tool(Arc::new(GithubTool::alias(
+                "github_issue_context",
+                "issue_context",
+            )))
+            .with_tool(Arc::new(GithubTool::alias("github_pr_context", "pr_context")))
+            .with_tool(Arc::new(AutomationTool::read_only("automation")))
+            .with_tool(Arc::new(AutomationTool::alias("automation_list", "list")))
+            .with_tool(Arc::new(AutomationTool::alias("automation_read", "read")))
     }
 
     /// Include web search and fetch tools.
@@ -869,16 +902,27 @@ impl ToolRegistryBuilder {
     }
 
     /// Include persistent RLM session tools.
+    ///
+    /// The model sees one tool, `rlm`, with an `action` parameter; the legacy
+    /// `rlm_*` names stay registered as hidden compat aliases (#4625 pattern,
+    /// piagent phase B).
     #[must_use]
     pub fn with_rlm_tool(self, client: Option<DeepSeekClient>, _root_model: String) -> Self {
-        use super::rlm::{
-            RlmCloseTool, RlmConfigureTool, RlmEvalTool, RlmOpenTool, RlmSessionObjectsTool,
-        };
-        self.with_tool(Arc::new(RlmSessionObjectsTool))
-            .with_tool(Arc::new(RlmOpenTool))
-            .with_tool(Arc::new(RlmEvalTool::new(client)))
-            .with_tool(Arc::new(RlmConfigureTool))
-            .with_tool(Arc::new(RlmCloseTool))
+        use super::rlm::RlmTool;
+        self.with_tool(Arc::new(RlmTool::new("rlm", client.clone())))
+            .with_tool(Arc::new(RlmTool::alias(
+                "rlm_session_objects",
+                "session_objects",
+                client.clone(),
+            )))
+            .with_tool(Arc::new(RlmTool::alias("rlm_open", "open", client.clone())))
+            .with_tool(Arc::new(RlmTool::alias("rlm_eval", "eval", client.clone())))
+            .with_tool(Arc::new(RlmTool::alias(
+                "rlm_configure",
+                "configure",
+                client.clone(),
+            )))
+            .with_tool(Arc::new(RlmTool::alias("rlm_close", "close", client)))
     }
 
     /// Include `handle_read`, the bounded projection reader for symbolic
@@ -2003,6 +2047,181 @@ mod tests {
 
         // All legacy aliases are hidden.
         for alias in ["exec_shell", "exec_wait", "exec_interact", "exec_shell_wait", "exec_shell_interact", "exec_shell_cancel"] {
+            assert!(
+                api_names.iter().all(|n| n != alias),
+                "{alias} should be hidden from the model catalog"
+            );
+        }
+    }
+
+    /// Piagent phase B — each durable-work family exposes one canonical
+    /// action-parameterized tool (`tasks`, `github`, `automation`); the
+    /// legacy per-action names remain callable as hidden compat aliases.
+    #[test]
+    fn runtime_task_families_expose_canonical_tools_with_hidden_aliases() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let registry = ToolRegistryBuilder::new()
+            .with_runtime_task_tools()
+            .build(ctx);
+
+        let legacy_aliases = [
+            "task_create",
+            "task_list",
+            "task_read",
+            "task_cancel",
+            "task_gate_run",
+            "pr_attempt_record",
+            "pr_attempt_list",
+            "pr_attempt_read",
+            "pr_attempt_preflight",
+            "github_issue_context",
+            "github_pr_context",
+            "github_comment",
+            "github_close_issue",
+            "github_close_pr",
+            "automation_create",
+            "automation_list",
+            "automation_read",
+            "automation_update",
+            "automation_pause",
+            "automation_resume",
+            "automation_delete",
+            "automation_run",
+        ];
+        // Legacy aliases stay callable.
+        for alias in legacy_aliases {
+            assert!(registry.contains(alias), "{alias} should remain callable");
+        }
+
+        let api_names: Vec<String> = registry
+            .to_api_tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+
+        // Only the canonical tools are model-visible.
+        for canonical in ["tasks", "github", "automation"] {
+            assert!(
+                api_names.iter().any(|n| n == canonical),
+                "{canonical} should be model-visible"
+            );
+        }
+        // All legacy aliases are hidden.
+        for alias in legacy_aliases {
+            assert!(
+                api_names.iter().all(|n| n != alias),
+                "{alias} should be hidden from the model catalog"
+            );
+        }
+    }
+
+    /// The Plan-mode read-only surface registers the same canonical tools
+    /// restricted to their read actions, plus hidden aliases for the legacy
+    /// read-only names only — write names stay unregistered, exactly as
+    /// before the unification.
+    #[test]
+    fn read_only_task_surface_keeps_write_aliases_unregistered() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let registry = ToolRegistryBuilder::new()
+            .with_runtime_read_only_task_tools()
+            .build(ctx);
+
+        for name in [
+            "task_list",
+            "task_read",
+            "pr_attempt_list",
+            "pr_attempt_read",
+            "github_issue_context",
+            "github_pr_context",
+            "automation_list",
+            "automation_read",
+        ] {
+            assert!(registry.contains(name), "{name} should remain callable");
+        }
+        for name in [
+            "task_create",
+            "task_cancel",
+            "task_gate_run",
+            "pr_attempt_record",
+            "pr_attempt_preflight",
+            "github_comment",
+            "github_close_issue",
+            "github_close_pr",
+            "automation_create",
+            "automation_update",
+            "automation_pause",
+            "automation_resume",
+            "automation_delete",
+            "automation_run",
+        ] {
+            assert!(
+                !registry.contains(name),
+                "{name} must stay unregistered on the read-only surface"
+            );
+        }
+
+        let api_names: Vec<String> = registry
+            .to_api_tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert_eq!(api_names.len(), 3);
+        for canonical in ["tasks", "github", "automation"] {
+            assert!(
+                api_names.iter().any(|n| n == canonical),
+                "{canonical} should be model-visible on the read-only surface"
+            );
+        }
+        // Every registered tool stays read-only (Plan-mode invariant).
+        for tool in registry.all() {
+            let caps = tool.capabilities();
+            assert!(
+                !caps.contains(&ToolCapability::WritesFiles)
+                    && !caps.contains(&ToolCapability::ExecutesCode),
+                "read-only surface must not register write/exec tools: {}",
+                tool.name()
+            );
+        }
+    }
+
+    /// The unified `rlm` tool is the only model-visible RLM surface; the
+    /// legacy `rlm_*` names remain callable as hidden aliases.
+    #[test]
+    fn rlm_family_exposes_canonical_tool_with_hidden_aliases() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let registry = ToolRegistryBuilder::new()
+            .with_rlm_tool(None, "deepseek-v4-pro".to_string())
+            .build(ctx);
+
+        for alias in [
+            "rlm_session_objects",
+            "rlm_open",
+            "rlm_eval",
+            "rlm_configure",
+            "rlm_close",
+        ] {
+            assert!(registry.contains(alias), "{alias} should remain callable");
+        }
+
+        let api_names: Vec<String> = registry
+            .to_api_tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(
+            api_names.iter().any(|n| n == "rlm"),
+            "rlm should be model-visible"
+        );
+        for alias in [
+            "rlm_session_objects",
+            "rlm_open",
+            "rlm_eval",
+            "rlm_configure",
+            "rlm_close",
+        ] {
             assert!(
                 api_names.iter().all(|n| n != alias),
                 "{alias} should be hidden from the model catalog"
