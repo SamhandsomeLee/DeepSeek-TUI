@@ -5082,6 +5082,539 @@ async fn dispatch_user_message_failed_send_clears_loading_state() {
     );
 }
 
+/// #4605 Phase 1: segmented send-latency profiling matrix.
+///
+/// Runs the documented reproduction dimensions against a mock engine and
+/// prints median / p95 / max for dispatch segments plus the slowest stage.
+/// Enable with `CODEWHALE_TRACE_SEND_LATENCY=1` (set inside the test) and run:
+///
+/// ```text
+/// cargo test -p codewhale-tui phase1_send_latency_profiling_matrix -- --nocapture
+/// ```
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn phase1_send_latency_profiling_matrix() {
+    use crate::tui::send_latency::TRACE_SEND_LATENCY_ENV;
+
+    let _settings = SettingsHomeGuard::new();
+    let _trace = crate::test_support::EnvVarGuard::set(TRACE_SEND_LATENCY_ENV, "1");
+    assert!(crate::tui::send_latency::send_latency_trace_enabled());
+
+    let iterations = 30usize;
+    let large_history = 1_000usize;
+
+    struct CaseResult {
+        name: &'static str,
+        totals_ms: Vec<u128>,
+        slowest_by_run: Vec<&'static str>,
+        segment_sums_ms: std::collections::BTreeMap<&'static str, Vec<u128>>,
+    }
+
+    fn percentile(sorted: &[u128], p: f64) -> u128 {
+        if sorted.is_empty() {
+            return 0;
+        }
+        let rank = (p / 100.0) * (sorted.len() as f64 - 1.0);
+        let idx = rank.round() as usize;
+        sorted[idx.min(sorted.len() - 1)]
+    }
+
+    async fn run_case(
+        name: &'static str,
+        iterations: usize,
+        setup: impl Fn(&mut App, &TempDir),
+        message: impl Fn() -> String,
+    ) -> CaseResult {
+        let mut totals_ms = Vec::with_capacity(iterations);
+        let mut slowest_by_run = Vec::with_capacity(iterations);
+        let mut segment_sums_ms: std::collections::BTreeMap<&'static str, Vec<u128>> =
+            std::collections::BTreeMap::new();
+
+        for i in 0..iterations {
+            let workspace = TempDir::new().expect("workspace");
+            let mut app = create_test_app();
+            app.workspace = workspace.path().to_path_buf();
+            setup(&mut app, &workspace);
+            let text = message();
+            app.input = text.clone();
+            app.begin_send_latency_trace();
+            assert!(
+                app.active_send_latency.is_some(),
+                "trace must arm when env enabled"
+            );
+            assert!(app.pending_send_ui_ack.is_some());
+            app.mark_send_latency("submit_input_done");
+            app.mark_send_latency("command_routing_done");
+
+            let mut engine = mock_engine_handle();
+            let config = Config::default();
+            dispatch_user_message(
+                &mut app,
+                &config,
+                &engine.handle,
+                QueuedMessage::new(text, None),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("case {name} iter {i} dispatch failed: {err}"));
+
+            assert!(
+                app.is_loading,
+                "case {name} iter {i}: successful dispatch must set is_loading"
+            );
+            assert!(
+                app.current_session_id.is_some(),
+                "case {name} iter {i}: checkpoint path must run (session id pinned); \
+                 otherwise session_snapshot_built timings are not real"
+            );
+
+            // Drain mailbox so the mock engine does not back up.
+            while engine.rx_op.try_recv().is_ok() {}
+
+            let mut trace = app
+                .active_send_latency
+                .take()
+                .expect("active send latency trace");
+            trace.mark("event_handler_returned");
+            for (seg, dur) in trace.segments() {
+                segment_sums_ms
+                    .entry(*seg)
+                    .or_default()
+                    .push(dur.as_micros());
+            }
+            totals_ms.push(trace.total().as_millis());
+            slowest_by_run.push(trace.slowest().map(|(n, _)| n).unwrap_or("(none)"));
+            if i == 0 {
+                eprintln!(
+                    "[{name}] sample0 segments: {}",
+                    trace
+                        .segments()
+                        .iter()
+                        .map(|(n, d)| {
+                            if d.as_millis() == 0 {
+                                format!("{n}={}µs", d.as_micros())
+                            } else {
+                                format!("{n}={}ms", d.as_millis())
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                eprintln!(
+                    "[{name}] sample0 session_id={:?} history_msgs={}",
+                    app.current_session_id,
+                    app.api_messages.len()
+                );
+            }
+            trace.finish();
+            app.pending_send_ui_ack = None;
+        }
+
+        CaseResult {
+            name,
+            totals_ms,
+            slowest_by_run,
+            segment_sums_ms,
+        }
+    }
+
+    let short_fresh = run_case(
+        "short/fresh/hooks-off",
+        iterations,
+        |_, _| {},
+        || "hello phase1".to_string(),
+    )
+    .await;
+
+    let short_large = run_case(
+        "short/1000-msg/hooks-off",
+        iterations,
+        |app, _| {
+            for i in 0..large_history {
+                app.api_messages.push(text_message(
+                    if i % 2 == 0 { "user" } else { "assistant" },
+                    &format!("history message {i}"),
+                ));
+            }
+        },
+        || "hello large session".to_string(),
+    )
+    .await;
+
+    let file_mention = run_case(
+        "short/fresh/@small-file",
+        iterations,
+        |_, workspace| {
+            std::fs::write(workspace.path().join("small.txt"), "small file body")
+                .expect("write small file");
+        },
+        || "@small.txt please summarize".to_string(),
+    )
+    .await;
+
+    let results = {
+        let mut results = vec![short_fresh, short_large, file_mention];
+
+        #[cfg(not(windows))]
+        {
+            let hook_sleep = run_case(
+                "short/fresh/hook-sleep-300ms",
+                iterations,
+                |app, workspace| {
+                    let command = write_message_submit_hook(
+                        workspace,
+                        "sleep_hook.sh",
+                        r#"#!/bin/sh
+sleep 0.3
+exit 0
+"#,
+                    );
+                    app.hooks = crate::hooks::HookExecutor::new(
+                        crate::hooks::HooksConfig {
+                            enabled: true,
+                            hooks: vec![crate::hooks::Hook::new(
+                                crate::hooks::HookEvent::MessageSubmit,
+                                &command,
+                            )],
+                            working_dir: Some(workspace.path().to_path_buf()),
+                            ..crate::hooks::HooksConfig::default()
+                        },
+                        workspace.path().to_path_buf(),
+                    );
+                },
+                || "hello with slow hook".to_string(),
+            )
+            .await;
+            results.push(hook_sleep);
+        }
+
+        #[cfg(windows)]
+        {
+            let hook_sleep = run_case(
+                "short/fresh/hook-sleep-300ms",
+                iterations,
+                |app, workspace| {
+                    let command = "powershell -NoProfile -Command \"Start-Sleep -Milliseconds 300\""
+                        .to_string();
+                    app.hooks = crate::hooks::HookExecutor::new(
+                        crate::hooks::HooksConfig {
+                            enabled: true,
+                            hooks: vec![crate::hooks::Hook::new(
+                                crate::hooks::HookEvent::MessageSubmit,
+                                &command,
+                            )],
+                            working_dir: Some(workspace.path().to_path_buf()),
+                            ..crate::hooks::HooksConfig::default()
+                        },
+                        workspace.path().to_path_buf(),
+                    );
+                },
+                || "hello with slow hook".to_string(),
+            )
+            .await;
+            results.push(hook_sleep);
+        }
+
+        results
+    };
+
+    eprintln!();
+    eprintln!(
+        "{:<32} {:>10} {:>10} {:>10}  slowest_mode",
+        "case", "median_ms", "p95_ms", "max_ms"
+    );
+    eprintln!("{}", "-".repeat(78));
+    for result in &results {
+        let mut sorted = result.totals_ms.clone();
+        sorted.sort_unstable();
+        let median = percentile(&sorted, 50.0);
+        let p95 = percentile(&sorted, 95.0);
+        let max = *sorted.last().unwrap_or(&0);
+        // Mode of slowest segment name across runs.
+        let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for name in &result.slowest_by_run {
+            *counts.entry(*name).or_default() += 1;
+        }
+        let slowest_mode = counts
+            .into_iter()
+            .max_by_key(|(_, c)| *c)
+            .map(|(n, _)| n)
+            .unwrap_or("(none)");
+        eprintln!(
+            "{:<32} {:>10} {:>10} {:>10}  {slowest_mode}",
+            result.name, median, p95, max
+        );
+
+        // Per-segment p95 (microseconds — ms rounding hid real sub-ms costs).
+        let mut seg_line = Vec::new();
+        for (seg, values) in &result.segment_sums_ms {
+            let mut v = values.clone();
+            v.sort_unstable();
+            let p95_us = percentile(&v, 95.0);
+            if p95_us >= 1000 {
+                seg_line.push(format!("{seg}_p95={}ms", p95_us / 1000));
+            } else {
+                seg_line.push(format!("{seg}_p95={p95_us}µs"));
+            }
+        }
+        eprintln!("  segments: {}", seg_line.join(" "));
+    }
+
+    // Sanity: tracing path must produce segments and a positive total on the
+    // short/fresh case (CI machines vary; only assert structure, not budgets).
+    assert!(
+        !results[0].totals_ms.is_empty(),
+        "expected profiling samples"
+    );
+    assert!(
+        results[0].totals_ms.iter().all(|&ms| ms < 60_000),
+        "unexpected multi-minute dispatch in mock-engine profiling"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn send_latency_trace_stays_off_when_env_disabled() {
+    use crate::tui::send_latency::TRACE_SEND_LATENCY_ENV;
+
+    let _settings = SettingsHomeGuard::new();
+    let _trace = crate::test_support::EnvVarGuard::remove(TRACE_SEND_LATENCY_ENV);
+    assert!(!crate::tui::send_latency::send_latency_trace_enabled());
+
+    let mut app = create_test_app();
+    app.input = "hello".to_string();
+    app.begin_send_latency_trace();
+    assert!(app.active_send_latency.is_none());
+    assert!(app.pending_send_ui_ack.is_none());
+    app.mark_send_latency("submit_input_done");
+    assert!(app.active_send_latency.is_none());
+}
+
+/// #4605 Phase 2: Enter arms pending UI without writing formal history.
+#[test]
+fn phase2_arm_pending_does_not_write_formal_history() {
+    let mut app = create_test_app();
+    // Enter path clears the composer before arming; mirror that here.
+    app.input.clear();
+    let queued = QueuedMessage::new("hello pending".to_string(), None);
+    assert!(app.arm_pending_user_dispatch(queued, false));
+    assert!(app.input.is_empty());
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some(crate::tui::pending_dispatch::PREPARING_MESSAGE_STATUS)
+    );
+    assert!(app.needs_redraw);
+    assert!(app.pending_user_dispatch.is_some());
+    assert!(app.api_messages.is_empty());
+    assert!(!app.is_loading);
+    assert!(
+        app.history
+            .iter()
+            .all(|cell| !matches!(cell, HistoryCell::User { .. })),
+        "Preparing must not create a formal user history cell"
+    );
+    assert!(
+        app.take_ready_pending_user_dispatch().is_none(),
+        "must not flush before first redraw"
+    );
+    app.note_pending_dispatch_redrawn();
+    let pending = app
+        .take_ready_pending_user_dispatch()
+        .expect("ready after redraw");
+    assert_eq!(pending.display(), "hello pending");
+}
+
+async fn await_dispatch_event(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::tui::dispatch_coordinator::DispatchEvent>,
+) -> crate::tui::dispatch_coordinator::DispatchEvent {
+    tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("dispatch event timed out")
+        .expect("dispatch coordinator closed")
+}
+
+/// #4605 Phase 2/3: Preparing frame is observed before a deliberately slow
+/// coordinator dispatch completes (ordering test).
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn phase2_preparing_frame_precedes_slow_fake_dispatch() {
+    let _settings = SettingsHomeGuard::new();
+    let dir = TempDir::new().expect("tempdir");
+
+    #[cfg(windows)]
+    let hook_command =
+        "powershell -NoProfile -Command \"Start-Sleep -Milliseconds 300\"".to_string();
+    #[cfg(not(windows))]
+    let hook_command = {
+        write_message_submit_hook(
+            &dir,
+            "slow_prepare.sh",
+            r#"#!/bin/sh
+sleep 0.3
+exit 0
+"#,
+        )
+    };
+
+    let mut app = create_test_app();
+    app.hooks = crate::hooks::HookExecutor::new(
+        crate::hooks::HooksConfig {
+            enabled: true,
+            hooks: vec![crate::hooks::Hook::new(
+                crate::hooks::HookEvent::MessageSubmit,
+                &hook_command,
+            )],
+            working_dir: Some(dir.path().to_path_buf()),
+            ..crate::hooks::HooksConfig::default()
+        },
+        dir.path().to_path_buf(),
+    );
+
+    let queued = QueuedMessage::new("slow prepare".to_string(), None);
+    assert!(app.arm_pending_user_dispatch(queued, false));
+    let preparing_observed_at = Instant::now();
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some(crate::tui::pending_dispatch::PREPARING_MESSAGE_STATUS)
+    );
+    assert!(app.api_messages.is_empty());
+    assert!(!app.is_loading);
+    app.note_pending_dispatch_redrawn();
+
+    let (coordinator, mut events) =
+        crate::tui::dispatch_coordinator::spawn_dispatch_coordinator();
+    let mut engine = mock_engine_handle();
+    let flush_started = Instant::now();
+    flush_deferred_user_dispatch(&mut app, &Config::default(), &engine.handle, &coordinator)
+        .await
+        .expect("flush");
+    // Flush returns immediately; coordinator still running the slow hook.
+    assert!(
+        flush_started.elapsed() < Duration::from_millis(200),
+        "Phase 3 flush must not wait for slow prep on the UI task"
+    );
+    assert!(
+        app.pending_user_dispatch
+            .as_ref()
+            .is_some_and(|pending| pending.is_awaiting_engine()),
+        "pending stays AwaitingEngine until coordinator finishes"
+    );
+    assert!(app.api_messages.is_empty());
+    assert!(!app.is_loading);
+
+    let event = await_dispatch_event(&mut events).await;
+    apply_dispatch_event(&mut app, &Config::default(), &engine.handle, event);
+    let total = preparing_observed_at.elapsed();
+    assert!(
+        total >= Duration::from_millis(250),
+        "slow coordinator path should take ~300ms; got {total:?}"
+    );
+    assert!(app.is_loading);
+    assert!(
+        app.api_messages
+            .last()
+            .is_some_and(|m| m.role == "user"),
+        "formal API history is written only after Engine acceptance"
+    );
+    while engine.rx_op.try_recv().is_ok() {}
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn phase2_rejected_dispatch_restores_input_without_formal_turn() {
+    let _settings = SettingsHomeGuard::new();
+    let mut app = create_test_app();
+    let queued = QueuedMessage::new("restore me".to_string(), None);
+    assert!(app.arm_pending_user_dispatch(queued, false));
+    app.note_pending_dispatch_redrawn();
+
+    let (coordinator, mut events) =
+        crate::tui::dispatch_coordinator::spawn_dispatch_coordinator();
+    let engine = mock_engine_handle();
+    drop(engine.rx_op); // closed mailbox → dispatch fails
+
+    flush_deferred_user_dispatch(&mut app, &Config::default(), &engine.handle, &coordinator)
+        .await
+        .expect("flush returns Ok");
+    let event = await_dispatch_event(&mut events).await;
+    apply_dispatch_event(&mut app, &Config::default(), &engine.handle, event);
+
+    assert_eq!(app.input, "restore me");
+    assert!(app.api_messages.is_empty());
+    assert!(!app.is_loading);
+    assert!(app.pending_user_dispatch.is_none());
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn phase2_stale_generation_does_not_commit() {
+    let mut app = create_test_app();
+    let queued = QueuedMessage::new("stale".to_string(), None);
+    assert!(app.arm_pending_user_dispatch(queued, false));
+    app.note_pending_dispatch_redrawn();
+    app.dispatch_generation = app.dispatch_generation.saturating_add(1);
+
+    let (coordinator, _events) =
+        crate::tui::dispatch_coordinator::spawn_dispatch_coordinator();
+    let engine = mock_engine_handle();
+    flush_deferred_user_dispatch(&mut app, &Config::default(), &engine.handle, &coordinator)
+        .await
+        .expect("stale flush");
+
+    assert_eq!(app.input, "stale");
+    assert!(app.api_messages.is_empty());
+    assert!(!app.is_loading);
+}
+
+/// #4605 Phase 3: late Accepted with mismatched id is ignored.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn phase3_late_mismatched_dispatch_id_is_ignored() {
+    let _settings = SettingsHomeGuard::new();
+    let mut app = create_test_app();
+    let queued = QueuedMessage::new("keep pending".to_string(), None);
+    assert!(app.arm_pending_user_dispatch(queued, false));
+    app.note_pending_dispatch_redrawn();
+    let pending_id = app
+        .pending_user_dispatch
+        .as_ref()
+        .map(|pending| pending.id.clone())
+        .expect("pending id");
+    let generation = app.dispatch_generation;
+
+    let engine = mock_engine_handle();
+    apply_dispatch_event(
+        &mut app,
+        &Config::default(),
+        &engine.handle,
+        crate::tui::dispatch_coordinator::DispatchEvent::Accepted(
+            crate::tui::dispatch_coordinator::PreparedDispatch {
+                dispatch_id: "send-other".to_string(),
+                generation,
+                message: QueuedMessage::new("spoof".to_string(), None),
+                references: Vec::new(),
+                next_system_prompt: crate::models::SystemPrompt::Text(String::new()),
+                next_api_message: text_message("user", "spoof"),
+                turn_compaction: crate::compaction::CompactionConfig::default(),
+                paused_plan: crate::tui::dispatch_coordinator::PausedCommandPlan::None,
+                auto_selection: None,
+                effective_provider: ApiProvider::Deepseek,
+                effective_model: "deepseek-v4-pro".to_string(),
+                effective_provider_identity: "deepseek".to_string(),
+                effective_provider_label: "DeepSeek".to_string(),
+                selected_reasoning_effort: None,
+                auto_model: false,
+            },
+        ),
+    );
+
+    assert_eq!(
+        app.pending_user_dispatch.as_ref().map(|p| p.id.as_str()),
+        Some(pending_id.as_str())
+    );
+    assert!(app.api_messages.is_empty());
+    assert!(!app.is_loading);
+}
+
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn auto_dispatch_keeps_last_and_pending_receipts_aligned() {

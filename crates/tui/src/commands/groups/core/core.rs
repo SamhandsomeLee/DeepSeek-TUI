@@ -86,6 +86,7 @@ pub(crate) fn reset_conversation_state(app: &mut App) -> bool {
     if !app.clear_todos() {
         return false;
     }
+    app.invalidate_pending_user_dispatch();
     app.clear_history();
     app.mark_history_updated();
     app.api_messages.clear();

@@ -1782,7 +1782,7 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
     }
 }
 
-fn configured_instruction_sources(config: &Config) -> Vec<prompts::InstructionSource> {
+pub(crate) fn configured_instruction_sources(config: &Config) -> Vec<prompts::InstructionSource> {
     config
         .instructions_paths()
         .into_iter()
@@ -2251,6 +2251,10 @@ async fn run_event_loop(
     }
 
     let mut pending_subagent_list_refresh = false;
+
+    // #4605 Phase 3: prep + Engine acceptance run on a dedicated task.
+    let (dispatch_coordinator, mut dispatch_event_rx) =
+        crate::tui::dispatch_coordinator::spawn_dispatch_coordinator();
 
     loop {
         // Drain the version-check handle once; re-assign None so we
@@ -4291,11 +4295,26 @@ async fn run_event_loop(
             force_terminal_repaint = false;
             frame_rate_limiter.mark_emitted(Instant::now());
             app.needs_redraw = false;
+            // #4605 Phase 2: first Preparing/empty-composer frame is now on
+            // screen; allow the deferred Enter dispatch to flush.
+            app.note_pending_dispatch_redrawn();
+        }
+        flush_deferred_user_dispatch(app, config, &engine_handle, &dispatch_coordinator).await?;
+        while let Ok(event) = dispatch_event_rx.try_recv() {
+            apply_dispatch_event(app, config, &engine_handle, event);
         }
 
+        let awaiting_coordinator = app
+            .pending_user_dispatch
+            .as_ref()
+            .is_some_and(|pending| pending.is_awaiting_engine());
         let mut poll_timeout =
             if app.is_loading || has_running_agents || app.is_compacting || app.is_purging {
                 Duration::from_millis(active_poll_ms(app))
+            } else if awaiting_coordinator {
+                // Keep the loop responsive while prep/engine acceptance runs
+                // off-thread so DispatchEvent can be applied promptly.
+                Duration::from_millis(16)
             } else {
                 Duration::from_millis(idle_poll_ms(app))
             };
@@ -6072,8 +6091,13 @@ async fn run_event_loop(
                             continue;
                         }
                     }
+                    // #4605 Phase 1: arm segmented send-latency + UI-ack
+                    // markers before submit. Non-send routes cancel below.
+                    app.begin_send_latency_trace();
                     if let Some(input) = app.handle_composer_enter() {
+                        app.mark_send_latency("submit_input_done");
                         if handle_plan_choice(app, config, &engine_handle, &input).await? {
+                            app.cancel_send_latency_trace();
                             continue;
                         }
                         // `# foo` quick-add (#492) — when memory is enabled,
@@ -6086,12 +6110,15 @@ async fn run_event_loop(
                         // TODO(v0.8.71): remove legacy quick-add when Moraine recall stable; see #3490, #3495
                         if should_intercept_memory_quick_add(config, &input) {
                             handle_memory_quick_add(app, &input, config);
+                            app.cancel_send_latency_trace();
                             continue;
                         }
                         if handle_bang_shell_input(app, &engine_handle, &input).await? {
+                            app.cancel_send_latency_trace();
                             continue;
                         }
                         if looks_like_slash_command_input(&input) {
+                            app.cancel_send_latency_trace();
                             if execute_command_input(
                                 terminal,
                                 app,
@@ -6106,33 +6133,39 @@ async fn run_event_loop(
                                 return Ok(());
                             }
                         } else {
+                            app.mark_send_latency("command_routing_done");
                             let queued = if let Some(mut draft) = app.queued_draft.take() {
                                 draft.display = input;
                                 draft
                             } else {
                                 build_queued_message(app, input)
                             };
-                            // #383: /edit — if the user invoked /edit to revise
-                            // the last message, undo the last exchange before
-                            // dispatching the replacement. Sync the engine
-                            // session so it also drops the old exchange.
+                            // #383: /edit — undo locally now; SyncSession is
+                            // deferred with the send so Enter can paint first.
+                            let mut needs_edit_sync = false;
                             if app.edit_in_progress {
                                 crate::commands::execute("/undo", app);
                                 app.edit_in_progress = false;
-                                let _ = engine_handle
-                                    .send(Op::SyncSession {
-                                        session_id: app.current_session_id.clone(),
-                                        messages: app.api_messages.clone(),
-                                        system_prompt: app.system_prompt.clone(),
-                                        system_prompt_override: false,
-                                        model: app.model.clone(),
-                                        workspace: app.workspace.clone(),
-                                        mode: app.mode,
-                                    })
-                                    .await;
+                                needs_edit_sync = true;
                             }
-                            submit_or_steer_message(app, config, &engine_handle, queued).await?;
+                            // #4605 Phase 2: acknowledge Enter immediately;
+                            // flush runs after the Preparing frame is drawn.
+                            if !app.arm_pending_user_dispatch(queued.clone(), needs_edit_sync) {
+                                // Another Preparing dispatch is in flight —
+                                // restore composer so the message is not lost.
+                                restore_failed_immediate_submit(
+                                    app,
+                                    queued,
+                                    &anyhow::anyhow!(
+                                        "another message is still preparing; try again"
+                                    ),
+                                );
+                                app.cancel_send_latency_trace();
+                            }
+                            continue;
                         }
+                    } else {
+                        app.cancel_send_latency_trace();
                     }
                 }
                 KeyCode::Backspace
@@ -8314,58 +8347,13 @@ Paused command: {title}\n\
     )
 }
 
-#[derive(Debug, Clone)]
-enum PausedCommandDispatch {
-    None,
-    ClearWithoutQuarry,
-    Resume { quarry: String, note: String },
-    Detach { note: String },
-}
-
-impl PausedCommandDispatch {
-    fn note(&self) -> Option<&str> {
-        match self {
-            Self::Resume { note, .. } | Self::Detach { note } => Some(note),
-            Self::None | Self::ClearWithoutQuarry => None,
-        }
-    }
-
-    fn goal_objective(&self, app: &App) -> Option<String> {
-        match self {
-            Self::Resume { quarry, .. } => Some(quarry.clone()),
-            Self::Detach { .. } | Self::ClearWithoutQuarry => None,
-            Self::None => app.hunt.quarry.clone(),
-        }
-    }
-
-    fn apply(self, app: &mut App, engine_handle: &EngineHandle) {
-        engine_handle.set_paused(false);
-        match self {
-            Self::None => {}
-            Self::ClearWithoutQuarry => {
-                app.paused = false;
-                app.pausable = false;
-            }
-            Self::Resume { quarry, .. } => {
-                app.paused = false;
-                app.paused_quarry = None;
-                app.hunt.quarry = Some(quarry);
-                app.pausable = true;
-            }
-            Self::Detach { .. } => {
-                app.paused = false;
-                app.hunt.quarry = None;
-                app.hunt.tokens_used = 0;
-                app.hunt.time_used_seconds = 0;
-                app.hunt.continuation_count = 0;
-            }
-        }
-    }
-}
-
-fn plan_paused_command_message(app: &App, user_message: &str) -> PausedCommandDispatch {
+fn plan_paused_command_message(
+    app: &App,
+    user_message: &str,
+) -> crate::tui::dispatch_coordinator::PausedCommandPlan {
+    use crate::tui::dispatch_coordinator::PausedCommandPlan;
     if !app.paused && app.paused_quarry.is_none() {
-        return PausedCommandDispatch::None;
+        return PausedCommandPlan::None;
     }
 
     let Some(quarry) = app
@@ -8373,16 +8361,16 @@ fn plan_paused_command_message(app: &App, user_message: &str) -> PausedCommandDi
         .clone()
         .or_else(|| app.hunt.quarry.clone())
     else {
-        return PausedCommandDispatch::ClearWithoutQuarry;
+        return PausedCommandPlan::ClearWithoutQuarry;
     };
     let title = paused_quarry_title(&quarry).to_string();
     if is_resume_message(user_message) {
-        PausedCommandDispatch::Resume {
+        PausedCommandPlan::Resume {
             quarry,
             note: paused_command_note(&title, true),
         }
     } else {
-        PausedCommandDispatch::Detach {
+        PausedCommandPlan::Detach {
             note: paused_command_note(&title, false),
         }
     }
@@ -8483,10 +8471,12 @@ async fn dispatch_user_message(
                 app.is_loading = false;
                 app.dispatch_started_at = None;
                 app.runtime_turn_status = None;
+                app.mark_send_latency("message_submit_hooks_done");
                 return Ok(());
             }
         }
     }
+    app.mark_send_latency("message_submit_hooks_done");
 
     let _ = app.maybe_nudge_for_planning_prompt(&message.display);
 
@@ -8501,10 +8491,12 @@ async fn dispatch_user_message(
         &app.workspace,
         cwd.clone(),
     );
+    app.mark_send_latency("context_references_done");
     let mut content = queued_message_content_for_app(app, &message, cwd)?;
     if let Some(note) = paused_dispatch.note() {
         content.push_str(note);
     }
+    app.mark_send_latency("queued_content_done");
     let (app_route_identity, route_config) = app_scoped_runtime_config(app, config);
     let auto_selection = if auto_router::should_resolve_auto_model_selection(app) {
         match auto_router::resolve_auto_model_selection(app, &route_config, &message, &content)
@@ -8516,12 +8508,14 @@ async fn dispatch_user_message(
                 app.dispatch_started_at = None;
                 app.last_send_at = None;
                 app.status_message = Some(format!("Auto model route unavailable: {err}"));
+                app.mark_send_latency("auto_route_done");
                 return Err(err);
             }
         }
     } else {
         None
     };
+    app.mark_send_latency("auto_route_done");
     let effective_provider = auto_selection
         .as_ref()
         .map(|selection| selection.provider)
@@ -8556,6 +8550,7 @@ async fn dispatch_user_message(
     } else {
         turn_route
     };
+    app.mark_send_latency("route_preflight_done");
     let turn_route_limits = crate::route_budget::known_route_limits(turn_route.candidate.limits());
     let effective_provider_identity = turn_route.identity.key.clone();
     let effective_provider_label = if effective_provider == ApiProvider::Custom {
@@ -8568,9 +8563,12 @@ async fn dispatch_user_message(
         &turn_route.model,
         turn_route_limits,
     );
-    let goal_objective = paused_dispatch.goal_objective(app);
+    let goal_objective = paused_dispatch
+        .goal_objective()
+        .or_else(|| app.hunt.quarry.clone());
     let next_system_prompt =
         build_app_system_prompt_with_goal(app, config, goal_objective.as_deref());
+    app.mark_send_latency("system_prompt_done");
     let next_api_message = Message {
         role: "user".to_string(),
         content: vec![ContentBlock::Text {
@@ -8638,6 +8636,7 @@ async fn dispatch_user_message(
             provenance: crate::core::ops::UserInputProvenance::ExternalUser,
         })
         .await?;
+    app.mark_send_latency("engine_send_accepted");
 
     paused_dispatch.apply(app, engine_handle);
 
@@ -8692,6 +8691,7 @@ async fn dispatch_user_message(
         .as_ref()
         .and_then(|selection| selection.receipt.clone());
     app.pending_turn_route = Some((effective_provider, effective_model, app.auto_model));
+    app.mark_send_latency("ui_state_committed");
 
     // Persist only after the engine accepted the turn and after its concrete
     // route receipt is installed. A failed mailbox send must not leave a
@@ -8700,6 +8700,7 @@ async fn dispatch_user_message(
     if let Ok(manager) = SessionManager::default_location()
         && let Ok(session) = build_session_snapshot(app, &manager)
     {
+        app.mark_send_latency("session_snapshot_built");
         // Pin the id so every checkpoint of this session lands in the same
         // per-session file and the eventual clear targets it.
         if app.current_session_id.is_none() {
@@ -8712,6 +8713,12 @@ async fn dispatch_user_message(
                 "Work update is pending: turn checkpoint could not be queued ({err})"
             ));
         }
+        app.mark_send_latency("checkpoint_enqueued");
+    } else {
+        // Still mark the stages so traces stay comparable across sessions
+        // that skip persistence (e.g. missing home dir in tests).
+        app.mark_send_latency("session_snapshot_built");
+        app.mark_send_latency("checkpoint_enqueued");
     }
 
     Ok(())
@@ -11238,6 +11245,378 @@ async fn submit_or_steer_message(
     }
 }
 
+/// #4605 Phase 2/3: after Preparing frame, either enqueue Immediate prep to
+/// the dispatch coordinator (UI stays free) or run Queue/Steer synchronously.
+async fn flush_deferred_user_dispatch(
+    app: &mut App,
+    config: &Config,
+    engine_handle: &EngineHandle,
+    coordinator: &crate::tui::dispatch_coordinator::DispatchCoordinatorHandle,
+) -> Result<()> {
+    let ready = app
+        .pending_user_dispatch
+        .as_ref()
+        .is_some_and(|pending| pending.is_ready());
+    if !ready {
+        return Ok(());
+    }
+
+    let pending_gen = app
+        .pending_user_dispatch
+        .as_ref()
+        .map(|pending| pending.generation)
+        .unwrap_or(0);
+    if pending_gen != app.dispatch_generation {
+        if let Some(pending) = app.take_ready_pending_user_dispatch() {
+            if app.input.is_empty() {
+                restore_failed_immediate_submit(
+                    app,
+                    pending.message,
+                    &anyhow::anyhow!("session changed before send completed"),
+                );
+            }
+            app.cancel_send_latency_trace();
+        }
+        return Ok(());
+    }
+
+    let needs_edit_sync = app
+        .pending_user_dispatch
+        .as_ref()
+        .is_some_and(|pending| pending.needs_edit_sync);
+    if needs_edit_sync {
+        let _ = engine_handle
+            .send(Op::SyncSession {
+                session_id: app.current_session_id.clone(),
+                messages: app.api_messages.clone(),
+                system_prompt: app.system_prompt.clone(),
+                system_prompt_override: false,
+                model: app.model.clone(),
+                workspace: app.workspace.clone(),
+                mode: app.mode,
+            })
+            .await;
+        if let Some(pending) = app.pending_user_dispatch.as_mut() {
+            pending.needs_edit_sync = false;
+        }
+    }
+
+    let disposition = app
+        .enter_with_double_tap()
+        .unwrap_or(SubmitDisposition::Immediate);
+
+    match disposition {
+        SubmitDisposition::Immediate => {
+            let Some(pending) = app.begin_awaiting_engine_dispatch() else {
+                return Ok(());
+            };
+            let paused_plan = plan_paused_command_message(app, pending.display());
+            let _ = app.maybe_nudge_for_planning_prompt(pending.display());
+            let request = crate::tui::dispatch_coordinator::DispatchRequest {
+                dispatch_id: pending.id.clone(),
+                generation: pending.generation,
+                message: pending.message.clone(),
+                context: dispatch_context_snapshot_from_app(
+                    app,
+                    config,
+                    paused_plan,
+                    engine_handle.client_preflight_required(),
+                ),
+                engine: engine_handle.clone(),
+            };
+            if let Err(returned) = coordinator.try_enqueue(request) {
+                let _ = app.take_pending_user_dispatch_matching(
+                    &returned.dispatch_id,
+                    returned.generation,
+                );
+                restore_failed_immediate_submit(
+                    app,
+                    returned.message,
+                    &anyhow::anyhow!("dispatch coordinator busy; message restored"),
+                );
+                app.cancel_send_latency_trace();
+            }
+            Ok(())
+        }
+        _ => {
+            let Some(pending) = app.take_ready_pending_user_dispatch() else {
+                return Ok(());
+            };
+            if app.status_message.as_deref()
+                == Some(crate::tui::pending_dispatch::PREPARING_MESSAGE_STATUS)
+            {
+                app.status_message = None;
+            }
+            // Re-enter disposition without double-counting: Queue/Steer paths
+            // already observed enter_with_double_tap above.
+            match disposition {
+                SubmitDisposition::Queue => {
+                    let count = app.queued_message_count().saturating_add(1);
+                    enqueue_offline_message(app, pending.message);
+                    let (status, toast) = if app.offline_mode {
+                        (
+                            format!(
+                                "Offline: {count} queued follow-up(s) — ↑ edit last, /queue send <n>"
+                            ),
+                            format!("Offline: queued follow-up ({count} total)"),
+                        )
+                    } else if app.mode == AppMode::Operate {
+                        (
+                            format!(
+                                "{count} queued task(s) — dispatches next while workers continue; ↑ edit last, /queue send <n>"
+                            ),
+                            format!("Queued task ({count} total) — dispatches next"),
+                        )
+                    } else {
+                        (
+                            format!(
+                                "{count} queued follow-up(s) — sends after current output; ↑ edit last, /queue send <n>"
+                            ),
+                            format!("Queued follow-up ({count} total) — sends after current output"),
+                        )
+                    };
+                    app.status_message = Some(status);
+                    app.push_status_toast(toast, StatusToastLevel::Info, Some(3_000));
+                }
+                SubmitDisposition::Steer => {
+                    attempt_steer_with_queue_fallback(app, engine_handle, pending.message).await;
+                }
+                SubmitDisposition::QueueFollowUp => {
+                    queue_follow_up(app, pending.message).await?;
+                }
+                SubmitDisposition::Immediate => unreachable!("handled above"),
+            }
+            app.finish_send_latency_trace();
+            Ok(())
+        }
+    }
+}
+
+fn dispatch_context_snapshot_from_app(
+    app: &App,
+    config: &Config,
+    paused_plan: crate::tui::dispatch_coordinator::PausedCommandPlan,
+    client_preflight_required: bool,
+) -> crate::tui::dispatch_coordinator::DispatchContextSnapshot {
+    let (route_identity, route_config) = app_scoped_runtime_config(app, config);
+    crate::tui::dispatch_coordinator::DispatchContextSnapshot {
+        workspace: app.workspace.clone(),
+        cwd: std::env::current_dir().ok(),
+        config: config.clone(),
+        route_identity,
+        route_config,
+        api_provider: app.api_provider,
+        model: app.model.clone(),
+        auto_model: app.auto_model,
+        mode: app.mode,
+        reasoning_effort: app.reasoning_effort,
+        api_messages: app.api_messages.clone(),
+        hooks: app.hooks.clone(),
+        hook_mode_label: app.mode.label().to_string(),
+        hook_session_id: app.hooks.session_id().to_string(),
+        hook_tokens: app.session.total_tokens,
+        skills_dir: app.skills_dir.clone(),
+        skills_scan_codewhale_only: app.skills_scan_codewhale_only,
+        plugin_registry: app.plugin_registry.clone(),
+        ui_locale: app.ui_locale,
+        translation_enabled: app.translation_enabled,
+        show_thinking: app.show_thinking,
+        verbosity: app.verbosity.clone(),
+        active_route_limits: app.active_route_limits,
+        allow_shell: app.allow_shell,
+        trust_mode: app.trust_mode,
+        auto_approve: app_auto_approve_enabled(app),
+        approval_mode: app.approval_mode,
+        active_allowed_tools: app.active_allowed_tools.clone(),
+        runtime_hook_executor: app.runtime_services.hook_executor.clone(),
+        hunt_token_budget: app.hunt.token_budget,
+        hunt_goal_status: app.hunt.verdict.goal_status(),
+        hunt_quarry: app.hunt.quarry.clone(),
+        paused_plan,
+        client_preflight_required,
+        auto_compact: app.auto_compact,
+        auto_compact_user_configured: app.auto_compact_user_configured,
+        auto_compact_threshold_percent: app.auto_compact_threshold_percent,
+    }
+}
+
+fn apply_dispatch_event(
+    app: &mut App,
+    config: &Config,
+    engine_handle: &EngineHandle,
+    event: crate::tui::dispatch_coordinator::DispatchEvent,
+) {
+    use crate::tui::dispatch_coordinator::DispatchEvent;
+    match event {
+        DispatchEvent::Accepted(prepared) => {
+            if app
+                .take_pending_user_dispatch_matching(&prepared.dispatch_id, prepared.generation)
+                .is_none()
+            {
+                tracing::debug!(
+                    dispatch_id = %prepared.dispatch_id,
+                    "ignoring late Accepted dispatch for unmatched pending"
+                );
+                return;
+            }
+            if prepared.generation != app.dispatch_generation {
+                tracing::debug!(
+                    dispatch_id = %prepared.dispatch_id,
+                    "ignoring Accepted dispatch after session generation change"
+                );
+                return;
+            }
+            commit_prepared_dispatch(app, config, engine_handle, prepared);
+            app.finish_send_latency_trace();
+            app.needs_redraw = true;
+        }
+        DispatchEvent::Rejected {
+            dispatch_id,
+            generation,
+            original,
+            error,
+            restore_composer,
+        } => {
+            if app
+                .take_pending_user_dispatch_matching(&dispatch_id, generation)
+                .is_none()
+            {
+                tracing::debug!(
+                    dispatch_id = %dispatch_id,
+                    "ignoring late Rejected dispatch for unmatched pending"
+                );
+                return;
+            }
+            if generation != app.dispatch_generation {
+                return;
+            }
+            app.mark_send_latency("engine_send_accepted");
+            if restore_composer {
+                if app.input.is_empty() {
+                    restore_failed_immediate_submit(app, original, &anyhow::anyhow!(error));
+                } else {
+                    // User already typed a new draft — park the failed message.
+                    enqueue_offline_message(app, original);
+                    app.status_message = Some(format!(
+                        "Send failed ({error}); original message kept in queue"
+                    ));
+                    app.needs_redraw = true;
+                }
+            } else {
+                app.status_message = Some(error);
+                app.needs_redraw = true;
+            }
+            app.cancel_send_latency_trace();
+        }
+    }
+}
+
+fn commit_prepared_dispatch(
+    app: &mut App,
+    config: &Config,
+    engine_handle: &EngineHandle,
+    prepared: crate::tui::dispatch_coordinator::PreparedDispatch,
+) {
+    let crate::tui::dispatch_coordinator::PreparedDispatch {
+        message,
+        references,
+        next_system_prompt,
+        next_api_message,
+        turn_compaction,
+        paused_plan,
+        auto_selection,
+        effective_provider,
+        effective_model,
+        effective_provider_identity,
+        effective_provider_label,
+        selected_reasoning_effort,
+        auto_model,
+        ..
+    } = prepared;
+
+    app.mark_send_latency("engine_send_accepted");
+    paused_plan.apply(app, engine_handle);
+
+    let dispatch_started_at = Instant::now();
+    app.is_loading = true;
+    app.dispatch_started_at = Some(dispatch_started_at);
+    app.runtime_turn_status = None;
+    app.last_send_at = Some(dispatch_started_at);
+    app.last_submitted_prompt = Some(message.display.clone());
+    app.clear_receipt();
+    app.tool_evidence.clear();
+
+    let message_index = app.api_messages.len();
+    app.system_prompt = Some(next_system_prompt);
+    app.add_message(HistoryCell::User {
+        content: message.display.clone(),
+    });
+    let history_cell = app.history.len().saturating_sub(1);
+    app.record_context_references(history_cell, message_index, references);
+    app.scroll_to_bottom();
+    app.api_messages.push(next_api_message);
+    maybe_warn_context_pressure_for_config(app, &turn_compaction);
+    app.session.last_prompt_tokens = None;
+    app.session.last_completion_tokens = None;
+    app.session.last_output_throughput = None;
+    app.session.last_prompt_cache_hit_tokens = None;
+    app.session.last_prompt_cache_miss_tokens = None;
+    app.session.last_reasoning_replay_tokens = None;
+    app.last_effective_reasoning_effort = selected_reasoning_effort;
+    if let Some(selection) = auto_selection.as_ref() {
+        if auto_model {
+            app.last_effective_model = Some(effective_model.clone());
+            app.last_effective_provider = Some(effective_provider);
+            app.last_effective_provider_identity = Some(effective_provider_identity);
+            app.last_auto_route_receipt = selection.receipt.clone();
+            let status = app
+                .tr(MessageId::AutoRouteSelectedToast)
+                .replace("{provider}", &effective_provider_label)
+                .replace("{model}", &effective_model)
+                .replace("{source}", selection.source.label());
+            app.push_status_toast(status, StatusToastLevel::Info, Some(6_000));
+        }
+    } else {
+        app.last_effective_model = None;
+        app.last_effective_provider = None;
+        app.last_effective_provider_identity = None;
+        app.last_auto_route_receipt = None;
+    }
+    app.pending_auto_route_receipt = auto_selection
+        .as_ref()
+        .and_then(|selection| selection.receipt.clone());
+    app.pending_turn_route = Some((effective_provider, effective_model, auto_model));
+    app.mark_send_latency("ui_state_committed");
+
+    if app.status_message.as_deref()
+        == Some(crate::tui::pending_dispatch::PREPARING_MESSAGE_STATUS)
+    {
+        app.status_message = None;
+    }
+
+    if let Ok(manager) = SessionManager::default_location()
+        && let Ok(session) = build_session_snapshot(app, &manager)
+    {
+        app.mark_send_latency("session_snapshot_built");
+        if app.current_session_id.is_none() {
+            app.current_session_id = Some(session.metadata.id.clone());
+        }
+        if let Err(err) =
+            persist_with_pending_work_boundary(app, PersistRequest::SaveCheckpoint { session })
+        {
+            app.status_message = Some(format!(
+                "Work update is pending: turn checkpoint could not be queued ({err})"
+            ));
+        }
+        app.mark_send_latency("checkpoint_enqueued");
+    } else {
+        app.mark_send_latency("session_snapshot_built");
+        app.mark_send_latency("checkpoint_enqueued");
+    }
+
+    let _ = config;
+}
+
 fn restore_failed_immediate_submit(app: &mut App, message: QueuedMessage, error: &anyhow::Error) {
     tracing::warn!(
         error = %error,
@@ -12002,6 +12381,20 @@ fn draw_app_frame_inner(
         let _ = terminal.backend_mut().write_all(END_SYNC_UPDATE);
     }
     let _ = terminal.backend_mut().flush();
+    // #4605: UI acknowledgement is measured only after a successful draw that
+    // already reflects Enter (empty composer and/or Sending/loading). Changing
+    // App state alone does not count — the user has to see it.
+    if result.is_ok() {
+        let composer_empty = app.input.is_empty();
+        let is_loading = app.is_loading;
+        let is_preparing = app.pending_user_dispatch.is_some();
+        crate::tui::send_latency::maybe_record_send_ui_ack_with_preparing(
+            &mut app.pending_send_ui_ack,
+            composer_empty,
+            is_loading,
+            is_preparing,
+        );
+    }
     result
 }
 

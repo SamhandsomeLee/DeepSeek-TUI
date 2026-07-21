@@ -52,7 +52,7 @@ pub(super) async fn resolve_auto_model_selection(
 /// collects up to six non-empty rows, and reverses them so the prompt
 /// reads oldest-first. Each row is `<role>: <truncated content>` and
 /// is capped at 900 characters.
-pub(super) fn recent_auto_router_context(messages: &[Message]) -> String {
+pub(crate) fn recent_auto_router_context(messages: &[Message]) -> String {
     let mut rows = Vec::new();
     for message in messages.iter().rev().skip(1) {
         if rows.len() >= 6 {

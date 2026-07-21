@@ -252,6 +252,9 @@ fn new_session_blockers(app: &App) -> Vec<&'static str> {
     if !app.input.trim().is_empty() {
         blockers.push("the composer has unsent text");
     }
+    if app.pending_user_dispatch.is_some() {
+        blockers.push("a message is still preparing to send");
+    }
     if !app.queued_messages.is_empty() || app.queued_draft.is_some() {
         blockers.push("queued messages are pending");
     }

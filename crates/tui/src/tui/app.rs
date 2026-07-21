@@ -2488,6 +2488,21 @@ pub struct App {
     pub turn_counter: u64,
     /// When the UI accepted a user message but has not observed `TurnStarted` yet.
     pub dispatch_started_at: Option<Instant>,
+    /// #4605: Enter-time marker for measuring UI acknowledgement latency
+    /// (Enter → first draw that shows cleared composer / Sending). Cleared
+    /// after a successful draw records the ack, or when the Enter path aborts
+    /// without dispatching.
+    pub pending_send_ui_ack: Option<crate::tui::send_latency::PendingSendUiAck>,
+    /// #4605: active segmented send-latency trace. Populated only when
+    /// `CODEWHALE_TRACE_SEND_LATENCY` is enabled; finished (and logged) when
+    /// the Enter event handler returns.
+    pub(crate) active_send_latency: Option<crate::tui::send_latency::SendLatencyTrace>,
+    /// #4605 Phase 2: deferred user send waiting for first Preparing redraw
+    /// before the existing dispatch path runs. Not persisted.
+    pub pending_user_dispatch: Option<crate::tui::pending_dispatch::PendingUserDispatch>,
+    /// Bumped on `/new`/`/clear`/session switch so late deferred dispatches
+    /// cannot commit into a replaced session.
+    pub dispatch_generation: u64,
 
     /// Cached git context snapshot for the footer.
     pub workspace_context: Option<String>,
@@ -3526,6 +3541,10 @@ impl App {
             runtime_turn_status: None,
             turn_counter: 0,
             dispatch_started_at: None,
+            pending_send_ui_ack: None,
+            active_send_latency: None,
+            pending_user_dispatch: None,
+            dispatch_generation: 0,
             workspace_context: None,
             workspace_context_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
             workspace_context_refreshed_at: None,
@@ -4074,6 +4093,7 @@ impl App {
     #[must_use]
     pub fn session_transition_blocked(&self) -> bool {
         self.is_loading
+            || self.pending_user_dispatch.is_some()
             || self.runtime_turn_status.as_deref() == Some("in_progress")
             || self.is_compacting
             || self.is_purging
@@ -6520,6 +6540,144 @@ impl App {
             }
         }
         self.submit_input()
+    }
+
+    /// #4605: begin segmented send-latency tracing for this Enter press when
+    /// `CODEWHALE_TRACE_SEND_LATENCY` is enabled. Also arms the UI-ack marker.
+    pub(crate) fn begin_send_latency_trace(&mut self) {
+        if !crate::tui::send_latency::send_latency_trace_enabled() {
+            return;
+        }
+        let dispatch_id = crate::tui::send_latency::new_dispatch_id();
+        let enter_received_at = Instant::now();
+        self.pending_send_ui_ack = Some(crate::tui::send_latency::PendingSendUiAck {
+            dispatch_id: dispatch_id.clone(),
+            enter_received_at,
+        });
+        let mut trace = crate::tui::send_latency::SendLatencyTrace::start(dispatch_id);
+        trace.input_chars = self.input.chars().count();
+        trace.history_messages = self.api_messages.len();
+        trace.mark("enter_received");
+        self.active_send_latency = Some(trace);
+    }
+
+    /// #4605: mark a named stage on the active send-latency trace (no-op when
+    /// tracing is off or no active send).
+    pub(crate) fn mark_send_latency(&mut self, name: &'static str) {
+        if let Some(trace) = self.active_send_latency.as_mut() {
+            trace.mark(name);
+        }
+    }
+
+    /// #4605: drop the active send-latency trace and UI-ack marker without
+    /// emitting a summary (Enter was absorbed or routed away from send).
+    pub(crate) fn cancel_send_latency_trace(&mut self) {
+        self.active_send_latency = None;
+        self.pending_send_ui_ack = None;
+    }
+
+    /// #4605: finish the active send-latency trace and emit the summary line.
+    pub(crate) fn finish_send_latency_trace(&mut self) {
+        if let Some(mut trace) = self.active_send_latency.take() {
+            trace.mark("event_handler_returned");
+            trace.finish();
+        }
+    }
+
+    /// #4605 Phase 2: arm a deferred send so Enter can return and paint one
+    /// Preparing/empty-composer frame before dispatch runs.
+    ///
+    /// Returns `false` when another Preparing dispatch is already armed
+    /// (idle session allows only one).
+    pub(crate) fn arm_pending_user_dispatch(
+        &mut self,
+        message: QueuedMessage,
+        needs_edit_sync: bool,
+    ) -> bool {
+        if self.pending_user_dispatch.is_some() {
+            return false;
+        }
+        let id = self
+            .pending_send_ui_ack
+            .as_ref()
+            .map(|ack| ack.dispatch_id.clone())
+            .unwrap_or_else(crate::tui::send_latency::new_dispatch_id);
+        self.status_message = Some(
+            crate::tui::pending_dispatch::PREPARING_MESSAGE_STATUS.to_string(),
+        );
+        self.needs_redraw = true;
+        self.pending_user_dispatch = Some(crate::tui::pending_dispatch::PendingUserDispatch {
+            id,
+            message,
+            created_at: Instant::now(),
+            state: crate::tui::pending_dispatch::PendingDispatchState::Preparing,
+            generation: self.dispatch_generation,
+            needs_edit_sync,
+        });
+        true
+    }
+
+    /// #4605: after a successful draw, allow the deferred dispatch to flush.
+    pub(crate) fn note_pending_dispatch_redrawn(&mut self) {
+        if let Some(pending) = self.pending_user_dispatch.as_mut() {
+            pending.mark_redrawn();
+        }
+    }
+
+    /// #4605: take a deferred dispatch that has already been painted once.
+    pub(crate) fn take_ready_pending_user_dispatch(
+        &mut self,
+    ) -> Option<crate::tui::pending_dispatch::PendingUserDispatch> {
+        let ready = self
+            .pending_user_dispatch
+            .as_ref()
+            .is_some_and(crate::tui::pending_dispatch::PendingUserDispatch::is_ready);
+        if !ready {
+            return None;
+        }
+        self.pending_user_dispatch.take()
+    }
+
+    /// #4605 Phase 3: clone a ready pending send and mark it AwaitingEngine so
+    /// the coordinator can run without dropping UI recovery state.
+    pub(crate) fn begin_awaiting_engine_dispatch(
+        &mut self,
+    ) -> Option<crate::tui::pending_dispatch::PendingUserDispatch> {
+        let pending = self.pending_user_dispatch.as_mut()?;
+        if !pending.is_ready() {
+            return None;
+        }
+        let cloned = pending.clone();
+        pending.mark_awaiting_engine();
+        Some(cloned)
+    }
+
+    /// #4605 Phase 3: take pending only when id + generation match.
+    pub(crate) fn take_pending_user_dispatch_matching(
+        &mut self,
+        dispatch_id: &str,
+        generation: u64,
+    ) -> Option<crate::tui::pending_dispatch::PendingUserDispatch> {
+        let matches = self.pending_user_dispatch.as_ref().is_some_and(|pending| {
+            pending.id == dispatch_id && pending.generation == generation
+        });
+        if !matches {
+            return None;
+        }
+        self.pending_user_dispatch.take()
+    }
+
+    /// #4605: drop deferred dispatch + latency markers. Does not restore input
+    /// (caller decides). Used by `/new`/`/clear` and abandoned Enter routes.
+    pub(crate) fn invalidate_pending_user_dispatch(&mut self) {
+        self.dispatch_generation = self.dispatch_generation.saturating_add(1);
+        self.pending_user_dispatch = None;
+        if self.status_message.as_deref()
+            == Some(crate::tui::pending_dispatch::PREPARING_MESSAGE_STATUS)
+        {
+            self.status_message = None;
+        }
+        self.cancel_send_latency_trace();
     }
 
     /// Public wrapper around [`Self::consolidate_large_input`] that no-ops

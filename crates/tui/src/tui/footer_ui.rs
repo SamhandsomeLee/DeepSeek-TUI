@@ -1163,6 +1163,11 @@ pub(crate) fn footer_state_label(app: &App) -> (&'static str, ratatui::style::Co
     if app.is_purging {
         return ("purging \u{238B}", app.ui_theme.status_warning);
     }
+    // #4605 Phase 2: show preparing before idle while deferred send awaits
+    // Engine acceptance. Distinct from `is_loading` (formal turn started).
+    if app.pending_user_dispatch.is_some() {
+        return ("preparing", app.ui_theme.status_working);
+    }
     if header_owns_live_pulse(app) {
         return ("ready", app.ui_theme.text_muted);
     }
