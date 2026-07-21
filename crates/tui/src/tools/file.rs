@@ -20,6 +20,71 @@ use tokio_util::sync::CancellationToken;
 
 // === ReadFileTool ===
 
+fn canonical_path_for_credential_guard(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(path)
+        }
+    })
+}
+
+fn config_backup_path_for_credential_guard(config_path: &Path) -> PathBuf {
+    let mut file_name = config_path
+        .file_name()
+        .map(std::ffi::OsString::from)
+        .unwrap_or_else(|| std::ffi::OsString::from(codewhale_config::CONFIG_FILE_NAME));
+    file_name.push(".bak");
+    config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(file_name)
+}
+
+fn is_config_or_backup(candidate: &Path, config_path: &Path) -> bool {
+    let config_path = canonical_path_for_credential_guard(config_path);
+    let backup_path =
+        canonical_path_for_credential_guard(&config_backup_path_for_credential_guard(&config_path));
+    candidate == config_path || candidate == backup_path
+}
+
+/// Return whether `read_file` must refuse a CodeWhale-owned credential file.
+///
+/// This is deliberately scoped to the active config, the two conventional
+/// config locations (including one-time backups), and CodeWhale's file-backed
+/// secret-store directories. Other dotfiles remain readable. Model-bound
+/// redaction is still required because shell tools can read these files and
+/// arbitrary commands can print credentials without reading a file at all.
+fn is_codewhale_credential_path(path: &Path) -> bool {
+    let candidate = canonical_path_for_credential_guard(path);
+
+    if let Ok(active_config) = codewhale_config::resolve_config_path(None)
+        && is_config_or_backup(&candidate, &active_config)
+    {
+        return true;
+    }
+
+    let roots = [
+        codewhale_config::codewhale_home(),
+        codewhale_config::legacy_deepseek_home(),
+    ];
+    for root in roots.into_iter().flatten() {
+        if is_config_or_backup(&candidate, &root.join(codewhale_config::CONFIG_FILE_NAME)) {
+            return true;
+        }
+
+        let secrets_dir = canonical_path_for_credential_guard(&root.join("secrets"));
+        if candidate.starts_with(secrets_dir) {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Tool for reading UTF-8 files from the workspace.
 pub struct ReadFileTool;
 
@@ -30,7 +95,7 @@ impl ToolSpec for ReadFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read a UTF-8 file from the workspace. Use this instead of `cat`, `head`, `tail`, or `sed -n '..p'` in `exec_shell` — it's faster, sandbox-aware, and skips the approval prompt. Plain text is returned as-is and records the file snapshot required before `edit_file` will make a narrow in-place edit. PDFs are auto-extracted via the bundled pure-Rust extractor (no Poppler install required). Image screenshots are OCR-extracted when local OCR is available. Cannot read other non-PDF binaries.\n\nFor large files, use `start_line` and `max_lines` to read in chunks. By default, returns at most 200 lines (~16KB). If `truncated=\"true\"` in the response, use `next_start_line` to continue reading. For PDFs, use `pages` instead — `start_line`/`max_lines` only apply to text files."
+        "Read a UTF-8 file from the workspace. Use this instead of `cat`, `head`, `tail`, or `sed -n '..p'` in `exec_shell` — it's faster, sandbox-aware, and skips the approval prompt. Plain text is returned as-is and records the file snapshot required before `edit_file` will make a narrow in-place edit. CodeWhale config files and file-backed credential stores cannot be read with this tool; use `codewhale config list` or `codewhale auth status` for safe inspection. PDFs are auto-extracted via the bundled pure-Rust extractor (no Poppler install required). Image screenshots are OCR-extracted when local OCR is available. Cannot read other non-PDF binaries.\n\nFor large files, use `start_line` and `max_lines` to read in chunks. By default, returns at most 200 lines (~16KB). If `truncated=\"true\"` in the response, use `next_start_line` to continue reading. For PDFs, use `pages` instead — `start_line`/`max_lines` only apply to text files."
     }
 
     fn input_schema(&self) -> Value {
@@ -69,6 +134,11 @@ impl ToolSpec for ReadFileTool {
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
         let path_str = required_str(&input, "path")?;
         let file_path = context.resolve_path(path_str)?;
+        if is_codewhale_credential_path(&file_path) {
+            return Err(ToolError::permission_denied(
+                "read_file cannot expose CodeWhale configuration or credential-store files; use `codewhale config list` or `codewhale auth status` for safe inspection",
+            ));
+        }
         let pages = optional_str(&input, "pages");
 
         if is_pdf(&file_path)? {
@@ -664,7 +734,7 @@ impl ToolSpec for WriteFileTool {
             })?;
         }
 
-        crate::utils::write_atomic(&file_path, file_content.as_bytes()).map_err(|e| {
+        crate::utils::write_atomic_workspace(&file_path, file_content.as_bytes()).map_err(|e| {
             ToolError::execution_failed(format!("Failed to write {}: {}", file_path.display(), e))
         })?;
         context.note_file_read(&file_path);
@@ -821,7 +891,7 @@ impl ToolSpec for EditFileTool {
             (contents.replace(search, replace), count, None)
         };
 
-        crate::utils::write_atomic(&file_path, updated.as_bytes()).map_err(|e| {
+        crate::utils::write_atomic_workspace(&file_path, updated.as_bytes()).map_err(|e| {
             ToolError::execution_failed(format!("Failed to write {}: {}", file_path.display(), e))
         })?;
         context.note_file_read(&file_path);
@@ -1143,7 +1213,7 @@ fn check_list_dir_cancelled(cancel_token: Option<&CancellationToken>) -> Result<
 }
 
 fn list_dir_cancelled() -> ToolError {
-    ToolError::execution_failed("list_dir cancelled before completion")
+    ToolError::cancelled("list_dir cancelled before completion")
 }
 
 fn list_dir_timeout(timeout: Duration) -> ToolError {
@@ -1183,6 +1253,50 @@ mod tests {
 
         assert!(result.success);
         assert_eq!(result.content, "hello world");
+    }
+
+    // This test deliberately serializes process-global environment changes
+    // while awaiting the tool path.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn read_file_denies_codewhale_config_backups_and_secret_store() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let tmp = tempdir().expect("tempdir");
+        let _codewhale_home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
+        let _config_path = crate::test_support::EnvVarGuard::remove("CODEWHALE_CONFIG_PATH");
+        let _legacy_config_path = crate::test_support::EnvVarGuard::remove("DEEPSEEK_CONFIG_PATH");
+
+        fs::write(tmp.path().join("config.toml"), "api_key = \"secret\"\n").expect("write config");
+        fs::write(
+            tmp.path().join("config.toml.bak"),
+            "api_key = \"old-secret\"\n",
+        )
+        .expect("write config backup");
+        fs::create_dir_all(tmp.path().join("secrets")).expect("create secrets dir");
+        fs::write(
+            tmp.path().join("secrets").join("secrets.json"),
+            r#"{"provider":"secret"}"#,
+        )
+        .expect("write file keyring");
+        fs::write(tmp.path().join("notes.txt"), "ordinary workspace data")
+            .expect("write ordinary file");
+
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        for path in ["config.toml", "config.toml.bak", "secrets/secrets.json"] {
+            let err = ReadFileTool
+                .execute(json!({"path": path}), &ctx)
+                .await
+                .expect_err("credential-bearing CodeWhale file must be denied");
+            let message = err.to_string();
+            assert!(message.contains("cannot expose CodeWhale"), "{message}");
+            assert!(message.contains("codewhale config list"), "{message}");
+        }
+
+        let ordinary = ReadFileTool
+            .execute(json!({"path": "notes.txt"}), &ctx)
+            .await
+            .expect("ordinary workspace file should remain readable");
+        assert_eq!(ordinary.content, "ordinary workspace data");
     }
 
     #[tokio::test]
@@ -1814,6 +1928,93 @@ mod tests {
         // Verify nested file was created
         let written = fs::read_to_string(tmp.path().join("subdir/nested/file.txt")).expect("read");
         assert_eq!(written, "nested content");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_file_tool_new_file_matches_standard_creation_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+
+        let control = tmp.path().join("control.txt");
+        fs::write(&control, b"control").expect("write control");
+
+        WriteFileTool
+            .execute(
+                json!({"path": "created.txt", "content": "from write_file"}),
+                &ctx,
+            )
+            .await
+            .expect("execute");
+
+        let control_mode = fs::metadata(&control)
+            .expect("control metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let created_mode = fs::metadata(tmp.path().join("created.txt"))
+            .expect("created metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(created_mode, control_mode);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_file_tool_preserves_existing_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let path = tmp.path().join("shared.txt");
+        fs::write(&path, b"before").expect("initial write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o664))
+            .expect("set shared permissions");
+
+        WriteFileTool
+            .execute(json!({"path": "shared.txt", "content": "after"}), &ctx)
+            .await
+            .expect("execute");
+
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o664);
+        assert_eq!(fs::read_to_string(&path).expect("read"), "after");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_file_tool_preserves_executable_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let path = tmp.path().join("script.sh");
+        fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("initial write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .expect("set executable permissions");
+        read_before_edit(&ctx, "script.sh").await;
+
+        EditFileTool
+            .execute(
+                json!({
+                    "path": "script.sh",
+                    "search": "exit 0",
+                    "replace": "exit 1"
+                }),
+                &ctx,
+            )
+            .await
+            .expect("execute");
+
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "#!/bin/sh\nexit 1\n"
+        );
     }
 
     #[tokio::test]

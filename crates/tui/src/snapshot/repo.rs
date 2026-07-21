@@ -958,7 +958,6 @@ mod tests {
     use super::*;
     use crate::test_support::lock_test_env;
     use std::fs::{File, FileTimes};
-    use std::sync::MutexGuard;
     use tempfile::tempdir;
 
     /// Holds the home directory pinned to a tempdir for the lifetime of a test. Also
@@ -966,7 +965,7 @@ mod tests {
     /// don't trample each other's home env vars.
     pub(super) struct ScopedHome {
         prev_vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
-        _guard: MutexGuard<'static, ()>,
+        _guard: crate::test_support::TestEnvLock,
     }
     impl Drop for ScopedHome {
         fn drop(&mut self) {

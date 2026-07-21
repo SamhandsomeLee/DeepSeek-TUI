@@ -134,14 +134,13 @@ fn short_sha(sha: &str) -> &str {
 mod tests {
     use super::*;
     use crate::test_support::lock_test_env;
-    use std::sync::MutexGuard;
     use tempfile::tempdir;
 
     /// Pins HOME to a tempdir for the duration of the test under the
     /// process-wide env mutex (`crate::test_support::lock_test_env`).
     struct HomeGuard {
         prev: Option<std::ffi::OsString>,
-        _lock: MutexGuard<'static, ()>,
+        _lock: crate::test_support::TestEnvLock,
     }
     impl Drop for HomeGuard {
         fn drop(&mut self) {

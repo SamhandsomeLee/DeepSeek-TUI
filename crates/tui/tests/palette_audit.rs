@@ -2,7 +2,7 @@
 //!
 //! These tests ensure that deprecated colors are not used directly in
 //! user-visible code. Backward-compatible DeepSeek aliases should point
-//! at the current CodeWhale semantic tokens instead of stale brand RGBs.
+//! at the current Codewhale semantic tokens instead of stale brand RGBs.
 
 use ratatui::style::Color;
 
@@ -87,23 +87,95 @@ fn verify_status_success_uses_success_token() {
 }
 
 #[test]
-#[allow(deprecated)]
-fn verify_brand_aliases_follow_whale_tokens() {
-    assert_eq!(palette::WHALE_ACCENT_PRIMARY_RGB, (246, 196, 83));
-    assert_eq!(palette::WHALE_INFO_RGB, (106, 174, 242));
-    assert_eq!(palette::WHALE_ERROR_RGB, (255, 92, 122));
-    assert_eq!(
-        color_to_rgb(palette::WHALE_ACCENT_PRIMARY),
-        palette::WHALE_ACCENT_PRIMARY_RGB
+fn whale_roles_are_pinned_and_non_colliding() {
+    assert_eq!(palette::WHALE_BG_RGB, (3, 7, 13));
+    assert_eq!(palette::WHALE_PANEL_RGB, (14, 23, 41));
+    assert_eq!(palette::WHALE_ELEVATED_RGB, (24, 39, 66));
+    assert_eq!(palette::WHALE_ACTION_RGB, (106, 174, 242));
+    assert_eq!(palette::WHALE_ACCENT_SECONDARY_RGB, (79, 209, 197));
+    assert_eq!(palette::WHALE_HUMAN_RGB, (246, 196, 83));
+    assert_eq!(palette::WHALE_WARNING_RGB, (255, 122, 89));
+    assert_eq!(palette::WHALE_ERROR_RGB, (255, 134, 178));
+    assert_eq!(palette::WHALE_MODE_AGENT_RGB, (118, 181, 245));
+    assert_eq!(palette::WHALE_MODE_YOLO_RGB, (255, 112, 160));
+    assert_eq!(palette::WHALE_MODE_PLAN_RGB, (185, 220, 236));
+    assert_eq!(palette::WHALE_MODE_OPERATE_RGB, (173, 136, 255));
+    assert_eq!(palette::LIGHT_SUCCESS_FG_RGB, (20, 118, 61));
+    assert_eq!(palette::LIGHT_MODE_AGENT_RGB, (50, 95, 216));
+    assert_eq!(palette::LIGHT_MODE_PLAN_RGB, (52, 92, 128));
+    assert_eq!(palette::LIGHT_OPERATE_RGB, (112, 71, 184));
+    assert_eq!(palette::LIGHT_MODE_YOLO_RGB, (181, 35, 90));
+    assert_eq!(palette::LIGHT_USER_BODY, palette::LIGHT_SUCCESS_FG);
+
+    let ui = palette::UI_THEME;
+    assert_eq!(ui.accent_primary, palette::WHALE_ACTION);
+    assert_eq!(ui.info, palette::WHALE_ACTION);
+    assert_eq!(ui.status_working, palette::WHALE_LIVE);
+    assert_eq!(ui.accent_action, palette::WHALE_HUMAN);
+    assert_eq!(ui.warning, palette::STATUS_WARNING);
+    assert_eq!(ui.error_fg, palette::WHALE_ERROR);
+    assert_eq!(ui.mode_operate, palette::MODE_OPERATE);
+    assert_ne!(
+        ui.mode_plan, ui.accent_action,
+        "Plan is structural; Signal Gold is reserved for human attention"
+    );
+    assert_ne!(
+        ui.status_working, ui.success,
+        "live and done need separate ink"
+    );
+    assert_ne!(ui.accent_action, ui.warning, "human asks are not warnings");
+    assert_ne!(
+        ui.warning, ui.error_fg,
+        "warning and danger must not collapse"
     );
 
-    assert_eq!(
-        palette::WHALE_ACCENT_PRIMARY_RGB,
-        palette::WHALE_ACCENT_PRIMARY_RGB
-    );
-    assert_eq!(palette::WHALE_ACCENT_PRIMARY, palette::WHALE_ACCENT_PRIMARY);
-    assert_eq!(palette::WHALE_INFO_RGB, palette::WHALE_INFO_RGB);
-    assert_eq!(palette::WHALE_ERROR_RGB, palette::WHALE_ERROR_RGB);
+    let foreground_domains = [
+        ("action", palette::WHALE_ACTION),
+        ("live", palette::WHALE_LIVE),
+        ("human", palette::WHALE_HUMAN),
+        ("success", palette::STATUS_SUCCESS),
+        ("warning", palette::STATUS_WARNING),
+        ("danger", palette::WHALE_ERROR),
+        ("agent mode", palette::MODE_AGENT),
+        ("full-access mode", palette::MODE_YOLO),
+        ("plan mode", palette::MODE_PLAN),
+        ("operate mode", palette::MODE_OPERATE),
+        ("reasoning", palette::TEXT_REASONING),
+        ("diff added", palette::DIFF_ADDED),
+    ];
+    for (index, (left_name, left)) in foreground_domains.iter().enumerate() {
+        for (right_name, right) in foreground_domains.iter().skip(index + 1) {
+            assert_ne!(
+                left, right,
+                "raw foreground adaptation domains '{left_name}' and '{right_name}' collide"
+            );
+        }
+    }
+
+    let background_domains = [
+        ("base", palette::WHALE_BG),
+        ("panel", palette::WHALE_PANEL),
+        ("composer", palette::WHALE_COMPOSER),
+        ("elevated", palette::SURFACE_ELEVATED),
+        ("tool", palette::SURFACE_TOOL),
+        ("tool active", palette::SURFACE_TOOL_ACTIVE),
+        ("reasoning", palette::SURFACE_REASONING),
+        ("reasoning tint", palette::SURFACE_REASONING_TINT),
+        ("reasoning active", palette::SURFACE_REASONING_ACTIVE),
+        ("success", palette::SURFACE_SUCCESS),
+        ("error", palette::SURFACE_ERROR),
+        ("selection", palette::SELECTION_BG),
+        ("diff added", palette::DIFF_ADDED_BG),
+        ("diff deleted", palette::DIFF_DELETED_BG),
+    ];
+    for (index, (left_name, left)) in background_domains.iter().enumerate() {
+        for (right_name, right) in background_domains.iter().skip(index + 1) {
+            assert_ne!(
+                left, right,
+                "raw background adaptation domains '{left_name}' and '{right_name}' collide"
+            );
+        }
+    }
 }
 
 #[test]
@@ -152,22 +224,65 @@ fn contrast_guardrails_for_key_ui_pairs() {
         palette::SURFACE_ELEVATED,
         min_readable,
     );
+    for (label, foreground) in [
+        ("action", palette::UI_THEME.accent_primary),
+        ("live", palette::UI_THEME.status_working),
+        ("human", palette::UI_THEME.accent_action),
+        ("warning", palette::UI_THEME.warning),
+        ("danger", palette::UI_THEME.error_fg),
+        ("act mode", palette::UI_THEME.mode_agent),
+        ("plan mode", palette::UI_THEME.mode_plan),
+        ("operate", palette::UI_THEME.mode_operate),
+        ("full-access mode", palette::UI_THEME.mode_yolo),
+        ("success", palette::UI_THEME.success),
+    ] {
+        assert_min_contrast(label, foreground, palette::SURFACE_ELEVATED, min_readable);
+    }
+    let light_foregrounds = [
+        ("body", palette::LIGHT_UI_THEME.text_body),
+        ("soft", palette::LIGHT_UI_THEME.text_soft),
+        ("muted", palette::LIGHT_UI_THEME.text_muted),
+        ("hint", palette::LIGHT_UI_THEME.text_hint),
+        ("action", palette::LIGHT_UI_THEME.accent_primary),
+        ("live", palette::LIGHT_UI_THEME.status_working),
+        ("human", palette::LIGHT_UI_THEME.accent_action),
+        ("warning", palette::LIGHT_UI_THEME.warning),
+        ("danger", palette::LIGHT_UI_THEME.error_fg),
+        ("act mode", palette::LIGHT_UI_THEME.mode_agent),
+        ("plan mode", palette::LIGHT_UI_THEME.mode_plan),
+        ("operate", palette::LIGHT_UI_THEME.mode_operate),
+        ("full-access mode", palette::LIGHT_UI_THEME.mode_yolo),
+        ("success", palette::LIGHT_UI_THEME.success),
+        ("user", palette::LIGHT_USER_BODY),
+    ];
+    for (background_name, background) in [
+        ("surface", palette::LIGHT_SURFACE),
+        ("panel", palette::LIGHT_PANEL),
+        ("raised", palette::LIGHT_ELEVATED),
+        ("selection", palette::LIGHT_SELECTION_BG),
+        ("reasoning", palette::LIGHT_REASONING),
+        ("success tint", palette::LIGHT_SUCCESS),
+        ("error tint", palette::LIGHT_ERROR),
+    ] {
+        for (foreground_name, foreground) in light_foregrounds {
+            assert_min_contrast(
+                &format!("light {foreground_name} on {background_name}"),
+                foreground,
+                background,
+                min_readable,
+            );
+        }
+    }
     assert_min_contrast(
-        "LIGHT_TEXT_BODY on LIGHT_SURFACE",
-        palette::LIGHT_TEXT_BODY,
-        palette::LIGHT_SURFACE,
+        "light user row on raised",
+        palette::LIGHT_USER_BODY,
+        palette::LIGHT_ELEVATED,
         min_readable,
     );
     assert_min_contrast(
-        "LIGHT_TEXT_MUTED on LIGHT_SURFACE",
-        palette::LIGHT_TEXT_MUTED,
-        palette::LIGHT_SURFACE,
-        min_readable,
-    );
-    assert_min_contrast(
-        "LIGHT_TEXT_BODY on LIGHT_SELECTION_BG",
-        palette::LIGHT_TEXT_BODY,
-        palette::LIGHT_SELECTION_BG,
+        "light work-surface success hover on raised",
+        palette::LIGHT_UI_THEME.success,
+        palette::LIGHT_UI_THEME.elevated_bg,
         min_readable,
     );
 }

@@ -26,22 +26,438 @@ use crate::tui::ui_text::truncate_line_to_width;
 use crate::tui::views::{HelpView, ModalView, ViewAction};
 use crate::working_set::Workspace;
 use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
-use ratatui::text::Span;
-use std::collections::{HashSet, VecDeque};
+use ratatui::{Terminal, backend::TestBackend, text::Span};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::MutexGuard;
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
 use crate::tui::selection::{SelectionAutoscroll, TranscriptSelectionPoint};
 use tempfile::TempDir;
 
+#[test]
+fn permission_cycle_shortcut_accepts_both_shift_tab_encodings() {
+    assert!(is_permission_cycle_shortcut(&KeyEvent::new(
+        KeyCode::BackTab,
+        KeyModifiers::NONE,
+    )));
+    assert!(is_permission_cycle_shortcut(&KeyEvent::new(
+        KeyCode::BackTab,
+        KeyModifiers::SHIFT,
+    )));
+    assert!(is_permission_cycle_shortcut(&KeyEvent::new(
+        KeyCode::Tab,
+        KeyModifiers::SHIFT,
+    )));
+    assert!(!is_permission_cycle_shortcut(&KeyEvent::new(
+        KeyCode::Tab,
+        KeyModifiers::NONE,
+    )));
+    assert!(!is_permission_cycle_shortcut(&KeyEvent::new(
+        KeyCode::BackTab,
+        KeyModifiers::CONTROL,
+    )));
+}
+
+#[test]
+fn ctrl_t_key_event_reaches_reasoning_effort_cycle() {
+    let mut app = create_test_app();
+    app.api_provider = crate::config::ApiProvider::Deepseek;
+    app.auto_model = false;
+    app.reasoning_effort = ReasoningEffort::Off;
+
+    assert!(handle_reasoning_effort_key(
+        &mut app,
+        &KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+    ));
+    assert_eq!(app.reasoning_effort, ReasoningEffort::High);
+    assert!(
+        !handle_reasoning_effort_key(
+            &mut app,
+            &KeyEvent::new(
+                KeyCode::Char('T'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+        ),
+        "Ctrl+Shift+T remains owned by the live transcript overlay",
+    );
+}
+
+#[test]
+fn underwater_motion_keeps_its_smoother_cadence_during_live_status() {
+    let mut app = create_test_app();
+    // App::new reads real terminal overlays. This test owns the authored
+    // motion cadence, so pin that input instead of inheriting a host's saved
+    // low-motion or legacy-console policy.
+    app.low_motion = false;
+    app.fancy_animations = true;
+
+    assert_eq!(
+        animation_interval_ms(&app, true, false),
+        UI_STATUS_ANIMATION_MS
+    );
+    assert_eq!(
+        animation_interval_ms(&app, false, true),
+        UI_UNDERWATER_ANIMATION_MS
+    );
+    assert_eq!(
+        animation_interval_ms(&app, true, true),
+        UI_UNDERWATER_ANIMATION_MS,
+        "the slower status spinner must not throttle ambient fish"
+    );
+}
+
+#[test]
+fn underwater_motion_ticks_only_for_visible_unobscured_owners() {
+    assert!(!underwater_motion_surface_visible(None, true, true, false));
+    assert!(!underwater_motion_surface_visible(
+        Some(Rect::new(0, 0, 0, 24)),
+        true,
+        true,
+        false,
+    ));
+    assert!(underwater_motion_surface_visible(
+        Some(Rect::new(0, 0, 40, 12)),
+        true,
+        false,
+        false,
+    ));
+    assert!(underwater_motion_surface_visible(
+        Some(Rect::new(0, 0, 60, 16)),
+        false,
+        true,
+        false,
+    ));
+    assert!(!underwater_motion_surface_visible(
+        Some(Rect::new(0, 0, 60, 16)),
+        false,
+        false,
+        false,
+    ));
+    assert!(underwater_motion_surface_visible(
+        Some(Rect::new(0, 0, 80, 24)),
+        false,
+        false,
+        false,
+    ));
+    assert!(!underwater_motion_surface_visible(
+        Some(Rect::new(0, 0, 100, 32)),
+        true,
+        true,
+        true,
+    ));
+}
+
+#[test]
+fn live_transcript_command_open_path_is_idempotent() {
+    let mut app = create_test_app();
+
+    open_live_transcript_overlay(&mut app);
+    open_live_transcript_overlay(&mut app);
+
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::LiveTranscript));
+    app.view_stack.pop();
+    assert_eq!(
+        app.view_stack.top_kind(),
+        None,
+        "opening twice must not stack duplicate transcript overlays"
+    );
+}
+
+#[test]
+fn approval_prompt_keeps_transcript_page_navigation_live() {
+    let mut app = create_test_app();
+    app.viewport.last_transcript_visible = 12;
+    app.view_stack.push(ApprovalView::new(ApprovalRequest::new(
+        "approval-scroll",
+        "exec_shell",
+        "Review command",
+        &serde_json::json!({"command": "git status"}),
+        "approval-scroll-key",
+    )));
+
+    assert!(handle_approval_transcript_key(
+        &mut app,
+        &KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+    ));
+    assert_eq!(app.viewport.pending_scroll_delta, -12);
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Approval));
+
+    assert!(handle_approval_transcript_key(
+        &mut app,
+        &KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+    ));
+    assert_eq!(app.viewport.pending_scroll_delta, 0);
+
+    assert!(handle_approval_transcript_key(
+        &mut app,
+        &KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL),
+    ));
+    assert_eq!(app.viewport.pending_scroll_delta, -3);
+
+    assert!(handle_approval_transcript_key(
+        &mut app,
+        &KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+    ));
+    assert!(app.viewport.pending_scroll_delta < -1_000_000);
+    assert!(app.user_scrolled_during_stream);
+
+    assert!(handle_approval_transcript_key(
+        &mut app,
+        &KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+    ));
+    assert_eq!(app.viewport.pending_scroll_delta, 0);
+    assert!(!app.user_scrolled_during_stream);
+
+    assert!(handle_approval_transcript_key(
+        &mut app,
+        &KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+    ));
+    assert_eq!(app.viewport.pending_scroll_delta, 3);
+    assert!(app.user_scrolled_during_stream);
+
+    assert!(
+        !handle_approval_transcript_key(
+            &mut app,
+            &KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        ),
+        "ordinary approval selection keys must stay with the decision card"
+    );
+}
+
+#[test]
+fn transcript_navigation_does_not_capture_keys_for_other_modals() {
+    let mut app = create_test_app();
+    app.view_stack.push(HelpView::new_for_locale(app.ui_locale));
+
+    assert!(!handle_approval_transcript_key(
+        &mut app,
+        &KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+    ));
+    assert_eq!(app.viewport.pending_scroll_delta, 0);
+}
+
+#[test]
+fn closing_work_inspector_pager_clears_opened_row_owner() {
+    let mut app = create_test_app();
+    app.todos.try_lock().expect("To-do state").add(
+        "Inspect me".to_string(),
+        crate::tools::todo::TodoStatus::InProgress,
+    );
+    let _ = crate::tui::work_surface::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT),
+    );
+    app.work_surface.opened = app.work_surface.selected.clone();
+    assert!(app.work_surface.opened.is_some());
+    app.view_stack
+        .push(PagerView::from_text("Work", "detail", 40));
+
+    let was_work_inspector =
+        app.work_surface.opened.is_some() && app.view_stack.top_kind() == Some(ModalKind::Pager);
+    let events = app
+        .view_stack
+        .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(events.is_empty());
+    clear_work_inspector_after_pager_close(&mut app, was_work_inspector);
+
+    assert_eq!(app.view_stack.top_kind(), None);
+    assert!(app.work_surface.opened.is_none());
+}
+
+#[test]
+fn approval_mouse_wheel_reviews_transcript_without_closing_card() {
+    let mut app = create_test_app();
+    app.view_stack.push(ApprovalView::new(ApprovalRequest::new(
+        "approval-scroll",
+        "exec_shell",
+        "Review command",
+        &serde_json::json!({"command": "git status"}),
+        "approval-scroll-key",
+    )));
+
+    let events = handle_mouse_event(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 4,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert!(events.is_empty());
+    assert!(app.viewport.pending_scroll_delta < 0);
+    assert!(app.user_scrolled_during_stream);
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Approval));
+}
+
+#[test]
+fn approval_wheel_preserves_sidebar_and_work_surface_ownership() {
+    let mut app = create_test_app();
+    app.view_stack.push(ApprovalView::new(ApprovalRequest::new(
+        "approval-scroll",
+        "exec_shell",
+        "Review command",
+        &serde_json::json!({"command": "git status"}),
+        "approval-scroll-key",
+    )));
+    app.viewport.last_sidebar_area = Some(Rect::new(60, 0, 20, 20));
+    app.work_surface.last_area = Some(Rect::new(0, 0, 30, 20));
+    app.viewport.last_approval_area = Some(Rect::new(0, 12, 80, 8));
+
+    for (column, row) in [(65, 4), (10, 4)] {
+        let events = handle_mouse_event(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(events.is_empty());
+        assert_eq!(
+            app.viewport.pending_scroll_delta, 0,
+            "approval wheel leaked from side surface at ({column}, {row})"
+        );
+    }
+
+    for (column, row) in [(65, 15), (10, 15)] {
+        let before = app.viewport.pending_scroll_delta;
+        let events = handle_mouse_event(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(events.is_empty());
+        assert!(
+            app.viewport.pending_scroll_delta < before,
+            "visible approval did not outrank underlying side surface at ({column}, {row})"
+        );
+    }
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Approval));
+}
+
+#[test]
+fn config_update_preview_suppresses_only_success_message_not_action_or_errors() {
+    let preview = prepare_config_update_result(
+        commands::CommandResult::with_message_and_action(
+            "preview confirmation",
+            AppAction::UpdateStreamChunkTimeout(42),
+        ),
+        false,
+    );
+    assert!(preview.message.is_none());
+    assert!(matches!(
+        preview.action,
+        Some(AppAction::UpdateStreamChunkTimeout(42))
+    ));
+
+    let persisted =
+        prepare_config_update_result(commands::CommandResult::message("saved confirmation"), true);
+    assert_eq!(persisted.message.as_deref(), Some("saved confirmation"));
+
+    let error =
+        prepare_config_update_result(commands::CommandResult::error("invalid value"), false);
+    assert!(error.is_error);
+    assert!(
+        error
+            .message
+            .as_deref()
+            .is_some_and(|msg| msg.contains("invalid value"))
+    );
+}
+
+#[test]
+fn config_refresh_preserves_active_search_filter() {
+    let mut app = create_test_app();
+    let mut view = ConfigView::new_for_app(&app);
+    for ch in "model".chars() {
+        let _ = view.handle_key(KeyEvent::new(
+            crossterm::event::KeyCode::Char(ch),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+    }
+    app.view_stack.push(view);
+
+    refresh_config_view_if_open(&mut app, "default_model");
+
+    let mut view = app.view_stack.pop().expect("refreshed config view");
+    let config = view
+        .as_any_mut()
+        .downcast_mut::<ConfigView>()
+        .expect("config view type");
+    assert_eq!(config.filter_query(), "model");
+}
+
+#[test]
+fn workflow_panel_plain_letters_return_to_composer() {
+    let mut app = create_test_app();
+    app.workflow_panel = Some(crate::tui::widgets::workflow_panel::WorkflowPanel::new(
+        "workflow_typing",
+        "typing regression",
+        0,
+    ));
+
+    for ch in ['t', 'c', 'j', 'k'] {
+        app.workflow_panel
+            .as_mut()
+            .expect("workflow panel")
+            .keyboard_focus = true;
+        let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+        assert!(
+            !handle_workflow_panel_key(&mut app, &key),
+            "plain {ch:?} must fall through to the composer"
+        );
+        assert!(
+            !app.workflow_panel
+                .as_ref()
+                .expect("workflow panel")
+                .keyboard_focus,
+            "typing releases panel focus"
+        );
+        app.insert_char(ch);
+    }
+
+    assert_eq!(app.input, "tcjk");
+}
+
+#[test]
+fn workflow_panel_uses_non_text_keys_for_controls() {
+    let mut app = create_test_app();
+    let mut panel = crate::tui::widgets::workflow_panel::WorkflowPanel::new(
+        "workflow_keys",
+        "keyboard controls",
+        0,
+    );
+    panel.keyboard_focus = true;
+    let was_expanded = panel.expanded;
+    app.workflow_panel = Some(panel);
+
+    assert!(handle_workflow_panel_key(
+        &mut app,
+        &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+    ));
+    assert_ne!(
+        app.workflow_panel
+            .as_ref()
+            .expect("workflow panel")
+            .expanded,
+        was_expanded
+    );
+}
+
 struct ConfigPathEnvGuard {
     _tmp: TempDir,
     previous: Option<OsString>,
-    _lock: MutexGuard<'static, ()>,
+    _lock: crate::test_support::TestEnvLock,
 }
 
 impl ConfigPathEnvGuard {
@@ -87,7 +503,7 @@ struct SettingsHomeGuard {
     previous_xdg_config_home: Option<OsString>,
     previous_appdata: Option<OsString>,
     previous_localappdata: Option<OsString>,
-    _lock: MutexGuard<'static, ()>,
+    _lock: crate::test_support::TestEnvLock,
 }
 
 impl SettingsHomeGuard {
@@ -185,10 +601,110 @@ fn plain_mcp_show_refreshes_discovery_counts() {
 
     assert!(mcp_ui_action_refreshes_discovery(&McpUiAction::Show));
     assert!(mcp_ui_action_refreshes_discovery(&McpUiAction::Validate));
-    assert!(mcp_ui_action_refreshes_discovery(&McpUiAction::Reload));
+    assert!(
+        !mcp_ui_action_refreshes_discovery(&McpUiAction::Reload),
+        "reload is handled by the engine-owned live pool, not a UI discovery pool"
+    );
     assert!(!mcp_ui_action_refreshes_discovery(&McpUiAction::Init {
         force: false,
     }));
+}
+
+#[tokio::test]
+async fn mcp_reload_uses_engine_snapshot_and_clears_pending_state() {
+    use crate::mcp::{McpManagerSnapshot, McpServerSnapshot};
+    use crate::tui::app::McpUiAction;
+
+    let mut app = create_test_app();
+    app.mcp_reload_required = true;
+    let config = Config::default();
+    let mut mock = mock_engine_handle();
+    let handle = mock.handle.clone();
+    let snapshot = McpManagerSnapshot {
+        config_path: PathBuf::from("mcp.json"),
+        config_exists: true,
+        reload_required: false,
+        servers: vec![McpServerSnapshot {
+            name: "ready".to_string(),
+            enabled: true,
+            required: false,
+            transport: "stdio".to_string(),
+            command_or_url: "server".to_string(),
+            connect_timeout: 5,
+            execute_timeout: 5,
+            read_timeout: 5,
+            connected: true,
+            error: None,
+            tools: Vec::new(),
+            resources: Vec::new(),
+            prompts: Vec::new(),
+        }],
+    };
+    let response_snapshot = snapshot.clone();
+    let respond = async {
+        match mock.rx_op.recv().await.expect("reload op") {
+            Op::ReloadMcp { config_path, tx } => {
+                assert_eq!(config_path, PathBuf::from("mcp.json"));
+                let sender = tx.lock().unwrap().take().expect("reload reply sender");
+                sender.send(Ok(response_snapshot)).expect("reload reply");
+            }
+            other => panic!("unexpected op: {other:?}"),
+        }
+    };
+    let action = handle_mcp_ui_action(&mut app, &handle, &config, McpUiAction::Reload);
+    tokio::join!(action, respond);
+
+    assert!(!app.mcp_reload_required);
+    assert_eq!(app.mcp_snapshot.as_ref(), Some(&snapshot));
+    assert_eq!(app.mcp_configured_count, 1);
+    assert!(app.history.iter().any(|cell| matches!(
+        cell,
+        HistoryCell::System { content }
+            if content.contains("MCP tool pool reloaded in process")
+                && content.contains("next model turn")
+    )));
+}
+
+#[tokio::test]
+async fn mcp_reload_failure_keeps_pending_state_and_live_snapshot() {
+    use crate::mcp::McpManagerSnapshot;
+    use crate::tui::app::McpUiAction;
+
+    let mut app = create_test_app();
+    app.mcp_reload_required = true;
+    app.mcp_snapshot = Some(McpManagerSnapshot {
+        config_path: PathBuf::from("mcp.json"),
+        config_exists: true,
+        reload_required: true,
+        servers: Vec::new(),
+    });
+    let previous = app.mcp_snapshot.clone();
+    let config = Config::default();
+    let mut mock = mock_engine_handle();
+    let handle = mock.handle.clone();
+    let respond = async {
+        match mock.rx_op.recv().await.expect("reload op") {
+            Op::ReloadMcp { config_path, tx } => {
+                assert_eq!(config_path, PathBuf::from("mcp.json"));
+                let sender = tx.lock().unwrap().take().expect("reload reply sender");
+                sender
+                    .send(Err("safe config parse failure".to_string()))
+                    .expect("reload reply");
+            }
+            other => panic!("unexpected op: {other:?}"),
+        }
+    };
+    let action = handle_mcp_ui_action(&mut app, &handle, &config, McpUiAction::Reload);
+    tokio::join!(action, respond);
+
+    assert!(app.mcp_reload_required);
+    assert_eq!(app.mcp_snapshot, previous);
+    assert!(app.history.iter().any(|cell| matches!(
+        cell,
+        HistoryCell::System { content }
+            if content.contains("live tool pool is unchanged")
+                && content.contains("safe config parse failure")
+    )));
 }
 
 #[test]
@@ -567,6 +1083,63 @@ fn selection_point_from_position_ignores_top_padding() {
     .expect("point");
     assert_eq!(p1.line_index, 1);
     assert_eq!(p1.column, 0);
+}
+
+/// #4208 evidence: the in-app selection copy strips every rendering rail
+/// (user quote bar, card rails) via cache metadata, so copied text is clean
+/// regardless of which decoration the transcript grammar uses. The
+/// remaining #4208 surface is terminal-native selection with mouse capture
+/// off, which no app-side clipboard code can intercept.
+#[test]
+fn selection_to_text_excludes_transcript_rail_decorations() {
+    let mut app = create_test_app();
+    app.history = vec![
+        HistoryCell::User {
+            content: "fix the flaky pty test".to_string(),
+        },
+        HistoryCell::Assistant {
+            content: "Looking at the failing test first.".to_string(),
+            streaming: false,
+        },
+    ];
+    app.resync_history_revisions();
+    app.viewport.transcript_cache.ensure(
+        &app.history,
+        &app.history_revisions,
+        80,
+        app.transcript_render_options(),
+    );
+
+    let last = app
+        .viewport
+        .transcript_cache
+        .lines()
+        .len()
+        .saturating_sub(1);
+    app.viewport.transcript_selection.anchor = Some(TranscriptSelectionPoint {
+        line_index: 0,
+        column: 0,
+    });
+    app.viewport.transcript_selection.head = Some(TranscriptSelectionPoint {
+        line_index: last,
+        column: 80,
+    });
+
+    let copied = selection_to_text(&app).expect("selection yields text");
+    for rail in ['▎', '▏', '╎', '│', '┃', '╭', '╰', '●'] {
+        assert!(
+            !copied.contains(rail),
+            "copied text must exclude the {rail:?} rail: {copied:?}"
+        );
+    }
+    assert!(
+        copied.contains("fix the flaky pty test"),
+        "content survives rail stripping: {copied:?}"
+    );
+    assert!(
+        copied.contains("Looking at the failing test first."),
+        "assistant content survives: {copied:?}"
+    );
 }
 
 #[test]
@@ -1547,6 +2120,54 @@ fn composer_mouse_wheel_up_moves_within_wrapped_draft() {
 }
 
 #[test]
+fn composer_mouse_first_visible_character_maps_to_zero_after_prompt_gutter() {
+    let mut app = create_test_app();
+    app.input = "abcdef".to_string();
+    app.cursor_position = app.input.chars().count();
+    app.viewport.last_composer_area = Some(Rect {
+        x: 10,
+        y: 10,
+        width: 12,
+        height: 4,
+    });
+    // Border-aware inner rect. The shared composer geometry reserves x=10..12
+    // for the persistent prompt and places the first visible character at 12.
+    app.viewport.last_composer_content = Some(Rect {
+        x: 10,
+        y: 11,
+        width: 12,
+        height: 3,
+    });
+    app.viewport.last_composer_scroll_offset = 0;
+    app.viewport.last_composer_top_padding = 0;
+
+    assert!(handle_composer_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 12,
+            row: 11,
+            modifiers: KeyModifiers::NONE,
+        },
+    ));
+    assert_eq!(
+        app.cursor_position, 0,
+        "the first rendered character must not inherit the prompt's two-column inset"
+    );
+
+    assert!(handle_composer_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 13,
+            row: 11,
+            modifiers: KeyModifiers::NONE,
+        },
+    ));
+    assert_eq!(app.cursor_position, 1);
+}
+
+#[test]
 fn copy_shortcut_accepts_cmd_and_ctrl_shift_only() {
     assert!(crate::tui::key_shortcuts::is_copy_shortcut(&KeyEvent::new(
         KeyCode::Char('c'),
@@ -1735,16 +2356,25 @@ fn create_test_app() -> App {
     // Pin locale and currency for deterministic tests regardless of host locale.
     app.cost_currency = crate::pricing::CostCurrency::Usd;
     app.ui_locale = crate::localization::Locale::En;
+    // Keep transcript tests independent of a concurrently swapped persisted
+    // settings home. Tests for hidden reasoning opt out explicitly.
+    app.show_thinking = true;
     // Pin the route identity too: App::new consults the developer's real
     // saved settings (provider/model maps, auto-model, route limits), so on
     // a machine with customized settings the context-window tests computed
     // against a different model than the requested deepseek-v4-pro.
-    app.api_provider = crate::config::ApiProvider::Deepseek;
+    app.set_provider_identity(crate::config::ApiProvider::Deepseek, "deepseek");
+    app.billing_presentation = crate::route_billing::BillingPresentation::Metered;
     app.model = "deepseek-v4-pro".to_string();
     app.auto_model = false;
     app.last_effective_model = None;
     app.active_route_limits = None;
     app.active_context_window_override = None;
+    // UI fixtures replace `app.workspace` freely. Do not retain App::new's
+    // real process cwd as a second discovery root: parallel tests and a large
+    // developer checkout can otherwise consume the bounded mention index
+    // before the fixture workspace is scanned.
+    app.composer.mention_cwd = None;
     app
 }
 
@@ -1856,10 +2486,7 @@ fn app_system_prompt_includes_configured_instructions() {
         ..Config::default()
     };
 
-    let prompt = match build_app_system_prompt(&app, &config) {
-        SystemPrompt::Text(text) => text,
-        SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-    };
+    let prompt = crate::prompts::system_prompt_flat_text(&build_app_system_prompt(&app, &config));
 
     assert!(prompt.contains("CONFIGURED_INSTRUCTIONS_MARKER"));
     assert!(prompt.contains(&instructions.display().to_string()));
@@ -1878,6 +2505,429 @@ fn session_denied_cache_matches_only_approval_key() {
     app.approval_session_denied
         .insert("file:edit_file:retry".to_string());
     assert!(is_session_denied_for_key(&app, "file:edit_file:retry"));
+}
+
+fn render_underwater_test_app(app: &mut App, width: u16, height: u16) -> String {
+    app.onboarding_workspace_trust_gate = false;
+    app.onboarding = OnboardingState::None;
+    let config = Config::default();
+    let mut terminal =
+        Terminal::new(TestBackend::new(width, height)).expect("underwater test terminal");
+    terminal
+        .draw(|frame| render(frame, app, &config))
+        .expect("render underwater shell");
+    terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>()
+}
+
+#[tokio::test]
+async fn session_denied_cache_auto_deny_explains_the_cached_rejection() {
+    let home = SettingsHomeGuard::new();
+    let audit_path = home._tmp.path().join(".codewhale").join("audit.log");
+    let mut app = create_test_app();
+    let mut engine = mock_engine_handle();
+    let approval_key = "shell:exec_shell:git push secret-token";
+
+    auto_deny_session_approval(
+        &mut app,
+        &engine.handle,
+        "tool-retry",
+        "exec_shell",
+        approval_key,
+    )
+    .await;
+
+    assert_eq!(
+        engine.recv_approval_event().await,
+        Some(crate::core::engine::MockApprovalEvent::Denied {
+            id: "tool-retry".to_string(),
+        })
+    );
+    let toast = app.status_toasts.back().expect("auto-deny warning toast");
+    assert_eq!(toast.level, StatusToastLevel::Warning);
+    assert_eq!(toast.ttl_ms, Some(12_000));
+    assert!(toast.text.contains("matching request was denied earlier"));
+    assert!(toast.text.contains("during this CodeWhale run"));
+    assert!(toast.text.contains("Restart CodeWhale"));
+    assert!(toast.text.contains("exec_shell"));
+    let history_notice = app
+        .history
+        .iter()
+        .rev()
+        .find_map(|cell| match cell {
+            HistoryCell::System { content } => Some(content.as_str()),
+            _ => None,
+        })
+        .expect("persistent auto-deny explanation");
+    assert_eq!(history_notice, toast.text);
+    for visible_text in [&toast.text, history_notice] {
+        assert!(
+            !visible_text.contains(approval_key)
+                && !visible_text.contains("git push")
+                && !visible_text.contains("secret-token"),
+            "the user-facing notice must not expose the approval key, command, or arguments"
+        );
+    }
+    let audit = std::fs::read_to_string(&audit_path).expect("isolated approval audit log");
+    assert!(audit.contains(approval_key));
+
+    let rendered = render_underwater_test_app(&mut app, 40, 12);
+    assert!(rendered.contains("Auto-denied"), "{rendered:?}");
+    assert!(
+        rendered.contains("Restart") && rendered.contains("CodeWhale"),
+        "{rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn session_denied_cache_notice_preserves_active_tool_index() {
+    let _home = SettingsHomeGuard::new();
+    let mut app = create_test_app();
+    let mut engine = mock_engine_handle();
+    let tool_id = "tool-retry";
+    let tool_name = "exec_shell";
+
+    handle_tool_call_started(
+        &mut app,
+        tool_id,
+        tool_name,
+        &serde_json::json!({"command": "git push secret-token"}),
+    );
+    let history_len = app.history.len();
+    let tool_index = app.tool_cells[tool_id];
+    assert_eq!(tool_index, history_len);
+
+    auto_deny_session_approval(
+        &mut app,
+        &engine.handle,
+        tool_id,
+        tool_name,
+        "shell:exec_shell:git push secret-token",
+    )
+    .await;
+
+    assert_eq!(
+        app.history.len(),
+        history_len,
+        "the notice must not shift virtual indices while a tool is active"
+    );
+    assert_eq!(app.tool_cells.get(tool_id), Some(&tool_index));
+    let active = app.active_cell.as_ref().expect("active tool and notice");
+    assert!(matches!(
+        active.entries().first(),
+        Some(HistoryCell::Tool(ToolCell::Exec(exec))) if exec.status == ToolStatus::Running
+    ));
+    assert!(matches!(
+        active.entries().get(1),
+        Some(HistoryCell::System { content }) if content.contains("Auto-denied")
+    ));
+
+    assert_eq!(
+        engine.recv_approval_event().await,
+        Some(crate::core::engine::MockApprovalEvent::Denied {
+            id: tool_id.to_string(),
+        })
+    );
+    let denied_result = Ok(crate::tools::spec::ToolResult::error(
+        "request denied by cached approval",
+    ));
+    handle_tool_call_complete(&mut app, tool_id, tool_name, &denied_result);
+
+    let active = app.active_cell.as_ref().expect("completed tool and notice");
+    assert!(matches!(
+        active.entries().first(),
+        Some(HistoryCell::Tool(ToolCell::Exec(exec))) if exec.status == ToolStatus::Failed
+    ));
+    assert!(matches!(
+        active.entries().get(1),
+        Some(HistoryCell::System { .. })
+    ));
+
+    app.flush_active_cell();
+    assert!(matches!(
+        app.history.get(history_len),
+        Some(HistoryCell::Tool(ToolCell::Exec(exec))) if exec.status == ToolStatus::Failed
+    ));
+    assert!(matches!(
+        app.history.get(history_len + 1),
+        Some(HistoryCell::System { content }) if content.contains("Auto-denied")
+    ));
+    let detail = app
+        .tool_detail_record_for_cell(history_len)
+        .expect("tool detail remains bound to the completed tool cell");
+    assert_eq!(detail.tool_id, tool_id);
+    assert!(
+        detail
+            .output
+            .as_deref()
+            .is_some_and(|output| output.contains("cached approval"))
+    );
+}
+
+#[tokio::test]
+async fn session_denied_cache_notice_preserves_parallel_tool_indices() {
+    let _home = SettingsHomeGuard::new();
+    let mut app = create_test_app();
+    let mut engine = mock_engine_handle();
+
+    handle_tool_call_started(
+        &mut app,
+        "tool-first",
+        "exec_shell",
+        &serde_json::json!({"command": "echo first"}),
+    );
+    handle_tool_call_started(
+        &mut app,
+        "tool-denied",
+        "exec_shell",
+        &serde_json::json!({"command": "git push secret-token"}),
+    );
+    let history_len = app.history.len();
+    let first_index = app.tool_cells["tool-first"];
+    let denied_index = app.tool_cells["tool-denied"];
+    assert_eq!(first_index, history_len);
+    assert_eq!(denied_index, history_len + 1);
+
+    auto_deny_session_approval(
+        &mut app,
+        &engine.handle,
+        "tool-denied",
+        "exec_shell",
+        "shell:exec_shell:git push secret-token",
+    )
+    .await;
+
+    assert_eq!(app.history.len(), history_len);
+    assert_eq!(app.tool_cells.get("tool-first"), Some(&first_index));
+    assert_eq!(app.tool_cells.get("tool-denied"), Some(&denied_index));
+    assert_eq!(
+        engine.recv_approval_event().await,
+        Some(crate::core::engine::MockApprovalEvent::Denied {
+            id: "tool-denied".to_string(),
+        })
+    );
+
+    let denied_result = Ok(crate::tools::spec::ToolResult::error(
+        "request denied by cached approval",
+    ));
+    handle_tool_call_complete(&mut app, "tool-denied", "exec_shell", &denied_result);
+    let active = app.active_cell.as_ref().expect("parallel tools and notice");
+    assert!(matches!(
+        active.entries().first(),
+        Some(HistoryCell::Tool(ToolCell::Exec(exec)))
+            if exec.status == ToolStatus::Running && exec.command == "echo first"
+    ));
+    assert!(matches!(
+        active.entries().get(1),
+        Some(HistoryCell::Tool(ToolCell::Exec(exec)))
+            if exec.status == ToolStatus::Failed
+                && exec.command == "git push secret-token"
+                && exec.output.as_deref().is_some_and(|output| output.contains("cached approval"))
+    ));
+    assert!(matches!(
+        active.entries().get(2),
+        Some(HistoryCell::System { content }) if content.contains("Auto-denied")
+    ));
+
+    handle_tool_call_complete(
+        &mut app,
+        "tool-first",
+        "exec_shell",
+        &ok_result("first output"),
+    );
+    app.flush_active_cell();
+
+    assert!(matches!(
+        app.history.get(history_len),
+        Some(HistoryCell::Tool(ToolCell::Exec(exec)))
+            if exec.status == ToolStatus::Success
+                && exec.command == "echo first"
+                && exec.output.as_deref() == Some("first output")
+    ));
+    assert!(matches!(
+        app.history.get(history_len + 1),
+        Some(HistoryCell::Tool(ToolCell::Exec(exec)))
+            if exec.status == ToolStatus::Failed && exec.command == "git push secret-token"
+    ));
+    assert!(matches!(
+        app.history.get(history_len + 2),
+        Some(HistoryCell::System { content }) if content.contains("Auto-denied")
+    ));
+}
+
+#[tokio::test]
+async fn session_denied_cache_notice_renders_host_scope_in_zh_hans() {
+    let _home = SettingsHomeGuard::new();
+    let mut app = create_test_app();
+    app.ui_locale = crate::localization::Locale::ZhHans;
+    let mut engine = mock_engine_handle();
+
+    auto_deny_session_approval(
+        &mut app,
+        &engine.handle,
+        "fetch-retry",
+        "fetch_url",
+        "net:example.com",
+    )
+    .await;
+
+    assert_eq!(
+        engine.recv_approval_event().await,
+        Some(crate::core::engine::MockApprovalEvent::Denied {
+            id: "fetch-retry".to_string(),
+        })
+    );
+    let notice = app
+        .history
+        .iter()
+        .rev()
+        .find_map(|cell| match cell {
+            HistoryCell::System { content } => Some(content.as_str()),
+            _ => None,
+        })
+        .expect("localized persistent auto-deny explanation");
+    assert!(notice.contains("本次 CodeWhale 运行期间"));
+    assert!(notice.contains("匹配请求"));
+    assert!(!notice.contains("example.com"));
+
+    let rendered = render_underwater_test_app(&mut app, 60, 16);
+    let rendered_compact = rendered
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    assert!(rendered_compact.contains("已自动拒绝"), "{rendered:?}");
+    assert!(rendered_compact.contains("匹配请求"), "{rendered:?}");
+    assert!(
+        rendered_compact.contains("重启") && rendered_compact.contains("CodeWhale"),
+        "{rendered:?}"
+    );
+}
+
+#[test]
+fn session_denied_notice_explains_cached_decision_and_recovery() {
+    let app = create_test_app();
+    let notice = session_denied_notice(&app, "exec_shell");
+
+    assert!(notice.contains("exec_shell"));
+    assert!(notice.contains("matching request was denied earlier"));
+    assert!(notice.contains("during this CodeWhale run"));
+    assert!(notice.contains("Restart CodeWhale"));
+}
+
+#[tokio::test]
+async fn cached_denial_explanation_survives_tool_completion_and_done_render() {
+    use crate::core::engine::MockApprovalEvent;
+    use crate::tools::spec::ToolError;
+    use crate::tui::ocean::OceanTreatment;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = create_test_app();
+    app.onboarding = OnboardingState::None;
+    app.launch.visible = false;
+    app.ocean_treatment = OceanTreatment::Ombre;
+    app.is_loading = true;
+    app.runtime_turn_status = Some("in_progress".to_string());
+
+    let tool_id = "cached-shell-denial";
+    let tool_name = "exec_shell";
+    handle_tool_call_started(
+        &mut app,
+        tool_id,
+        tool_name,
+        &serde_json::json!({"command": "printf cached-denial"}),
+    );
+
+    // Mirror the cached ApprovalRequired branch: send the denial back to the
+    // blocked engine, then project the explanation into the UI.
+    let mut engine = mock_engine_handle();
+    engine
+        .handle
+        .deny_tool_call(tool_id)
+        .await
+        .expect("send cached denial");
+    surface_session_denied_notice(&mut app, tool_name);
+    assert!(matches!(
+        engine.recv_approval_event().await,
+        Some(MockApprovalEvent::Denied { id }) if id == tool_id
+    ));
+
+    // These are the events that immediately follow the auto-deny in a real
+    // turn. A later generic status is deliberately applied too: the detailed
+    // recovery receipt must not depend on winning the one-line status race.
+    let result = Err(ToolError::permission_denied(
+        "Tool 'exec_shell' denied by user".to_string(),
+    ));
+    handle_tool_call_complete(&mut app, tool_id, tool_name, &result);
+    app.flush_active_cell();
+
+    let denied_tool_index = app
+        .history
+        .iter()
+        .position(|cell| {
+            matches!(
+                cell,
+                HistoryCell::Tool(ToolCell::Exec(exec))
+                    if exec.command == "printf cached-denial"
+                        && exec.status == ToolStatus::Failed
+            )
+        })
+        .expect("cached denial must settle the pending tool as failed");
+    let recovery_receipt_index = app
+        .history
+        .iter()
+        .position(|cell| {
+            matches!(
+                cell,
+                HistoryCell::System { content }
+                    if content.contains("Auto-denied exec_shell")
+                        && content.contains("Restart CodeWhale")
+            )
+        })
+        .expect("cached denial must leave a durable recovery receipt");
+    assert!(
+        denied_tool_index < recovery_receipt_index,
+        "recovery receipt must follow the tool it explains"
+    );
+
+    app.is_loading = false;
+    app.runtime_turn_status = Some("completed".to_string());
+    app.status_message = Some("Tool 'exec_shell' denied by user".to_string());
+    app.sync_status_message_to_toasts();
+
+    let config = Config::default();
+    let backend = TestBackend::new(89, 24);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| render(frame, &mut app, &config))
+        .expect("render completed denial sequence");
+    let buffer = terminal.backend().buffer();
+    let rendered = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        rendered.contains("Auto-denied exec_shell"),
+        "cached-decision explanation disappeared after completion:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Restart CodeWhale"),
+        "cached-denial recovery path disappeared after completion:\n{rendered}"
+    );
+    assert_eq!(
+        app.view_stack.top_kind(),
+        None,
+        "cache hit must not re-prompt"
+    );
 }
 
 #[test]
@@ -1908,6 +2958,8 @@ fn forced_approval_prompt_bypasses_auto_mode_shortcut() {
 #[test]
 fn forced_approval_prompt_bypasses_session_approval_shortcut() {
     let mut app = create_test_app();
+    app.mode = AppMode::Agent;
+    app.approval_mode = ApprovalMode::Suggest;
     app.approval_session_approved
         .insert("shell:exec_shell:cargo test".to_string());
 
@@ -1920,7 +2972,7 @@ fn forced_approval_prompt_bypasses_session_approval_shortcut() {
 }
 
 #[test]
-fn approval_request_uses_session_cache_not_current_mode_shortcut() {
+fn full_access_auto_approves_requests_while_auto_review_does_not() {
     let mut app = create_test_app();
     app.approval_mode = ApprovalMode::Auto;
     assert!(!should_auto_approve_approval_request(
@@ -1931,21 +2983,35 @@ fn approval_request_uses_session_cache_not_current_mode_shortcut() {
     ));
 
     app.approval_mode = ApprovalMode::Bypass;
-    assert!(!should_auto_approve_approval_request(
+    assert!(should_auto_approve_approval_request(
         &app,
         "exec_shell",
         "shell:exec_shell:cargo test",
         false,
     ));
+    assert!(!should_auto_approve_approval_request(
+        &app,
+        "exec_shell",
+        "shell:exec_shell:cargo test",
+        true,
+    ));
+    assert!(should_auto_deny_forced_approval_request(&app, true));
 
     app.approval_mode = ApprovalMode::Suggest;
     app.mode = AppMode::Yolo;
-    assert!(!should_auto_approve_approval_request(
+    assert!(should_auto_approve_approval_request(
         &app,
         "exec_shell",
         "shell:exec_shell:cargo test",
         false,
     ));
+    assert!(!should_auto_approve_approval_request(
+        &app,
+        "exec_shell",
+        "shell:exec_shell:cargo test",
+        true,
+    ));
+    assert!(should_auto_deny_forced_approval_request(&app, true));
 
     app.mode = AppMode::Agent;
     app.approval_session_approved
@@ -1956,6 +3022,7 @@ fn approval_request_uses_session_cache_not_current_mode_shortcut() {
         "shell:exec_shell:cargo test",
         false,
     ));
+    assert!(!should_auto_deny_forced_approval_request(&app, true));
 }
 
 #[test]
@@ -1974,6 +3041,30 @@ fn app_auto_approval_helper_covers_yolo_and_bypass_only() {
     app.approval_mode = ApprovalMode::Suggest;
     app.mode = AppMode::Yolo;
     assert!(app_auto_approve_enabled(&app));
+}
+
+#[test]
+fn auto_review_suppresses_stale_question_prompts_while_other_postures_allow_them() {
+    let mut app = create_test_app();
+    for (posture, expected) in [
+        (ApprovalMode::Suggest, false),
+        (ApprovalMode::Auto, true),
+        (ApprovalMode::Bypass, false),
+        (ApprovalMode::Never, false),
+    ] {
+        app.approval_mode = posture;
+        assert_eq!(
+            should_suppress_user_input_prompt(&app),
+            expected,
+            "{posture:?}"
+        );
+    }
+
+    // Compatibility shape: legacy Yolo hosts can carry a stale Auto enum,
+    // but their effective posture is Full Access, where questions are valid.
+    app.mode = AppMode::Yolo;
+    app.approval_mode = ApprovalMode::Auto;
+    assert!(!should_suppress_user_input_prompt(&app));
 }
 
 fn create_test_options() -> TuiOptions {
@@ -2087,6 +3178,7 @@ fn setup_runtime_preset_apply_persists_settings_config_and_state() {
     assert!(summary.contains("preset=ask-first"));
     let settings = Settings::load().expect("load saved settings");
     assert_eq!(settings.default_mode, "plan");
+    assert_eq!(settings.permission_posture.as_deref(), Some("ask"));
     assert_eq!(app.mode, AppMode::Plan);
     assert!(!app.allow_shell);
     assert_eq!(app.approval_mode, ApprovalMode::Suggest);
@@ -2113,6 +3205,345 @@ fn setup_runtime_preset_apply_persists_settings_config_and_state() {
     assert_eq!(
         saved_state.runtime_posture_source,
         codewhale_config::RuntimePostureSource::Confirmed
+    );
+}
+
+#[test]
+fn setup_runtime_preset_rolls_back_durable_and_live_state_when_state_save_fails() {
+    let _home = SettingsHomeGuard::new();
+    let config_path = crate::config_persistence::config_toml_path(None).expect("config path");
+    std::fs::create_dir_all(config_path.parent().expect("config parent"))
+        .expect("config parent exists");
+    std::fs::write(
+        &config_path,
+        "# keep exact bytes\napproval_policy = \"auto\"\nallow_shell = true\nsandbox_mode = \"workspace-write\"\n",
+    )
+    .expect("seed config");
+    let original_settings = Settings {
+        default_mode: "agent".to_string(),
+        permission_posture: Some("auto-review".to_string()),
+        ..Settings::default()
+    };
+    original_settings.save().expect("seed settings");
+
+    let config_before = std::fs::read(&config_path).expect("read config snapshot");
+    let settings_path = Settings::path().expect("settings path");
+    let settings_before = std::fs::read(&settings_path).expect("read settings snapshot");
+
+    let mut app = create_test_app();
+    app.config_path = Some(config_path.clone());
+    app.set_agent_runtime_baseline(true, false, ApprovalMode::Auto);
+    app.set_mode(AppMode::Agent);
+    let app_before = (
+        app.mode,
+        app.allow_shell,
+        app.trust_mode,
+        app.approval_mode,
+        app.approval_policy_locked(),
+    );
+    let mut config = Config {
+        approval_policy: Some("auto".to_string()),
+        allow_shell: Some(true),
+        sandbox_mode: Some("workspace-write".to_string()),
+        ..Config::default()
+    };
+    let config_before_live = (
+        config.approval_policy.clone(),
+        config.allow_shell,
+        config.sandbox_mode.clone(),
+    );
+
+    // SetupState::save is atomic; an existing directory at the destination
+    // forces the final persist to fail after config and settings were staged.
+    let state_path = codewhale_config::SetupState::path().expect("state path");
+    std::fs::create_dir_all(&state_path).expect("state path directory");
+    let error = apply_setup_runtime_preset(
+        &mut app,
+        &mut config,
+        crate::tui::setup::SetupRuntimePreset::AskFirst,
+        codewhale_config::SetupState::default(),
+    )
+    .expect_err("state persistence must fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("failed to persist setup runtime posture state"),
+        "{error:#}"
+    );
+    assert_eq!(std::fs::read(config_path).unwrap(), config_before);
+    assert_eq!(std::fs::read(settings_path).unwrap(), settings_before);
+    assert_eq!(
+        (
+            app.mode,
+            app.allow_shell,
+            app.trust_mode,
+            app.approval_mode,
+            app.approval_policy_locked(),
+        ),
+        app_before
+    );
+    assert_eq!(
+        (
+            config.approval_policy,
+            config.allow_shell,
+            config.sandbox_mode,
+        ),
+        config_before_live
+    );
+}
+
+#[test]
+fn setup_high_trust_persists_full_access_without_legacy_yolo_mode() {
+    let _home = SettingsHomeGuard::new();
+    let config_path = crate::config_persistence::config_toml_path(None).expect("config path");
+    std::fs::create_dir_all(config_path.parent().expect("config parent"))
+        .expect("config parent exists");
+    std::fs::write(
+        &config_path,
+        "# keep me\napproval_policy = \"on-request\"\nallow_shell = false\n",
+    )
+    .expect("seed config");
+
+    let mut app = create_test_app();
+    app.config_path = Some(config_path.clone());
+    let mut config = Config {
+        approval_policy: Some("on-request".to_string()),
+        ..Config::default()
+    };
+    let preset = crate::tui::setup::SetupRuntimePreset::HighTrustLocal;
+
+    apply_setup_runtime_preset(
+        &mut app,
+        &mut config,
+        preset,
+        codewhale_config::SetupState::default(),
+    )
+    .expect("apply high trust");
+
+    let settings = Settings::load().expect("load saved settings");
+    assert_eq!(settings.default_mode, "agent");
+    assert_eq!(settings.permission_posture.as_deref(), Some("full-access"));
+    assert_eq!(config.approval_policy, None);
+    assert_eq!(app.mode, AppMode::Agent);
+    assert_eq!(app.approval_mode, ApprovalMode::Bypass);
+    assert!(app.allow_shell);
+    assert!(app.trust_mode);
+
+    app.set_mode(AppMode::Plan);
+    assert!(!app.allow_shell);
+    assert_eq!(app.approval_mode, ApprovalMode::Suggest);
+    app.set_mode(AppMode::Agent);
+    assert!(app.allow_shell, "High Trust shell must survive Plan → Act");
+    assert!(app.trust_mode, "High Trust trust must survive Plan → Act");
+    assert_eq!(app.approval_mode, ApprovalMode::Bypass);
+
+    let body = std::fs::read_to_string(&config_path).expect("read saved config");
+    assert!(body.contains("# keep me"), "comment lost: {body}");
+    assert!(
+        !body.contains("approval_policy"),
+        "top-level policy would override the saved Full Access posture: {body}"
+    );
+}
+
+#[test]
+fn setup_high_trust_cannot_override_project_approval_policy() {
+    let _home = SettingsHomeGuard::new();
+    let config_path = crate::config_persistence::config_toml_path(None).expect("config path");
+    std::fs::create_dir_all(config_path.parent().expect("config parent"))
+        .expect("config parent exists");
+    std::fs::write(&config_path, "approval_policy = \"on-request\"\n").expect("root config");
+    let workspace = config_path
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("temporary home")
+        .join("project");
+    let project_dir = workspace.join(codewhale_config::CODEWHALE_APP_DIR);
+    std::fs::create_dir_all(&project_dir).expect("project config dir");
+    std::fs::write(
+        project_dir.join("config.toml"),
+        "approval_policy = \"never\"\n",
+    )
+    .expect("project config");
+
+    let mut app = create_test_app();
+    app.workspace = workspace;
+    app.config_path = Some(config_path.clone());
+    let mut config = Config {
+        approval_policy: Some("never".to_string()),
+        ..Config::default()
+    };
+
+    let error = apply_setup_runtime_preset(
+        &mut app,
+        &mut config,
+        crate::tui::setup::SetupRuntimePreset::HighTrustLocal,
+        codewhale_config::SetupState::default(),
+    )
+    .expect_err("project policy must control the live session");
+
+    assert!(
+        error.to_string().contains("project runtime configuration"),
+        "{error:#}"
+    );
+    assert_eq!(config.approval_policy.as_deref(), Some("never"));
+    assert!(
+        std::fs::read_to_string(config_path)
+            .expect("root config remains")
+            .contains("approval_policy = \"on-request\"")
+    );
+}
+
+#[test]
+fn project_runtime_provenance_only_blocks_values_startup_would_accept() {
+    let _home = SettingsHomeGuard::new();
+    let settings = Settings {
+        permission_posture: Some("ask".to_string()),
+        ..Settings::default()
+    };
+    settings.save().expect("save settings");
+
+    let workspace = Settings::path()
+        .expect("settings path")
+        .parent()
+        .expect("Codewhale home")
+        .parent()
+        .expect("temporary home")
+        .join("project");
+    let project_dir = workspace.join(codewhale_config::CODEWHALE_APP_DIR);
+    std::fs::create_dir_all(&project_dir).expect("project config dir");
+    let project_path = project_dir.join("config.toml");
+    std::fs::write(
+        &project_path,
+        "approval_policy = \"auto\"\nsandbox_mode = \"danger-full-access\"\nallow_shell = true\n",
+    )
+    .expect("project config");
+
+    let config = Config {
+        sandbox_mode: Some("read-only".to_string()),
+        ..Config::default()
+    };
+    assert_eq!(
+        config.approval_policy_control(None, None, &workspace),
+        crate::config::ApprovalPolicyControl::Unset,
+        "project Auto would loosen saved Ask and must not claim provenance"
+    );
+    assert_eq!(
+        config.allow_shell_control(None, None, &workspace),
+        crate::config::ShellAccessControl::Unset,
+        "project allow_shell=true is ignored by startup"
+    );
+    assert_eq!(
+        config.runtime_preset_blocker(None, None, &workspace),
+        None,
+        "ignored project escalations must not create a phantom preset blocker"
+    );
+
+    std::fs::write(
+        &project_path,
+        "approval_policy = \"never\"\nsandbox_mode = \"read-only\"\nallow_shell = false\n",
+    )
+    .expect("tightening project config");
+    assert_eq!(
+        config.approval_policy_control(None, None, &workspace),
+        crate::config::ApprovalPolicyControl::ProjectConfig
+    );
+    assert_eq!(
+        config.allow_shell_control(None, None, &workspace),
+        crate::config::ShellAccessControl::ProjectConfig
+    );
+    assert_eq!(
+        config.runtime_preset_blocker(None, None, &workspace),
+        Some("project runtime configuration")
+    );
+}
+
+#[test]
+fn saved_full_access_baseline_allows_project_approval_tightening() {
+    let _home = SettingsHomeGuard::new();
+    let settings = Settings {
+        permission_posture: Some("full-access".to_string()),
+        ..Settings::default()
+    };
+    settings.save().expect("save settings");
+
+    let workspace = Settings::path()
+        .expect("settings path")
+        .parent()
+        .expect("Codewhale home")
+        .parent()
+        .expect("temporary home")
+        .join("project");
+    let project_dir = workspace.join(codewhale_config::CODEWHALE_APP_DIR);
+    std::fs::create_dir_all(&project_dir).expect("project config dir");
+    std::fs::write(
+        project_dir.join("config.toml"),
+        "approval_policy = \"on-request\"\n",
+    )
+    .expect("project config");
+
+    assert_eq!(
+        Config::default().approval_policy_control(None, None, &workspace),
+        crate::config::ApprovalPolicyControl::ProjectConfig,
+        "Ask is a tightening from saved Full Access and owns the effective policy"
+    );
+}
+
+#[test]
+fn setup_presets_cannot_override_managed_runtime_requirements() {
+    let _home = SettingsHomeGuard::new();
+    let config_path = crate::config_persistence::config_toml_path(None).expect("config path");
+    std::fs::create_dir_all(config_path.parent().expect("config parent"))
+        .expect("config parent exists");
+    std::fs::write(&config_path, "# managed posture stays intact\n").expect("root config");
+    let requirements_path = config_path
+        .parent()
+        .expect("config parent")
+        .join("requirements.toml");
+    std::fs::write(
+        &requirements_path,
+        "allowed_approval_policies = [\"never\"]\nallowed_sandbox_modes = [\"read-only\"]\n",
+    )
+    .expect("requirements");
+
+    let mut app = create_test_app();
+    app.config_path = Some(config_path.clone());
+    app.allow_shell = false;
+    app.approval_mode = ApprovalMode::Never;
+    let mut config = Config {
+        approval_policy: Some("never".to_string()),
+        sandbox_mode: Some("read-only".to_string()),
+        allow_shell: Some(false),
+        requirements_path: Some(requirements_path.to_string_lossy().into_owned()),
+        ..Config::default()
+    };
+
+    for preset in [
+        crate::tui::setup::SetupRuntimePreset::AskFirst,
+        crate::tui::setup::SetupRuntimePreset::NormalAgent,
+        crate::tui::setup::SetupRuntimePreset::HighTrustLocal,
+    ] {
+        let error = apply_setup_runtime_preset(
+            &mut app,
+            &mut config,
+            preset,
+            codewhale_config::SetupState::default(),
+        )
+        .expect_err("managed requirements must win");
+        assert!(
+            error.to_string().contains("managed runtime requirements"),
+            "{error:#}"
+        );
+    }
+
+    assert_eq!(config.approval_policy.as_deref(), Some("never"));
+    assert_eq!(config.sandbox_mode.as_deref(), Some("read-only"));
+    assert_eq!(config.allow_shell, Some(false));
+    assert_eq!(app.approval_mode, ApprovalMode::Never);
+    assert!(!app.allow_shell);
+    assert_eq!(
+        std::fs::read_to_string(config_path).expect("root config"),
+        "# managed posture stays intact\n"
     );
 }
 
@@ -2231,6 +3662,7 @@ fn saved_session_with_messages(messages: Vec<Message>) -> SavedSession {
             total_tokens: 0,
             model: "deepseek-v4-pro".to_string(),
             model_provider: "deepseek".to_string(),
+            model_provider_id: None,
             workspace: PathBuf::from("/tmp/resume-recovery"),
             mode: Some("yolo".to_string()),
             cost: crate::session_manager::SessionCostSnapshot::default(),
@@ -2243,6 +3675,28 @@ fn saved_session_with_messages(messages: Vec<Message>) -> SavedSession {
         context_references: Vec::new(),
         artifacts: Vec::new(),
         work_state: None,
+        last_auto_route: None,
+    }
+}
+
+fn named_custom_session_config(name: &str, base_url: &str, model: &str) -> Config {
+    let mut custom = HashMap::new();
+    custom.insert(
+        name.to_string(),
+        ProviderConfig {
+            kind: Some("openai-compatible".to_string()),
+            base_url: Some(base_url.to_string()),
+            model: Some(model.to_string()),
+            ..ProviderConfig::default()
+        },
+    );
+    Config {
+        provider: Some(name.to_string()),
+        providers: Some(ProvidersConfig {
+            custom,
+            ..ProvidersConfig::default()
+        }),
+        ..Config::default()
     }
 }
 
@@ -2300,6 +3754,91 @@ fn apply_loaded_session_does_not_restore_slash_command_tail_as_retry_draft() {
 }
 
 #[test]
+fn apply_loaded_session_projects_subagent_handoff_without_retry_draft_or_user_cell() {
+    let mut app = create_test_app();
+    let payload = concat!(
+        "Implemented the resume projection.\nCheckpoint: focused tests pass.\n",
+        "<codewhale:subagent.done>{\"agent_id\":\"agent_resume\",\"name\":\"Tide\",",
+        "\"agent_type\":\"implementer\",\"status\":\"completed\",",
+        "\"summary_location\":\"previous_line\"}</codewhale:subagent.done>",
+    );
+    // Literal v0.9.0 persisted fixture: keep this independent from the current
+    // producer so a producer/parser drift cannot make the regression test
+    // self-fulfilling.
+    let persisted_handoff = Message {
+        role: "user".to_string(),
+        content: vec![
+            ContentBlock::Text {
+                text: format!(
+                    "<codewhale:runtime_event kind=\"subagent_completion\" visibility=\"internal\">\n\
+This is an internal runtime event, not user input. Use the sub-agent completion \
+data below to continue coordinating the current task. Do not tell the user they \
+pasted sentinels, do not explain the sentinel protocol, and do not quote the raw \
+XML unless the user explicitly asks to debug sub-agent internals.\n\n\
+{payload}\n\
+</codewhale:runtime_event>"
+                ),
+                cache_control: None,
+            },
+            ContentBlock::Text {
+                text: "<turn_meta>\nInput provenance: subagent_handoff\nInput authority: non_authoritative\n</turn_meta>".to_string(),
+                cache_control: None,
+            },
+        ],
+    };
+    let session = saved_session_with_messages(vec![
+        text_message("user", "Fix the resume regression"),
+        text_message("assistant", "I delegated the restore path."),
+        persisted_handoff,
+    ]);
+
+    let recovered =
+        apply_loaded_session(&mut app, &mut Config::default(), &session).expect("restore session");
+
+    assert!(!recovered);
+    assert!(app.input.is_empty());
+    assert!(app.queued_draft.is_none());
+    assert_eq!(app.api_messages.len(), 3);
+    assert!(app.api_messages.iter().any(|message| {
+        message.role == "user"
+            && message.content.iter().any(|block| {
+                matches!(block, ContentBlock::Text { text, .. } if text == "Fix the resume regression")
+            })
+    }));
+    let restored = crate::runtime_handoff::restored_subagent_checkpoint_display(
+        app.api_messages.last().expect("restored handoff"),
+    )
+    .expect("projected handoff");
+    assert!(restored.contains("Status: completed"));
+    assert!(restored.contains("Checkpoint: focused tests pass."));
+    assert!(!restored.contains("runtime_event"));
+    assert!(!restored.contains("subagent.done"));
+    let checkpoint_cell = app
+        .history
+        .iter()
+        .find(|cell| {
+            matches!(cell, HistoryCell::System { content } if content.contains("Status: completed"))
+        })
+        .expect("restored checkpoint Note cell");
+    let rendered = checkpoint_cell
+        .lines(28)
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    assert!(rendered.contains("Note"));
+    assert!(rendered.contains("Status: completed"));
+    assert!(
+        !rendered.contains('▎'),
+        "must not render with the user glyph"
+    );
+    assert!(!rendered.contains("runtime_event"));
+    assert!(app.history.iter().all(|cell| {
+        !matches!(cell, HistoryCell::User { content } if content.contains("agent_resume") || content.contains("runtime_event"))
+    }));
+}
+
+#[test]
 fn apply_loaded_session_resets_unpersisted_telemetry() {
     let mut app = create_test_app();
     app.session.session_cost = 1.25;
@@ -2316,6 +3855,7 @@ fn apply_loaded_session_resets_unpersisted_telemetry() {
     app.session.last_reasoning_replay_tokens = Some(12);
     app.push_turn_cache_record(crate::tui::app::TurnCacheRecord {
         provider: None,
+        provider_identity: None,
         model: None,
         auto_model: false,
         input_tokens: 120,
@@ -2784,13 +4324,64 @@ fn file_mentions_add_local_text_context_to_model_payload() {
     app.workspace = tmpdir.path().to_path_buf();
     let message = QueuedMessage::new("Summarize @guide.md".to_string(), None);
 
-    let content = queued_message_content_for_app(&app, &message, None);
+    let content = queued_message_content_for_app(&app, &message, None)
+        .expect("native queued message should remain dispatchable");
 
     assert!(content.starts_with("Summarize @guide.md"));
     assert!(content.contains("Local context from @mentions:"));
     assert!(content.contains("<file mention=\"@guide.md\""));
     assert!(content.contains("# Guide\nUse the fast path."));
     assert_eq!(message.display, "Summarize @guide.md");
+}
+
+#[test]
+fn persisted_queued_plugin_skill_is_denied_after_cross_process_revocation() {
+    let tmpdir = TempDir::new().expect("tempdir");
+    let workspace = tmpdir.path().join("workspace");
+    let plugins_root = tmpdir.path().join("plugins");
+    let plugin = plugins_root.join("queued-skill");
+    std::fs::create_dir_all(plugin.join("skills/queued")).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(
+        plugin.join("plugin.toml"),
+        "schema_version = 1\n[plugin]\nname = \"queued-skill\"\nversion = \"1.0.0\"\n[skills]\npath = \"skills\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        plugin.join("skills/queued/SKILL.md"),
+        "---\nname: queued\ndescription: Queue provenance test\n---\nDo the queued work.\n",
+    )
+    .unwrap();
+    let discovery = crate::plugins::discovery::DiscoveryConfig {
+        workspace: workspace.clone(),
+        user_plugins_dir: plugins_root,
+        workspace_plugins_dir: tmpdir.path().join("workspace-plugins-unused"),
+        builtin_plugin_dirs: Vec::new(),
+        state_path: tmpdir.path().join("plugin-state/state.json"),
+    };
+    let mut registry = crate::plugins::discovery::discover_with_config(&discovery);
+    registry.trust("queued-skill").unwrap();
+    registry.enable("queued-skill").unwrap();
+    let authority = registry.authority_for("queued-skill").unwrap();
+
+    let queued = QueuedMessage::new(
+        "finish it".to_string(),
+        Some("Do the queued work.".to_string()),
+    )
+    .with_skill_provenance(Some(authority));
+    let serialized = serde_json::to_string(&queued_ui_to_session(&queued)).unwrap();
+    let persisted: QueuedSessionMessage = serde_json::from_str(&serialized).unwrap();
+    let restored = queued_session_to_ui(persisted);
+    let mut app = create_test_app();
+    app.workspace = workspace;
+    assert!(queued_message_content_for_app(&app, &restored, None).is_ok());
+
+    let mut external = crate::plugins::discovery::discover_with_config(&discovery);
+    external.revoke_trust("queued-skill").unwrap();
+    let error = queued_message_content_for_app(&app, &restored, None)
+        .expect_err("persisted queued Skill must be denied after external revocation")
+        .to_string();
+    assert!(error.contains("disabled, revoked, or no longer matches"));
 }
 
 #[test]
@@ -2937,15 +4528,19 @@ fn saved_default_provider_syncs_back_to_runtime_config() {
 #[test]
 fn provider_picker_reselecting_active_provider_preserves_current_model() {
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Ollama;
+    app.set_provider_identity(ApiProvider::Ollama, "ollama");
     app.model = "deepseek-coder-v2:16b".to_string();
+    let config = Config {
+        provider: Some("ollama".to_string()),
+        ..Config::default()
+    };
 
     assert_eq!(
-        provider_picker_model_override(&app, ApiProvider::Ollama).as_deref(),
+        provider_picker_model_override(&app, &config, ApiProvider::Ollama).as_deref(),
         Some("deepseek-coder-v2:16b")
     );
     assert_eq!(
-        provider_picker_model_override(&app, ApiProvider::Deepseek),
+        provider_picker_model_override(&app, &config, ApiProvider::Deepseek),
         None
     );
 }
@@ -2961,6 +4556,7 @@ async fn provider_switch_clears_turn_cache_history() {
     let mut app = create_test_app();
     app.push_turn_cache_record(crate::tui::app::TurnCacheRecord {
         provider: None,
+        provider_identity: None,
         model: None,
         auto_model: false,
         input_tokens: 100,
@@ -3226,7 +4822,8 @@ async fn provider_switch_model_override_updates_target_provider_model_slot() {
         .expect("provider/model result");
     assert!(provider_model_result.contains("provider=deepseek"));
     assert!(provider_model_result.contains("model=deepseek-v4-flash"));
-    assert!(provider_model_result.contains("auth=present/local"));
+    assert!(provider_model_result.contains("auth=key saved · not checked"));
+    assert!(provider_model_result.contains("health=attemptable"));
     assert!(!provider_model_result.contains("deepseek-key"));
 }
 
@@ -3461,10 +5058,6 @@ async fn dispatch_user_message_failed_send_clears_loading_state() {
     let config = Config::default();
     drop(engine.rx_op);
 
-    // #4605: dispatch now spawns the async phase and reports errors via channel.
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    app.dispatch_error_tx = Some(tx);
-
     let result = dispatch_user_message(
         &mut app,
         &config,
@@ -3474,23 +5067,555 @@ async fn dispatch_user_message_failed_send_clears_loading_state() {
     .await;
 
     assert!(
-        result.is_ok(),
-        "dispatch_user_message returns Ok; the spawned task reports errors via channel"
+        result.is_err(),
+        "dispatch should fail when engine channel is closed"
     );
     assert!(
-        app.is_loading,
-        "loading state is set immediately in the sync prepare phase"
+        !app.is_loading,
+        "failed dispatch must not leave the composer in a permanent busy state"
+    );
+    assert!(app.last_send_at.is_none());
+    assert!(app.dispatch_started_at.is_none());
+    assert!(
+        app.pending_turn_route.is_none(),
+        "failed dispatch must not leave stale route telemetry"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn auto_dispatch_keeps_last_and_pending_receipts_aligned() {
+    let _env_lock = crate::test_support::lock_test_env();
+    let _deepseek = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
+    let _zai = crate::test_support::EnvVarGuard::set("ZAI_API_KEY", "zai-test-key");
+    let mut app = create_test_app();
+    app.set_provider_identity(ApiProvider::Zai, "zai");
+    app.set_model_selection("auto".to_string());
+    let config = Config {
+        provider: Some("zai".to_string()),
+        default_text_model: Some("auto".to_string()),
+        ..Default::default()
+    };
+    let engine = mock_engine_handle();
+
+    dispatch_user_message(
+        &mut app,
+        &config,
+        &engine.handle,
+        QueuedMessage::new("quick status".to_string(), None),
+    )
+    .await
+    .expect("Auto dispatch");
+
+    assert_eq!(
+        app.pending_turn_route
+            .as_ref()
+            .map(|(provider, model, auto)| (*provider, model.as_str(), *auto)),
+        Some((ApiProvider::Zai, crate::config::ZAI_GLM_5_TURBO_MODEL, true))
+    );
+    assert_eq!(
+        app.last_auto_route_receipt, app.pending_auto_route_receipt,
+        "the fallback inspector must never pair a newly resolved route with a stale receipt"
+    );
+    assert_eq!(
+        app.last_auto_route_receipt
+            .as_ref()
+            .map(|receipt| receipt.tier),
+        Some(crate::model_routing::AutoRouteTier::Fast)
+    );
+}
+
+#[tokio::test]
+async fn failed_paused_dispatch_preserves_app_checkpoint_state_and_engine_gate() {
+    let mut app = create_test_app();
+    app.pausable = true;
+    app.paused = true;
+    app.paused_quarry = Some("finish the paused audit".to_string());
+    app.hunt.quarry = None;
+    app.hunt.tokens_used = 7;
+    app.hunt.time_used_seconds = 11;
+    app.hunt.continuation_count = 2;
+    app.api_messages
+        .push(text_message("assistant", "existing conversation"));
+    app.add_message(HistoryCell::System {
+        content: "existing transcript".to_string(),
+    });
+    let before_messages = app.api_messages.clone();
+    let before_history = format!("{:?}", app.history);
+    let before_context_references = app.session_context_references.clone();
+    let before_system_prompt = app.system_prompt.clone();
+    let before_last_prompt = app.last_submitted_prompt.clone();
+    let engine = mock_engine_handle();
+    engine.handle.set_paused(true);
+    drop(engine.rx_op);
+
+    dispatch_user_message(
+        &mut app,
+        &Config::default(),
+        &engine.handle,
+        QueuedMessage::new("please continue".to_string(), None),
+    )
+    .await
+    .expect_err("closed engine mailbox must reject the paused dispatch");
+
+    assert!(app.paused);
+    assert!(app.pausable);
+    assert_eq!(
+        app.paused_quarry.as_deref(),
+        Some("finish the paused audit")
+    );
+    assert!(app.hunt.quarry.is_none());
+    assert_eq!(app.hunt.tokens_used, 7);
+    assert_eq!(app.hunt.time_used_seconds, 11);
+    assert_eq!(app.hunt.continuation_count, 2);
+    assert!(engine.handle.is_paused());
+    assert_eq!(app.api_messages, before_messages);
+    assert_eq!(format!("{:?}", app.history), before_history);
+    assert_eq!(app.session_context_references, before_context_references);
+    assert_eq!(app.system_prompt, before_system_prompt);
+    assert_eq!(app.last_submitted_prompt, before_last_prompt);
+    assert!(!app.is_loading);
+    assert!(app.dispatch_started_at.is_none());
+    assert!(app.last_send_at.is_none());
+    assert!(app.pending_turn_route.is_none());
+}
+
+#[tokio::test]
+async fn paused_dispatch_at_compaction_threshold_enqueues_one_atomic_send() {
+    let mut app = create_test_app();
+    app.pausable = true;
+    app.paused = true;
+    app.paused_quarry = Some("finish the paused audit".to_string());
+    app.hunt.quarry = None;
+    app.auto_compact_user_configured = true;
+    app.auto_compact = true;
+    app.auto_compact_threshold_percent = 10.0;
+    app.api_messages = vec![text_message("assistant", &"context ".repeat(240_000))];
+    let planned_compaction =
+        app.compaction_config_for_route(app.api_provider, &app.model, app.active_route_limits);
+    assert!(
+        should_auto_compact_before_send_with_config(&app, &planned_compaction),
+        "fixture must already require compaction"
     );
 
-    // Wait for the spawned task to report the error.
-    let err_msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-        .await
-        .expect("spawned dispatch should report error within timeout")
-        .expect("channel should receive error message");
+    let mut engine = mock_engine_handle();
+    engine.handle.set_paused(true);
+    dispatch_user_message(
+        &mut app,
+        &Config::default(),
+        &engine.handle,
+        QueuedMessage::new("please continue".to_string(), None),
+    )
+    .await
+    .expect("atomic paused dispatch");
+
+    match engine.rx_op.recv().await.expect("single send operation") {
+        Op::SendMessage {
+            compaction,
+            goal_objective,
+            ..
+        } => {
+            assert!(compaction.enabled);
+            assert_eq!(goal_objective.as_deref(), Some("finish the paused audit"));
+        }
+        other => panic!("expected SendMessage, got {other:?}"),
+    }
     assert!(
-        err_msg.contains("Dispatch failed"),
-        "error message should indicate dispatch failure: {err_msg}"
+        engine.rx_op.try_recv().is_err(),
+        "route-bound compaction must travel inside the one SendMessage op"
     );
+    assert!(!app.paused);
+    assert!(!engine.handle.is_paused());
+}
+
+#[tokio::test]
+async fn real_engine_client_preflight_failure_leaves_dispatch_state_atomic() {
+    let mut config =
+        named_custom_session_config("lm-studio", "http://127.0.0.1:1234/v1", "local-model");
+    config
+        .providers
+        .as_mut()
+        .expect("providers")
+        .custom
+        .get_mut("lm-studio")
+        .expect("lm-studio")
+        .insecure_skip_tls_verify = Some(true);
+    let mut app = create_test_app();
+    app.set_provider_identity(ApiProvider::Custom, "lm-studio");
+    app.set_model_selection("local-model".to_string());
+    let (_engine, handle) = crate::core::engine::Engine::new(EngineConfig::default(), &config);
+
+    let err = dispatch_user_message(
+        &mut app,
+        &config,
+        &handle,
+        QueuedMessage::new("keep this retryable".to_string(), None),
+    )
+    .await
+    .expect_err("real engine routes must preflight their concrete client");
+
+    assert!(
+        err.to_string()
+            .contains("Failed to configure provider route")
+    );
+    assert!(!app.is_loading);
+    assert!(app.dispatch_started_at.is_none());
+    assert!(app.last_send_at.is_none());
+    assert!(app.last_submitted_prompt.is_none());
+    assert!(app.api_messages.is_empty());
+    assert!(app.history.is_empty());
+    assert!(app.pending_turn_route.is_none());
+}
+
+#[tokio::test]
+async fn immediate_submit_closed_mailbox_restores_composer_and_skill() {
+    let mut app = create_test_app();
+    app.input = "retry this exactly".to_string();
+    app.cursor_position = app.input.chars().count();
+    app.active_skill = Some("keep the selected skill".to_string());
+    let input = app
+        .handle_composer_enter()
+        .expect("non-empty composer should submit");
+    let queued = build_queued_message(&mut app, input);
+    assert!(app.input.is_empty());
+    assert!(app.active_skill.is_none());
+
+    let engine = mock_engine_handle();
+    drop(engine.rx_op);
+
+    submit_or_steer_message(&mut app, &Config::default(), &engine.handle, queued)
+        .await
+        .expect("UI submit failures must remain inside the TUI");
+
+    assert_eq!(app.input, "retry this exactly");
+    assert_eq!(app.cursor_position, app.input.chars().count());
+    assert_eq!(app.active_skill.as_deref(), Some("keep the selected skill"));
+    assert!(!app.is_loading);
+    assert!(app.status_message.as_deref().is_some_and(|status| {
+        status.contains("Message not sent") && status.contains("restored to composer")
+    }));
+    let sticky = app
+        .sticky_status
+        .as_ref()
+        .expect("dispatch failure should stay visible");
+    assert_eq!(sticky.level, StatusToastLevel::Error);
+    assert!(sticky.ttl_ms.is_none());
+}
+
+#[tokio::test]
+async fn immediate_submit_custom_provider_preflight_restores_exact_message() {
+    let mut config =
+        named_custom_session_config("lm-studio", "http://127.0.0.1:1234/v1", "local-model");
+    config
+        .providers
+        .as_mut()
+        .expect("providers")
+        .custom
+        .get_mut("lm-studio")
+        .expect("lm-studio")
+        .insecure_skip_tls_verify = Some(true);
+    let mut app = create_test_app();
+    app.set_provider_identity(ApiProvider::Custom, "lm-studio");
+    app.set_model_selection("local-model".to_string());
+    app.input = "preserve 用户 input".to_string();
+    app.cursor_position = app.input.chars().count();
+    let input = app
+        .handle_composer_enter()
+        .expect("non-empty composer should submit");
+    let queued = build_queued_message(&mut app, input);
+    let (_engine, handle) = crate::core::engine::Engine::new(EngineConfig::default(), &config);
+
+    submit_or_steer_message(&mut app, &config, &handle, queued)
+        .await
+        .expect("provider preflight failures must remain inside the TUI");
+
+    assert_eq!(app.input, "preserve 用户 input");
+    assert_eq!(app.cursor_position, app.input.chars().count());
+    assert!(app.api_messages.is_empty());
+    assert!(app.history.is_empty());
+    assert!(app.last_submitted_prompt.is_none());
+    assert!(app.status_message.as_deref().is_some_and(|status| {
+        status.contains("Failed to configure provider route")
+            && status.contains("restored to composer")
+    }));
+}
+
+#[tokio::test]
+async fn dispatch_uses_app_owned_exact_custom_identity_when_config_selector_drifts() {
+    let mut custom = HashMap::new();
+    for (name, base_url, model) in [
+        ("custom-a", "http://127.0.0.1:18181/v1", "model-a"),
+        ("custom-b", "http://127.0.0.1:18182/v1", "model-b"),
+    ] {
+        custom.insert(
+            name.to_string(),
+            ProviderConfig {
+                kind: Some("openai-compatible".to_string()),
+                base_url: Some(base_url.to_string()),
+                model: Some(model.to_string()),
+                api_key: Some(format!("{name}-test-key")),
+                ..Default::default()
+            },
+        );
+    }
+    let config = Config {
+        // Simulate a picker/config overlay that has moved ahead to B while
+        // App and the active engine still own A.
+        provider: Some("custom-b".to_string()),
+        providers: Some(ProvidersConfig {
+            custom,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut app = create_test_app();
+    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    app.set_model_selection("model-a".to_string());
+    let mut engine = mock_engine_handle();
+
+    dispatch_user_message(
+        &mut app,
+        &config,
+        &engine.handle,
+        QueuedMessage::new("stay on A".to_string(), None),
+    )
+    .await
+    .expect("dispatch exact App-owned route");
+
+    match engine.rx_op.recv().await.expect("send message op") {
+        Op::SendMessage { route, .. } => {
+            assert_eq!(route.identity.provider, ApiProvider::Custom);
+            assert_eq!(route.identity.key, "custom-a");
+            assert_eq!(route.identity.exact_id.as_deref(), Some("custom-a"));
+            assert_eq!(route.model, "model-a");
+            assert_eq!(
+                route.config.deepseek_base_url(),
+                "http://127.0.0.1:18181/v1"
+            );
+        }
+        other => panic!("expected SendMessage, got {other:?}"),
+    }
+    assert_eq!(config.provider.as_deref(), Some("custom-b"));
+}
+
+#[tokio::test]
+async fn dispatch_idless_custom_identity_keeps_legacy_root_over_literal_table() {
+    let config = Config {
+        provider: Some("custom".to_string()),
+        api_key: Some("legacy-root-test-key".to_string()),
+        base_url: Some("http://127.0.0.1:18180/v1".to_string()),
+        default_text_model: Some("legacy-root-model".to_string()),
+        providers: Some(ProvidersConfig {
+            custom: HashMap::from([(
+                "custom".to_string(),
+                ProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    api_key: Some("literal-table-test-key".to_string()),
+                    base_url: Some("http://127.0.0.1:18181/v1".to_string()),
+                    model: Some("literal-table-model".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut app = create_test_app();
+    app.set_provider_identity(ApiProvider::Custom, "custom");
+    app.set_model_selection("legacy-root-model".to_string());
+    let mut engine = mock_engine_handle();
+
+    dispatch_user_message(
+        &mut app,
+        &config,
+        &engine.handle,
+        QueuedMessage::new("keep the released root route".to_string(), None),
+    )
+    .await
+    .expect("dispatch idless legacy root route");
+
+    match engine.rx_op.recv().await.expect("send message op") {
+        Op::SendMessage { route, .. } => {
+            assert_eq!(route.identity.provider, ApiProvider::Custom);
+            assert_eq!(route.identity.key, "custom");
+            assert_eq!(route.identity.exact_id, None);
+            assert_eq!(route.model, "legacy-root-model");
+            assert_eq!(
+                route.config.deepseek_base_url(),
+                "http://127.0.0.1:18180/v1"
+            );
+            assert!(
+                route
+                    .config
+                    .providers
+                    .as_ref()
+                    .is_none_or(|providers| !providers.custom.contains_key("custom"))
+            );
+        }
+        other => panic!("expected SendMessage, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn failed_real_preflight_preserves_paused_command_state_and_engine_gate() {
+    let mut config =
+        named_custom_session_config("lm-studio", "http://127.0.0.1:1234/v1", "local-model");
+    config
+        .providers
+        .as_mut()
+        .expect("providers")
+        .custom
+        .get_mut("lm-studio")
+        .expect("lm-studio")
+        .insecure_skip_tls_verify = Some(true);
+    let mut app = create_test_app();
+    app.set_provider_identity(ApiProvider::Custom, "lm-studio");
+    app.set_model_selection("local-model".to_string());
+    app.paused = true;
+    app.pausable = true;
+    app.paused_quarry = Some("finish the paused audit".to_string());
+    app.hunt.quarry = None;
+    app.hunt.tokens_used = 7;
+    app.hunt.time_used_seconds = 11;
+    app.hunt.continuation_count = 2;
+    let (_engine, handle) = crate::core::engine::Engine::new(EngineConfig::default(), &config);
+    handle.set_paused(true);
+
+    dispatch_user_message(
+        &mut app,
+        &config,
+        &handle,
+        QueuedMessage::new("please continue".to_string(), None),
+    )
+    .await
+    .expect_err("invalid client must fail before changing pause state");
+
+    assert!(app.paused);
+    assert!(app.pausable);
+    assert_eq!(
+        app.paused_quarry.as_deref(),
+        Some("finish the paused audit")
+    );
+    assert!(app.hunt.quarry.is_none());
+    assert_eq!(app.hunt.tokens_used, 7);
+    assert_eq!(app.hunt.time_used_seconds, 11);
+    assert_eq!(app.hunt.continuation_count, 2);
+    assert!(handle.is_paused());
+    assert!(app.api_messages.is_empty());
+    assert!(app.history.is_empty());
+}
+
+#[test]
+fn logout_memory_clear_respects_named_and_legacy_custom_scopes() {
+    let mut named_app = create_test_app();
+    named_app.set_provider_identity(ApiProvider::Custom, "lm-studio");
+    let mut named_config = Config {
+        provider: Some("lm-studio".to_string()),
+        api_key: Some("deepseek-root-key".to_string()),
+        providers: Some(ProvidersConfig {
+            custom: HashMap::from([(
+                "lm-studio".to_string(),
+                ProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    api_key: Some("named-key".to_string()),
+                    base_url: Some("http://127.0.0.1:18181/v1".to_string()),
+                    model: Some("local-model".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    clear_active_provider_api_key_from_memory(&named_app, &mut named_config);
+
+    assert_eq!(named_config.api_key.as_deref(), Some("deepseek-root-key"));
+    assert_eq!(
+        named_config
+            .providers
+            .as_ref()
+            .and_then(|providers| providers.custom.get("lm-studio"))
+            .and_then(|provider| provider.api_key.as_deref()),
+        None
+    );
+
+    let mut legacy_app = create_test_app();
+    legacy_app.set_provider_identity(ApiProvider::Custom, "custom");
+    let mut legacy_config = Config {
+        provider: Some("custom".to_string()),
+        api_key: Some("legacy-key".to_string()),
+        base_url: Some("http://127.0.0.1:18180/v1".to_string()),
+        default_text_model: Some("legacy-model".to_string()),
+        ..Default::default()
+    };
+
+    clear_active_provider_api_key_from_memory(&legacy_app, &mut legacy_config);
+
+    assert_eq!(legacy_config.api_key, None);
+    assert!(legacy_config.providers.is_none());
+}
+
+#[test]
+fn auto_routed_turn_compaction_uses_selected_route_not_stale_app_route() {
+    let mut app = create_test_app();
+    app.auto_model = true;
+    app.model = "auto".to_string();
+    app.api_provider = ApiProvider::Deepseek;
+    app.active_route_limits = Some(codewhale_config::route::RouteLimits {
+        context_tokens: Some(32_000),
+        ..Default::default()
+    });
+    app.auto_compact_threshold_percent = 75.0;
+
+    let config = Config {
+        provider: Some("openrouter".to_string()),
+        providers: Some(ProvidersConfig {
+            openrouter: ProviderConfig {
+                api_key: Some("test-openrouter-key".to_string()),
+                model: Some("vendor/model-b".to_string()),
+                context_window: Some(196_000),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let route = resolve_runtime_route(&config, ApiProvider::Openrouter, Some("vendor/model-b"))
+        .expect("resolve auto-selected route")
+        .validate()
+        .expect("preflight auto-selected route");
+    let route_limits = crate::route_budget::known_route_limits(route.candidate.limits());
+
+    let compaction =
+        app.compaction_config_for_route(route.identity.provider, &route.model, route_limits);
+
+    assert_eq!(compaction.model, "vendor/model-b");
+    assert_eq!(compaction.effective_context_window, Some(196_000));
+    assert_eq!(
+        compaction.token_threshold,
+        crate::route_budget::compaction_threshold_for_route_at_percent(
+            ApiProvider::Openrouter,
+            "vendor/model-b",
+            route_limits,
+            75.0,
+        )
+    );
+    assert_ne!(compaction, app.compaction_config());
+
+    let pre_send_compact = crate::core::ops::Op::CompactContext {
+        route: Box::new(route.into_resolved()),
+        compaction: Box::new(compaction.clone()),
+    };
+    match pre_send_compact {
+        crate::core::ops::Op::CompactContext { route, compaction } => {
+            assert_eq!(route.identity.provider, ApiProvider::Openrouter);
+            assert_eq!(route.model, "vendor/model-b");
+            assert_eq!(compaction.model, "vendor/model-b");
+            assert_eq!(compaction.effective_context_window, Some(196_000));
+        }
+        other => panic!("expected route-bound compact op, got {other:?}"),
+    }
 }
 
 #[cfg(not(windows))]
@@ -3619,6 +5744,59 @@ printf '%s\n' '{"text":"after soft failure"}'
         }
         other => panic!("expected SendMessage, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn dispatch_route_failure_leaves_loading_and_transcript_unchanged() {
+    let mut app = create_test_app();
+    app.set_provider_identity(ApiProvider::Custom, "lm-studio");
+    app.set_model_selection("local-model".to_string());
+    app.api_messages
+        .push(text_message("assistant", "existing conversation"));
+    app.add_message(HistoryCell::System {
+        content: "existing receipt".to_string(),
+    });
+    let mut custom = HashMap::new();
+    custom.insert(
+        "lm-studio".to_string(),
+        ProviderConfig {
+            kind: Some("openai-compatible".to_string()),
+            base_url: Some("ftp://invalid.example/v1".to_string()),
+            model: Some("local-model".to_string()),
+            api_key: Some("local-test-key".to_string()),
+            ..ProviderConfig::default()
+        },
+    );
+    let config = Config {
+        provider: Some("lm-studio".to_string()),
+        providers: Some(ProvidersConfig {
+            custom,
+            ..ProvidersConfig::default()
+        }),
+        ..Config::default()
+    };
+    let mut engine = mock_engine_handle();
+
+    let err = dispatch_user_message(
+        &mut app,
+        &config,
+        &engine.handle,
+        QueuedMessage::new("do not duplicate me".to_string(), None),
+    )
+    .await
+    .expect_err("malformed named custom route must fail closed");
+
+    assert!(err.to_string().contains("http"), "{err}");
+    assert!(!app.is_loading);
+    assert!(app.dispatch_started_at.is_none());
+    assert!(app.last_send_at.is_none());
+    assert_eq!(app.api_messages.len(), 1);
+    assert_eq!(app.history.len(), 1);
+    assert!(matches!(
+        &app.history[0],
+        HistoryCell::System { content } if content == "existing receipt"
+    ));
+    assert!(engine.rx_op.try_recv().is_err());
 }
 
 #[cfg(not(windows))]
@@ -3937,6 +6115,66 @@ fn apply_goal_snapshot_updates_visible_goal_status() {
 }
 
 #[test]
+fn canonical_goal_clear_wins_after_stale_active_snapshot() {
+    let mut app = create_test_app();
+    let stale_active = crate::tools::goal::GoalSnapshot {
+        objective: Some("Goal cleared while the prior turn finished".to_string()),
+        status: "active".to_string(),
+        token_budget: Some(10_000),
+        tokens_used: 500,
+        time_used_seconds: 5,
+        continuation_count: 2,
+        elapsed_seconds: Some(5),
+        evidence: None,
+        blocker: None,
+        completion_verification: None,
+    };
+    assert!(apply_goal_snapshot_to_app(&mut app, &stale_active));
+    assert!(app.hunt.quarry.is_some());
+
+    // SetGoalStatus(clear) is processed after the prior turn's active update.
+    // Its canonical empty snapshot must be observable and win the replay.
+    let cleared = crate::tools::goal::GoalSnapshot {
+        objective: None,
+        status: "none".to_string(),
+        token_budget: None,
+        tokens_used: 0,
+        time_used_seconds: 0,
+        continuation_count: 0,
+        elapsed_seconds: None,
+        evidence: None,
+        blocker: None,
+        completion_verification: None,
+    };
+    assert!(apply_goal_snapshot_to_app(&mut app, &cleared));
+    assert!(app.hunt.quarry.is_none());
+    assert!(app.hunt.token_budget.is_none());
+    assert_eq!(app.hunt.tokens_used, 0);
+    assert_eq!(app.hunt.time_used_seconds, 0);
+    assert_eq!(app.hunt.continuation_count, 0);
+    assert!(app.hunt.started_at.is_none());
+    assert!(app.hunt.finished_at.is_none());
+    assert_eq!(app.hunt.verdict, crate::tui::app::HuntVerdict::Hunting);
+    assert!(
+        !apply_goal_snapshot_to_app(&mut app, &cleared),
+        "replaying the same clear receipt must be idempotent"
+    );
+
+    // Only the exact empty/none pair is a clear. A malformed objective-less
+    // active update must not erase subsequently visible goal state.
+    assert!(apply_goal_snapshot_to_app(&mut app, &stale_active));
+    let malformed = crate::tools::goal::GoalSnapshot {
+        status: "active".to_string(),
+        ..cleared
+    };
+    assert!(!apply_goal_snapshot_to_app(&mut app, &malformed));
+    assert_eq!(
+        app.hunt.quarry.as_deref(),
+        Some("Goal cleared while the prior turn finished")
+    );
+}
+
+#[test]
 fn apply_goal_snapshot_resume_clears_frozen_timer() {
     let mut app = create_test_app();
     app.hunt.quarry = Some("Ship the release lane".to_string());
@@ -4064,6 +6302,8 @@ fn turn_liveness_watchdog_clears_stale_dispatch() {
     app.dispatch_started_at =
         Some(Instant::now() - DISPATCH_WATCHDOG_TIMEOUT - Duration::from_millis(1));
     app.turn_started_at = Some(Instant::now());
+    app.pending_turn_route = Some((ApiProvider::Deepseek, "pending-model".to_string(), false));
+    app.suppress_stream_events_until_turn_complete = true;
 
     let recovered = reconcile_turn_liveness(&mut app, Instant::now(), false);
 
@@ -4071,6 +6311,9 @@ fn turn_liveness_watchdog_clears_stale_dispatch() {
     assert!(!app.is_loading);
     assert!(app.dispatch_started_at.is_none());
     assert!(app.turn_started_at.is_none());
+    assert!(app.pending_turn_route.is_none());
+    assert!(app.active_turn.is_none());
+    assert!(!app.suppress_stream_events_until_turn_complete);
     let toast = app.status_toasts.back().expect("watchdog toast");
     assert_eq!(toast.level, StatusToastLevel::Error);
     assert!(toast.text.contains("Turn dispatch timed out"));
@@ -4201,6 +6444,52 @@ fn turn_liveness_does_not_abort_running_tool_with_recent_heartbeat() {
 }
 
 #[test]
+fn turn_liveness_keeps_max_duration_exec_shell_wait_alive_with_heartbeat() {
+    // `exec_shell_wait` accepts exactly 600_000ms. Before the heartbeat was
+    // restored, that supported boundary raced the identically timed tool-hang
+    // watchdog and falsely made the UI idle while the engine still owned the
+    // turn.
+    const EXEC_SHELL_WAIT_MAX: Duration =
+        Duration::from_millis(crate::tools::shell::EXEC_SHELL_WAIT_MAX_TIMEOUT_MS);
+    assert_eq!(TOOL_HANG_WATCHDOG_TIMEOUT, EXEC_SHELL_WAIT_MAX);
+
+    let mut app = create_test_app();
+    let started_at = Instant::now();
+    let wait_deadline = started_at + EXEC_SHELL_WAIT_MAX;
+    let now = wait_deadline + Duration::from_secs(1);
+    app.is_loading = true;
+    app.runtime_turn_status = Some("in_progress".to_string());
+    app.runtime_turn_id = Some("max-shell-wait-turn".to_string());
+    app.turn_started_at = Some(started_at);
+    app.turn_last_activity_at = Some(started_at);
+    let mut active = ActiveCell::new();
+    active.push_tool(
+        "shell-wait",
+        HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: "exec_shell_wait".to_string(),
+            status: ToolStatus::Running,
+            input_summary: Some("task_id: shell-test, wait: true, timeout_ms: 600000".to_string()),
+            output: None,
+            prompts: None,
+            spillover_path: None,
+            output_summary: None,
+            is_diff: false,
+        })),
+    );
+    app.active_cell = Some(active);
+
+    record_turn_activity(&mut app, &EngineEvent::ToolCallHeartbeat, wait_deadline);
+    let recovered = reconcile_turn_liveness(&mut app, now, false);
+
+    assert!(!recovered);
+    assert!(app.is_loading);
+    assert_eq!(app.runtime_turn_status.as_deref(), Some("in_progress"));
+    assert_eq!(app.runtime_turn_id.as_deref(), Some("max-shell-wait-turn"));
+    assert!(app.status_message.is_none());
+    assert!(app.status_toasts.is_empty());
+}
+
+#[test]
 fn turn_liveness_respects_stream_idle_budget_for_quiet_model_waits() {
     let mut app = create_test_app();
     let started_at = Instant::now();
@@ -4269,6 +6558,18 @@ fn turn_liveness_recovers_stalled_in_progress_turn() {
     app.turn_started_at = Some(now - turn_stall_watchdog_timeout(&app) - Duration::from_millis(1));
     app.streaming_message_index = Some(0);
     app.user_scrolled_during_stream = true;
+    app.pending_turn_route = Some((ApiProvider::Deepseek, "pending-model".to_string(), false));
+    app.active_turn = Some(crate::tui::app::ActiveTurnMetadata {
+        turn_id: "stale-turn-id".to_string(),
+        created_at: chrono::Utc::now(),
+        route: Some(crate::core::events::TurnRoute {
+            provider: ApiProvider::Openai,
+            provider_identity: "openai".to_string(),
+            model: "gpt-5.5".to_string(),
+            auto_model: false,
+        }),
+        auto_route_receipt: None,
+    });
 
     let recovered = reconcile_turn_liveness(&mut app, now, false);
 
@@ -4281,6 +6582,9 @@ fn turn_liveness_recovers_stalled_in_progress_turn() {
     assert!(app.streaming_message_index.is_none());
     assert!(app.streaming_thinking_active_entry.is_none());
     assert!(!app.user_scrolled_during_stream);
+    assert!(app.pending_turn_route.is_none());
+    assert!(app.active_turn.is_none());
+    assert!(!app.suppress_stream_events_until_turn_complete);
     let toast = app.status_toasts.back().expect("stall toast");
     assert_eq!(toast.level, StatusToastLevel::Error);
     assert!(toast.text.contains("Turn stalled"));
@@ -4295,6 +6599,18 @@ fn engine_event_disconnect_recovers_live_turn_immediately() {
     app.turn_started_at = Some(Instant::now());
     app.dispatch_started_at = Some(Instant::now());
     app.user_scrolled_during_stream = true;
+    app.pending_turn_route = Some((ApiProvider::Deepseek, "pending-model".to_string(), false));
+    app.active_turn = Some(crate::tui::app::ActiveTurnMetadata {
+        turn_id: "turn_dead".to_string(),
+        created_at: chrono::Utc::now(),
+        route: Some(crate::core::events::TurnRoute {
+            provider: ApiProvider::Openai,
+            provider_identity: "openai".to_string(),
+            model: "gpt-5.5".to_string(),
+            auto_model: false,
+        }),
+        auto_route_receipt: None,
+    });
     let thinking_idx = crate::tui::streaming_thinking::ensure_active_entry(&mut app);
     crate::tui::streaming_thinking::append(&mut app, thinking_idx, "partial reasoning");
     app.push_pending_steer(crate::tui::app::QueuedMessage::new(
@@ -4312,6 +6628,9 @@ fn engine_event_disconnect_recovers_live_turn_immediately() {
     assert!(app.turn_started_at.is_none());
     assert!(app.streaming_thinking_active_entry.is_none());
     assert!(!app.user_scrolled_during_stream);
+    assert!(app.pending_turn_route.is_none());
+    assert!(app.active_turn.is_none());
+    assert!(!app.suppress_stream_events_until_turn_complete);
     assert_eq!(app.queued_message_count(), 1);
     assert_eq!(
         app.queued_messages
@@ -4340,6 +6659,34 @@ fn engine_event_disconnect_while_idle_is_noop() {
     assert!(!recovered);
     assert!(app.history.is_empty());
     assert!(app.status_toasts.is_empty());
+}
+
+#[test]
+fn engine_event_disconnect_cleans_cancelled_turn_metadata() {
+    let mut app = create_test_app();
+    app.suppress_stream_events_until_turn_complete = true;
+    app.active_turn = Some(crate::tui::app::ActiveTurnMetadata {
+        turn_id: "cancelled-turn".to_string(),
+        created_at: chrono::Utc::now(),
+        route: Some(crate::core::events::TurnRoute {
+            provider: ApiProvider::Openai,
+            provider_identity: "openai".to_string(),
+            model: "gpt-5.5".to_string(),
+            auto_model: false,
+        }),
+        auto_route_receipt: None,
+    });
+
+    let recovered = recover_engine_event_disconnect(&mut app);
+
+    assert!(recovered);
+    assert!(app.active_turn.is_none());
+    assert!(!app.suppress_stream_events_until_turn_complete);
+    assert!(app.history.iter().any(|cell| matches!(
+        cell,
+        HistoryCell::Error { message, .. }
+            if message.contains("Engine stopped before completing the turn")
+    )));
 }
 
 #[test]
@@ -4845,30 +7192,9 @@ fn sidebar_auto_idle_false_for_explicit_focus() {
 }
 
 #[test]
-fn jobs_panel_ignores_model_reasoning_but_shows_for_real_jobs() {
+fn jobs_panel_ignores_completed_history_but_shows_for_real_jobs() {
     let mut app = create_test_app();
     app.sidebar_focus = SidebarFocus::Auto;
-
-    // Per-turn model reasoning must NOT bring the jobs/tasks panel up — an
-    // ordinary reasoning turn stays idle (full-width transcript).
-    app.task_panel = vec![crate::tui::app::TaskPanelEntry {
-        id: "reasoning".to_string(),
-        status: "running".to_string(),
-        prompt_summary: "thinking".to_string(),
-        duration_ms: None,
-        kind: crate::tui::app::TaskPanelEntryKind::ModelReasoning,
-        stale: false,
-        elapsed_since_output_ms: None,
-        owner_agent_id: None,
-        owner_agent_name: None,
-        current_tool: None,
-        role: None,
-        files_touched: 0,
-    }];
-    assert!(
-        crate::tui::sidebar::sidebar_auto_idle(&mut app),
-        "model reasoning alone must not surface the jobs panel"
-    );
 
     // Completed background history must not reopen the auto Tasks panel.
     app.task_panel.push(crate::tui::app::TaskPanelEntry {
@@ -4909,6 +7235,16 @@ fn jobs_panel_ignores_model_reasoning_but_shows_for_real_jobs() {
         !crate::tui::sidebar::sidebar_auto_idle(&mut app),
         "a live background job must surface the jobs panel"
     );
+}
+
+#[test]
+fn background_receipt_tip_only_detects_a_visible_active_to_completed_transition() {
+    let active = HashSet::from(["task_running", "shell_running"]);
+    assert!(newly_completed_id(
+        active.clone(),
+        ["task_old", "task_running"]
+    ));
+    assert!(!newly_completed_id(active, ["task_old", "task_unseen"]));
 }
 
 #[test]
@@ -5290,6 +7626,21 @@ fn subagent_status_from_completion_result_maps_terminal_sentinels() {
     assert_eq!(
         subagent_status_from_completion_result("plain successful summary"),
         crate::tools::subagent::SubAgentStatus::Completed
+    );
+}
+
+#[test]
+fn agent_complete_terminal_verb_is_truthful_for_cancelled_workers() {
+    let cancelled = subagent_status_from_completion_result(
+        r#"Cancelled
+<codewhale:subagent.done>{"agent_id":"agent_x","status":"cancelled"}</codewhale:subagent.done>"#,
+    );
+
+    assert_eq!(subagent_terminal_verb(&cancelled), "cancelled");
+    assert_ne!(subagent_terminal_verb(&cancelled), "completed");
+    assert_eq!(
+        subagent_terminal_verb(&crate::tools::subagent::SubAgentStatus::Completed),
+        "completed"
     );
 }
 
@@ -5840,6 +8191,10 @@ async fn bang_shell_input_dispatches_shell_op_instead_of_model_message() {
     let mut app = create_test_app();
     app.mode = AppMode::Agent;
     app.trust_mode = false;
+    // Pin the posture: App::new consults the developer's real saved
+    // settings, so a machine dogfooding with Bypass/Full Access would flip
+    // the auto_approve assertion below (hermeticity, not behavior).
+    app.approval_mode = ApprovalMode::Suggest;
 
     let mut engine = mock_engine_handle();
 
@@ -6347,53 +8702,28 @@ fn context_usage_snapshot_prefers_live_estimate_while_loading() {
 }
 
 #[test]
-fn should_auto_compact_before_send_respects_threshold_and_setting() {
+fn should_auto_compact_before_send_uses_shared_token_threshold() {
     let mut app = create_test_app();
-    let messages_for_repeats = |repeats: usize| {
-        vec![Message {
-            role: "user".to_string(),
-            content: vec![ContentBlock::Text {
-                text: "context ".repeat(repeats),
-                cache_control: None,
-            }],
-        }]
-    };
+    app.api_messages = vec![Message {
+        role: "user".to_string(),
+        content: vec![ContentBlock::Text {
+            text: "context ".repeat(240_000),
+            cache_control: None,
+        }],
+    }];
+    let (used, _, _) = context_usage_snapshot(&app).expect("context snapshot");
+    let used = usize::try_from(used).expect("non-negative context estimate");
 
-    // High estimated context + auto_compact ON → auto-compact triggers.
-    app.api_messages = messages_for_repeats(240_000);
     app.auto_compact = true;
-    app.auto_compact_threshold_percent = 70.0;
+    app.compact_threshold = used;
     assert!(should_auto_compact_before_send(&app));
 
-    let (_, _, high_percent) =
-        context_usage_snapshot(&app).expect("high context snapshot should be available");
-    assert!(
-        (70.0..90.0).contains(&high_percent),
-        "test fixture should sit between default and high custom thresholds; got {high_percent:.2}%"
-    );
-    app.auto_compact_threshold_percent = 90.0;
+    app.compact_threshold = used.saturating_add(1);
     assert!(!should_auto_compact_before_send(&app));
 
-    // Same high context but auto_compact OFF → never triggers.
     app.auto_compact = false;
+    app.compact_threshold = 0;
     assert!(!should_auto_compact_before_send(&app));
-
-    // Small estimated context + auto_compact ON can trigger once the
-    // configured percent threshold is crossed. This still matches the
-    // #115 fix: the estimate is the primary signal, not the engine's
-    // turn-cumulative reported value (which used to rule the displayed
-    // % and could spuriously trigger / suppress auto-compact).
-    app.api_messages = messages_for_repeats(80_000);
-    app.auto_compact = true;
-    app.auto_compact_threshold_percent = 10.0;
-    app.session.last_prompt_tokens = Some(10_000);
-    let (used, _, percent) =
-        context_usage_snapshot(&app).expect("context snapshot should be available");
-    assert!(
-        used > 0 && percent >= 10.0,
-        "test fixture should cross percent threshold; used={used} percent={percent:.2}"
-    );
-    assert!(should_auto_compact_before_send(&app));
 }
 
 #[test]
@@ -6407,7 +8737,13 @@ fn context_pressure_warning_reflects_auto_compact_threshold_state() {
         }],
     }];
     app.auto_compact = true;
-    app.auto_compact_threshold_percent = 70.0;
+    app.auto_compact_threshold_percent = 100.0;
+    let (used, _, percent) = context_usage_snapshot(&app).expect("context snapshot");
+    assert!(
+        percent < app.auto_compact_threshold_percent,
+        "fixture must remain below the raw window-relative setting"
+    );
+    app.compact_threshold = usize::try_from(used).expect("non-negative context estimate");
 
     maybe_warn_context_pressure(&mut app);
 
@@ -6605,6 +8941,98 @@ fn local_cancel_marks_late_stream_events_for_suppression() {
             message: "Request cancelled".to_string(),
         }
     ));
+}
+
+#[test]
+fn turn_started_route_is_captured_before_cancel_suppression() {
+    let mut app = create_test_app();
+    app.suppress_stream_events_until_turn_complete = true;
+    app.ocean_completion_started_at = Some(Instant::now());
+    app.pending_turn_route = Some((ApiProvider::Deepseek, "pending-model".to_string(), true));
+    app.pending_auto_route_receipt = Some(crate::model_routing::AutoRouteReceipt {
+        tier: crate::model_routing::AutoRouteTier::Fast,
+        pair: crate::model_routing::AutoRoutePair {
+            strong: "deepseek-v4-pro".to_string(),
+            fast: Some("deepseek-v4-flash".to_string()),
+        },
+        scope: crate::model_routing::AutoRouteScope::ResolvedProvider,
+        data_path: crate::model_routing::AutoRouteDataPath::LocalHeuristic,
+        reason: crate::model_routing::AutoRouteReason::LocalHeuristic(
+            crate::model_routing::AutoRouteHeuristicReason::ShortRequest,
+        ),
+    });
+    let created_at = chrono::Utc::now();
+    let event = EngineEvent::TurnStarted {
+        turn_id: "turn_cancel_race".to_string(),
+        created_at,
+        route: Some(crate::core::events::TurnRoute {
+            provider: ApiProvider::Openai,
+            provider_identity: "openai".to_string(),
+            model: "gpt-5.5".to_string(),
+            auto_model: true,
+        }),
+    };
+
+    capture_turn_started_metadata(&mut app, &event);
+
+    let active_turn = app.active_turn.as_ref().expect("captured turn");
+    assert_eq!(active_turn.turn_id, "turn_cancel_race");
+    assert_eq!(active_turn.created_at, created_at);
+    let route = active_turn.route.as_ref().expect("captured route");
+    assert_eq!(route.provider, ApiProvider::Openai);
+    assert_eq!(route.model, "gpt-5.5");
+    assert!(route.auto_model);
+    assert_eq!(
+        active_turn
+            .auto_route_receipt
+            .as_ref()
+            .map(|receipt| receipt.tier),
+        Some(crate::model_routing::AutoRouteTier::Fast)
+    );
+    assert!(app.pending_turn_route.is_none());
+    assert!(app.pending_auto_route_receipt.is_none());
+    assert!(app.ocean_completion_started_at.is_none());
+
+    let observer = turn_end_observer_metadata(Some(active_turn));
+    assert_eq!(observer.turn_id.as_ref(), "turn_cancel_race");
+    assert_eq!(observer.created_at, created_at);
+    assert_eq!(observer.route, Some(route));
+}
+
+#[test]
+fn engine_error_health_accounting_uses_active_turn_route() {
+    let mut app = create_test_app();
+    app.api_provider = ApiProvider::Deepseek;
+    app.model = "current-model".to_string();
+    let event = EngineEvent::TurnStarted {
+        turn_id: "routed-turn".to_string(),
+        created_at: chrono::Utc::now(),
+        route: Some(crate::core::events::TurnRoute {
+            provider: ApiProvider::Openai,
+            provider_identity: "openai".to_string(),
+            model: "gpt-5.5".to_string(),
+            auto_model: true,
+        }),
+    };
+    capture_turn_started_metadata(&mut app, &event);
+
+    let route = error_health_route(&app, app.api_provider);
+
+    assert_eq!(route, (ApiProvider::Openai, "gpt-5.5".to_string()));
+}
+
+#[test]
+fn completion_only_hook_metadata_is_synthetic_and_non_model() {
+    let observed_after = chrono::Utc::now();
+    let first = turn_end_observer_metadata(None);
+    let second = turn_end_observer_metadata(None);
+
+    assert!(first.turn_id.starts_with("lifecycle_"));
+    assert!(second.turn_id.starts_with("lifecycle_"));
+    assert_ne!(first.turn_id, second.turn_id);
+    assert!(first.created_at >= observed_after);
+    assert!(first.route.is_none());
+    assert!(second.route.is_none());
 }
 
 #[test]
@@ -6917,7 +9345,7 @@ fn visible_slash_model_completions_are_provider_scoped() {
         "openrouter".to_string(),
         crate::config::DEFAULT_OPENROUTER_MODEL.to_string(),
     );
-    app.input = "/model".to_string();
+    app.input = "/model deep".to_string();
     app.cursor_position = app.input.chars().count();
 
     let entries = visible_slash_menu_entries(&app, 128);
@@ -7531,7 +9959,7 @@ async fn steer_user_message_records_prompt_for_cancel_restore() {
 }
 
 #[tokio::test]
-async fn ctrl_s_sends_next_queued_message_into_running_turn() {
+async fn composer_send_shortcut_sends_next_queued_message_into_running_turn() {
     let mut app = create_test_app();
     app.is_loading = true;
     app.queue_message(crate::tui::app::QueuedMessage::new(
@@ -7542,9 +9970,9 @@ async fn ctrl_s_sends_next_queued_message_into_running_turn() {
     let mut engine = crate::core::engine::mock_engine_handle();
 
     assert!(
-        send_ctrl_s_queued_message_now(&mut app, &config, &engine.handle)
+        send_shortcut_queued_message_now(&mut app, &config, &engine.handle)
             .await
-            .expect("ctrl+s send succeeds")
+            .expect("composer send shortcut succeeds")
     );
 
     assert_eq!(app.queued_message_count(), 0);
@@ -7555,7 +9983,7 @@ async fn ctrl_s_sends_next_queued_message_into_running_turn() {
 }
 
 #[tokio::test]
-async fn ctrl_s_sends_edited_queued_draft_into_running_turn() {
+async fn composer_send_shortcut_sends_edited_queued_draft_into_running_turn() {
     let mut app = create_test_app();
     app.is_loading = true;
     app.queued_draft = Some(crate::tui::app::QueuedMessage::new(
@@ -7568,9 +9996,9 @@ async fn ctrl_s_sends_edited_queued_draft_into_running_turn() {
     let mut engine = crate::core::engine::mock_engine_handle();
 
     assert!(
-        send_ctrl_s_queued_message_now(&mut app, &config, &engine.handle)
+        send_shortcut_queued_message_now(&mut app, &config, &engine.handle)
             .await
-            .expect("ctrl+s draft send succeeds")
+            .expect("composer send shortcut succeeds")
     );
 
     assert!(app.queued_draft.is_none());
@@ -7729,6 +10157,53 @@ async fn streaming_enter_queue_pushes_visible_toast() {
 }
 
 #[tokio::test]
+async fn operate_streaming_enter_queues_another_parallel_task() {
+    let mut app = create_test_app();
+    app.mode = AppMode::Operate;
+    app.is_loading = true;
+    app.streaming_message_index = Some(0);
+    let config = Config::default();
+    let engine = crate::core::engine::mock_engine_handle();
+    let queued = build_queued_message(&mut app, "check the docs too".to_string());
+
+    submit_or_steer_message(&mut app, &config, &engine.handle, queued)
+        .await
+        .expect("Operate streaming submit queues another task");
+
+    assert_eq!(app.queued_message_count(), 1);
+    assert!(app.status_message.as_deref().is_some_and(
+        |status| status.contains("queued task(s)") && status.contains("workers continue")
+    ));
+    let toast = app.status_toasts.back().expect("Operate queue toast");
+    assert_eq!(toast.level, StatusToastLevel::Info);
+    assert!(toast.text.contains("Queued task"));
+    assert!(toast.text.contains("dispatches next"));
+}
+
+#[tokio::test]
+async fn inline_skill_request_keeps_instruction_when_busy_queueing() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.streaming_message_index = Some(0);
+    app.active_skill = Some("Use the test skill".to_string());
+    let config = Config::default();
+    let engine = crate::core::engine::mock_engine_handle();
+
+    let queued = build_queued_message(&mut app, "do X".to_string());
+    assert!(app.active_skill.is_none(), "skill must be consumed once");
+    submit_or_steer_message(&mut app, &config, &engine.handle, queued)
+        .await
+        .expect("streaming skill request queues");
+
+    let queued = app.queued_messages.front().expect("queued skill request");
+    assert_eq!(queued.display, "do X");
+    assert_eq!(
+        queued.skill_instruction.as_deref(),
+        Some("Use the test skill")
+    );
+}
+
+#[tokio::test]
 async fn numeric_plan_choice_still_queues_follow_up_when_busy() {
     let mut app = create_test_app();
     app.mode = AppMode::Plan;
@@ -7762,26 +10237,70 @@ async fn numeric_plan_choice_still_queues_follow_up_when_busy() {
 
 #[test]
 fn api_key_validation_warns_without_blocking_unusual_formats() {
+    let config = Config::default();
     assert!(matches!(
-        crate::tui::onboarding::validate_api_key_for_onboarding(""),
+        crate::tui::onboarding::validate_api_key_for_onboarding(&config, ApiProvider::Deepseek, "",),
         crate::tui::onboarding::ApiKeyValidation::Reject(_)
     ));
     assert!(matches!(
-        crate::tui::onboarding::validate_api_key_for_onboarding("sk short"),
+        crate::tui::onboarding::validate_api_key_for_onboarding(
+            &config,
+            ApiProvider::Deepseek,
+            "sk short",
+        ),
         crate::tui::onboarding::ApiKeyValidation::Reject(_)
     ));
     assert!(matches!(
-        crate::tui::onboarding::validate_api_key_for_onboarding("short-key"),
+        crate::tui::onboarding::validate_api_key_for_onboarding(
+            &config,
+            ApiProvider::Deepseek,
+            "short-key",
+        ),
         crate::tui::onboarding::ApiKeyValidation::Accept { warning: Some(_) }
     ));
     assert!(matches!(
-        crate::tui::onboarding::validate_api_key_for_onboarding("averylongkeywithoutdash123456"),
+        crate::tui::onboarding::validate_api_key_for_onboarding(
+            &config,
+            ApiProvider::Deepseek,
+            "averylongkeywithoutdash123456",
+        ),
         crate::tui::onboarding::ApiKeyValidation::Accept { warning: Some(_) }
     ));
     assert!(matches!(
-        crate::tui::onboarding::validate_api_key_for_onboarding("sk-valid-format-1234567890"),
+        crate::tui::onboarding::validate_api_key_for_onboarding(
+            &config,
+            ApiProvider::Deepseek,
+            "sk-valid-format-1234567890",
+        ),
         crate::tui::onboarding::ApiKeyValidation::Accept { warning: None }
     ));
+}
+
+#[tokio::test]
+async fn onboarding_empty_key_activates_and_persists_keyless_local_provider() {
+    let _home = SettingsHomeGuard::new();
+    let mut app = create_test_app();
+    app.onboarding = OnboardingState::ApiKey;
+    app.onboarding_needs_api_key = true;
+    app.onboarding_provider = ApiProvider::Ollama;
+    app.onboarding_missing_key_recovery = false;
+    app.onboarding_had_api_key_step = true;
+    app.trust_mode = true;
+    app.api_key_input.clear();
+    let mut config = Config::default();
+    let mut engine = mock_engine_handle();
+
+    assert!(submit_keyless_onboarding_provider(&mut app, &mut engine.handle, &mut config).await);
+
+    assert_eq!(app.api_provider, ApiProvider::Ollama);
+    assert_eq!(config.provider.as_deref(), Some("ollama"));
+    assert_eq!(app.onboarding, OnboardingState::MentalModels);
+    assert!(!app.onboarding_needs_api_key);
+    assert!(!app.api_key_env_only);
+    assert!(!app.offline_mode);
+    let config_path = std::env::var("DEEPSEEK_CONFIG_PATH").expect("isolated config path");
+    let saved = std::fs::read_to_string(config_path).expect("persisted provider config");
+    assert!(saved.contains("provider = \"ollama\""), "{saved}");
 }
 
 #[test]
@@ -7789,12 +10308,13 @@ fn onboarding_after_api_key_save_does_not_repeat_language_step() {
     let mut app = create_test_app();
     app.onboarding = OnboardingState::ApiKey;
     app.onboarding_needs_api_key = false;
+    app.onboarding_missing_key_recovery = false;
     app.trust_mode = true;
     app.status_message = Some("saved".to_string());
 
     crate::tui::onboarding::advance_onboarding_after_api_key(&mut app);
 
-    assert_eq!(app.onboarding, OnboardingState::Tips);
+    assert_eq!(app.onboarding, OnboardingState::MentalModels);
     assert_eq!(app.status_message, None);
 }
 
@@ -7805,11 +10325,59 @@ fn onboarding_after_api_key_save_routes_to_trust_when_needed() {
     app.workspace = tmpdir.path().to_path_buf();
     app.onboarding = OnboardingState::ApiKey;
     app.onboarding_needs_api_key = false;
+    app.onboarding_missing_key_recovery = false;
     app.trust_mode = false;
 
     crate::tui::onboarding::advance_onboarding_after_api_key(&mut app);
 
     assert_eq!(app.onboarding, OnboardingState::TrustDirectory);
+}
+
+#[test]
+fn missing_key_recovery_skips_first_run_mental_models() {
+    let mut app = create_test_app();
+    app.onboarding = OnboardingState::ApiKey;
+    app.onboarding_missing_key_recovery = true;
+    app.trust_mode = true;
+
+    crate::tui::onboarding::advance_onboarding_after_api_key(&mut app);
+
+    assert_eq!(app.onboarding, OnboardingState::Tips);
+}
+
+#[test]
+fn missing_key_recovery_still_requires_workspace_trust() {
+    let tmpdir = TempDir::new().expect("tempdir");
+    let mut app = create_test_app();
+    app.workspace = tmpdir.path().to_path_buf();
+    app.onboarding = OnboardingState::ApiKey;
+    app.onboarding_missing_key_recovery = true;
+    app.trust_mode = false;
+
+    crate::tui::onboarding::advance_onboarding_after_api_key(&mut app);
+
+    assert_eq!(app.onboarding, OnboardingState::TrustDirectory);
+}
+
+#[test]
+fn mental_models_backtracks_to_the_last_first_run_decision() {
+    let mut app = create_test_app();
+    app.onboarding = OnboardingState::MentalModels;
+    app.onboarding_had_api_key_step = false;
+    app.onboarding_had_trust_step = true;
+    crate::tui::onboarding::back_from_mental_models(&mut app);
+    assert_eq!(app.onboarding, OnboardingState::TrustDirectory);
+
+    app.onboarding = OnboardingState::MentalModels;
+    app.onboarding_had_trust_step = false;
+    app.onboarding_had_api_key_step = true;
+    crate::tui::onboarding::back_from_mental_models(&mut app);
+    assert_eq!(app.onboarding, OnboardingState::ApiKey);
+
+    app.onboarding = OnboardingState::MentalModels;
+    app.onboarding_had_api_key_step = false;
+    crate::tui::onboarding::back_from_mental_models(&mut app);
+    assert_eq!(app.onboarding, OnboardingState::Language);
 }
 
 #[test]
@@ -7829,21 +10397,40 @@ fn api_key_escape_returns_to_provider_step() {
 }
 
 #[test]
-fn trust_directory_completion_advances_to_tips() {
+fn trust_directory_completion_advances_to_mental_models() {
     let _guard = ConfigPathEnvGuard::new();
     let tmpdir = TempDir::new().expect("workspace tempdir");
     let mut app = create_test_app();
     app.workspace = tmpdir.path().to_path_buf();
     app.onboarding = OnboardingState::TrustDirectory;
     app.onboarding_workspace_trust_gate = false;
+    app.onboarding_missing_key_recovery = false;
+    app.onboarding_had_trust_step = true;
     app.trust_mode = false;
 
     complete_trust_directory_onboarding(&mut app, &Config::default())
         .expect("trust completion should succeed");
 
     assert!(app.trust_mode);
-    assert_eq!(app.onboarding, OnboardingState::Tips);
+    assert_eq!(app.onboarding, OnboardingState::MentalModels);
     assert!(app.runtime_services.hook_executor.is_some());
+}
+
+#[test]
+fn trust_completion_during_missing_key_recovery_advances_to_tips() {
+    let _guard = ConfigPathEnvGuard::new();
+    let tmpdir = TempDir::new().expect("workspace tempdir");
+    let mut app = create_test_app();
+    app.workspace = tmpdir.path().to_path_buf();
+    app.onboarding = OnboardingState::TrustDirectory;
+    app.onboarding_workspace_trust_gate = false;
+    app.onboarding_missing_key_recovery = true;
+    app.trust_mode = false;
+
+    complete_trust_directory_onboarding(&mut app, &Config::default())
+        .expect("trust completion should succeed");
+
+    assert_eq!(app.onboarding, OnboardingState::Tips);
 }
 
 #[test]
@@ -7893,6 +10480,16 @@ fn api_key_paste_shortcut_is_not_plain_text_input() {
 
     let shifted = KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT);
     assert!(crate::tui::key_shortcuts::is_text_input_key(&shifted));
+}
+
+#[test]
+fn international_layout_glyphs_remain_plain_text_input() {
+    for ch in ['\u{00e7}', '\u{00bf}'] {
+        let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+        assert!(crate::tui::key_shortcuts::is_text_input_key(&key));
+        assert!(!crate::tui::shell_key_routing::is_help_shortcut(&key));
+        assert!(!crate::tui::shell_key_routing::is_context_inspector_shortcut(&key));
+    }
 }
 
 #[test]
@@ -8362,27 +10959,6 @@ fn active_rlm_task_entries_surface_foreground_rlm_work() {
 }
 
 #[test]
-fn active_reasoning_task_entries_surface_reasoning_only_turns() {
-    let mut app = create_test_app();
-    app.turn_started_at = Some(Instant::now() - Duration::from_secs(2));
-    let mut active = ActiveCell::new();
-    active.push_thinking(HistoryCell::Thinking {
-        content: "reasoning text".to_string(),
-        streaming: true,
-        duration_secs: None,
-    });
-    app.active_cell = Some(active);
-
-    let entries = active_reasoning_task_entries(&app);
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].id, "reasoning-1");
-    assert_eq!(entries[0].status, "running");
-    assert_eq!(entries[0].prompt_summary, "model reasoning");
-    assert_eq!(entries[0].kind, TaskPanelEntryKind::ModelReasoning);
-    assert!(entries[0].duration_ms.unwrap_or_default() >= 2000);
-}
-
-#[test]
 fn alt_nav_modifiers_require_alt_and_exclude_ctrl_super() {
     // v0.8.30 — transcript-nav shortcuts (`Alt+[`, `Alt+]`, etc.) require
     // Alt, allow Shift for capital-letter forms, and block Ctrl/Super so
@@ -8484,6 +11060,29 @@ fn file_mention_completion_ranks_prefix_before_substring() {
     assert_eq!(matches.first().map(String::as_str), Some("README.md"));
 }
 
+fn await_visible_mention_entries(app: &mut App, limit: usize) -> Vec<String> {
+    let partial = partial_file_mention_at_cursor(&app.input, app.cursor_position)
+        .expect("test input should contain a mention")
+        .1;
+    let started = Instant::now();
+    loop {
+        let entries = visible_mention_menu_entries(app, limit);
+        let ready = app
+            .composer
+            .mention_completion_cache
+            .as_ref()
+            .is_some_and(|cache| cache.partial == partial && cache.limit == limit);
+        if ready {
+            return entries;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timed out waiting for background mention discovery"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
 #[test]
 fn try_autocomplete_file_mention_unique_replaces_partial() {
     let tmpdir = TempDir::new().expect("tempdir");
@@ -8495,6 +11094,7 @@ fn try_autocomplete_file_mention_unique_replaces_partial() {
     app.input = "summarize @docs/de".to_string();
     app.cursor_position = app.input.chars().count();
 
+    let _ = await_visible_mention_entries(&mut app, 64);
     assert!(try_autocomplete_file_mention(&mut app));
     assert_eq!(app.input, "summarize @docs/deepseek_v4.pdf");
     assert_eq!(app.cursor_position, app.input.chars().count());
@@ -8512,6 +11112,7 @@ fn try_autocomplete_file_mention_extends_to_common_prefix() {
     app.input = "@crates/tui/".to_string();
     app.cursor_position = app.input.chars().count();
 
+    let _ = await_visible_mention_entries(&mut app, 64);
     assert!(try_autocomplete_file_mention(&mut app));
     // Both files share the `crates/tui/` prefix and one more letter is
     // not unique (`l` vs `m`), so the partial extends to the common prefix
@@ -8535,6 +11136,7 @@ fn try_autocomplete_file_mention_no_match_reports_status() {
     app.input = "@nonexistent_xyz".to_string();
     app.cursor_position = app.input.chars().count();
 
+    let _ = await_visible_mention_entries(&mut app, 64);
     assert!(try_autocomplete_file_mention(&mut app));
     assert_eq!(app.input, "@nonexistent_xyz");
     assert_eq!(
@@ -8553,6 +11155,7 @@ fn try_autocomplete_file_mention_no_match_mentions_depth_cap_for_path_like_parti
     app.input = "@a/b/c/d/e/f/g/target".to_string();
     app.cursor_position = app.input.chars().count();
 
+    let _ = await_visible_mention_entries(&mut app, 64);
     assert!(try_autocomplete_file_mention(&mut app));
     assert_eq!(
         app.status_message.as_deref(),
@@ -8572,6 +11175,7 @@ fn try_autocomplete_file_mention_no_match_skips_depth_hint_for_shallow_path() {
     app.input = "@shallow_missing/main.rs".to_string();
     app.cursor_position = app.input.chars().count();
 
+    let _ = await_visible_mention_entries(&mut app, 64);
     assert!(try_autocomplete_file_mention(&mut app));
     assert_eq!(
         app.status_message.as_deref(),
@@ -8589,6 +11193,7 @@ fn try_autocomplete_file_mention_no_match_skips_depth_hint_when_unlimited() {
     app.input = "@a/b/c/d/e/f/g/target".to_string();
     app.cursor_position = app.input.chars().count();
 
+    let _ = await_visible_mention_entries(&mut app, 64);
     assert!(try_autocomplete_file_mention(&mut app));
     assert_eq!(
         app.status_message.as_deref(),
@@ -8620,6 +11225,40 @@ fn mention_popup_is_empty_when_cursor_is_not_in_a_mention() {
 }
 
 #[test]
+fn plain_at_returns_immediately_while_discovery_is_stalled() {
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = std::sync::Mutex::new(release_rx);
+
+    let mut app = create_test_app();
+    app.input = "@".to_string();
+    app.cursor_position = 1;
+    app.composer.mention_discovery =
+        crate::tui::mention_completion::MentionDiscovery::with_scanner(move |_, _| {
+            let _ = started_tx.send(());
+            let _ = release_rx.lock().expect("release lock").recv();
+            vec!["README.md".to_string()]
+        });
+
+    let started = Instant::now();
+    let initial = visible_mention_menu_entries(&mut app, 6);
+    assert!(initial.is_empty());
+    assert!(
+        started.elapsed() < Duration::from_millis(50),
+        "plain @ waited for discovery instead of returning immediately"
+    );
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("plain @ should start discovery in the background");
+
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        await_visible_mention_entries(&mut app, 6),
+        vec!["README.md"]
+    );
+}
+
+#[test]
 fn mention_popup_lists_workspace_matches_for_cursor_partial() {
     let tmpdir = TempDir::new().expect("tempdir");
     std::fs::create_dir_all(tmpdir.path().join("docs")).unwrap();
@@ -8632,7 +11271,7 @@ fn mention_popup_lists_workspace_matches_for_cursor_partial() {
     app.input = "look at @docs/".to_string();
     app.cursor_position = app.input.chars().count();
 
-    let entries = visible_mention_menu_entries(&mut app, 6);
+    let entries = await_visible_mention_entries(&mut app, 6);
     assert!(!entries.is_empty(), "popup should surface docs/ entries");
     assert!(entries.iter().any(|e| e.starts_with("docs/")));
     // README.md doesn't match `docs/` — confirm we didn't dump every file.
@@ -8653,7 +11292,7 @@ fn mention_popup_browser_mode_lists_immediate_directory_children() {
     app.input = "look at @src/".to_string();
     app.cursor_position = app.input.chars().count();
 
-    let entries = visible_mention_menu_entries(&mut app, 8);
+    let entries = await_visible_mention_entries(&mut app, 8);
     assert_eq!(entries, vec!["src/lib.rs", "src/nested/"]);
 }
 
@@ -8668,7 +11307,7 @@ fn mention_popup_reuses_cache_when_cursor_moves_inside_same_token() {
     app.input = "look at @docs/".to_string();
     app.cursor_position = app.input.chars().count();
 
-    let entries = visible_mention_menu_entries(&mut app, 6);
+    let entries = await_visible_mention_entries(&mut app, 6);
     assert!(entries.iter().any(|e| e == "docs/alpha.md"));
 
     std::fs::write(tmpdir.path().join("docs/beta.md"), "x").unwrap();
@@ -8683,7 +11322,11 @@ fn mention_popup_reuses_cache_when_cursor_moves_inside_same_token() {
     app.input = "look at @docs/b".to_string();
     app.cursor_position = app.input.chars().count();
 
-    let entries_after_partial_change = visible_mention_menu_entries(&mut app, 6);
+    // The bounded background index is intentionally reused for the same
+    // workspace generation; filesystem mutations become visible on refresh.
+    app.composer.mention_discovery.invalidate();
+    app.composer.mention_completion_cache = None;
+    let entries_after_partial_change = await_visible_mention_entries(&mut app, 6);
     assert!(
         entries_after_partial_change
             .iter()
@@ -8721,7 +11364,7 @@ fn apply_mention_menu_selection_splices_selected_entry() {
     app.input = "open @crates/tui/m".to_string();
     app.cursor_position = app.input.chars().count();
 
-    let entries = visible_mention_menu_entries(&mut app, 6);
+    let entries = await_visible_mention_entries(&mut app, 6);
     assert!(!entries.is_empty(), "expected entries for @crates/tui/m");
     // Pick whichever entry appears at index 0; it's deterministic given the
     // workspace setup. Apply it.
@@ -9095,6 +11738,8 @@ fn picker_rename_of_inactive_session_does_not_touch_active_metadata() {
 fn codex_tool_child_usage_does_not_inherit_public_api_pricing() {
     let mut app = create_test_app();
     app.api_provider = crate::config::ApiProvider::OpenaiCodex;
+    app.billing_presentation =
+        crate::route_billing::BillingPresentation::Subscription("Codex OAuth quota");
     let result = Ok(crate::tools::spec::ToolResult::success("ok").with_metadata(
         serde_json::json!({
             "child_model": "gpt-5.5",
@@ -9187,6 +11832,58 @@ fn existing_session_snapshot_updates_model_selection() {
 }
 
 #[test]
+fn automatic_session_snapshot_keeps_named_custom_identity_secret_free() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let manager =
+        crate::session_manager::SessionManager::new(tmp.path().join("sessions")).expect("manager");
+    let mut config =
+        named_custom_session_config("lm-studio", "http://127.0.0.1:1234/v1", "local-code-model");
+    config
+        .providers
+        .as_mut()
+        .and_then(|providers| providers.custom.get_mut("lm-studio"))
+        .expect("custom provider")
+        .api_key = Some("super-secret-local-key".to_string());
+    let mut app = App::new(create_test_options(), &config);
+    app.api_messages.push(text_message("user", "persist me"));
+
+    let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
+    let serialized = serde_json::to_string(&snapshot).expect("serialize session");
+
+    assert_eq!(snapshot.metadata.model_provider, "custom");
+    assert_eq!(
+        snapshot.metadata.model_provider_id.as_deref(),
+        Some("lm-studio")
+    );
+    assert!(serialized.contains("\"model_provider\":\"custom\""));
+    assert!(serialized.contains("\"model_provider_id\":\"lm-studio\""));
+    assert!(!serialized.contains("super-secret-local-key"));
+    assert!(!serialized.contains("127.0.0.1:1234"));
+}
+
+#[test]
+fn automatic_session_snapshot_omits_id_for_legacy_root_custom_route() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let manager =
+        crate::session_manager::SessionManager::new(tmp.path().join("sessions")).expect("manager");
+    let config = Config {
+        provider: Some("custom".to_string()),
+        base_url: Some("http://127.0.0.1:18180/v1".to_string()),
+        default_text_model: Some("legacy-root-model".to_string()),
+        ..Config::default()
+    };
+    let mut app = App::new(create_test_options(), &config);
+    app.api_messages.push(text_message("user", "persist root"));
+
+    let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
+    let serialized = serde_json::to_string(&snapshot).expect("serialize session");
+
+    assert_eq!(snapshot.metadata.model_provider, "custom");
+    assert_eq!(snapshot.metadata.model_provider_id, None);
+    assert!(!serialized.contains("model_provider_id"));
+}
+
+#[test]
 fn session_snapshot_and_resume_round_trip_work_state() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let manager =
@@ -9256,8 +11953,8 @@ fn session_snapshot_preserves_last_work_state_when_lock_is_busy() {
     assert_eq!(contended.work_state, expected);
 }
 
-#[test]
-fn session_snapshot_prefers_newer_memory_over_stale_disk_when_lock_is_busy() {
+#[tokio::test]
+async fn session_snapshot_prefers_newer_memory_over_stale_disk_when_lock_is_busy() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let manager =
         crate::session_manager::SessionManager::new(tmp.path().join("sessions")).expect("manager");
@@ -9271,11 +11968,28 @@ fn session_snapshot_prefers_newer_memory_over_stale_disk_when_lock_is_busy() {
     manager
         .save_session(&disk_snapshot)
         .expect("save disk snapshot");
+    app.publish_pending_work_state()
+        .expect("publish saved disk state");
 
-    app.todos.try_lock().expect("todos lock").add(
+    let mut desired = crate::tools::todo::TodoList::from_snapshot(
+        &app.todos.try_lock().expect("todos lock").snapshot(),
+    )
+    .expect("current To-do state");
+    desired.add(
         "newer memory state".to_string(),
         crate::tools::todo::TodoStatus::InProgress,
     );
+    app.runtime_services
+        .work
+        .as_ref()
+        .expect("Work Graph runtime")
+        .apply_todo_update(
+            "work-cache-newer-than-disk",
+            "work_update",
+            &desired.snapshot(),
+        )
+        .await
+        .expect("graph-backed memory update");
     let memory_snapshot = build_session_snapshot(&mut app, &manager).expect("memory snapshot");
     assert_ne!(memory_snapshot.work_state, disk_snapshot.work_state);
 
@@ -9401,6 +12115,7 @@ fn contended_work_restore_leaves_current_session_wholly_unchanged() {
     app.current_session_id = Some("current-session".to_string());
     let mut session = saved_session_with_messages(vec![text_message("user", "replacement")]);
     session.work_state = Some(crate::session_manager::SessionWorkState {
+        graph: None,
         todos: crate::tools::todo::TodoListSnapshot {
             items: vec![crate::tools::todo::TodoItem {
                 id: 1,
@@ -9420,6 +12135,444 @@ fn contended_work_restore_leaves_current_session_wholly_unchanged() {
     assert!(err.contains("session was not restored"), "{err}");
     assert_eq!(app.api_messages.len(), 1);
     assert_eq!(app.current_session_id.as_deref(), Some("current-session"));
+}
+
+#[test]
+fn missing_named_custom_provider_resume_leaves_current_session_wholly_unchanged() {
+    let mut app = create_test_app();
+    app.api_messages
+        .push(text_message("user", "keep the current conversation"));
+    app.current_session_id = Some("current-session".to_string());
+    app.workspace = PathBuf::from("/tmp/current-workspace");
+    app.set_model_selection("deepseek-v4-pro".to_string());
+    app.set_provider_identity(ApiProvider::Deepseek, "deepseek");
+    app.add_message(HistoryCell::System {
+        content: "existing receipt".to_string(),
+    });
+    app.status_message = Some("existing status".to_string());
+    let mut config = Config {
+        provider: Some("deepseek".to_string()),
+        ..Config::default()
+    };
+    let mut session = saved_session_with_messages(vec![text_message("user", "replacement")]);
+    session.metadata.model_provider = "lm-studio".to_string();
+    session.metadata.model = "local-code-model".to_string();
+    session.metadata.workspace = PathBuf::from("/tmp/other-workspace");
+
+    let err = apply_loaded_session_config_snapshot(
+        &mut app,
+        &mut config,
+        &session,
+        Config::default(),
+        true,
+    )
+    .expect_err("removed custom provider must fail closed");
+
+    assert!(err.contains("[providers.lm-studio]"), "{err}");
+    assert!(err.contains("will not fall back"), "{err}");
+    assert_eq!(app.current_session_id.as_deref(), Some("current-session"));
+    assert_eq!(app.api_messages.len(), 1);
+    assert_eq!(app.workspace, PathBuf::from("/tmp/current-workspace"));
+    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.provider_identity_for_persistence(), "deepseek");
+    assert_eq!(app.model_selection_for_persistence(), "deepseek-v4-pro");
+    assert_eq!(config.provider.as_deref(), Some("deepseek"));
+    assert_eq!(app.history.len(), 1);
+    assert!(matches!(
+        &app.history[0],
+        HistoryCell::System { content } if content == "existing receipt"
+    ));
+    assert_eq!(app.status_message.as_deref(), Some("existing status"));
+}
+
+#[test]
+fn custom_session_resume_requires_structural_route_not_client_construction() {
+    let mut app = create_test_app();
+    app.api_messages
+        .push(text_message("user", "keep the current conversation"));
+    app.current_session_id = Some("current-session".to_string());
+    app.workspace = PathBuf::from("/tmp/current-workspace");
+    app.set_model_selection("deepseek-v4-pro".to_string());
+    app.set_provider_identity(ApiProvider::Deepseek, "deepseek");
+    app.add_message(HistoryCell::System {
+        content: "existing receipt".to_string(),
+    });
+    app.status_message = Some("existing status".to_string());
+    let mut config =
+        named_custom_session_config("lm-studio", "http://127.0.0.1:1234/v1", "local-code-model");
+    config
+        .providers
+        .as_mut()
+        .expect("providers")
+        .custom
+        .get_mut("lm-studio")
+        .expect("lm-studio")
+        .insecure_skip_tls_verify = Some(true);
+    let mut session = saved_session_with_messages(vec![text_message("user", "replacement")]);
+    session.metadata.model_provider = "lm-studio".to_string();
+    session.metadata.model = "local-code-model".to_string();
+    session.metadata.workspace = PathBuf::from("/tmp/other-workspace");
+
+    let recovered = apply_loaded_session(&mut app, &mut config, &session)
+        .expect("session restore should not require provider credentials or TLS client setup");
+
+    assert!(recovered);
+    assert_eq!(
+        app.current_session_id.as_deref(),
+        Some("resume-recovery-session")
+    );
+    assert!(app.api_messages.is_empty());
+    assert_eq!(app.input, "replacement");
+    assert_eq!(app.workspace, PathBuf::from("/tmp/other-workspace"));
+    assert_eq!(app.api_provider, ApiProvider::Custom);
+    assert_eq!(app.provider_identity_for_persistence(), "lm-studio");
+    assert_eq!(app.model_selection_for_persistence(), "local-code-model");
+    assert!(app.history.is_empty());
+    assert!(
+        app.status_message
+            .as_deref()
+            .is_some_and(|message| message.contains("Recovered interrupted prompt"))
+    );
+    assert_eq!(config.provider.as_deref(), Some("lm-studio"));
+}
+
+#[test]
+fn named_custom_provider_resume_uses_exact_live_endpoint_model_and_workspace() {
+    let resumed_workspace = tempfile::tempdir().expect("resume workspace");
+    let mut config = named_custom_session_config(
+        "lm-studio",
+        "http://127.0.0.1:1234/v1",
+        "configured-default",
+    );
+    let mut app = create_test_app();
+    let mut session = saved_session_with_messages(vec![
+        text_message("user", "resume local work"),
+        text_message("assistant", "ready"),
+    ]);
+    session.metadata.model_provider = "lm-studio".to_string();
+    session.metadata.model = "local-code-model".to_string();
+    session.metadata.workspace = resumed_workspace.path().to_path_buf();
+
+    apply_loaded_session(&mut app, &mut config, &session).expect("restore exact custom route");
+
+    assert_eq!(app.api_provider, ApiProvider::Custom);
+    assert_eq!(app.provider_identity_for_persistence(), "lm-studio");
+    assert_eq!(app.model_selection_for_persistence(), "local-code-model");
+    assert_eq!(app.workspace, resumed_workspace.path());
+    assert_eq!(config.provider.as_deref(), Some("lm-studio"));
+    let route = resolve_runtime_route(&config, app.api_provider, Some(&app.model))
+        .expect("runtime route remains exact");
+    assert_eq!(
+        route.candidate.endpoint().base_url,
+        "http://127.0.0.1:1234/v1"
+    );
+    assert_eq!(route.model, "local-code-model");
+}
+
+#[test]
+fn same_workspace_named_custom_switch_requires_engine_respawn() {
+    let mut config =
+        named_custom_session_config("custom-a", "http://127.0.0.1:18181/v1", "model-a");
+    config.providers.as_mut().expect("providers").custom.insert(
+        "custom-b".to_string(),
+        crate::config::ProviderConfig {
+            kind: Some("openai-compatible".to_string()),
+            base_url: Some("http://127.0.0.1:18182/v1".to_string()),
+            model: Some("model-b".to_string()),
+            ..Default::default()
+        },
+    );
+    let workspace = PathBuf::from("/tmp/same-workspace-custom-switch");
+    let mut app = create_test_app();
+    app.workspace.clone_from(&workspace);
+    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    app.set_model_selection("model-a".to_string());
+    let previous_provider = app.api_provider;
+    let previous_identity = app.provider_identity_for_persistence().to_string();
+    let previous_workspace = app.workspace.clone();
+
+    let mut session = saved_session_with_messages(vec![text_message("user", "switch route")]);
+    session.metadata.model_provider = "custom-b".to_string();
+    session.metadata.model = "model-b".to_string();
+    session.metadata.workspace = workspace;
+    apply_loaded_session(&mut app, &mut config, &session).expect("restore custom B");
+
+    assert_eq!(previous_provider, ApiProvider::Custom);
+    assert_eq!(app.api_provider, ApiProvider::Custom);
+    assert_eq!(app.provider_identity_for_persistence(), "custom-b");
+    assert!(loaded_session_requires_engine_respawn(
+        &app,
+        previous_provider,
+        &previous_identity,
+        &previous_workspace,
+    ));
+}
+
+#[test]
+fn file_load_uses_one_fresh_config_snapshot_for_custom_route_and_app_state() {
+    let workspace = PathBuf::from("/tmp/atomic-file-load");
+    let mut stale_config =
+        named_custom_session_config("custom-a", "http://127.0.0.1:18181/v1", "model-a");
+    let fresh_config =
+        named_custom_session_config("custom-b", "http://127.0.0.1:18182/v1", "model-b");
+    let mut app = create_test_app();
+    app.workspace.clone_from(&workspace);
+    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    app.set_model_selection("model-a".to_string());
+    app.api_messages
+        .push(text_message("user", "old conversation"));
+    let mut session = saved_session_with_messages(vec![
+        text_message("user", "new conversation"),
+        text_message("assistant", "loaded reply"),
+    ]);
+    session.metadata.model_provider = "custom-b".to_string();
+    session.metadata.model = "model-b".to_string();
+    session.metadata.workspace = workspace;
+
+    let (recovered, respawn) = apply_loaded_session_config_snapshot(
+        &mut app,
+        &mut stale_config,
+        &session,
+        fresh_config,
+        true,
+    )
+    .expect("fresh disk config should atomically restore custom B");
+
+    assert!(!recovered);
+    assert!(respawn);
+    assert_eq!(app.provider_identity_for_persistence(), "custom-b");
+    assert_eq!(app.model_selection_for_persistence(), "model-b");
+    assert_eq!(app.api_messages, session.messages);
+    assert_eq!(stale_config.provider.as_deref(), Some("custom-b"));
+    assert_eq!(
+        stale_config.deepseek_base_url(),
+        "http://127.0.0.1:18182/v1"
+    );
+}
+
+#[test]
+fn session_load_keeps_idless_custom_record_on_root_when_table_coexists() {
+    let mut config =
+        named_custom_session_config("custom", "http://127.0.0.1:18182/v1", "table-model");
+    config.base_url = Some("http://127.0.0.1:18181/v1".to_string());
+    config.default_text_model = Some("legacy-root-model".to_string());
+    let mut app = create_test_app();
+    app.api_messages
+        .push(text_message("user", "current conversation"));
+    let mut session = saved_session_with_messages(vec![
+        text_message("user", "legacy custom conversation"),
+        text_message("assistant", "legacy reply"),
+    ]);
+    session.metadata.model_provider = "custom".to_string();
+    session.metadata.model_provider_id = None;
+    session.metadata.model = "legacy-saved-model".to_string();
+
+    let recovered = apply_loaded_session(&mut app, &mut config, &session)
+        .expect("id-less custom record must retain root provenance");
+    assert!(!recovered);
+    assert_eq!(app.api_messages, session.messages);
+    assert_eq!(app.api_provider, ApiProvider::Custom);
+    assert_eq!(app.provider_identity_for_persistence(), "custom");
+    assert_eq!(app.provider_id_for_persistence(), None);
+    assert_eq!(config.deepseek_base_url(), "http://127.0.0.1:18181/v1");
+    assert!(
+        config
+            .providers
+            .as_ref()
+            .is_none_or(|providers| !providers.custom.contains_key("custom"))
+    );
+}
+
+#[test]
+fn session_load_rejects_exact_custom_table_record_when_only_root_remains() {
+    let mut config = Config {
+        provider: Some("custom".to_string()),
+        base_url: Some("http://127.0.0.1:18181/v1".to_string()),
+        default_text_model: Some("legacy-root-model".to_string()),
+        ..Config::default()
+    };
+    let mut app = create_test_app();
+    app.api_messages
+        .push(text_message("user", "current conversation"));
+    let previous_messages = app.api_messages.clone();
+    let previous_identity = app.provider_identity_for_persistence().to_string();
+
+    let mut session = saved_session_with_messages(vec![
+        text_message("user", "exact table conversation"),
+        text_message("assistant", "exact table reply"),
+    ]);
+    session.metadata.model_provider = "custom".to_string();
+    session.metadata.model_provider_id = Some("custom".to_string());
+    session.metadata.model = "table-model".to_string();
+
+    let error = apply_loaded_session(&mut app, &mut config, &session)
+        .expect_err("exact table record must not fall back to root");
+    assert!(error.contains("[providers.custom]"), "{error}");
+    assert!(error.contains("will not fall back"), "{error}");
+    assert_eq!(app.api_messages, previous_messages);
+    assert_eq!(app.provider_identity_for_persistence(), previous_identity);
+}
+
+#[test]
+fn session_load_rejects_empty_custom_id_when_root_and_table_coexist() {
+    let mut config =
+        named_custom_session_config("custom", "http://127.0.0.1:18182/v1", "table-model");
+    config.base_url = Some("http://127.0.0.1:18181/v1".to_string());
+    config.default_text_model = Some("legacy-root-model".to_string());
+    let mut app = create_test_app();
+    app.api_messages
+        .push(text_message("user", "current conversation"));
+    app.set_provider_identity(ApiProvider::Deepseek, "deepseek");
+    app.set_model_selection("deepseek-v4-pro".to_string());
+    let previous_messages = app.api_messages.clone();
+    let previous_provider = app.api_provider;
+    let previous_identity = app.provider_identity_for_persistence().to_string();
+    let previous_provider_id = app.provider_id_for_persistence().map(str::to_string);
+    let previous_model = app.model.clone();
+    let previous_config_provider = config.provider.clone();
+
+    let mut session = saved_session_with_messages(vec![
+        text_message("user", "malformed custom conversation"),
+        text_message("assistant", "must never load"),
+    ]);
+    session.metadata.model_provider = "custom".to_string();
+    session.metadata.model_provider_id = Some("   ".to_string());
+    session.metadata.model = "legacy-root-model".to_string();
+
+    let error = apply_loaded_session(&mut app, &mut config, &session)
+        .expect_err("an explicit empty id must not load either custom route");
+    assert!(error.contains("empty exact provider id"), "{error}");
+    assert_eq!(app.api_messages, previous_messages);
+    assert_eq!(app.api_provider, previous_provider);
+    assert_eq!(app.provider_identity_for_persistence(), previous_identity);
+    assert_eq!(
+        app.provider_id_for_persistence().map(str::to_string),
+        previous_provider_id
+    );
+    assert_eq!(app.model, previous_model);
+    assert_eq!(config.provider, previous_config_provider);
+    assert_eq!(config.deepseek_base_url(), "http://127.0.0.1:18182/v1");
+}
+
+#[test]
+fn file_load_respawns_engine_when_same_custom_identity_changes_endpoint() {
+    let workspace = PathBuf::from("/tmp/atomic-file-load-same-custom");
+    let mut stale_config =
+        named_custom_session_config("custom-a", "http://127.0.0.1:18181/v1", "model-a");
+    let mut fresh_config =
+        named_custom_session_config("custom-a", "http://127.0.0.1:18199/v1", "model-a");
+    let fresh_entry = fresh_config
+        .providers
+        .as_mut()
+        .expect("providers")
+        .custom
+        .get_mut("custom-a")
+        .expect("custom A");
+    fresh_entry.api_key = Some("rotated-key".to_string());
+    fresh_entry.http_headers = Some(std::collections::HashMap::from([(
+        "X-Route-Version".to_string(),
+        "fresh".to_string(),
+    )]));
+
+    let mut app = create_test_app();
+    app.workspace.clone_from(&workspace);
+    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    app.set_model_selection("model-a".to_string());
+    let mut session = saved_session_with_messages(vec![text_message("user", "new endpoint")]);
+    session.metadata.model_provider = "custom-a".to_string();
+    session.metadata.model = "model-a".to_string();
+    session.metadata.workspace = workspace;
+
+    let (_, respawn) = apply_loaded_session_config_snapshot(
+        &mut app,
+        &mut stale_config,
+        &session,
+        fresh_config,
+        true,
+    )
+    .expect("same-key fresh config should load atomically");
+
+    assert!(respawn, "file loads must install the fresh engine config");
+    assert_eq!(app.provider_identity_for_persistence(), "custom-a");
+    assert_eq!(
+        stale_config.deepseek_base_url(),
+        "http://127.0.0.1:18199/v1"
+    );
+    let entry = stale_config
+        .provider_config_for(ApiProvider::Custom)
+        .expect("fresh custom route");
+    assert_eq!(entry.api_key.as_deref(), Some("rotated-key"));
+    assert_eq!(
+        entry
+            .http_headers
+            .as_ref()
+            .and_then(|headers| headers.get("X-Route-Version"))
+            .map(String::as_str),
+        Some("fresh")
+    );
+}
+
+#[test]
+fn file_load_route_refresh_preserves_effective_permission_and_feature_overlays() {
+    let workspace = PathBuf::from("/tmp/atomic-file-load-policy");
+    let mut effective_config =
+        named_custom_session_config("custom-a", "http://127.0.0.1:18181/v1", "model-a");
+    effective_config.approval_policy = Some("never".to_string());
+    effective_config.sandbox_mode = Some("read-only".to_string());
+    effective_config.allow_shell = Some(false);
+    effective_config.max_subagents = Some(1);
+    effective_config.features = Some(crate::features::FeaturesToml {
+        entries: std::collections::BTreeMap::from([
+            ("shell_tool".to_string(), false),
+            ("subagents".to_string(), false),
+        ]),
+    });
+
+    let mut raw_disk_config =
+        named_custom_session_config("custom-a", "http://127.0.0.1:18199/v1", "model-a");
+    raw_disk_config.approval_policy = Some("always".to_string());
+    raw_disk_config.sandbox_mode = Some("danger-full-access".to_string());
+    raw_disk_config.allow_shell = Some(true);
+    raw_disk_config.max_subagents = Some(64);
+    raw_disk_config.features = Some(crate::features::FeaturesToml {
+        entries: std::collections::BTreeMap::from([
+            ("shell_tool".to_string(), true),
+            ("subagents".to_string(), true),
+        ]),
+    });
+
+    let mut app = create_test_app();
+    app.workspace.clone_from(&workspace);
+    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    app.set_model_selection("model-a".to_string());
+    let mut session = saved_session_with_messages(vec![text_message("user", "keep policy")]);
+    session.metadata.model_provider = "custom-a".to_string();
+    session.metadata.model = "model-a".to_string();
+    session.metadata.workspace = workspace;
+
+    let (_, respawn) = apply_loaded_session_config_snapshot(
+        &mut app,
+        &mut effective_config,
+        &session,
+        raw_disk_config,
+        true,
+    )
+    .expect("fresh route plus effective policy should load");
+
+    assert!(respawn);
+    assert_eq!(
+        effective_config.deepseek_base_url(),
+        "http://127.0.0.1:18199/v1"
+    );
+    assert_eq!(effective_config.approval_policy.as_deref(), Some("never"));
+    assert_eq!(effective_config.sandbox_mode.as_deref(), Some("read-only"));
+    assert_eq!(effective_config.allow_shell, Some(false));
+    assert_eq!(effective_config.max_subagents, Some(1));
+    let features = effective_config
+        .features
+        .expect("effective feature overlay");
+    assert_eq!(features.entries.get("shell_tool"), Some(&false));
+    assert_eq!(features.entries.get("subagents"), Some(&false));
 }
 
 #[test]
@@ -9522,9 +12675,67 @@ fn apply_loaded_session_restores_auto_model_mode() {
     assert_eq!(app.model, "auto");
     assert_eq!(app.model_selection_for_persistence(), "auto");
     assert_eq!(app.last_effective_model, None);
+    assert_eq!(app.last_effective_provider, None);
+    assert_eq!(app.last_effective_provider_identity, None);
+    assert_eq!(app.last_auto_route_receipt, None);
     assert_eq!(app.last_effective_reasoning_effort, None);
     assert_eq!(app.reasoning_effort, ReasoningEffort::Auto);
     assert_eq!(app.effective_model_for_budget(), DEFAULT_TEXT_MODEL);
+}
+
+#[test]
+fn auto_route_receipt_survives_session_snapshot_and_restore() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let manager =
+        crate::session_manager::SessionManager::new(tmp.path().join("sessions")).expect("manager");
+    let receipt = crate::model_routing::AutoRouteReceipt {
+        tier: crate::model_routing::AutoRouteTier::Strong,
+        pair: crate::model_routing::AutoRoutePair {
+            strong: crate::config::ZAI_GLM_5_2_MODEL.to_string(),
+            fast: Some(crate::config::ZAI_GLM_5_TURBO_MODEL.to_string()),
+        },
+        scope: crate::model_routing::AutoRouteScope::ResolvedProvider,
+        data_path: crate::model_routing::AutoRouteDataPath::LocalHeuristic,
+        reason: crate::model_routing::AutoRouteReason::LocalHeuristic(
+            crate::model_routing::AutoRouteHeuristicReason::ComplexRequest,
+        ),
+    };
+    let mut app = create_test_app();
+    app.set_model_selection("auto".to_string());
+    app.last_effective_provider = Some(ApiProvider::Zai);
+    app.last_effective_provider_identity = Some("zai".to_string());
+    app.last_effective_model = Some(crate::config::ZAI_GLM_5_2_MODEL.to_string());
+    app.last_auto_route_receipt = Some(receipt.clone());
+    app.api_messages
+        .push(text_message("user", "inspect this route"));
+
+    let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
+    let serialized = serde_json::to_string(&snapshot).expect("serialize session");
+    let persisted: SavedSession = serde_json::from_str(&serialized).expect("deserialize session");
+    let saved = persisted
+        .last_auto_route
+        .as_ref()
+        .expect("persisted Auto route");
+    assert_eq!(saved.provider, ApiProvider::Zai);
+    assert_eq!(saved.provider_identity, "zai");
+    assert_eq!(saved.model, crate::config::ZAI_GLM_5_2_MODEL);
+    assert_eq!(saved.receipt, receipt);
+
+    let mut restored_app = create_test_app();
+    apply_loaded_session(&mut restored_app, &mut Config::default(), &persisted)
+        .expect("restore session");
+
+    assert!(restored_app.auto_model);
+    assert_eq!(restored_app.last_effective_provider, Some(ApiProvider::Zai));
+    assert_eq!(
+        restored_app.last_effective_provider_identity.as_deref(),
+        Some("zai")
+    );
+    assert_eq!(
+        restored_app.last_effective_model.as_deref(),
+        Some(crate::config::ZAI_GLM_5_2_MODEL)
+    );
+    assert_eq!(restored_app.last_auto_route_receipt, Some(receipt));
 }
 
 #[test]
@@ -9607,6 +12818,7 @@ async fn model_picker_persists_model_and_reasoning_effort() {
         &mut config,
         "deepseek-v4-pro".to_string(),
         None,
+        None,
         ReasoningEffort::High,
         "auto".to_string(),
         ReasoningEffort::Auto,
@@ -9641,8 +12853,140 @@ async fn model_picker_persists_model_and_reasoning_effort() {
         .expect("provider/model result");
     assert!(provider_model_result.contains("provider=deepseek"));
     assert!(provider_model_result.contains("model=deepseek-v4-pro"));
-    assert!(provider_model_result.contains("auth=present/local"));
+    assert!(provider_model_result.contains("auth=key saved · not checked"));
+    assert!(provider_model_result.contains("health=attemptable"));
     assert!(!provider_model_result.contains("test-key"));
+}
+
+#[tokio::test]
+async fn model_picker_switches_between_exact_named_custom_routes() {
+    let _guard = SettingsHomeGuard::new();
+    let mut app = create_test_app();
+    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    app.set_model_selection("model-a".to_string());
+    let previous_effort = app.reasoning_effort;
+    let mut custom = HashMap::new();
+    for (name, base_url, model) in [
+        ("custom-a", "http://127.0.0.1:18181/v1", "model-a"),
+        ("custom-b", "http://127.0.0.1:18182/v1", "model-b"),
+    ] {
+        custom.insert(
+            name.to_string(),
+            ProviderConfig {
+                kind: Some("openai-compatible".to_string()),
+                base_url: Some(base_url.to_string()),
+                model: Some(model.to_string()),
+                api_key: Some("local-test-key".to_string()),
+                ..Default::default()
+            },
+        );
+    }
+    // Opening custom B's model picker retargets only Config; App/engine still
+    // own A until the operator applies a model.
+    let mut config = Config {
+        provider: Some("custom-b".to_string()),
+        providers: Some(ProvidersConfig {
+            custom,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut engine = mock_engine_handle();
+
+    apply_model_picker_choice(
+        &mut app,
+        &mut engine.handle,
+        &mut config,
+        "model-b".to_string(),
+        None,
+        Some("custom-b".to_string()),
+        ReasoningEffort::High,
+        "model-a".to_string(),
+        previous_effort,
+    )
+    .await;
+
+    assert_eq!(app.api_provider, ApiProvider::Custom);
+    assert_eq!(app.provider_identity_for_persistence(), "custom-b");
+    assert_eq!(app.model_selection_for_persistence(), "model-b");
+    assert_eq!(config.provider.as_deref(), Some("custom-b"));
+    assert_eq!(config.deepseek_base_url(), "http://127.0.0.1:18182/v1");
+}
+
+#[tokio::test]
+async fn model_picker_auto_switches_exact_named_custom_route_transactionally() {
+    let _guard = SettingsHomeGuard::new();
+    let mut app = create_test_app();
+    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    app.set_model_selection("model-a".to_string());
+    let previous_effort = app.reasoning_effort;
+    let mut custom = HashMap::new();
+    for (name, base_url, model) in [
+        ("custom-a", "http://127.0.0.1:18181/v1", "model-a"),
+        ("custom-b", "http://127.0.0.1:18182/v1", "model-b"),
+    ] {
+        custom.insert(
+            name.to_string(),
+            ProviderConfig {
+                kind: Some("openai-compatible".to_string()),
+                base_url: Some(base_url.to_string()),
+                model: Some(model.to_string()),
+                api_key: Some("local-test-key".to_string()),
+                ..Default::default()
+            },
+        );
+    }
+    let mut config = Config {
+        provider: Some("custom-b".to_string()),
+        providers: Some(ProvidersConfig {
+            custom,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut engine = mock_engine_handle();
+
+    apply_model_picker_choice(
+        &mut app,
+        &mut engine.handle,
+        &mut config,
+        "auto".to_string(),
+        None,
+        Some("custom-b".to_string()),
+        ReasoningEffort::Auto,
+        "model-a".to_string(),
+        previous_effort,
+    )
+    .await;
+
+    assert_eq!(app.api_provider, ApiProvider::Custom);
+    assert_eq!(app.provider_identity_for_persistence(), "custom-b");
+    assert!(app.auto_model);
+    assert_eq!(app.model_selection_for_persistence(), "auto");
+    assert_eq!(config.provider.as_deref(), Some("custom-b"));
+    assert_eq!(config.deepseek_base_url(), "http://127.0.0.1:18182/v1");
+}
+
+#[test]
+fn dismissing_named_custom_model_picker_restores_app_owned_config_route() {
+    let mut app = create_test_app();
+    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    let mut config =
+        named_custom_session_config("custom-a", "http://127.0.0.1:18181/v1", "model-a");
+    config.providers.as_mut().expect("providers").custom.insert(
+        "custom-b".to_string(),
+        ProviderConfig {
+            kind: Some("openai-compatible".to_string()),
+            base_url: Some("http://127.0.0.1:18182/v1".to_string()),
+            model: Some("model-b".to_string()),
+            ..Default::default()
+        },
+    );
+    config.provider = Some("custom-b".to_string());
+
+    sync_config_provider_from_app(&mut config, &app);
+
+    assert_eq!(config.provider.as_deref(), Some("custom-a"));
 }
 
 #[tokio::test]
@@ -9675,6 +13019,7 @@ async fn model_picker_skips_setup_receipt_when_settings_persistence_fails() {
         &mut engine.handle,
         &mut config,
         "deepseek-v4-pro".to_string(),
+        None,
         None,
         ReasoningEffort::High,
         "auto".to_string(),
@@ -10468,8 +13813,20 @@ fn activity_detail_includes_tool_handle_and_neighbor_context() {
         body.contains("retrieve_tool_result ref=art_call-read"),
         "{body}"
     );
-    assert!(body.contains("v raw"), "{body}");
-    assert!(body.contains("details)"), "{body}");
+    let details_chord = crate::tui::shell_key_routing::display_chord(
+        crate::tui::shell_key_routing::binding(
+            crate::tui::shell_key_routing::ShellBindingId::ToolDetails,
+        )
+        .footer_chord,
+    );
+    // The pager wraps this line at a platform-dependent point ("⌥V raw /
+    // details" on macOS, "Alt+V / raw details" on Windows), so normalize
+    // whitespace before asserting the full truthful hint.
+    let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(&format!("{details_chord} raw details)")),
+        "{body}"
+    );
 }
 
 #[test]
@@ -10531,10 +13888,23 @@ fn activity_detail_fallback_uses_recent_meaningful_activity_without_full_tool_du
 
     assert!(body.contains("Activity: read"));
     assert!(body.contains("Status: done"));
-    assert!(body.contains("Detail handle: v details"), "{body}");
+    let details = crate::tui::shell_key_routing::display_chord(
+        crate::tui::shell_key_routing::binding(
+            crate::tui::shell_key_routing::ShellBindingId::ToolDetails,
+        )
+        .footer_chord,
+    );
     assert!(
-        !body.contains("Detail handle: v raw details"),
+        body.contains(&format!("Detail handle: {details} details")),
+        "{body}"
+    );
+    assert!(
+        !body.contains(&format!("Detail handle: {details} raw details")),
         "fallback tool details should not be labeled raw: {body}"
+    );
+    assert!(
+        !body.contains("Detail handle: v details"),
+        "bare-v details claim must not appear: {body}"
     );
     assert!(
         !body.contains("line 10"),
@@ -10582,15 +13952,27 @@ fn turn_inspector_renders_overview_sections_for_active_turn() {
 
     let body = turn_inspector_text(&app);
 
-    // Overview framing + Ctrl+O vs. v contract.
+    // Overview framing + Ctrl+O vs. Alt+V/⌥V contract.
+    let details = crate::tui::shell_key_routing::display_chord(
+        crate::tui::shell_key_routing::binding(
+            crate::tui::shell_key_routing::ShellBindingId::ToolDetails,
+        )
+        .footer_chord,
+    );
     assert!(
         body.contains("Turn turn_abc1234 \u{00B7} completed"),
         "{body}"
     );
     assert!(!body.contains("turn_abc123456789"), "{body}");
     assert!(
-        body.contains("press v for the selected item's raw detail"),
+        body.contains(&format!(
+            "press {details} for the selected item's raw detail"
+        )),
         "{body}"
+    );
+    assert!(
+        !body.contains("press v for the selected item's raw detail"),
+        "bare-v details claim must not appear: {body}"
     );
     // Section headers for all nine sections must be present.
     for header in [
@@ -10621,6 +14003,39 @@ fn turn_inspector_renders_overview_sections_for_active_turn() {
         "{body}"
     );
     assert!(body.contains("Status: completed"), "{body}");
+}
+
+#[test]
+fn turn_inspector_pager_retains_complete_long_final_result() {
+    let mut app = create_test_app();
+    let final_result = format!(
+        "{}\nSecond paragraph remains available.\nTAIL-SENTINEL-4482",
+        "Long final result content. ".repeat(20)
+    );
+    assert!(final_result.len() > 200);
+    app.history = vec![
+        HistoryCell::User {
+            content: "Inspect the complete result".to_string(),
+        },
+        HistoryCell::Assistant {
+            content: final_result,
+            streaming: false,
+        },
+    ];
+    app.runtime_turn_status = Some("completed".to_string());
+
+    assert!(open_turn_inspector_pager(&mut app));
+    let body = pop_pager_body(&mut app);
+
+    assert!(body.contains("TAIL-SENTINEL-4482"), "{body}");
+    assert!(
+        body.contains("Second paragraph remains available."),
+        "{body}"
+    );
+    assert!(
+        !body.contains("Long final result content. ..."),
+        "pager data must not be pre-truncated: {body}"
+    );
 }
 
 #[test]
@@ -10688,20 +14103,28 @@ fn turn_inspector_timeline_numbers_semantic_entries_and_checkpoint_actions() {
         body.contains("1. user prompt: Fix timeline evidence"),
         "{body}"
     );
+    let details_chord = crate::tui::shell_key_routing::display_chord(
+        crate::tui::shell_key_routing::binding(
+            crate::tui::shell_key_routing::ShellBindingId::ToolDetails,
+        )
+        .footer_chord,
+    );
     assert!(
-        body.contains("2. read/search: read · src.rs — done · actions: v raw detail"),
+        body.contains(&format!(
+            "2. read/search: read · src.rs — done · actions: {details_chord} raw detail"
+        )),
         "{body}"
     );
     assert!(
-        body.contains(
-            "3. edit: src.rs — add timeline evidence — done · actions: v raw detail, d diff"
-        ),
+        body.contains(&format!(
+            "3. edit: src.rs — add timeline evidence — done · actions: {details_chord} diff"
+        )),
         "{body}"
     );
     assert!(
-        body.contains(
-            "4. test/verifier: cargo test timeline — done · 1.2s · actions: v raw detail"
-        ),
+        body.contains(&format!(
+            "4. test/verifier: cargo test timeline — done · 1.2s · actions: {details_chord} raw detail"
+        )),
         "{body}"
     );
     assert!(
@@ -11008,9 +14431,12 @@ fn approval_prompt_uses_event_input_after_message_complete_drain() {
         .as_any_mut()
         .downcast_mut::<ApprovalView>()
         .expect("approval view");
-    let action = approval.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+    // Bare `v` must not open the params pager.
+    let bare = approval.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+    assert!(matches!(bare, ViewAction::None));
+    let action = approval.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT));
     let ViewAction::Emit(ViewEvent::OpenTextPager { content, .. }) = action else {
-        panic!("expected approval params pager");
+        panic!("expected approval params pager from Alt+V");
     };
 
     assert!(content.contains("cargo test -p codewhale-tui approval"));
@@ -11382,6 +14808,75 @@ fn fallback_switch_status_shows_one_based_position_and_reason() {
 }
 
 #[tokio::test]
+async fn failed_fallback_restores_exact_literal_custom_identity_without_root_crossover() {
+    let mut config = Config {
+        provider: Some("custom".to_string()),
+        api_key: Some("legacy-root-key".to_string()),
+        base_url: Some("http://127.0.0.1:18180/v1".to_string()),
+        default_text_model: Some("legacy-root-model".to_string()),
+        providers: Some(ProvidersConfig {
+            custom: HashMap::from([(
+                "custom".to_string(),
+                ProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    api_key: Some("literal-table-key".to_string()),
+                    base_url: Some("http://127.0.0.1:18181/v1".to_string()),
+                    model: Some("literal-table-model".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let previous_identity = ProviderIdentity {
+        provider: ApiProvider::Custom,
+        key: "custom".to_string(),
+        exact_id: Some("custom".to_string()),
+    };
+    let mut app = create_test_app();
+    app.set_provider_identity_record(previous_identity.clone());
+    app.set_model_selection("literal-table-model".to_string());
+    // Mirror `apply_engine_error_to_app`: the fallback chain has advanced the
+    // enum while the previous exact route remains the rollback authority.
+    app.api_provider = ApiProvider::Openrouter;
+    let mut engine = mock_engine_handle();
+    let previous_chain = app.provider_chain.clone();
+
+    apply_provider_fallback_switch(
+        &mut app,
+        &mut engine.handle,
+        &mut config,
+        ProviderFallbackRollback {
+            identity: previous_identity.clone(),
+            chain: previous_chain,
+        },
+    )
+    .await;
+
+    assert_eq!(app.api_provider, ApiProvider::Custom);
+    assert_eq!(app.provider_identity_for_persistence(), "custom");
+    assert_eq!(app.provider_id_for_persistence(), Some("custom"));
+    let (restored_identity, restored_config) = app_scoped_runtime_config(&app, &config);
+    assert_eq!(restored_identity, previous_identity);
+    let route = resolve_runtime_route_for_identity(
+        &restored_config,
+        &restored_identity,
+        Some("literal-table-model"),
+    )
+    .expect("restored identity must still resolve the exact literal table");
+    assert_eq!(route.identity.exact_id.as_deref(), Some("custom"));
+    assert_eq!(
+        route.candidate.endpoint().base_url,
+        "http://127.0.0.1:18181/v1"
+    );
+    assert_ne!(
+        route.candidate.endpoint().base_url,
+        "http://127.0.0.1:18180/v1"
+    );
+}
+
+#[tokio::test]
 async fn provider_switch_auth_error_restores_previous_provider_and_model() {
     use crate::error_taxonomy::ErrorEnvelope;
 
@@ -11473,7 +14968,8 @@ async fn provider_switch_auth_error_restores_previous_provider_and_model() {
         .expect("provider/model result");
     assert!(provider_model_result.contains("provider=deepseek"));
     assert!(provider_model_result.contains("model=deepseek-v4-pro"));
-    assert!(provider_model_result.contains("auth=present/local"));
+    assert!(provider_model_result.contains("auth=key saved · not checked"));
+    assert!(provider_model_result.contains("health=attemptable"));
     assert!(!provider_model_result.contains("moonshot"));
     assert!(!provider_model_result.contains("kimi-k2.6"));
     assert!(!provider_model_result.contains("deepseek-key"));
@@ -11636,7 +15132,7 @@ fn non_recoverable_engine_error_enters_offline_mode() {
 }
 
 #[test]
-fn env_only_auth_failure_reopens_api_key_onboarding() {
+fn env_only_auth_failure_reopens_provider_onboarding() {
     use crate::error_taxonomy::ErrorEnvelope;
     let mut app = create_test_app();
     app.api_key_env_only = true;
@@ -11651,8 +15147,8 @@ fn env_only_auth_failure_reopens_api_key_onboarding() {
     assert!(app.offline_mode);
     assert_eq!(
         app.onboarding,
-        crate::tui::app::OnboardingState::ApiKey,
-        "env-only auth failures should prompt for a saved config key"
+        crate::tui::app::OnboardingState::Provider,
+        "env-only auth failures reopen the canonical provider setup picker"
     );
     assert!(app.onboarding_needs_api_key);
     assert!(app.turn_error_posted, "turn_error_posted must be set");
@@ -11867,10 +15363,7 @@ fn accidental_queue_edit_while_loading_is_labeled_and_recoverable() {
 
 #[test]
 fn build_pending_input_preview_includes_current_context_chips() {
-    let tmpdir = TempDir::new().expect("tempdir");
-    std::fs::write(tmpdir.path().join("guide.md"), "hello").expect("write");
     let mut app = create_test_app();
-    app.workspace = tmpdir.path().to_path_buf();
     app.input = "Read @guide.md and @missing.md".to_string();
     app.cursor_position = app.input.chars().count();
 
@@ -11880,29 +15373,35 @@ fn build_pending_input_preview_includes_current_context_chips() {
         preview
             .context_items
             .iter()
-            .any(|item| item.kind == "file" && item.label == "guide.md" && item.included),
-        "file mention preview missing: {:?}",
+            .any(|item| item.kind == "mention"
+                && item.label == "guide.md"
+                && !item.included
+                && item.detail.as_deref() == Some("resolved on send")),
+        "neutral mention preview missing: {:?}",
         preview.context_items
     );
     assert!(
         preview
             .context_items
             .iter()
-            .any(|item| item.kind == "missing" && item.label == "missing.md" && !item.included),
-        "missing mention preview missing: {:?}",
+            .any(|item| item.kind == "mention"
+                && item.label == "missing.md"
+                && !item.included
+                && item.detail.as_deref() == Some("resolved on send")),
+        "unresolved mention preview missing: {:?}",
         preview.context_items
     );
 }
 
 #[test]
-fn render_footer_from_with_default_items_renders_model_without_mode() {
-    // Header owns mode; footer shows model/cost/status only.
+fn render_footer_from_with_default_items_leaves_header_owned_facts_out() {
+    // Header owns model and mode; footer shows cost/status only.
     let mut app = create_test_app();
     app.session.session_cost = 0.00005;
     let items = crate::config::StatusItem::default_footer();
     let props = render_footer_from(&app, &items, None);
     assert!(props.mode_label.is_empty(), "footer should not repeat mode");
-    assert!(!props.model.is_empty(), "footer should show a model name");
+    assert!(props.model.is_empty(), "footer should not repeat model");
     // Tiny but real costs should render instead of disappearing as "$0.00".
     assert!(!props.cost.is_empty());
     assert_eq!(spans_text(&props.cost), "<$0.0001");
@@ -12011,7 +15510,7 @@ fn render_footer_from_drops_only_unselected_clusters() {
         .collect();
     let props = render_footer_from(&app, &items, None);
     assert!(props.mode_label.is_empty());
-    assert!(!props.model.is_empty(), "footer should show a model name");
+    assert!(props.model.is_empty(), "footer should not repeat model");
     assert!(
         props.cost.is_empty(),
         "cost cluster should be empty when Cost is disabled"
@@ -12822,10 +16321,11 @@ fn completed_turn_notification_leads_with_user_locale() {
 
 #[test]
 fn subagent_completion_notification_uses_summary_line_not_sentinel() {
-    let msg = crate::tui::notifications::subagent_completion_message(
+    let msg = crate::tui::notifications::subagent_terminal_message(
         crate::localization::Locale::En,
         "agent_live",
         "Finished the docs audit.\n<codewhale:subagent.done>{}</codewhale:subagent.done>",
+        &crate::tools::subagent::SubAgentStatus::Completed,
         false,
         Duration::from_secs(42),
     );
@@ -12839,15 +16339,31 @@ fn subagent_completion_notification_uses_summary_line_not_sentinel() {
 
 #[test]
 fn subagent_completion_notification_can_include_elapsed_summary() {
-    let msg = crate::tui::notifications::subagent_completion_message(
+    let msg = crate::tui::notifications::subagent_terminal_message(
         crate::localization::Locale::En,
         "agent_live",
         "",
+        &crate::tools::subagent::SubAgentStatus::Completed,
         true,
         Duration::from_secs(65),
     );
 
     assert_eq!(msg, "Sub-agent complete (1m 5s)\nagent_live");
+}
+
+#[test]
+fn subagent_cancelled_notification_never_claims_completion() {
+    let msg = crate::tui::notifications::subagent_terminal_message(
+        crate::localization::Locale::En,
+        "agent_stopped",
+        "Cancelled\n<codewhale:subagent.done>{\"status\":\"cancelled\"}</codewhale:subagent.done>",
+        &crate::tools::subagent::SubAgentStatus::Cancelled,
+        false,
+        Duration::from_secs(2),
+    );
+
+    assert_eq!(msg, "Sub-agent cancelled\nagent_stopped: Cancelled");
+    assert!(!msg.contains("Sub-agent complete"));
 }
 
 #[test]
@@ -13014,13 +16530,15 @@ fn toast_stack_overlay_respects_composer_boundary() {
     );
 }
 
-// === Bug #1913: Work sidebar should hide stale completed tasks ============
+// === Bugs #1913/#4416: Work sidebar session ownership =====================
 //
 // The Work sidebar reads `~/.deepseek/tasks/` on startup, which holds every
 // durable task the user has ever run. Without filtering, completed tasks
-// from prior sessions persist indefinitely. The projection helper keeps
-// active tasks, keeps tasks that finished during this session, keeps tasks
-// that finished within the last `recent_ttl`, and drops everything older.
+// from prior sessions persist indefinitely. Worse, startup recovery can mark
+// an old running task failed *during* a new TUI session. The projection helper
+// keeps active durable tasks, but only renders terminal receipts that were
+// created and completed during this TUI session. Shared history stays in
+// `/tasks` instead of making a fresh Work surface look failed.
 
 mod work_sidebar_projection_tests {
     use super::*;
@@ -13030,6 +16548,7 @@ mod work_sidebar_projection_tests {
     fn sample_task(
         id: &str,
         status: TaskStatus,
+        created_at: chrono::DateTime<Utc>,
         ended_at: Option<chrono::DateTime<Utc>>,
     ) -> TaskSummary {
         TaskSummary {
@@ -13038,10 +16557,11 @@ mod work_sidebar_projection_tests {
             prompt_summary: format!("task {id}"),
             model: "deepseek-v4-flash".to_string(),
             mode: "agent".to_string(),
-            created_at: Utc.with_ymd_and_hms(2026, 5, 16, 12, 0, 0).unwrap(),
-            started_at: Some(Utc.with_ymd_and_hms(2026, 5, 16, 12, 1, 0).unwrap()),
+            created_at,
+            started_at: Some(created_at + Duration::seconds(1)),
             ended_at,
             duration_ms: ended_at.map(|_| 1_234),
+            lifecycle_seq: 1,
             hunt_verdict: None,
             error: None,
             thread_id: None,
@@ -13050,29 +16570,48 @@ mod work_sidebar_projection_tests {
     }
 
     #[test]
-    fn work_sidebar_hides_stale_completed_tasks_but_keeps_active_and_recent() {
-        // Pretend the TUI session started on 2026-05-23T10:00:00Z. "Now"
-        // is one minute into the session.
+    fn work_sidebar_hides_other_session_terminals_but_keeps_current_and_active() {
+        // Pretend the TUI session started on 2026-05-23T10:00:00Z.
         let session_started_at = Utc.with_ymd_and_hms(2026, 5, 23, 10, 0, 0).unwrap();
-        let now = session_started_at + Duration::minutes(1);
-        let recent_ttl = Duration::hours(2);
 
-        let active_running = sample_task("active_run", TaskStatus::Running, None);
-        let active_queued = sample_task("active_q", TaskStatus::Queued, None);
+        let active_running = sample_task(
+            "active_run",
+            TaskStatus::Running,
+            session_started_at - Duration::minutes(30),
+            None,
+        );
+        let active_queued = sample_task(
+            "active_q",
+            TaskStatus::Queued,
+            session_started_at - Duration::minutes(20),
+            None,
+        );
 
-        // Completed during the current session — must show.
+        // Created and completed during the current session — must show.
         let just_finished = sample_task(
             "just_done",
             TaskStatus::Completed,
+            session_started_at + Duration::seconds(5),
             Some(session_started_at + Duration::seconds(30)),
         );
 
-        // Completed shortly before the session started, inside the
-        // recent-TTL window — must show.
+        // Completed shortly before the session started — shared history, not
+        // this session's live-work receipt.
         let recently_finished_before_session = sample_task(
             "recent_done",
             TaskStatus::Failed,
+            session_started_at - Duration::minutes(20),
             Some(session_started_at - Duration::minutes(15)),
+        );
+
+        // Exact restart regression: a prior-session running record is marked
+        // failed by TaskManager startup and gets a fresh ended_at. Its old
+        // creation time keeps it off the fresh Work surface.
+        let recovered_after_restart = sample_task(
+            "recovered_old_run",
+            TaskStatus::Failed,
+            session_started_at - Duration::minutes(30),
+            Some(session_started_at + Duration::seconds(1)),
         );
 
         // Stale completed from 6 days ago (the exact scenario in #1913) —
@@ -13080,34 +16619,43 @@ mod work_sidebar_projection_tests {
         let stale_completed = sample_task(
             "stale_done",
             TaskStatus::Completed,
+            session_started_at - Duration::days(6) - Duration::minutes(1),
             Some(session_started_at - Duration::days(6)),
         );
         let stale_canceled = sample_task(
             "stale_cancel",
             TaskStatus::Canceled,
+            session_started_at - Duration::days(7) - Duration::minutes(1),
             Some(session_started_at - Duration::days(7)),
         );
         let stale_failed = sample_task(
             "stale_fail",
             TaskStatus::Failed,
+            session_started_at - Duration::days(3) - Duration::minutes(1),
             Some(session_started_at - Duration::days(3)),
         );
 
         // A terminal task without `ended_at` shouldn't sneak through.
-        let terminal_no_timestamp = sample_task("ghost", TaskStatus::Completed, None);
+        let terminal_no_timestamp = sample_task(
+            "ghost",
+            TaskStatus::Completed,
+            session_started_at + Duration::seconds(1),
+            None,
+        );
 
         let tasks = vec![
             active_running.clone(),
             active_queued.clone(),
             just_finished.clone(),
             recently_finished_before_session.clone(),
+            recovered_after_restart.clone(),
             stale_completed.clone(),
             stale_canceled.clone(),
             stale_failed.clone(),
             terminal_no_timestamp.clone(),
         ];
 
-        let kept = select_work_sidebar_tasks(tasks, session_started_at, now, recent_ttl);
+        let kept = select_work_sidebar_tasks(tasks, session_started_at);
         let kept_ids: Vec<&str> = kept.iter().map(|t| t.id.as_str()).collect();
 
         assert!(
@@ -13123,9 +16671,13 @@ mod work_sidebar_projection_tests {
             "task completed during the current session must show: {kept_ids:?}"
         );
         assert!(
-            kept_ids.contains(&"recent_done"),
-            "task completed within the recent TTL before session start must show: \
+            !kept_ids.contains(&"recent_done"),
+            "prior-session terminal task must stay in explicit history: \
              {kept_ids:?}"
+        );
+        assert!(
+            !kept_ids.contains(&"recovered_old_run"),
+            "startup recovery must not turn an old task into a fresh red row: {kept_ids:?}"
         );
 
         assert!(
@@ -13151,13 +16703,14 @@ mod work_sidebar_projection_tests {
         // Edge case: a task that finished at exactly the same instant the
         // session started should still be visible (>= comparison).
         let session_started_at = Utc.with_ymd_and_hms(2026, 5, 23, 10, 0, 0).unwrap();
-        let now = session_started_at + Duration::seconds(1);
-        let recent_ttl = Duration::hours(2);
+        let at_boundary = sample_task(
+            "boundary",
+            TaskStatus::Completed,
+            session_started_at,
+            Some(session_started_at),
+        );
 
-        let at_boundary = sample_task("boundary", TaskStatus::Completed, Some(session_started_at));
-
-        let kept =
-            select_work_sidebar_tasks(vec![at_boundary], session_started_at, now, recent_ttl);
+        let kept = select_work_sidebar_tasks(vec![at_boundary], session_started_at);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].id, "boundary");
     }

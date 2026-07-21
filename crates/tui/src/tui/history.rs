@@ -14,6 +14,7 @@ use crate::tools::plan::PlanSnapshot;
 use crate::tools::review::ReviewOutput;
 use crate::tui::app::TranscriptSpacing;
 use crate::tui::diff_render;
+use crate::tui::ui_text::CopyLineSeparator;
 
 mod agent_activity;
 mod archived_context;
@@ -241,6 +242,7 @@ impl HistoryCell {
         }
     }
 
+    #[allow(dead_code)] // retained for focused/detail renderers and direct rendering tests
     pub fn lines_with_options(
         &self,
         width: u16,
@@ -359,6 +361,19 @@ impl HistoryCell {
                     width,
                 )
             }
+            HistoryCell::Tool(_) => self
+                .lines_with_options_folded(width, options, folded)
+                .into_iter()
+                .map(|line| {
+                    let copy_prefix_width = tool_copy_prefix_width(&line);
+                    RenderedTranscriptLine {
+                        line,
+                        links: Vec::new(),
+                        copy_prefix_width,
+                        copy_separator_after: CopyLineSeparator::Newline,
+                    }
+                })
+                .collect(),
             _ => hard_break_copy_lines(self.lines_with_options_folded(width, options, folded)),
         }
     }
@@ -432,11 +447,23 @@ impl HistoryCell {
 /// Convert a message into history cells for rendering.
 #[must_use]
 pub fn history_cells_from_message(msg: &Message) -> Vec<HistoryCell> {
+    if let Some(display) = crate::runtime_handoff::restored_subagent_checkpoint_display(msg) {
+        return vec![HistoryCell::System {
+            content: display.to_string(),
+        }];
+    }
+
     let mut cells = Vec::new();
 
     for block in &msg.content {
         match block {
             ContentBlock::Text { text, .. } => {
+                if text.starts_with("[tool_history_repair]") {
+                    cells.push(HistoryCell::System {
+                        content: text.clone(),
+                    });
+                    continue;
+                }
                 // Check if this is an `<archived_context>` block.
                 if msg.role == "assistant"
                     && let Some(archived) = parse_archived_context(text)
@@ -1037,7 +1064,7 @@ impl ReviewCell {
         lines.push(Line::from(Span::styled(
             "Issues",
             Style::default()
-                .fg(palette::WHALE_ACCENT_PRIMARY)
+                .fg(palette::WHALE_ACTION)
                 .add_modifier(Modifier::BOLD),
         )));
         if output.issues.is_empty() {
@@ -1071,7 +1098,7 @@ impl ReviewCell {
         lines.push(Line::from(Span::styled(
             "Suggestions",
             Style::default()
-                .fg(palette::WHALE_ACCENT_PRIMARY)
+                .fg(palette::WHALE_ACTION)
                 .add_modifier(Modifier::BOLD),
         )));
         if output.suggestions.is_empty() {
@@ -1221,6 +1248,9 @@ pub struct WebSearchCell {
     pub query: String,
     pub status: ToolStatus,
     pub summary: Option<String>,
+    pub source: Option<String>,
+    pub degraded: Option<String>,
+    pub ref_count: usize,
 }
 
 impl WebSearchCell {
@@ -1241,6 +1271,30 @@ impl WebSearchCell {
             tool_value_style(),
             width,
         ));
+        if let Some(source) = self.source.as_ref() {
+            lines.extend(render_compact_kv(
+                "source",
+                source,
+                tool_value_style(),
+                width,
+            ));
+        }
+        if let Some(degraded) = self.degraded.as_ref() {
+            lines.extend(render_compact_kv(
+                "degraded",
+                degraded,
+                tool_value_style(),
+                width,
+            ));
+        }
+        if self.ref_count > 0 {
+            lines.extend(render_compact_kv(
+                "citations",
+                &self.ref_count.to_string(),
+                tool_value_style(),
+                width,
+            ));
+        }
         if let Some(summary) = self.summary.as_ref() {
             lines.extend(render_compact_kv(
                 "result",
@@ -1767,6 +1821,69 @@ fn wrap_card_rail(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
     lines
 }
 
+/// Return the width of tool-cell chrome that remains after the transcript
+/// cache removes the cell-local card rail. Tool headers have two additional
+/// visual tokens (`✓`/spinner and the family glyph); detail rows have the
+/// thin transcript rail. Keeping this width with the rendered line avoids
+/// making selection copy infer chrome from glyph ranges, which can consume
+/// real code or CJK text that happens to begin with a box-drawing character.
+fn tool_copy_prefix_width(line: &Line<'static>) -> usize {
+    let spans = line.spans.as_slice();
+    let mut index = 0;
+
+    // The cache removes these exact local card rails before flattening.
+    if spans
+        .first()
+        .is_some_and(|span| matches!(span.content.as_ref(), "─ " | "╭ " | "│ " | "╰ "))
+    {
+        index = 1;
+    }
+
+    // Detail rows and pager affordances use the transcript rail as their
+    // first span. The live transcript's general rail accounting removes it;
+    // do not report it again as cell-local copy chrome.
+    if spans
+        .get(index)
+        .is_some_and(|span| span.content.as_ref() == TRANSCRIPT_RAIL)
+    {
+        return 0;
+    }
+
+    // A tool header starts with `<status> <family> `. Only consume this
+    // pair when both tokens are present, so output beginning with `✓` or a
+    // braille character remains copyable content.
+    let Some(status) = spans.get(index).map(|span| span.content.as_ref()) else {
+        return 0;
+    };
+    let Some(family) = spans.get(index + 1).map(|span| span.content.as_ref()) else {
+        return 0;
+    };
+    if !status.ends_with(' ')
+        || !is_tool_status_glyph(status.trim_end())
+        || !family.ends_with(' ')
+        || UnicodeWidthStr::width(family.trim_end()) != 1
+    {
+        return 0;
+    }
+
+    UnicodeWidthStr::width(status) + UnicodeWidthStr::width(family)
+}
+
+fn is_tool_status_glyph(text: &str) -> bool {
+    let mut chars = text.chars();
+    let Some(ch) = chars.next() else {
+        return false;
+    };
+    chars.next().is_none()
+        && matches!(
+            ch,
+            '\u{2713}' // ✓
+                | '\u{2715}' // ✕
+                | '\u{00B7}' // ·
+                | '\u{2800}'..='\u{28FF}' // braille spinner frames
+        )
+}
+
 fn review_severity_color(severity: &str) -> Color {
     match severity {
         "error" => palette::STATUS_ERROR,
@@ -1796,7 +1913,7 @@ fn is_cycle_boundary(content: &str) -> bool {
 /// horizontal rule above for visual separation.
 fn render_cycle_boundary(content: &str, width: u16) -> Vec<Line<'static>> {
     let style = Style::default()
-        .fg(palette::WHALE_ACCENT_PRIMARY)
+        .fg(palette::WHALE_ACTION)
         .add_modifier(Modifier::BOLD);
     let rule_style = Style::default().fg(palette::TEXT_DIM);
     let content_width = usize::from(width.saturating_sub(2).max(1));
@@ -1821,8 +1938,16 @@ fn render_cycle_boundary(content: &str, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
-fn status_symbol(started_at: Option<Instant>, status: ToolStatus, low_motion: bool) -> String {
+fn status_symbol(
+    started_at: Option<Instant>,
+    status: ToolStatus,
+    low_motion: bool,
+    family: crate::tui::widgets::tool_card::ToolFamily,
+) -> String {
     match status {
+        ToolStatus::Running if family == crate::tui::widgets::tool_card::ToolFamily::Verify => {
+            crate::tui::spinner::verification_tick_frame(started_at, low_motion).to_string()
+        }
         ToolStatus::Running => {
             crate::tui::spinner::braille_spinner_frame(started_at, low_motion).to_string()
         }
@@ -1951,7 +2076,7 @@ fn render_tool_header_with_family_and_summary(
 
     let mut spans = vec![
         Span::styled(
-            format!("{} ", status_symbol(started_at, status, low_motion)),
+            format!("{} ", status_symbol(started_at, status, low_motion, family)),
             Style::default().fg(tool_state_color(status)),
         ),
         Span::styled(

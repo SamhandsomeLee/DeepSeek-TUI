@@ -6,6 +6,7 @@
 use crate::compaction::CompactionConfig;
 use crate::config::ApiProvider;
 use crate::models::{Message, SystemPrompt};
+use crate::route_runtime::ResolvedRuntimeRoute;
 use crate::tools::goal::GoalStatus;
 use crate::tui::app::AppMode;
 use crate::tui::approval::ApprovalMode;
@@ -22,7 +23,10 @@ pub struct SessionSnapshot {
     pub messages: Vec<Message>,
     pub total_tokens: u64,
     pub model: String,
+    /// Generic provider kind retained for serialized compatibility.
     pub model_provider: String,
+    /// Exact non-secret configured provider key.
+    pub model_provider_id: Option<String>,
     pub workspace: PathBuf,
     pub system_prompt: Option<SystemPrompt>,
     pub mode: String,
@@ -36,6 +40,9 @@ pub struct ProviderRuntimeStatus {
     pub request_concurrency_limit: Option<usize>,
     pub active_provider_requests: usize,
 }
+
+/// Result of rebuilding the engine-owned MCP pool in process.
+pub type McpReloadResult = Result<crate::mcp::McpManagerSnapshot, String>;
 
 /// Origin of text being introduced as a user-role turn.
 ///
@@ -76,19 +83,16 @@ impl UserInputProvenance {
 }
 
 /// Operations that can be submitted to the engine.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum Op {
     /// Send a message to the AI
     SendMessage {
         content: String,
         mode: AppMode,
-        /// Provider route to use for this turn. `None` keeps the session
-        /// provider; auto model routing sets this when the inventory selects a
-        /// different authenticated provider.
-        provider: Option<ApiProvider>,
-        model: String,
-        /// Provider-route limits resolved by the host for this exact turn.
-        route_limits: Option<codewhale_config::route::RouteLimits>,
+        /// Exact, structurally resolved route authority for this turn. The
+        /// engine activates its client before mutating turn state; injected
+        /// engines may use their already-supplied client with the same receipt.
+        route: Box<ResolvedRuntimeRoute>,
         /// Compaction policy derived from the same provider route. Carrying it
         /// atomically avoids a model/limit mismatch before `SendMessage`.
         compaction: Box<CompactionConfig>,
@@ -121,6 +125,20 @@ pub enum Op {
         /// Structural input origin. This gates whether the turn may inherit
         /// YOLO/auto-approval authority; user-shaped text is not enough.
         provenance: UserInputProvenance,
+    },
+
+    /// Re-check and dispatch an interactive goal continuation when this
+    /// operation reaches the front of the engine queue. Keeping this distinct
+    /// from `SendMessage` prevents a queued `/goal pause` or `/goal clear`
+    /// from being overwritten by a stale synthetic Active snapshot.
+    ContinueGoal {
+        /// Runtime-supplied tools remain available across the synthetic turn
+        /// that continues the same logical goal run.
+        dynamic_tools: Vec<DynamicToolSpec>,
+        /// Opaque identity for an engine-owned synthetic continuation. Direct
+        /// callers use `None`; the engine uses `Some` to coalesce one token
+        /// across capacity-waiting, enqueued, and running-adjacent states.
+        engine_schedule_id: Option<u64>,
     },
 
     /// Execute a user-submitted composer shell command (`! <command>`) without
@@ -201,6 +219,13 @@ pub enum Op {
         heartbeat_timeout_secs: u64,
     },
 
+    /// Replace the engine's merged Fleet roster after the setup wizard saves a
+    /// project or personal profile. Subsequent turns can use the new role
+    /// immediately instead of requiring an application restart.
+    SetFleetRoster {
+        roster: std::sync::Arc<crate::fleet::roster::FleetRoster>,
+    },
+
     /// Sync engine session state (used for resume/load)
     SyncSession {
         session_id: Option<String>,
@@ -212,8 +237,12 @@ pub enum Op {
         mode: AppMode,
     },
 
-    /// Run context compaction immediately.
-    CompactContext,
+    /// Run context compaction on one exact, structurally resolved provider
+    /// route with policy derived from that same descriptor.
+    CompactContext {
+        route: Box<ResolvedRuntimeRoute>,
+        compaction: Box<CompactionConfig>,
+    },
 
     /// Get a snapshot of the current session state (messages, tokens, etc.)
     /// for saving to disk. Returns the result via the oneshot sender so
@@ -227,6 +256,13 @@ pub enum Op {
         tx: std::sync::Arc<
             std::sync::Mutex<Option<tokio::sync::oneshot::Sender<ProviderRuntimeStatus>>>,
         >,
+    },
+
+    /// Force the engine-owned MCP config/catalog to reload and reconnect.
+    /// The returned snapshot is taken from that same live pool.
+    ReloadMcp {
+        config_path: PathBuf,
+        tx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<McpReloadResult>>>>,
     },
 
     /// Run agent-driven context purging.

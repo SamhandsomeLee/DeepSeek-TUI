@@ -519,9 +519,16 @@ mod tests {
 
         // A priced row surfaces its stated per-token rate.
         let minimax = db
-            .find("minimax", "MiniMax-M3")
+            .find("minimax", "MiniMax-M2.7")
             .expect("bundled minimax row");
         assert_eq!(minimax.price_label(), "$0.30 / $1.20 per Mtok");
+
+        // MiniMax-M3 ships without verified per-token pricing, so its price
+        // stays honestly unknown rather than inheriting a sibling's rate.
+        let minimax_m3 = db
+            .find("minimax", "MiniMax-M3")
+            .expect("bundled minimax m3 row");
+        assert_eq!(minimax_m3.price_label(), "unknown");
     }
 
     #[test]

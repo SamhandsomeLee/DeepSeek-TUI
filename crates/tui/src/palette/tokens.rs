@@ -2,29 +2,44 @@
 
 use ratatui::style::Color;
 
-// v0.8.46 Whale dark palette — improved contrast and layer separation.
-pub const WHALE_BG_RGB: (u8, u8, u8) = (10, 17, 32); // #0A1120 Deep Navy
-pub const WHALE_PANEL_RGB: (u8, u8, u8) = (22, 34, 56); // #162238
-pub const WHALE_ELEVATED_RGB: (u8, u8, u8) = (36, 52, 78); // #24344E
-pub const WHALE_SELECTION_RGB: (u8, u8, u8) = (40, 56, 84); // #283854 — darker to avoid bright pop on deep navy
+// Codewhale Whale palette. Semantic colors own state, never decoration alone.
+pub const WHALE_BG_RGB: (u8, u8, u8) = (3, 7, 13); // #03070D Deep field
+pub const WHALE_CHROME_RGB: (u8, u8, u8) = (8, 17, 28); // #08111C Ink / chrome
+pub const WHALE_PANEL_RGB: (u8, u8, u8) = (14, 23, 41); // #0E1729 Panel surface
+pub const WHALE_COMPOSER_RGB: (u8, u8, u8) = (22, 34, 56); // #162238 Plate
+pub const WHALE_ELEVATED_RGB: (u8, u8, u8) = (24, 39, 66); // #182742 Raised
+pub const WHALE_SELECTION_RGB: (u8, u8, u8) = (31, 50, 77); // #1F324D Action-blue tint
 pub const WHALE_TEXT_BODY_RGB: (u8, u8, u8) = (246, 242, 232); // #F6F2E8 Whale Ivory
-pub const WHALE_TEXT_SOFT_RGB: (u8, u8, u8) = (217, 224, 234); // #D9E0EA
-pub const WHALE_TEXT_MUTED_RGB: (u8, u8, u8) = (169, 180, 199); // #A9B4C7 Mist Gray
-pub const WHALE_TEXT_HINT_RGB: (u8, u8, u8) = (138, 150, 174); // #8A96AE
+pub const WHALE_TEXT_SOFT_RGB: (u8, u8, u8) = (182, 192, 212); // #B6C0D4
+pub const WHALE_TEXT_MUTED_RGB: (u8, u8, u8) = (147, 160, 184); // #93A0B8
+pub const WHALE_TEXT_HINT_RGB: (u8, u8, u8) = (132, 145, 170); // #8491AA
 #[allow(dead_code)]
-pub const WHALE_TEXT_DIM_RGB: (u8, u8, u8) = (118, 130, 156); // #76829C
-pub const WHALE_ACCENT_PRIMARY_RGB: (u8, u8, u8) = (246, 196, 83); // #F6C453 Signal Gold
+pub const WHALE_TEXT_DIM_RGB: (u8, u8, u8) = (105, 119, 145); // #697791
+pub const WHALE_ACTION_RGB: (u8, u8, u8) = (106, 174, 242); // #6AAEF2 Blue — owns interaction on dark
+#[allow(dead_code)]
+pub const WHALE_COBALT_RGB: (u8, u8, u8) = (49, 95, 216); // #315FD8 Cobalt — light-mode action
+#[allow(dead_code)]
+pub const WHALE_ICE_RGB: (u8, u8, u8) = (209, 235, 244); // #D1EBF4 Ice — structure on dark
+#[allow(dead_code)]
+pub const WHALE_CYAN_RGB: (u8, u8, u8) = (72, 215, 255); // #48D7FF Cyan — bounded accents only
 pub const WHALE_ACCENT_SECONDARY_RGB: (u8, u8, u8) = (79, 209, 197); // #4FD1C5 Seafoam
-pub const WHALE_ACCENT_ACTION_RGB: (u8, u8, u8) = (255, 122, 89); // #FF7A59 Coral Spark
-pub const WHALE_ERROR_RGB: (u8, u8, u8) = (255, 92, 122); // #FF5C7A Rose Red
-pub const WHALE_ERROR_HOVER_RGB: (u8, u8, u8) = (255, 120, 144); // #FF7890 Rose Hover
-pub const WHALE_ERROR_SURFACE_RGB: (u8, u8, u8) = (42, 18, 26); // #2A121A Error Surface
-pub const WHALE_ERROR_BORDER_RGB: (u8, u8, u8) = (255, 138, 160); // #FF8AA0 Error Border
-pub const WHALE_ERROR_TEXT_RGB: (u8, u8, u8) = (255, 214, 222); // #FFD6DE Error Text
-pub const WHALE_WARNING_RGB: (u8, u8, u8) = (240, 160, 48); // #F0A030
-pub const WHALE_SUCCESS_RGB: (u8, u8, u8) = (79, 209, 197); // #4FD1C5 Seafoam
-pub const WHALE_INFO_RGB: (u8, u8, u8) = (106, 174, 242); // #6AAEF2 Sky
-pub const WHALE_BORDER_RGB: (u8, u8, u8) = (52, 88, 145); // #345891
+pub const WHALE_HUMAN_RGB: (u8, u8, u8) = (246, 196, 83); // #F6C453 Signal Gold
+/// Blue Stage grammar: the primary accent is the interaction blue. Signal Gold
+/// is reserved for the whale mark and human-attention roles
+/// ([`WHALE_HUMAN_RGB`]), never for general interaction.
+pub const WHALE_ACCENT_PRIMARY_RGB: (u8, u8, u8) = WHALE_ACTION_RGB;
+pub const WHALE_WORKING_GREEN_RGB: (u8, u8, u8) = (155, 214, 111); // #9BD66F Working Green
+#[allow(dead_code)]
+pub const WHALE_ACCENT_ACTION_RGB: (u8, u8, u8) = WHALE_ACTION_RGB;
+pub const WHALE_ERROR_RGB: (u8, u8, u8) = (255, 134, 178); // #FF86B2 Rose danger
+pub const WHALE_ERROR_HOVER_RGB: (u8, u8, u8) = (255, 156, 194); // #FF9CC2
+pub const WHALE_ERROR_SURFACE_RGB: (u8, u8, u8) = (43, 21, 34); // #2B1522
+pub const WHALE_ERROR_BORDER_RGB: (u8, u8, u8) = WHALE_ERROR_RGB;
+pub const WHALE_ERROR_TEXT_RGB: (u8, u8, u8) = (255, 219, 232); // #FFDBE8
+pub const WHALE_WARNING_RGB: (u8, u8, u8) = (255, 122, 89); // #FF7A59 Coral warning
+pub const WHALE_SUCCESS_RGB: (u8, u8, u8) = WHALE_WORKING_GREEN_RGB; // completed / verified
+pub const WHALE_INFO_RGB: (u8, u8, u8) = WHALE_ACTION_RGB;
+pub const WHALE_BORDER_RGB: (u8, u8, u8) = (38, 62, 92); // #263E5C, blue at 25% on stage
 pub const WHALE_REASONING_TEXT_RGB: (u8, u8, u8) = (224, 153, 72); // #E09948
 pub const WHALE_REASONING_SURFACE_RGB: (u8, u8, u8) = (42, 34, 24); // #2A2218
 pub const WHALE_REASONING_TINT_RGB: (u8, u8, u8) = (24, 36, 52); // #182434
@@ -51,29 +66,46 @@ pub const SOLARIZED_SELECT_RGB: (u8, u8, u8) = (0xD6, 0xD2, 0xC9);
 
 pub const WHALE_DIFF_ADDED_RGB: (u8, u8, u8) = (87, 199, 133); // #57C785
 #[allow(dead_code)]
-pub const WHALE_DIFF_DELETED_RGB: (u8, u8, u8) = (255, 92, 122); // #FF5C7A Rose Red
+pub const WHALE_DIFF_DELETED_RGB: (u8, u8, u8) = WHALE_ERROR_RGB;
 pub const WHALE_DIFF_ADDED_BG_RGB: (u8, u8, u8) = (18, 42, 34); // #122A22
-pub const WHALE_DIFF_DELETED_BG_RGB: (u8, u8, u8) = (42, 18, 26); // #2A121A
-pub const WHALE_MODE_AGENT_RGB: (u8, u8, u8) = (80, 150, 255); // #5096FF
-pub const WHALE_MODE_YOLO_RGB: (u8, u8, u8) = (255, 100, 100); // #FF6464
-pub const WHALE_MODE_PLAN_RGB: (u8, u8, u8) = (246, 196, 83); // #F6C453 Signal Gold
-pub const WHALE_MODE_OPERATE_RGB: (u8, u8, u8) = (178, 132, 255); // #B284FF
-pub const WHALE_TOOL_LIVE_RGB: (u8, u8, u8) = (140, 190, 238); // #8CBEEE
-pub const WHALE_TOOL_ISSUE_RGB: (u8, u8, u8) = (198, 150, 160); // #C696A0
-pub const WHALE_TOOL_OUTPUT_RGB: (u8, u8, u8) = (194, 208, 224); // #C2D0E0
-pub const WHALE_TOOL_SURFACE_RGB: (u8, u8, u8) = (28, 40, 62); // #1C283E
-pub const WHALE_TOOL_ACTIVE_RGB: (u8, u8, u8) = (38, 54, 80); // #263650
+// Raw colors that are remapped by equality must remain distinct across roles.
+// These stay in the same perceptual families as action, danger, and human asks
+// while preserving mode identity for Terminal and community themes.
+pub const WHALE_DIFF_DELETED_BG_RGB: (u8, u8, u8) = (52, 24, 39); // #341827
+pub const WHALE_MODE_AGENT_RGB: (u8, u8, u8) = (118, 181, 245); // #76B5F5
+pub const WHALE_MODE_YOLO_RGB: (u8, u8, u8) = (255, 112, 160); // #FF70A0
+pub const WHALE_MODE_PLAN_RGB: (u8, u8, u8) = (185, 220, 236); // #B9DCEC Structural Ice
+pub const WHALE_MODE_OPERATE_RGB: (u8, u8, u8) = (173, 136, 255); // #AD88FF
+pub const WHALE_TOOL_LIVE_RGB: (u8, u8, u8) = WHALE_ACCENT_SECONDARY_RGB;
+pub const WHALE_TOOL_ISSUE_RGB: (u8, u8, u8) = WHALE_ERROR_RGB;
+pub const WHALE_TOOL_OUTPUT_RGB: (u8, u8, u8) = WHALE_TEXT_SOFT_RGB;
+pub const WHALE_TOOL_SURFACE_RGB: (u8, u8, u8) = (18, 29, 50); // #121D32
+pub const WHALE_TOOL_ACTIVE_RGB: (u8, u8, u8) = (27, 44, 68); // #1B2C44
 
-pub const LIGHT_SURFACE_RGB: (u8, u8, u8) = (246, 248, 251); // #F6F8FB
-pub const LIGHT_PANEL_RGB: (u8, u8, u8) = (236, 242, 248); // #ECF2F8
-pub const LIGHT_ELEVATED_RGB: (u8, u8, u8) = (219, 229, 240); // #DBE5F0
+pub const LIGHT_SURFACE_RGB: (u8, u8, u8) = (244, 247, 251); // #F4F7FB
+pub const LIGHT_PANEL_RGB: (u8, u8, u8) = (255, 253, 248); // #FFFDF8
+pub const LIGHT_ELEVATED_RGB: (u8, u8, u8) = (232, 238, 248); // #E8EEF8
 pub const LIGHT_REASONING_RGB: (u8, u8, u8) = (255, 246, 214); // #FFF6D6
 pub const LIGHT_SUCCESS_RGB: (u8, u8, u8) = (223, 247, 231); // #DFF7E7
-pub const LIGHT_ERROR_RGB: (u8, u8, u8) = (254, 229, 229); // #FEE5E5
-pub const LIGHT_TEXT_BODY_RGB: (u8, u8, u8) = (15, 23, 42); // #0F172A
-pub const LIGHT_TEXT_MUTED_RGB: (u8, u8, u8) = (51, 65, 85); // #334155
-pub const LIGHT_TEXT_HINT_RGB: (u8, u8, u8) = (100, 116, 139); // #64748B
-pub const LIGHT_TEXT_SOFT_RGB: (u8, u8, u8) = (30, 41, 59); // #1E293B
+pub const LIGHT_SUCCESS_FG_RGB: (u8, u8, u8) = (20, 118, 61); // #14763D, readable on every light surface
+pub const LIGHT_ERROR_RGB: (u8, u8, u8) = (252, 235, 242); // #FCEBF2
+pub const LIGHT_TEXT_BODY_RGB: (u8, u8, u8) = (20, 33, 58); // #14213A
+pub const LIGHT_TEXT_MUTED_RGB: (u8, u8, u8) = (91, 103, 128); // #5B6780
+pub const LIGHT_TEXT_HINT_RGB: (u8, u8, u8) = (95, 107, 129); // #5F6B81
+pub const LIGHT_TEXT_SOFT_RGB: (u8, u8, u8) = (69, 81, 104); // #455168
+pub const LIGHT_ACTION_RGB: (u8, u8, u8) = (49, 95, 216); // #315FD8 Cobalt
+pub const LIGHT_LIVE_RGB: (u8, u8, u8) = (8, 118, 109); // #08766D
+pub const LIGHT_HUMAN_RGB: (u8, u8, u8) = (122, 85, 0); // #7A5500
+pub const LIGHT_WARNING_RGB: (u8, u8, u8) = (169, 71, 36); // #A94724
+pub const LIGHT_DANGER_RGB: (u8, u8, u8) = (180, 35, 90); // #B4235A
+// Mode shades stay in their parent semantic families while remaining distinct
+// inputs to the render backend. A `Cell` carries only a `Color`, so reusing the
+// exact action/human/danger value here would erase the mode role before ANSI
+// adaptation can preserve it.
+pub const LIGHT_MODE_AGENT_RGB: (u8, u8, u8) = (50, 95, 216); // #325FD8
+pub const LIGHT_MODE_YOLO_RGB: (u8, u8, u8) = (181, 35, 90); // #B5235A
+pub const LIGHT_MODE_PLAN_RGB: (u8, u8, u8) = (52, 92, 128); // #345C80 Structural steel-blue
+pub const LIGHT_OPERATE_RGB: (u8, u8, u8) = (112, 71, 184); // #7047B8
 
 // Solarized Light palette colors
 pub const SOLARIZED_TEXT_DIM: Color = Color::Rgb(
@@ -168,8 +200,8 @@ pub const SOLARIZED_COMPOSER: Color = Color::Rgb(
     SOLARIZED_PANEL_RGB.2,
 );
 
-pub const LIGHT_BORDER_RGB: (u8, u8, u8) = (139, 161, 184); // #8BA1B8
-pub const LIGHT_SELECTION_RGB: (u8, u8, u8) = (207, 224, 247); // #CFE0F7
+pub const LIGHT_BORDER_RGB: (u8, u8, u8) = (169, 184, 207); // #A9B8CF
+pub const LIGHT_SELECTION_RGB: (u8, u8, u8) = (238, 246, 255); // #EEF6FF
 pub const GRAYSCALE_SURFACE_RGB: (u8, u8, u8) = (10, 10, 10); // #0A0A0A
 pub const GRAYSCALE_PANEL_RGB: (u8, u8, u8) = (18, 18, 18); // #121212
 pub const GRAYSCALE_ELEVATED_RGB: (u8, u8, u8) = (31, 31, 31); // #1F1F1F
@@ -193,17 +225,32 @@ pub const MATRIX_TEXT_SOFT_RGB: (u8, u8, u8) = (221, 255, 221); // #DDFFDD
 pub const MATRIX_TEXT_DIM_RGB: (u8, u8, u8) = (0, 68, 0); // #004400
 pub const MATRIX_BORDER_RGB: (u8, u8, u8) = (0, 204, 0); // #00CC00
 
-// New semantic colors
-pub const BORDER_COLOR_RGB: (u8, u8, u8) = WHALE_BORDER_RGB; // #2A4A7F
+// Semantic colors
+pub const BORDER_COLOR_RGB: (u8, u8, u8) = WHALE_BORDER_RGB;
 
 pub const WHALE_ACCENT_PRIMARY: Color = Color::Rgb(
     WHALE_ACCENT_PRIMARY_RGB.0,
     WHALE_ACCENT_PRIMARY_RGB.1,
     WHALE_ACCENT_PRIMARY_RGB.2,
 );
+pub const WHALE_ACTION: Color =
+    Color::Rgb(WHALE_ACTION_RGB.0, WHALE_ACTION_RGB.1, WHALE_ACTION_RGB.2);
+pub const WHALE_LIVE: Color = Color::Rgb(
+    WHALE_ACCENT_SECONDARY_RGB.0,
+    WHALE_ACCENT_SECONDARY_RGB.1,
+    WHALE_ACCENT_SECONDARY_RGB.2,
+);
+pub const WHALE_HUMAN: Color = Color::Rgb(WHALE_HUMAN_RGB.0, WHALE_HUMAN_RGB.1, WHALE_HUMAN_RGB.2);
 pub const WHALE_INFO: Color = Color::Rgb(WHALE_INFO_RGB.0, WHALE_INFO_RGB.1, WHALE_INFO_RGB.2);
 pub const WHALE_BG: Color = Color::Rgb(WHALE_BG_RGB.0, WHALE_BG_RGB.1, WHALE_BG_RGB.2);
+pub const WHALE_CHROME: Color =
+    Color::Rgb(WHALE_CHROME_RGB.0, WHALE_CHROME_RGB.1, WHALE_CHROME_RGB.2);
 pub const WHALE_PANEL: Color = Color::Rgb(WHALE_PANEL_RGB.0, WHALE_PANEL_RGB.1, WHALE_PANEL_RGB.2);
+pub const WHALE_COMPOSER: Color = Color::Rgb(
+    WHALE_COMPOSER_RGB.0,
+    WHALE_COMPOSER_RGB.1,
+    WHALE_COMPOSER_RGB.2,
+);
 pub const WHALE_ERROR: Color = Color::Rgb(WHALE_ERROR_RGB.0, WHALE_ERROR_RGB.1, WHALE_ERROR_RGB.2);
 
 pub const LIGHT_SURFACE: Color = Color::Rgb(
@@ -227,6 +274,11 @@ pub const LIGHT_SUCCESS: Color = Color::Rgb(
     LIGHT_SUCCESS_RGB.1,
     LIGHT_SUCCESS_RGB.2,
 );
+pub const LIGHT_SUCCESS_FG: Color = Color::Rgb(
+    LIGHT_SUCCESS_FG_RGB.0,
+    LIGHT_SUCCESS_FG_RGB.1,
+    LIGHT_SUCCESS_FG_RGB.2,
+);
 pub const LIGHT_ERROR: Color = Color::Rgb(LIGHT_ERROR_RGB.0, LIGHT_ERROR_RGB.1, LIGHT_ERROR_RGB.2);
 pub const LIGHT_TEXT_BODY: Color = Color::Rgb(
     LIGHT_TEXT_BODY_RGB.0,
@@ -247,6 +299,37 @@ pub const LIGHT_TEXT_SOFT: Color = Color::Rgb(
     LIGHT_TEXT_SOFT_RGB.0,
     LIGHT_TEXT_SOFT_RGB.1,
     LIGHT_TEXT_SOFT_RGB.2,
+);
+pub const LIGHT_ACTION: Color =
+    Color::Rgb(LIGHT_ACTION_RGB.0, LIGHT_ACTION_RGB.1, LIGHT_ACTION_RGB.2);
+pub const LIGHT_LIVE: Color = Color::Rgb(LIGHT_LIVE_RGB.0, LIGHT_LIVE_RGB.1, LIGHT_LIVE_RGB.2);
+pub const LIGHT_HUMAN: Color = Color::Rgb(LIGHT_HUMAN_RGB.0, LIGHT_HUMAN_RGB.1, LIGHT_HUMAN_RGB.2);
+pub const LIGHT_WARNING: Color = Color::Rgb(
+    LIGHT_WARNING_RGB.0,
+    LIGHT_WARNING_RGB.1,
+    LIGHT_WARNING_RGB.2,
+);
+pub const LIGHT_DANGER: Color =
+    Color::Rgb(LIGHT_DANGER_RGB.0, LIGHT_DANGER_RGB.1, LIGHT_DANGER_RGB.2);
+pub const LIGHT_MODE_AGENT: Color = Color::Rgb(
+    LIGHT_MODE_AGENT_RGB.0,
+    LIGHT_MODE_AGENT_RGB.1,
+    LIGHT_MODE_AGENT_RGB.2,
+);
+pub const LIGHT_MODE_YOLO: Color = Color::Rgb(
+    LIGHT_MODE_YOLO_RGB.0,
+    LIGHT_MODE_YOLO_RGB.1,
+    LIGHT_MODE_YOLO_RGB.2,
+);
+pub const LIGHT_MODE_PLAN: Color = Color::Rgb(
+    LIGHT_MODE_PLAN_RGB.0,
+    LIGHT_MODE_PLAN_RGB.1,
+    LIGHT_MODE_PLAN_RGB.2,
+);
+pub const LIGHT_OPERATE: Color = Color::Rgb(
+    LIGHT_OPERATE_RGB.0,
+    LIGHT_OPERATE_RGB.1,
+    LIGHT_OPERATE_RGB.2,
 );
 pub const LIGHT_BORDER: Color =
     Color::Rgb(LIGHT_BORDER_RGB.0, LIGHT_BORDER_RGB.1, LIGHT_BORDER_RGB.2);
@@ -357,9 +440,9 @@ pub const TEXT_PRIMARY: Color = TEXT_BODY;
 pub const TEXT_MUTED: Color = TEXT_SECONDARY;
 pub const TEXT_DIM: Color = TEXT_HINT;
 pub const USER_BODY: Color = Color::Rgb(74, 222, 128); // #4ADE80 green
-pub const LIGHT_USER_BODY: Color = Color::Rgb(21, 128, 61); // #15803D green
+pub const LIGHT_USER_BODY: Color = LIGHT_SUCCESS_FG;
 
-// New semantic colors for UI theming
+// Compatibility semantic colors for UI theming
 pub const BORDER_COLOR: Color =
     Color::Rgb(BORDER_COLOR_RGB.0, BORDER_COLOR_RGB.1, BORDER_COLOR_RGB.2);
 #[allow(dead_code)]
@@ -405,7 +488,6 @@ pub const SURFACE_TOOL: Color = Color::Rgb(
     WHALE_TOOL_SURFACE_RGB.1,
     WHALE_TOOL_SURFACE_RGB.2,
 );
-#[allow(dead_code)]
 pub const SURFACE_TOOL_ACTIVE: Color = Color::Rgb(
     WHALE_TOOL_ACTIVE_RGB.0,
     WHALE_TOOL_ACTIVE_RGB.1,
@@ -498,4 +580,4 @@ pub const SELECTION_BG: Color = Color::Rgb(
     WHALE_SELECTION_RGB.2,
 );
 #[allow(dead_code)]
-pub const COMPOSER_BG: Color = WHALE_PANEL;
+pub const COMPOSER_BG: Color = WHALE_COMPOSER;

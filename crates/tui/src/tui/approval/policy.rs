@@ -260,6 +260,38 @@ mod tests {
     }
 
     #[test]
+    fn shell_exec_flags_are_not_benign() {
+        let category = get_tool_category("exec_shell");
+        for command in [
+            "fd -x ./pwn.sh",
+            "fd -uHtx ./pwn.sh",
+            "rg --pre /tmp/evil.sh needle .",
+            "git grep -O needle",
+            "git grep -nO needle",
+        ] {
+            assert_eq!(
+                classify_risk("exec_shell", category, &json!({"command": command})),
+                RiskLevel::Destructive,
+                "{command} should not be classified as benign"
+            );
+        }
+
+        for command in [
+            "fd -e rs .",
+            "fd -H --type f src",
+            "rg needle crates/",
+            "git grep needle crates/",
+            "git grep -n needle crates/",
+        ] {
+            assert_eq!(
+                classify_risk("exec_shell", category, &json!({"command": command})),
+                RiskLevel::Benign,
+                "{command} should remain benign"
+            );
+        }
+    }
+
+    #[test]
     fn web_run_open_and_click_fetch_remote_content() {
         let category = get_tool_category("web_run");
         assert_eq!(

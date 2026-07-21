@@ -8,12 +8,11 @@
 //! ordering, and formatting survive, and the result is replaced atomically
 //! (same-directory temp file + rename) with owner-only permissions.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
-use crate::config::{ApiProvider, StatusItem, effective_home_dir, expand_path};
+use crate::config::{ApiProvider, StatusItem, expand_path};
 
 /// Parse the TOML document at `path` (an absent or empty file yields an empty
 /// document), apply `mutate`, and atomically persist the result.
@@ -25,68 +24,14 @@ pub(crate) fn mutate_config_document<F>(path: &Path, mutate: F) -> anyhow::Resul
 where
     F: FnOnce(&mut toml_edit::DocumentMut) -> anyhow::Result<()>,
 {
-    let raw = if path.exists() {
-        Some(
-            fs::read_to_string(path)
-                .with_context(|| format!("failed to read config at {}", path.display()))?,
-        )
-    } else {
-        None
-    };
-    let mut document = match raw.as_deref() {
-        Some(raw) if !raw.trim().is_empty() => raw
-            .parse::<toml_edit::DocumentMut>()
-            .with_context(|| format!("failed to parse config at {}", path.display()))?,
-        _ => toml_edit::DocumentMut::new(),
-    };
-    mutate(&mut document)?;
-    write_config_toml_atomic(path, &document.to_string())
+    codewhale_config::mutate_config_document(path, mutate)
 }
 
 /// Atomically replace `path` with `body` via a same-directory temp file and
 /// rename. On Unix the file lands with 0o600 permissions: config.toml can
 /// hold API keys, so this matches `ConfigStore::save` and the auth save path.
 pub(crate) fn write_config_toml_atomic(path: &Path, body: &str) -> anyhow::Result<()> {
-    use std::io::Write as _;
-
-    let parent = match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
-    fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create config directory {}", parent.display()))?;
-
-    let mut temporary = tempfile::NamedTempFile::new_in(parent).with_context(|| {
-        format!(
-            "failed to create temporary config file in {}",
-            parent.display()
-        )
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        temporary
-            .as_file()
-            .set_permissions(fs::Permissions::from_mode(0o600))
-            .with_context(|| {
-                format!(
-                    "failed to secure temporary config file for {}",
-                    path.display()
-                )
-            })?;
-    }
-    temporary
-        .write_all(body.as_bytes())
-        .with_context(|| format!("failed to write config at {}", path.display()))?;
-    temporary
-        .as_file()
-        .sync_all()
-        .with_context(|| format!("failed to sync config at {}", path.display()))?;
-    temporary
-        .persist(path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("failed to replace config at {}", path.display()))?;
-    Ok(())
+    codewhale_config::create_config_document(path, body)
 }
 
 /// Set the value at `segments` (parent tables plus the final key), creating
@@ -100,24 +45,7 @@ pub(crate) fn set_document_value(
     segments: &[&str],
     value: impl Into<toml_edit::Value>,
 ) -> anyhow::Result<()> {
-    let (key, parents) = segments
-        .split_last()
-        .context("config value path must not be empty")?;
-    let table = table_like_at_path_mut(doc.as_table_mut(), parents, PathLookup::Create)?
-        .expect("Create lookups always yield a table");
-    match table.get_mut(key) {
-        Some(item) => {
-            let mut value = value.into();
-            if let Some(existing) = item.as_value() {
-                *value.decor_mut() = existing.decor().clone();
-            }
-            *item = toml_edit::Item::Value(value);
-        }
-        None => {
-            table.insert(key, toml_edit::value(value));
-        }
-    }
-    Ok(())
+    codewhale_config::set_config_document_value(doc, segments, value)
 }
 
 /// Remove the value at `segments`. Returns `Ok(true)` when an entry was
@@ -126,14 +54,7 @@ pub(crate) fn unset_document_value(
     doc: &mut toml_edit::DocumentMut,
     segments: &[&str],
 ) -> anyhow::Result<bool> {
-    let (key, parents) = segments
-        .split_last()
-        .context("config value path must not be empty")?;
-    let Some(table) = table_like_at_path_mut(doc.as_table_mut(), parents, PathLookup::Existing)?
-    else {
-        return Ok(false);
-    };
-    Ok(table.remove(key).is_some())
+    codewhale_config::unset_config_document_value(doc, segments)
 }
 
 /// Remove every entry named `key` from `table` and, recursively, from nested
@@ -152,7 +73,7 @@ pub(crate) fn remove_document_key_recursive(table: &mut dyn toml_edit::TableLike
     }
 }
 
-fn remove_key_preserving_leading_decor(table: &mut dyn toml_edit::TableLike, key: &str) {
+fn remove_key_preserving_leading_decor(table: &mut dyn toml_edit::TableLike, key: &str) -> bool {
     let mut found = false;
     let next_key = table.iter().find_map(|(candidate, _)| {
         if found {
@@ -164,22 +85,23 @@ fn remove_key_preserving_leading_decor(table: &mut dyn toml_edit::TableLike, key
     });
     let leading_prefix = leading_prefix_for_key(table, key);
     if table.remove(key).is_none() {
-        return;
+        return false;
     }
     let Some(prefix) = leading_prefix else {
-        return;
+        return true;
     };
     let Some(next_key) = next_key else {
-        return;
+        return true;
     };
     if prefix.as_str() == Some("") {
-        return;
+        return true;
     }
     if let Some(mut next_key_decor) = table.key_mut(&next_key)
         && decor_prefix_is_empty(next_key_decor.leaf_decor())
     {
         next_key_decor.leaf_decor_mut().set_prefix(prefix);
     }
+    true
 }
 
 fn decor_prefix_is_empty(decor: &toml_edit::Decor) -> bool {
@@ -204,50 +126,6 @@ fn leading_prefix_for_key(
         })
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PathLookup {
-    /// Create missing intermediate tables; error when a segment exists but is
-    /// not table-like.
-    Create,
-    /// Return `None` when a segment is missing or not table-like.
-    Existing,
-}
-
-fn table_like_at_path_mut<'a>(
-    root: &'a mut toml_edit::Table,
-    segments: &[&str],
-    lookup: PathLookup,
-) -> anyhow::Result<Option<&'a mut dyn toml_edit::TableLike>> {
-    let mut current: &mut dyn toml_edit::TableLike = root;
-    for segment in segments {
-        if current.get(segment).is_none() {
-            match lookup {
-                PathLookup::Create => {
-                    // Implicit, so creating `providers.foo.base_url` does not
-                    // emit an empty `[providers]` header.
-                    let mut table = toml_edit::Table::new();
-                    table.set_implicit(true);
-                    current.insert(segment, toml_edit::Item::Table(table));
-                }
-                PathLookup::Existing => return Ok(None),
-            }
-        }
-        let item = current
-            .get_mut(segment)
-            .expect("segment exists or was inserted above");
-        match item.as_table_like_mut() {
-            Some(table) => current = table,
-            None => match lookup {
-                PathLookup::Create => {
-                    anyhow::bail!("`{segment}` in config.toml must be a table")
-                }
-                PathLookup::Existing => return Ok(None),
-            },
-        }
-    }
-    Ok(Some(current))
-}
-
 pub(crate) fn persist_status_items(items: &[StatusItem]) -> anyhow::Result<PathBuf> {
     let path = config_toml_path(None)?;
     let items: toml_edit::Array = items.iter().map(|item| item.key()).collect();
@@ -264,6 +142,15 @@ pub(crate) fn persist_root_string_key(
 ) -> anyhow::Result<PathBuf> {
     let path = config_toml_path(config_path)?;
     mutate_config_document(&path, |doc| set_document_value(doc, &[key], value))?;
+    Ok(path)
+}
+
+pub(crate) fn persist_unset_root_key(
+    config_path: Option<&Path>,
+    key: &str,
+) -> anyhow::Result<PathBuf> {
+    let path = config_toml_path(config_path)?;
+    mutate_config_document(&path, |doc| unset_document_value(doc, &[key]).map(|_| ()))?;
     Ok(path)
 }
 
@@ -347,6 +234,38 @@ pub(crate) fn persist_provider_base_url_key(
     Ok(path)
 }
 
+/// Persist the model for one exact provider route without rewriting the
+/// legacy root DeepSeek fallback used by unrelated providers.
+///
+/// First-party DeepSeek retains its historical `default_text_model` root key.
+/// Every other built-in provider writes to its typed `[providers.<name>]`
+/// table, while named custom routes use their exact user-owned table id.
+pub(crate) fn persist_provider_model_key(
+    config_path: Option<&Path>,
+    provider: ApiProvider,
+    provider_identity: &str,
+    value: &str,
+) -> anyhow::Result<PathBuf> {
+    if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
+        return persist_root_string_key(config_path, "default_text_model", value);
+    }
+
+    let provider_key = if provider == ApiProvider::Custom {
+        normalize_custom_provider_id(provider_identity)?
+    } else {
+        provider
+            .metadata()
+            .context("provider config metadata")?
+            .provider_config_key()
+            .to_string()
+    };
+    let path = config_toml_path(config_path)?;
+    mutate_config_document(&path, |doc| {
+        set_document_value(doc, &["providers", &provider_key, "model"], value)
+    })?;
+    Ok(path)
+}
+
 fn provider_base_url_table_key(provider: ApiProvider) -> anyhow::Result<&'static str> {
     match provider {
         ApiProvider::Deepseek | ApiProvider::DeepseekCN => {
@@ -378,8 +297,10 @@ fn provider_base_url_table_key(provider: ApiProvider) -> anyhow::Result<&'static
         ApiProvider::Zai => Ok("zai"),
         ApiProvider::Stepfun => Ok("stepfun"),
         ApiProvider::Minimax => Ok("minimax"),
+        ApiProvider::MinimaxAnthropic => Ok("minimax_anthropic"),
         ApiProvider::Sakana => Ok("sakana"),
         ApiProvider::LongCat => Ok("longcat"),
+        ApiProvider::OpencodeGo => Ok("opencode_go"),
         ApiProvider::Meta => Ok("meta"),
         ApiProvider::Xai => Ok("xai"),
         // Custom providers live under a user-chosen `[providers.<name>]` table,
@@ -504,34 +425,8 @@ pub(crate) fn config_toml_path(config_path: Option<&Path>) -> anyhow::Result<Pat
     if let Some(path) = config_path {
         return Ok(expand_path(path.to_string_lossy().as_ref()));
     }
-    if let Ok(env) = std::env::var("CODEWHALE_CONFIG_PATH") {
-        let trimmed = env.trim();
-        if !trimmed.is_empty() {
-            return Ok(PathBuf::from(trimmed));
-        }
-    }
-    if let Ok(env) = std::env::var("DEEPSEEK_CONFIG_PATH") {
-        let trimmed = env.trim();
-        if !trimmed.is_empty() {
-            return Ok(PathBuf::from(trimmed));
-        }
-    }
-    let codewhale_home = codewhale_config::codewhale_home()
-        .context("failed to resolve CodeWhale home for config.toml path")?;
-    let primary = codewhale_home.join("config.toml");
-    if codewhale_config::codewhale_home_is_explicit() {
-        return Ok(primary);
-    }
-    let home =
-        effective_home_dir().context("failed to resolve home directory for config.toml path")?;
-    if primary.exists() {
-        return Ok(primary);
-    }
-    let legacy = home.join(".deepseek").join("config.toml");
-    if legacy.exists() {
-        return Ok(legacy);
-    }
-    Ok(primary)
+    crate::config::resolve_load_config_path(None)
+        .context("failed to resolve the active config.toml path")
 }
 
 #[cfg(test)]
@@ -549,7 +444,7 @@ mod tests {
         codewhale_home: Option<OsString>,
         codewhale_config_path: Option<OsString>,
         deepseek_config_path: Option<OsString>,
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: crate::test_support::TestEnvLock,
     }
 
     impl EnvGuard {
@@ -744,6 +639,23 @@ mod tests {
         }
 
         assert_eq!(config_toml_path(None).unwrap(), preferred);
+    }
+
+    #[test]
+    fn config_toml_path_uses_existing_home_fallback_when_env_target_is_missing() {
+        let temp_root = temp_root("codewhale-config-path-missing-env-fallback");
+        let home_config = temp_root.join(".codewhale").join("config.toml");
+        fs::create_dir_all(home_config.parent().unwrap()).unwrap();
+        fs::write(&home_config, "# existing fallback\n").unwrap();
+        let _guard = EnvGuard::new(&temp_root);
+        let missing_env = temp_root.join("override").join("missing.toml");
+
+        unsafe {
+            env::set_var("DEEPSEEK_CONFIG_PATH", &missing_env);
+        }
+
+        assert_eq!(config_toml_path(None).unwrap(), home_config);
+        assert!(!missing_env.exists());
     }
 
     #[test]
@@ -1234,6 +1146,19 @@ action = "mode.plan"
         assert!(!unset_document_value(&mut doc, &["model", "nested"]).unwrap());
         assert!(unset_document_value(&mut doc, &["model"]).unwrap());
         assert!(!unset_document_value(&mut doc, &["model"]).unwrap());
+    }
+
+    #[test]
+    fn unset_last_root_value_preserves_its_leading_comment() {
+        let mut doc = "# keep this explanation\napproval_policy = \"on-request\"\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+
+        assert!(unset_document_value(&mut doc, &["approval_policy"]).unwrap());
+
+        let saved = doc.to_string();
+        assert!(saved.contains("# keep this explanation"), "{saved:?}");
+        assert!(!saved.contains("approval_policy"), "{saved:?}");
     }
 
     #[test]

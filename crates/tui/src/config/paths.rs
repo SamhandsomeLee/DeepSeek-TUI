@@ -84,6 +84,17 @@ pub(crate) fn canonicalize_or_keep(path: &Path) -> PathBuf {
 }
 
 pub(crate) fn env_config_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        crate::test_support::with_test_env_lock(env_config_path_unlocked)
+    }
+    #[cfg(not(test))]
+    {
+        env_config_path_unlocked()
+    }
+}
+
+fn env_config_path_unlocked() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("CODEWHALE_CONFIG_PATH") {
         let trimmed = path.trim();
         if !trimmed.is_empty() {

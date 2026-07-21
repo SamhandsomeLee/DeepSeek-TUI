@@ -416,6 +416,13 @@ impl From<ToolError> for ErrorEnvelope {
                 "tool_timeout",
                 format!("Tool timed out after {seconds}s"),
             ),
+            ToolError::Cancelled { message } => Self::new(
+                ErrorCategory::Tool,
+                ErrorSeverity::Info,
+                false,
+                "tool_cancelled",
+                message,
+            ),
             ToolError::NotAvailable { message } => Self::new(
                 ErrorCategory::State,
                 ErrorSeverity::Error,

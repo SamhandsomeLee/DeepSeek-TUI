@@ -1,9 +1,20 @@
 # Localization Matrix
 
-Canonical tracking document for every locale CodeWhale ships, is actively
+Canonical tracking document for every locale Codewhale ships, is actively
 building, is planning, or has explicitly deferred.
 
-Last updated: 2026-06-29.
+> **Scope note (2026-07-12):** this matrix tracks the website/README surface.
+> The TUI ships its own locale packs under `crates/tui/locales/`
+> (en, es-419, ja, ko, pt-BR, vi, zh-Hans complete; zh-Hant intentionally
+> partial per #4057), guarded by raw key-parity tests in
+> `crates/tui/src/localization.rs`. Keep the two surfaces distinct when
+> updating status here.
+
+Customer-visible copy also follows the [Codewhale voice and terminal
+charter](VOICE.md); commands, key names, and glyphs remain code-owned around
+localized prose.
+
+Last updated: 2026-07-12.
 Source-of-truth README: `README.md` (English, post-#3087).
 
 ## Status legend

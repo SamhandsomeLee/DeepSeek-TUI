@@ -46,6 +46,7 @@ CLI/API surfaces are not implemented yet.
 
 | Entry | Transport | Use |
 |---|---|---|
+| `codewhale web [--port 7878]` | HTTP/SSE on `127.0.0.1:7878` + embedded client | First-class loopback-only browser client; opens the default browser |
 | `codewhale app-server --http` | HTTP/SSE on `127.0.0.1:7878` | Full `/v1/*` runtime API (canonical) |
 | `codewhale app-server --mobile` | HTTP/SSE on `0.0.0.0:7878` + `/mobile` | Runtime API + phone control page |
 | `codewhale app-server --stdio` | JSON-RPC 2.0 over stdio | Local SDK / control probe (no listener) |
@@ -89,7 +90,7 @@ this; the table maps each integration need to where a local client reads it.
 
 | Integration need | Where it comes from | Status |
 |---|---|---|
-| Route / effective model | `TurnRecord` + thread `model`; per-run `--provider`/`--model` overrides | available |
+| Route / effective model / billing surface | `TurnRecord` + thread `model`; per-run `--provider`/`--model` overrides | available |
 | Permission / sandbox / approval profile | thread `auto_approve`, sandbox + approval policy | available |
 | Run / thread / turn IDs | `thread_id`, `turn_id`, SSE event envelope | available |
 | Event stream | `GET /v1/threads/{id}/events` (replay + live SSE) | available |
@@ -163,12 +164,20 @@ codewhale doctor --json
 | `config_path` | string | Resolved config file path |
 | `config_present` | bool | Whether the config file exists |
 | `workspace` | string | Default workspace directory |
-| `legacy_state.primary_root` | string | Primary CodeWhale state root inspected for known state paths |
+| `legacy_state.primary_root` | string | Primary Codewhale state root inspected for known state paths |
 | `legacy_state.legacy_root` | string | Legacy `.deepseek` state root inspected for known state paths |
-| `legacy_state.needs_attention` | bool | Whether known `~/.deepseek` state paths are unmigrated or also present beside `~/.codewhale` |
+| `legacy_state.needs_attention` | bool | Whether known `~/.deepseek` state paths need review or the read-only session recovery diagnostic found missing destination filenames / could not complete |
 | `legacy_state.legacy_only_count` | number | Count of known state paths present only under the legacy root |
 | `legacy_state.dual_present_count` | number | Count of known state paths present under both primary and legacy roots |
 | `legacy_state.entries` | array | Per-path migration status: `{name, primary_present, legacy_present, status}` |
+| `legacy_state.session_recovery.status` | string | `isolated`, `no_legacy_sessions`, `migration_pending`, `migration_incomplete`, `migration_complete`, or `scan_failed` |
+| `legacy_state.session_recovery.read_only` | bool | Always true; doctor never invokes session migration or modifies either session directory |
+| `legacy_state.session_recovery.chat_contents_read` | bool | Always false; comparison is based only on top-level `.json` filenames and filesystem metadata |
+| `legacy_state.session_recovery.checkpoint_internals_scanned` | bool | Always false; `sessions/checkpoints/` and all other directories are skipped |
+| `legacy_state.session_recovery.recoverable_files` | array | Bounded sample of up to 100 missing destination filenames with source and destination paths; no chat payloads |
+| `legacy_state.session_recovery.recoverable_file_count` | number | Total missing destination filename count, including entries beyond the bounded sample |
+| `legacy_state.session_recovery.recoverable_files_truncated` | bool | Whether more than 100 recoverable filenames were found |
+| `legacy_state.session_recovery.recovery_command` | string or null | `codewhale sessions` when additive automatic recovery is available; null for isolated, complete, empty, or failed scans |
 | `api_key.source` | string | `env`, `config`, or `missing` |
 | `base_url` | string | API base URL |
 | `default_text_model` | string | Default model |
@@ -177,9 +186,11 @@ codewhale doctor --json
 | `memory.file_present` | bool | Whether memory file exists |
 | `mcp.config_path` | string | MCP config file path |
 | `mcp.present` | bool | Whether MCP config exists |
-| `mcp.servers` | array | Per-server health: `{name, enabled, status, detail}` |
+| `mcp.probe_scope` | string | `configuration`; doctor does not start MCP servers |
+| `mcp.live_health_checked` | bool | Always false for doctor JSON |
+| `mcp.servers` | array | Per-server configuration result plus separate `checks` for command availability, process reachability, protocol initialization, and backend/tool health; live stages are `not_checked` |
 | `skills.selected` | string | Resolved skills directory |
-| `skills.global.path` / `.present` / `.count` | — | CodeWhale global skills dir (`~/.codewhale/skills`, with legacy `~/.deepseek/skills` support) |
+| `skills.global.path` / `.present` / `.count` | — | Codewhale global skills dir (`~/.codewhale/skills`, with legacy `~/.deepseek/skills` support) |
 | `skills.agents.path` / `.present` / `.count` | — | Workspace `.agents/skills/` dir |
 | `skills.agents_global.path` / `.present` / `.count` | — | agentskills.io global skills dir (`~/.agents/skills`) |
 | `skills.local.path` / `.present` / `.count` | — | `skills/` dir |
@@ -230,6 +241,7 @@ codewhale doctor --json
 codewhale app-server --http [--host 127.0.0.1] [--port 7878] [--workers 2] [--auth-token TOKEN] [--insecure-no-auth]
 codewhale app-server --mobile [--host 0.0.0.0] [--port 7878] [--auth-token TOKEN]
 codewhale app-server --mobile --host 127.0.0.1 [--port 7878] [--insecure-no-auth]
+codewhale web [--port 7878]
 
 # Compatibility aliases — identical server, serve flag names:
 codewhale serve --http   [...] [--insecure]
@@ -247,27 +259,75 @@ no-auth mode with the `--mobile` default host `0.0.0.0`; use a token for LAN
 mobile access, or add `--host 127.0.0.1` for local-only no-auth testing. The
 `codewhale serve` compatibility aliases use `--insecure` for the same loopback
 escape hatch.
-Pass `--auth-token TOKEN` or set `DEEPSEEK_RUNTIME_TOKEN=TOKEN` before starting
-the server. If neither is set, the process generates a one-time token and prints
-it at startup. `/health` and `/v1/runtime/info` remain public for local
-supervision and bootstrap. `/mobile` returns 404 when mobile mode is disabled;
-when mobile mode is enabled and auth is enabled, `/mobile` returns 401 unless
-the request supplies the runtime token.
+Pass `--auth-token TOKEN` or set `CODEWHALE_RUNTIME_TOKEN=TOKEN` before starting
+the server; `DEEPSEEK_RUNTIME_TOKEN` remains a compatibility alias. If neither
+is set, the process generates a Runtime token for that process and does **not**
+print it. `/health`, `/v1/runtime/info`, and an enabled static client shell
+remain public; Runtime mutations and thread data stay behind `/v1/*`
+authentication. `/mobile` returns 404 when mobile mode is disabled and serves
+the unchanged static shell when it is enabled.
 
 Authenticated clients can provide the token as `Authorization: Bearer TOKEN`,
-`X-DeepSeek-Runtime-Token: TOKEN`, or `?token=TOKEN` for EventSource-style
-clients that cannot set custom headers.
+`X-Codewhale-Runtime-Token: TOKEN`, the legacy
+`X-DeepSeek-Runtime-Token: TOKEN`, or the `codewhale_runtime_token` cookie.
+Query-string authentication is not supported.
+
+### Local browser client
+
+`codewhale web` starts the canonical Runtime API on `127.0.0.1`, serves
+dependency-free assets embedded in the binary, and opens the default browser.
+It cannot bind to a non-loopback host and cannot run with Runtime auth disabled.
+
+The browser-launch URL contains a random, short-lived, one-time bootstrap
+capability, never the Runtime token. A loopback request exchanges that
+capability for a
+`codewhale_web_session=…; HttpOnly; SameSite=Strict; Path=/` cookie backed by a
+single process-local server session that expires 12 hours after the server
+process starts, consumes the capability immediately, and redirects to `/`.
+Reused, expired, malformed, or
+non-loopback bootstrap attempts fail closed. The Runtime bearer token is not
+placed in rendered HTML, browser storage, logs, URL queries/fragments, or
+browser-launch arguments. The one-time bootstrap capability does transit the
+OS browser launcher's argument list for a sub-second window; a same-user
+process scraping the process table in that window could race the browser to
+the exchange, which is why the capability is single-use, loopback-only, and
+expiring — and why a same-user attacker has strictly easier local avenues
+than this race.
+Existing bearer/header/cookie authorization for `/v1/*` is unchanged outside
+web mode. In web mode, cookie-authenticated unsafe requests must also carry the
+exact local web origin, and Fetch Metadata identifying a cross-origin cookie
+request is rejected. Explicit bearer and Runtime-token header clients keep
+their existing behavior.
+
+The v0.9.1 client provides a responsive thread/search rail, Runtime-owned
+session facts, transcript and tool receipts, and a bottom composer. It can
+create, select, rename, and archive threads; start or steer turns; interrupt
+work; resolve approvals; and answer Runtime user-input requests. Selection
+loads `GET /v1/threads/{id}` first, then opens the replayable event stream with
+`since_seq=latest_seq`; reconnection advances from the newest accepted sequence
+and drops duplicates or events from a stale selection. The thread detail
+snapshot includes `pending_approvals`, `pending_user_inputs`, and
+`pending_dynamic_tool_calls`; clients must hydrate those fields before
+subscribing so a reload cannot strand work whose request event is at or before
+`latest_seq`. Resolution is also published as `approval.decided`,
+`user_input.answered`, `user_input.canceled`, `tool_call.resolved`,
+`tool_call.canceled`, or `tool_call.timeout` for already-connected clients.
+
+Model, mode, permission posture, workspace, and branch are display-only in this
+client. Files/Changes, PTY/terminal, preview, artifacts, provider login/model
+selection, Fleet creation, and undo/retry/restore controls are intentionally
+absent until the Runtime publishes explicit contracts for them.
 
 ### Mobile control page
 
 `codewhale serve --mobile` starts the same HTTP/SSE runtime API and serves a
 phone-friendly control page at `/mobile`. When the bind host is left at the
 default, mobile mode binds to `0.0.0.0`, prints a warning, and prints local/LAN
-URLs. Pass `--host 127.0.0.1` to keep the mobile page loopback-only. If a
-runtime token is generated or supplied, the printed mobile URL includes it as a
-query parameter; the page stores it locally and removes it from the address bar.
-The static HTML page contains no secrets, but it is still token-gated when auth
-is enabled so unauthenticated LAN clients cannot fingerprint the mobile surface.
+URLs. Pass `--host 127.0.0.1` to keep the mobile page loopback-only. The static
+HTML page contains no secrets and is not itself token-gated. Its calls to
+`/v1/*` are authenticated: for LAN use, start with an explicit Runtime token
+and enter it in the page. Generated Runtime tokens are deliberately unprinted,
+so they cannot be copied into another device.
 
 The mobile page can list/create threads, send prompts, follow live SSE events,
 steer or interrupt an active turn, and resolve normal tool approvals through
@@ -363,8 +423,54 @@ accept an empty string to clear a previously-set value. Added in v0.8.10 (#562):
 - `POST /v1/approvals/{approval_id}` with body
   `{ "decision": "allow" | "deny", "remember": false }`
 
+**User input**
+- `POST /v1/user-input/{thread_id}/{input_id}` with body
+  `{ "answers": [{ "id": "question-id", "label": "Choice", "value": "Choice" }] }`
+
+Submitted values are delivered to the active model turn but are deliberately
+excluded from durable Runtime items and events. The settled tool item contains
+only a neutral receipt and a machine-readable `response_redacted` marker. The
+Runtime accepts only an exact pending `(thread_id, input_id)` request; an
+unknown, concurrently settling, or already settled id returns 404 and is never
+placed in the engine mailbox. It commits the secret-free
+`user_input.answered` receipt before removing the snapshot-authoritative prompt
+or delivering the answer to the engine. That settlement runs independently of
+the HTTP connection, so disconnecting after submission cannot leave a prompt
+half accepted. Terminal-turn cancellation follows the same receipt-before-
+removal ordering through `user_input.canceled`.
+
+**Client-executed dynamic tools**
+- `POST /v1/threads/{thread_id}/turns/{turn_id}/tool-calls/{call_id}/result`
+
+The thread and turn in the result route must match the pending call. A call is
+settled at most once; wrong-route and duplicate results return 404. Terminal
+lifecycle events carry identifiers and status only, never tool result content.
+The Runtime commits the terminal lifecycle event before making a submitted
+result available to the model. Result delivery, timeout, and terminal-turn
+cancellation race through one settlement owner, so exactly one of these events
+is durable for a call:
+
+- `tool_call.requested` — the typed client-executed call became pending;
+- `tool_call.resolved` — a result was durably accepted by the Runtime
+  (`result_accepted: true`; `success` is result metadata, but result content is
+  excluded);
+- `tool_call.timeout` — no result won before the bounded wait expired;
+- `tool_call.canceled` — the turn terminated before a submitted result won.
+
+HTTP `202 Accepted` and `tool_call.resolved` share that durable-acceptance
+meaning. Neither claims that the model consumed the result: a concurrent turn
+shutdown may close the model receiver after acceptance. Once the Runtime has
+accepted the result, that call is terminal and a duplicate result returns 404.
+
 **Events** (SSE replay + live stream)
 - `GET /v1/threads/{id}/events?since_seq=<u64>`
+
+Durable history parsing runs off the async server workers and reaches SSE in
+bounded batches of at most 256 events through a backpressured channel. Broadcast
+delivery is only a wake-up optimization: a lagged receiver opens the same
+bounded durable replay from its last accepted cursor. Optional `replay_limit`
+returns the newest requested tail and may not exceed 4096; `previous_seq` on
+the first returned event advances past exactly the omitted history.
 
 **Snapshots** (read-only side-git restore point listing)
 - `GET /v1/snapshots?limit=20`
@@ -417,6 +523,11 @@ specified and tested.
 - `GET /v1/apps/mcp/servers`
 - `GET /v1/apps/mcp/tools?server=<optional>`
 
+Skill activation toggles are persisted under a cross-process transaction lock.
+Each mutation reloads and merges the latest exact-name state before an atomic
+write, and `GET /v1/skills` refreshes that shared state so another Codewhale
+process's successful toggle is visible without restarting the Runtime API.
+
 **Usage** (token/cost aggregation across threads)
 - `GET /v1/usage?since=<rfc3339>&until=<rfc3339>&group_by=<day|model|provider|thread>`
 
@@ -461,18 +572,33 @@ The runtime uses a durable Thread/Turn/Item lifecycle.
   `mode`, `task_id`, `system_prompt`, `latest_turn_id`,
   `latest_response_bookmark`, `archived`
 - **TurnRecord** — `id`, `thread_id`, `status` (`queued|in_progress|completed|
-  failed|interrupted|canceled`), timestamps, duration, usage, error summary
+  failed|interrupted|canceled`), `effective_provider`, `effective_model`,
+  `effective_billing_surface`, timestamps, duration, usage, error summary
 - **TurnItemRecord** — `id`, `turn_id`, `kind` (`user_message|agent_message|
   tool_call|file_change|command_execution|context_compaction|status|error`),
   lifecycle `status`, `metadata`
 
 Events are append-only with a global monotonic `seq` for replay/resume.
 
+`effective_billing_surface` is a non-secret classification derived from the
+endpoint that served the turn. Recognized StepFun routes use `stepfun-payg` or
+`stepfun-plan`; unknown and custom endpoints leave it unset. The raw base URL is
+not persisted in `TurnRecord`.
+
 ### Restart semantics
 
 - If the process restarts while a turn or item is `queued` or `in_progress`,
   the recovered record is marked `interrupted` with an `"Interrupted by
   process restart"` error.
+- The trailing newline is an event append's commit marker. On startup, a final
+  JSONL fragment without that delimiter is truncated and fsynced even when its
+  bytes form valid JSON; it is an uncommitted append, and its already-reserved
+  sequence number is not reused. Newline-terminated malformed records are not
+  identifiable crash debris and continue to fail closed during replay.
+- If a terminal turn record reached disk but its terminal event sequence did
+  not, the first async read reconciles any unresolved dynamic calls as
+  `tool_call.canceled` and then emits one `turn.completed`. Existing terminal
+  call and turn receipts are detected and never duplicated.
 - Task execution performs its own recovery on top of the same persisted
   thread/turn store.
 
@@ -492,6 +618,7 @@ The SSE event payload shape for `/v1/threads/{id}/events`:
 {
   "schema_version": 1,
   "seq": 42,
+  "previous_seq": 38,
   "event": "item.delta",
   "kind": "item.delta",
   "thread_id": "thr_1234abcd",
@@ -512,6 +639,14 @@ Compatibility notes:
   the runtime store schema used for persisted thread/turn/event records.
 - `event` remains the SSE event name in existing clients; it is preserved as-is.
 - `kind` mirrors `event` in the stable envelope for typed clients.
+- `seq` is allocated globally across all Runtime threads. Consequently, gaps
+  between a thread's events are normal when other threads interleave. On this
+  per-thread SSE stream, `previous_seq` is the sequence of the last event
+  delivered for this thread (or the requested replay cursor for the first
+  event); clients detect loss by comparing it with their accepted per-thread
+  cursor, not by requiring `seq == previous_seq + 1`. Sequence allocation is
+  also not rewound after an append is transactionally rolled back, so a retry
+  can intentionally skip an unused value without implying a missing event.
 - `thread.started`, `turn.started`, and `turn.completed` are emitted as SSE event
   names exactly as before.
 - `timestamp` remains the canonical event time for schema version 1. `created_at`
@@ -522,7 +657,18 @@ Common event names: `thread.started`, `thread.forked`, `turn.started`,
 `turn.lifecycle`, `turn.steered`, `turn.interrupt_requested`,
 `turn.completed`, `item.started`, `item.delta`, `item.completed`,
 `item.failed`, `item.interrupted`, `approval.required`, `approval.decided`,
-`approval.timeout`, `sandbox.denied`.
+`approval.timeout`, `user_input.required`, `user_input.answered`,
+`user_input.canceled`, `tool_call.requested`, `tool_call.resolved`,
+`tool_call.timeout`, `tool_call.canceled`, `sandbox.denied`.
+
+Agent-message and reasoning deltas are materialized into the item projection
+before their corresponding `item.delta` event is sequenced. To avoid an fsync
+for every provider fragment, adjacent deltas are coalesced to configured bounds
+of at most 32 ms or approximately 16 KiB before publication (an indivisible
+upstream chunk can itself exceed the byte target). A process crash inside that
+unpublished window can lose the recent suffix; no durable event claims that
+suffix existed. Once an `item.delta` is durable, snapshots at or beyond its
+cursor include the same materialized prefix.
 
 `approval.required` events may include a `matched_rule` string when an
 execution-policy rule caused the prompt. This field is explanatory metadata for
@@ -565,13 +711,16 @@ when developing a UI on Vite's default `:5173`), use any of:
 
 User-supplied origins **stack on top of** the built-in defaults; they do not
 replace them. Wildcard origins are not supported — the explicit allow-list
-model is preserved. Added in v0.8.10 (#561).
+model is preserved. Cross-origin preflights advertise only `Authorization`,
+`Content-Type`, `Accept`, `X-Codewhale-Runtime-Token`, and the compatibility
+`X-DeepSeek-Runtime-Token` request header; custom request headers are not
+allowed. Added in v0.8.10 (#561), tightened in v0.9.1 (#4454).
 
 ## Runtime SDK Fleet Helpers
 
 The v0.8.60 Runtime SDK fixture lives in `npm/runtime-sdk` and is exposed as
 the `@codewhale/runtime-sdk` workspace package. It is deliberately thin: every
-helper calls the local Rust Runtime API and therefore cannot bypass CodeWhale's
+helper calls the local Rust Runtime API and therefore cannot bypass Codewhale's
 sandbox, approval prompts, provider configuration, or fleet ledger authority.
 
 ```js

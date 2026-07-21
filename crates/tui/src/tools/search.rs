@@ -290,7 +290,7 @@ where
 }
 
 fn grep_cancelled() -> ToolError {
-    ToolError::execution_failed("grep_files cancelled before completion")
+    ToolError::cancelled("grep_files cancelled before completion")
 }
 
 fn grep_timeout(timeout: Duration) -> ToolError {
@@ -539,9 +539,7 @@ fn visit_files_recursive(
 
 fn check_cancelled(cancel_token: Option<&CancellationToken>) -> Result<(), ToolError> {
     if cancel_token.is_some_and(CancellationToken::is_cancelled) {
-        return Err(ToolError::execution_failed(
-            "search cancelled before completion",
-        ));
+        return Err(ToolError::cancelled("search cancelled before completion"));
     }
     Ok(())
 }

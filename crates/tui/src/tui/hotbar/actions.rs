@@ -527,6 +527,16 @@ impl HotbarActionRegistry {
         self.register_source(&SkillHotbarActionSource { skills });
     }
 
+    /// Atomically replace the Skill-derived action source while retaining
+    /// built-ins, configured routes, slash commands, and live MCP actions.
+    /// Plugin lifecycle changes call this from the same cache refresh that
+    /// updates command dispatch, preventing stale revoked bindings.
+    pub(crate) fn replace_skills(&mut self, skills: &[(String, String)]) {
+        self.actions
+            .retain(|_, action| action.category() != HotbarActionCategory::Skill.as_str());
+        self.register_skills(skills);
+    }
+
     /// Replace the MCP-tool hotbar actions with the tools in `snapshot`.
     ///
     /// Called when a live MCP discovery snapshot lands (or is refreshed) so
@@ -585,7 +595,7 @@ impl HotbarActionSource for BuiltinHotbarActionSource {
             "mode.operate",
             "operate",
             "Operate mode",
-            "Manage Fleet workers, subagents, and workflow lanes.",
+            "Send tasks while Fleet workers run in parallel.",
             AppHotbarKind::Mode(AppMode::Operate),
         ));
         registry.register(AppHotbarAction::new(
@@ -1020,16 +1030,7 @@ impl HotbarAction for AppHotbarAction {
                 if app.auto_model {
                     bail!("Reasoning effort is controlled by auto model routing.");
                 }
-                app.reasoning_effort = app
-                    .reasoning_effort
-                    .cycle_next_for_provider(app.api_provider);
-                app.last_effective_reasoning_effort = None;
-                app.update_model_compaction_budget();
-                app.status_message = Some(format!(
-                    "Reasoning effort: {}",
-                    app.reasoning_effort
-                        .display_label_for_provider(app.api_provider)
-                ));
+                app.apply_reasoning_effort_cycle();
                 Ok(HotbarDispatch::AppAction(AppAction::UpdateCompaction(
                     app.compaction_config(),
                 )))
@@ -1505,7 +1506,7 @@ mod tests {
         McpManagerSnapshot {
             config_path: PathBuf::from("mcp.json"),
             config_exists: true,
-            restart_required: false,
+            reload_required: false,
             servers: vec![
                 server(
                     "search",
@@ -2187,6 +2188,36 @@ mod tests {
         assert_eq!(metadata.safety, HotbarSafetyClass::ExistingCommand);
         assert_eq!(metadata.recommendation, HotbarRecommendation::Eligible);
         assert!(registry.metadata_validation_errors(Locale::En).is_empty());
+    }
+
+    #[test]
+    fn replacing_skills_removes_stale_plugin_actions_atomically() {
+        let mut registry = HotbarActionRegistry::with_builtins();
+        registry.register_skills(&[
+            ("native".to_string(), "native Skill".to_string()),
+            (
+                "demo:review".to_string(),
+                "reviewed plugin Skill".to_string(),
+            ),
+        ]);
+        assert!(registry.get("skill.demo:review").is_some());
+        let builtin_count = registry
+            .iter()
+            .filter(|action| action.category() != HotbarActionCategory::Skill.as_str())
+            .count();
+
+        registry.replace_skills(&[("native".to_string(), "refreshed".to_string())]);
+
+        assert!(registry.get("skill.demo:review").is_none());
+        assert!(registry.get("skill.native").is_some());
+        assert_eq!(
+            registry
+                .iter()
+                .filter(|action| action.category() != HotbarActionCategory::Skill.as_str())
+                .count(),
+            builtin_count,
+            "refresh must preserve every non-Skill action source"
+        );
     }
 
     #[test]

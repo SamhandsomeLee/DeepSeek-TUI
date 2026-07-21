@@ -24,7 +24,9 @@ use ratatui::{
 use crate::deepseek_theme::Theme;
 use crate::palette;
 use crate::tools::plan::StepStatus;
-use crate::tools::subagent::{AgentWorkerStatus, SubAgentStatus, agent_worker_status_name};
+use crate::tools::subagent::{
+    AgentWorkerStatus, SubAgentStatus, agent_worker_status_name, localized_whale_display_names,
+};
 use crate::tools::todo::TodoStatus;
 
 use super::app::{
@@ -294,9 +296,16 @@ fn render_hotbar_panel(f: &mut Frame, area: Rect, app: &mut App, config: &Config
         &title,
         hotbar_panel_lines(&slots, content_width, &app.ui_theme),
         hotbar_panel_hover_texts(&slots),
-        Vec::new(),
+        hotbar_panel_row_actions(),
         app,
     );
+}
+
+fn hotbar_panel_row_actions() -> Vec<Option<SidebarRowAction>> {
+    (1..=codewhale_config::HOTBAR_SLOT_COUNT)
+        .step_by(HOTBAR_ROW_COLUMNS)
+        .map(|slot| Some(SidebarRowAction::HotbarSlot(slot)))
+        .collect()
 }
 
 fn hotbar_panel_enabled(app: &App, config: &Config) -> bool {
@@ -791,11 +800,11 @@ fn work_panel_hover_texts(
         && texts.len() < max_rows
     {
         let icon = if summary.goal_completed {
-            "✓"
+            crate::tui::glyphs::DONE
         } else if summary.workflow_paused {
-            "⏸"
+            crate::tui::glyphs::PAUSED
         } else {
-            "◆"
+            crate::tui::glyphs::ATTENTION
         };
         texts.push(format!("Goal: {icon} {objective}"));
 
@@ -988,11 +997,11 @@ fn push_work_goal_lines(
     }
 
     let icon = if summary.goal_completed {
-        "✓"
+        crate::tui::glyphs::DONE
     } else if summary.workflow_paused {
-        "⏸"
+        crate::tui::glyphs::PAUSED
     } else {
-        "◆"
+        crate::tui::glyphs::ATTENTION
     };
     let status_style = if summary.goal_completed {
         Style::default()
@@ -1394,13 +1403,12 @@ struct SidebarToolRow {
 /// Row sets shared by the Tasks panel line renderer and hover-text builder.
 ///
 /// Computed once per frame in `render_sidebar_tasks` (#3898): both consumers
-/// previously recomputed `active_tool_rows` / `reasoning_task_rows` /
-/// `background_task_rows` (a clone+sort of `app.task_panel`) independently,
+/// previously recomputed `active_tool_rows` / `background_task_rows` (a
+/// clone+sort of `app.task_panel`) independently,
 /// doubling the work and risking the two passes disagreeing across an
 /// `Instant::elapsed` TTL boundary within the same frame.
 struct TaskPanelRowSets {
     active: Vec<SidebarToolRow>,
-    reasoning: Vec<TaskPanelEntry>,
     background: Vec<TaskPanelEntry>,
     recent: Vec<SidebarToolRow>,
 }
@@ -1408,7 +1416,6 @@ struct TaskPanelRowSets {
 fn task_panel_row_sets(app: &App) -> TaskPanelRowSets {
     let explicit_tasks_focus = app.sidebar_focus == SidebarFocus::Tasks;
     let active = active_tool_rows(app);
-    let reasoning = reasoning_task_rows(app);
     // Auto/Pinned mode deliberately skips live-tool dedup (passes an empty
     // slice), matching the previous per-consumer call sites.
     let background = background_task_rows(app, if explicit_tasks_focus { &active } else { &[] });
@@ -1419,7 +1426,6 @@ fn task_panel_row_sets(app: &App) -> TaskPanelRowSets {
     };
     TaskPanelRowSets {
         active,
-        reasoning,
         background,
         recent,
     }
@@ -1470,12 +1476,6 @@ fn task_panel_rows(
         push_tool_rows(&mut lines, active_rows, content_width, max_rows, theme);
     }
 
-    let reasoning_rows = &row_sets.reasoning;
-    if explicit_tasks_focus && !reasoning_rows.is_empty() && lines.len() < max_rows {
-        push_sidebar_label_theme(&mut lines, "Model reasoning", theme);
-        push_reasoning_rows(&mut lines, reasoning_rows, content_width, max_rows, theme);
-    }
-
     let background_rows = &row_sets.background;
     // Lines pushed so far (turn label, Live tools header, live tool rows)
     // are not clickable — backfill their action slots.
@@ -1518,7 +1518,7 @@ fn task_panel_rows(
                 .map(format_duration_ms)
                 .unwrap_or_else(|| "-".to_string());
             let (label, detail) = background_task_labels(task, &duration);
-            let label = background_task_spinner_prefix(task)
+            let label = background_task_spinner_prefix(task, app.low_motion)
                 .map(|prefix| format!("{prefix} {label}"))
                 .unwrap_or(label);
             let (show_action, detail_action) = background_task_click_actions(task);
@@ -1599,7 +1599,6 @@ fn task_panel_rows(
         || (lines.len() == 1
             && app.runtime_turn_id.is_some()
             && active_rows.is_empty()
-            && reasoning_rows.is_empty()
             && background_rows.is_empty())
     {
         lines.push(Line::from(Span::styled(
@@ -1629,12 +1628,6 @@ fn task_panel_hover_texts(app: &App, row_sets: &TaskPanelRowSets, max_rows: usiz
         push_tool_row_hover_texts(&mut texts, active_rows, max_rows);
     }
 
-    let reasoning_rows = &row_sets.reasoning;
-    if explicit_tasks_focus && !reasoning_rows.is_empty() && texts.len() < max_rows {
-        texts.push("Model reasoning".to_string());
-        push_reasoning_row_hover_texts(&mut texts, reasoning_rows, max_rows);
-    }
-
     let background_rows = &row_sets.background;
     if !background_rows.is_empty() && texts.len() < max_rows {
         let running = background_rows
@@ -1658,7 +1651,7 @@ fn task_panel_hover_texts(app: &App, row_sets: &TaskPanelRowSets, max_rows: usiz
                 .map(format_duration_ms)
                 .unwrap_or_else(|| "-".to_string());
             let (label, detail) = background_task_labels(task, &duration);
-            let label = background_task_spinner_prefix(task)
+            let label = background_task_spinner_prefix(task, app.low_motion)
                 .map(|prefix| format!("{prefix} {label}"))
                 .unwrap_or(label);
             texts.push(label);
@@ -1705,7 +1698,6 @@ fn task_panel_hover_texts(app: &App, row_sets: &TaskPanelRowSets, max_rows: usiz
         || (texts.len() == 1
             && app.runtime_turn_id.is_some()
             && active_rows.is_empty()
-            && reasoning_rows.is_empty()
             && background_rows.is_empty())
     {
         texts.push("No live tools or background jobs".to_string());
@@ -1735,69 +1727,6 @@ fn push_tool_row_hover_texts(texts: &mut Vec<String>, rows: &[SidebarToolRow], m
         texts.push(label);
         if !row.summary.trim().is_empty() && texts.len() < max_rows {
             texts.push(format!("  {}", row.summary));
-        }
-    }
-}
-
-fn push_reasoning_rows(
-    lines: &mut Vec<Line<'static>>,
-    rows: &[TaskPanelEntry],
-    content_width: usize,
-    max_rows: usize,
-    theme: &palette::UiTheme,
-) {
-    for task in rows {
-        if lines.len() >= max_rows {
-            break;
-        }
-        let color = match task.status.as_str() {
-            "running" => theme.warning,
-            "completed" => theme.success,
-            "failed" => theme.error_fg,
-            _ => theme.text_muted,
-        };
-        let duration = task
-            .duration_ms
-            .map(format_duration_ms)
-            .unwrap_or_else(|| "-".to_string());
-        lines.push(Line::from(Span::styled(
-            truncate_line_to_width(
-                &format!("thinking {} {duration}", task.status),
-                content_width,
-            ),
-            Style::default().fg(color),
-        )));
-        if !task.prompt_summary.trim().is_empty() && lines.len() < max_rows {
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "  {}",
-                    truncate_line_to_width(
-                        &task.prompt_summary,
-                        content_width.saturating_sub(2).max(1)
-                    )
-                ),
-                Style::default().fg(theme.text_dim),
-            )));
-        }
-    }
-}
-
-fn push_reasoning_row_hover_texts(
-    texts: &mut Vec<String>,
-    rows: &[TaskPanelEntry],
-    max_rows: usize,
-) {
-    for task in rows {
-        if texts.len() >= max_rows {
-            break;
-        }
-        let duration = task
-            .duration_ms
-            .map(format_duration_ms)
-            .unwrap_or_else(|| "-".to_string());
-        texts.push(format!("thinking {} {duration}", task.status));
-        if !task.prompt_summary.trim().is_empty() && texts.len() < max_rows {
-            texts.push(format!("  {}", task.prompt_summary));
         }
     }
 }
@@ -1848,13 +1777,13 @@ fn background_task_is_live(task: &TaskPanelEntry) -> bool {
         && matches!(task.status.as_str(), "queued" | "running")
 }
 
-fn background_task_spinner_prefix(task: &TaskPanelEntry) -> Option<&'static str> {
+fn background_task_spinner_prefix(task: &TaskPanelEntry, low_motion: bool) -> Option<&'static str> {
     if task.status != "running" {
         return None;
     }
     Some(braille_spinner_frame_for_duration_ms(
         task.duration_ms.unwrap_or_default(),
-        false,
+        low_motion,
     ))
 }
 
@@ -2230,17 +2159,6 @@ fn background_task_rows(app: &App, active_rows: &[SidebarToolRow]) -> Vec<TaskPa
         .iter()
         .filter(|task| task.kind == TaskPanelEntryKind::Background)
         .filter(|task| !background_task_duplicates_live_tool(task, active_rows))
-        .cloned()
-        .collect();
-    rows.sort_by_key(|task| (task_status_rank(task.status.as_str()), task.id.clone()));
-    rows
-}
-
-fn reasoning_task_rows(app: &App) -> Vec<TaskPanelEntry> {
-    let mut rows: Vec<TaskPanelEntry> = app
-        .task_panel
-        .iter()
-        .filter(|task| task.kind == TaskPanelEntryKind::ModelReasoning)
         .cloned()
         .collect();
     rows.sort_by_key(|task| (task_status_rank(task.status.as_str()), task.id.clone()));
@@ -2689,6 +2607,17 @@ fn foreground_rlm_running(app: &App) -> bool {
 }
 
 fn sidebar_agent_rows(app: &App) -> Vec<SidebarAgentRow> {
+    let cached_ids: std::collections::HashSet<&str> = app
+        .subagent_cache
+        .iter()
+        .map(|agent| agent.agent_id.as_str())
+        .collect();
+    let display_names = localized_whale_display_names(
+        app.subagent_cache
+            .iter()
+            .map(|agent| (agent.agent_id.as_str(), agent.nickname.as_deref())),
+        app.ui_locale.tag(),
+    );
     let mut rows: Vec<SidebarAgentRow> = app
         .subagent_cache
         .iter()
@@ -2704,12 +2633,11 @@ fn sidebar_agent_rows(app: &App) -> Vec<SidebarAgentRow> {
                         .map(summarize_tool_output)
                         .filter(|summary| !summary.trim().is_empty())
                 });
-            // #3030: Prefer the user-assigned nickname > stable label
-            // ("Agent 1") > raw name. Every spawned agent gets a label-map
-            // entry, so the generated label must not shadow nicknames.
-            let display_name = agent
-                .nickname
-                .clone()
+            // Generated whales are locale-derived from the neutral agent id;
+            // never replay a persisted label from another language.
+            let display_name = display_names
+                .get(&agent.agent_id)
+                .cloned()
                 .or_else(|| app.agent_label_map.get(&agent.agent_id).cloned())
                 .unwrap_or_else(|| agent.name.clone());
             SidebarAgentRow {
@@ -2735,17 +2663,14 @@ fn sidebar_agent_rows(app: &App) -> Vec<SidebarAgentRow> {
         })
         .collect();
 
-    let cached_ids: std::collections::HashSet<&str> = app
-        .subagent_cache
-        .iter()
-        .map(|agent| agent.agent_id.as_str())
-        .collect();
     rows.extend(
         app.agent_progress
             .iter()
             .filter(|(id, _)| !cached_ids.contains(id.as_str()))
             .map(|(id, progress)| {
-                // #3030: Prefer stable label for progress-only agents too.
+                // Progress-only rows do not carry a generated whale name yet;
+                // keep their existing stable Agent-N placeholder until the
+                // manager snapshot arrives.
                 let display_name = app
                     .agent_label_map
                     .get(id.as_str())
@@ -2911,12 +2836,12 @@ fn indented_detail_line(indent: &str, body: &str, content_width: usize) -> Strin
     )
 }
 
-/// #4094: reference to a worker's full output transcript, surfaced as a
+/// #4094: reference to a worker's transcript projection, surfaced as a
 /// `handle_read` handle instead of dumping the (possibly huge) transcript
 /// inline — the inline dump is the freeze/emptiness risk this issue tracks.
 /// The child transcript is addressable as the `agent:<id>/full_transcript` var
-/// handle (see `subagent_session_projection`), so the panel hands the user a
-/// copyable reference to the fuller artifact rather than the bytes themselves.
+/// handle (see `subagent_session_projection`); its JSON names the private
+/// complete artifact, while clicking Open loads that artifact directly.
 ///
 /// Returns `None` for workers that have not produced anything inspectable yet,
 /// so an empty transcript is never advertised. This is the one place a raw
@@ -3089,10 +3014,10 @@ fn subagent_panel_rows(
             agent_id: row.id.clone(),
         }));
 
-        // #4094: hand the user a copyable handle to the worker's *full* output
-        // transcript instead of dumping it inline — the inline dump is this
-        // issue's freeze/emptiness risk. The bounded dossier above is the
-        // preview; this is the "inspect/copy more" affordance the AC calls for.
+        // #4094: hand the user a copyable bounded projection instead of
+        // dumping the transcript inline — the inline dump is this issue's
+        // freeze/emptiness risk. Clicking the row opens the complete private
+        // artifact; handle_read exposes bounded slices and its artifact path.
         // Guarded by `max_rows` so the panel stays bounded, and width-clamped so
         // narrow terminals never overflow.
         if let Some(handle) = subagent_output_handle(row) {
@@ -3102,7 +3027,7 @@ fn subagent_panel_rows(
             lines.push(Line::from(Span::styled(
                 indented_detail_line(
                     "  ",
-                    &format!("\u{25B8} full output \u{00B7} handle_read {handle}"),
+                    &format!("\u{25B8} complete chat: open \u{00B7} handle_read {handle}"),
                     content_width.max(1),
                 ),
                 Style::default().fg(theme.text_muted),
@@ -3369,16 +3294,13 @@ fn render_context_panel(f: &mut Frame, area: Rect, app: &mut App) {
 
     // ── MCP servers ──────────────────────────────────────────────
     if app.mcp_configured_count > 0 {
-        let restart_hint = if app.mcp_restart_required {
-            " (restart needed)"
+        let reload_hint = if app.mcp_reload_required {
+            " (reload needed)"
         } else {
             ""
         };
         lines.push(Line::from(Span::styled(
-            format!(
-                "mcp: {} server(s){}",
-                app.mcp_configured_count, restart_hint
-            ),
+            format!("mcp: {} server(s){}", app.mcp_configured_count, reload_hint),
             Style::default().fg(theme.text_muted),
         )));
     }
@@ -3415,27 +3337,40 @@ fn render_context_panel(f: &mut Frame, area: Rect, app: &mut App) {
 
 fn context_panel_cost_line(app: &App) -> String {
     let displayed_total = app.displayed_session_cost_for_currency(app.cost_currency);
-    if displayed_total == 0.0
-        && !crate::pricing::has_pricing_for_provider(app.api_provider, &app.model)
-    {
-        return format!("cost: n/a (no pricing data for {})", app.model);
-    }
-
-    let session_cost = app.session_cost_for_currency(app.cost_currency);
-    let agent_cost = app.subagent_cost_for_currency(app.cost_currency);
-    let real_total = session_cost + agent_cost;
-    // Only show the additive breakdown when it matches the displayed
-    // total; when the high-water mark is in effect (post-reconciliation),
-    // the breakdown would not sum to the displayed value (#244).
-    if (displayed_total - real_total).abs() < COST_EQ_TOLERANCE {
-        format!(
-            "cost: {} (session {} + agents {})",
-            app.format_cost_amount(displayed_total),
-            app.format_cost_amount(session_cost),
-            app.format_cost_amount(agent_cost)
-        )
-    } else {
-        format!("cost: {}", app.format_cost_amount(displayed_total))
+    let chip = crate::route_billing::usage_chip(
+        app.billing_presentation,
+        app.api_provider,
+        &app.model,
+        displayed_total,
+        app.cost_display_currency(app.cost_currency),
+        None,
+    );
+    match &chip {
+        crate::route_billing::UsageChip::Money(_)
+            if crate::route_billing::has_priced_metered_basis(
+                app.billing_presentation,
+                app.api_provider,
+                &app.model,
+            ) =>
+        {
+            let session_cost = app.session_cost_for_currency(app.cost_currency);
+            let agent_cost = app.subagent_cost_for_currency(app.cost_currency);
+            let real_total = session_cost + agent_cost;
+            // Only show the additive breakdown when it matches the displayed
+            // total; when the high-water mark is in effect (post-reconciliation),
+            // the breakdown would not sum to the displayed value (#244).
+            if (displayed_total - real_total).abs() < COST_EQ_TOLERANCE {
+                format!(
+                    "cost: {} (session {} + agents {})",
+                    app.format_cost_amount(displayed_total),
+                    app.format_cost_amount(session_cost),
+                    app.format_cost_amount(agent_cost)
+                )
+            } else {
+                crate::route_billing::format_usage_line(&chip)
+            }
+        }
+        _ => crate::route_billing::format_usage_line(&chip),
     }
 }
 
@@ -3595,8 +3530,11 @@ fn agent_stop_action_for_click(action: &SidebarRowAction) -> Option<SidebarRowAc
             agent_id: agent_id.clone(),
         }),
         SidebarRowAction::Command(_)
+        | SidebarRowAction::PrefillCommand(_)
+        | SidebarRowAction::HotbarSlot(_)
         | SidebarRowAction::OpenAgentDetail { .. }
-        | SidebarRowAction::CancelAgent { .. } => None,
+        | SidebarRowAction::CancelAgent { .. }
+        | SidebarRowAction::InspectWork { .. } => None,
     }
 }
 
@@ -3630,7 +3568,7 @@ mod tests {
     use crate::tui::history::{
         ExecCell, ExecSource, GenericToolCell, HistoryCell, ToolCell, ToolStatus,
     };
-    use crate::tui::spinner::BRAILLE_SPINNER_FRAME_MS;
+    use crate::tui::spinner::{BRAILLE_SPINNER_FRAME_MS, LIVE_MARKER_DELAY_MS, LIVE_STATIC_MARKER};
     use ratatui::{Terminal, backend::TestBackend, text::Line};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
@@ -3689,11 +3627,9 @@ mod tests {
     fn context_panel_cost_line_shows_na_for_unpriced_zero_cost_model() {
         let mut app = create_test_app();
         app.model = "unknown-provider/unknown-model".to_string();
+        app.billing_presentation = crate::route_billing::BillingPresentation::Metered;
 
-        assert_eq!(
-            context_panel_cost_line(&app),
-            "cost: n/a (no pricing data for unknown-provider/unknown-model)"
-        );
+        assert_eq!(context_panel_cost_line(&app), "cost: unknown");
     }
 
     #[test]
@@ -3701,17 +3637,35 @@ mod tests {
         let mut app = create_test_app();
         app.api_provider = crate::config::ApiProvider::OpenaiCodex;
         app.model = "gpt-5.5".to_string();
+        app.billing_presentation =
+            crate::route_billing::BillingPresentation::Subscription("Codex OAuth quota");
+        app.accrue_session_cost_estimate(crate::pricing::CostEstimate::usd_only(12.34));
 
-        assert_eq!(
-            context_panel_cost_line(&app),
-            "cost: n/a (no pricing data for gpt-5.5)"
-        );
+        let line = context_panel_cost_line(&app);
+        assert_eq!(line, "usage: Codex OAuth quota");
+        assert!(!line.contains('$'), "OAuth must not invent dollars: {line}");
+    }
+
+    #[test]
+    fn context_panel_cost_line_marks_unpriced_metered_as_unknown() {
+        let mut app = create_test_app();
+        app.api_provider = crate::config::ApiProvider::NvidiaNim;
+        app.model = "deepseek-ai/deepseek-v4-pro".to_string();
+        app.billing_presentation = crate::route_billing::BillingPresentation::Metered;
+
+        assert_eq!(context_panel_cost_line(&app), "cost: unknown");
     }
 
     #[test]
     fn context_panel_cost_line_uses_usd_for_usd_only_model_in_cny_mode() {
         let mut app = create_test_app();
         app.model = "kimi-k2.6".to_string();
+        // This test is about METERED currency rendering; pin the route class
+        // and a metered provider so the session default (which may be a
+        // subscription/OAuth route with no API pricing basis) cannot change
+        // what is under test (TUI-DOG-010).
+        app.api_provider = crate::config::ApiProvider::Moonshot;
+        app.billing_presentation = crate::route_billing::BillingPresentation::Metered;
         app.cost_currency = crate::pricing::CostCurrency::Cny;
         app.accrue_session_cost_estimate(crate::pricing::CostEstimate::usd_only(0.42));
 
@@ -3853,6 +3807,17 @@ mod tests {
                 .iter()
                 .all(|slot| slot.state == HotbarSlotState::Empty),
             "fresh config resolves to no bound slots"
+        );
+    }
+
+    #[test]
+    fn hotbar_rows_register_one_typed_action_per_rendered_row() {
+        assert_eq!(
+            super::hotbar_panel_row_actions(),
+            vec![
+                Some(SidebarRowAction::HotbarSlot(1)),
+                Some(SidebarRowAction::HotbarSlot(5)),
+            ]
         );
     }
 
@@ -5099,6 +5064,7 @@ mod tests {
     #[test]
     fn tasks_panel_puts_background_shell_command_on_primary_row() {
         let mut app = create_test_app();
+        app.low_motion = false;
         app.task_panel.push(TaskPanelEntry {
             id: "shell_33a08c3c".to_string(),
             status: "running".to_string(),
@@ -5123,10 +5089,8 @@ mod tests {
             "background shell headline should show the command, not only the shell id: {text:?}"
         );
         assert!(
-            text.iter().any(|line| line.contains(&format!(
-                "{} Bash running",
-                crate::tui::spinner::BRAILLE_SPINNER_FRAMES[0]
-            ))),
+            text.iter()
+                .any(|line| line.contains(&format!("{} Bash running", LIVE_STATIC_MARKER))),
             "running background shell should show a braille spinner prefix: {text:?}"
         );
         assert!(
@@ -5183,62 +5147,33 @@ mod tests {
         };
 
         assert_eq!(
-            background_task_spinner_prefix(&task),
+            background_task_spinner_prefix(&task, false),
+            Some(LIVE_STATIC_MARKER)
+        );
+
+        task.duration_ms = Some(LIVE_MARKER_DELAY_MS - 1);
+        assert_eq!(
+            background_task_spinner_prefix(&task, false),
+            Some(LIVE_STATIC_MARKER)
+        );
+
+        task.duration_ms = Some(LIVE_MARKER_DELAY_MS);
+        assert_eq!(
+            background_task_spinner_prefix(&task, false),
             Some(crate::tui::spinner::BRAILLE_SPINNER_FRAMES[0])
         );
 
-        task.duration_ms = Some(BRAILLE_SPINNER_FRAME_MS - 1);
+        task.duration_ms = Some(LIVE_MARKER_DELAY_MS + BRAILLE_SPINNER_FRAME_MS);
         assert_eq!(
-            background_task_spinner_prefix(&task),
-            Some(crate::tui::spinner::BRAILLE_SPINNER_FRAMES[0])
-        );
-
-        task.duration_ms = Some(BRAILLE_SPINNER_FRAME_MS);
-        assert_eq!(
-            background_task_spinner_prefix(&task),
+            background_task_spinner_prefix(&task, false),
             Some(crate::tui::spinner::BRAILLE_SPINNER_FRAMES[1])
-        );
-    }
-
-    #[test]
-    fn tasks_panel_renders_model_reasoning_outside_background_commands() {
-        let mut app = create_test_app();
-        app.sidebar_focus = SidebarFocus::Tasks;
-        app.task_panel.push(TaskPanelEntry {
-            id: "reasoning-1".to_string(),
-            status: "running".to_string(),
-            prompt_summary: "model reasoning".to_string(),
-            duration_ms: Some(4_200),
-            kind: TaskPanelEntryKind::ModelReasoning,
-            stale: false,
-            elapsed_since_output_ms: None,
-            owner_agent_id: None,
-            owner_agent_name: None,
-            current_tool: None,
-            role: None,
-            files_touched: 0,
-        });
-
-        let text = lines_to_text(&task_panel_lines(&app, 80, 8));
-
-        assert!(
-            text.iter().any(|line| line == "Model reasoning"),
-            "reasoning section missing: {text:?}"
-        );
-        assert!(
-            text.iter()
-                .any(|line| line.contains("thinking running 4.2s")),
-            "reasoning row should show live thinking duration: {text:?}"
-        );
-        assert!(
-            !text.iter().any(|line| line.contains("Bash jobs")),
-            "reasoning must not be counted as a background command: {text:?}"
         );
     }
 
     #[test]
     fn tasks_panel_auto_mode_shows_only_live_background_jobs() {
         let mut app = create_test_app();
+        app.low_motion = false;
         app.sidebar_focus = SidebarFocus::Auto;
         app.runtime_turn_id = Some("turn_abcdef123456".to_string());
         app.runtime_turn_status = Some("in_progress".to_string());
@@ -5269,20 +5204,6 @@ mod tests {
                 is_diff: false,
             })));
         app.task_panel.push(TaskPanelEntry {
-            id: "reasoning-1".to_string(),
-            status: "running".to_string(),
-            prompt_summary: "model reasoning".to_string(),
-            duration_ms: Some(4_200),
-            kind: TaskPanelEntryKind::ModelReasoning,
-            stale: false,
-            elapsed_since_output_ms: None,
-            owner_agent_id: None,
-            owner_agent_name: None,
-            current_tool: None,
-            role: None,
-            files_touched: 0,
-        });
-        app.task_panel.push(TaskPanelEntry {
             id: "shell_live".to_string(),
             status: "running".to_string(),
             prompt_summary: "shell: cargo test -p codewhale-tui".to_string(),
@@ -5304,10 +5225,8 @@ mod tests {
             "auto Tasks should keep live background jobs visible: {text:?}"
         );
         assert!(
-            text.iter().any(|line| line.contains(&format!(
-                "{} Bash running",
-                crate::tui::spinner::BRAILLE_SPINNER_FRAMES[0]
-            ))),
+            text.iter()
+                .any(|line| line.contains(&format!("{} Bash running", LIVE_STATIC_MARKER))),
             "auto Tasks should animate running background jobs: {text:?}"
         );
         for hidden in [
@@ -5324,6 +5243,30 @@ mod tests {
                 "auto Tasks should not show {hidden:?}: {text:?}"
             );
         }
+    }
+
+    #[test]
+    fn tasks_panel_keeps_model_reasoning_in_transcript_only() {
+        let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Tasks;
+        app.runtime_turn_id = Some("turn_reasoning".to_string());
+        app.runtime_turn_status = Some("in_progress".to_string());
+        app.history.push(HistoryCell::Thinking {
+            content: "private chain of thought".to_string(),
+            streaming: true,
+            duration_secs: Some(1.0),
+        });
+
+        let text = lines_to_text(&task_panel_lines(&app, 96, 12));
+
+        assert!(
+            !text.iter().any(|line| {
+                line.contains("Model reasoning")
+                    || line.contains("private chain of thought")
+                    || line.contains("thinking")
+            }),
+            "reasoning belongs to transcript detail, not Activity: {text:?}"
+        );
     }
 
     #[test]
@@ -7361,6 +7304,7 @@ mod tests {
     #[test]
     fn sidebar_progress_only_rows_parse_status_instead_of_hardcoding_running() {
         let mut app = create_test_app();
+        app.ensure_agent_label("agent_queued");
         app.agent_progress.insert(
             "agent_queued".to_string(),
             "queued for launch permit".to_string(),
@@ -7369,11 +7313,12 @@ mod tests {
         let rows = sidebar_agent_rows(&app);
 
         assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "Agent 1");
         assert_eq!(rows[0].status, "queued");
     }
 
     #[test]
-    fn sidebar_agent_rows_prefer_nickname_over_generated_label() {
+    fn sidebar_agent_rows_preserve_explicit_names_and_derive_whales_from_locale() {
         let mut app = create_test_app();
         let agent_id = "agent_cafe0123";
         app.ensure_agent_label(agent_id);
@@ -7383,13 +7328,47 @@ mod tests {
         let rows = super::sidebar_agent_rows(&app);
         assert_eq!(
             rows[0].name, "doc-fixer",
-            "user nickname must beat the generated Agent-N label"
+            "an explicit custom nickname remains user-owned"
         );
 
-        // Without a nickname the generated label is used.
+        // Without an explicit nickname, display is derived from the neutral id
+        // in the active UI locale rather than from the old Agent-N label.
         app.subagent_cache[0].nickname = None;
         let rows = super::sidebar_agent_rows(&app);
-        assert_eq!(rows[0].name, "Agent 1");
+        assert_eq!(
+            rows[0].name,
+            crate::tools::subagent::whale_name_for_id_in_locale(agent_id, "en")
+        );
+    }
+
+    #[test]
+    fn english_sidebar_relocalizes_mixed_persisted_whale_names() {
+        let mut app = create_test_app();
+        app.ui_locale = Locale::En;
+        for (agent_id, legacy_locale) in [
+            ("agent_locale_a", "zh-Hans"),
+            ("agent_locale_b", "ja"),
+            ("agent_locale_c", "vi"),
+        ] {
+            let legacy_name =
+                crate::tools::subagent::whale_name_for_id_in_locale(agent_id, legacy_locale);
+            app.subagent_cache
+                .push(cached_agent(agent_id, Some(&legacy_name)));
+        }
+
+        let rows = super::sidebar_agent_rows(&app);
+        assert_eq!(rows.len(), 3);
+        for row in rows {
+            assert!(
+                row.name.is_ascii(),
+                "English Fleet display leaked a prior-locale whale: {}",
+                row.name
+            );
+            assert_eq!(
+                row.name,
+                crate::tools::subagent::whale_name_for_id_in_locale(&row.id, "en")
+            );
+        }
     }
 
     // --- Unicode / CJK / terminal-width QA (issue #3488) -------------------

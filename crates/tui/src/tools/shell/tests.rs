@@ -21,6 +21,37 @@ fn env_lock() -> &'static Mutex<()> {
 
 const BACKGROUND_COMPLETION_WAIT_MS: u64 = 30_000;
 
+#[cfg(not(target_env = "ohos"))]
+#[test]
+fn pty_exit_status_preserves_high_windows_code_losslessly() {
+    let raw = 0xC000_0005;
+    let status = ShellExitStatus::from_pty(portable_pty::ExitStatus::with_exit_code(raw));
+
+    assert!(!status.success);
+    assert_eq!(status.code, Some(i64::from(raw)));
+    assert_eq!(
+        exit_code_label(status.code),
+        "exit code 3221225477 (0xC0000005)"
+    );
+    assert_eq!(exit_code_hex(status.code).as_deref(), Some("0xC0000005"));
+}
+
+#[cfg(not(target_env = "ohos"))]
+#[test]
+fn ordinary_pty_exit_status_keeps_concise_label() {
+    let status = ShellExitStatus::from_pty(portable_pty::ExitStatus::with_exit_code(127));
+
+    assert_eq!(status.code, Some(127));
+    assert_eq!(exit_code_label(status.code), "exit code 127");
+    assert_eq!(exit_code_hex(status.code), None);
+}
+
+#[cfg(windows)]
+#[test]
+fn std_windows_exit_status_reinterprets_signed_dword() {
+    assert_eq!(std_exit_code_i64(0xC000_0005_u32 as i32), 0xC000_0005);
+}
+
 #[cfg(windows)]
 const JOB_OBJECT_QUERY_ACCESS: u32 = 0x0004;
 
@@ -147,6 +178,69 @@ fn wait_for_completed_shell(manager: &mut ShellManager, task_id: &str) -> ShellR
 }
 
 #[test]
+fn shell_owner_registers_before_spawn_and_silent_work_stays_live() {
+    let work = crate::work_graph::new_shared_work_runtime(
+        crate::tools::todo::new_shared_todo_list(),
+        crate::tools::plan::new_shared_plan_state(),
+    );
+    let lifecycle = ShellWorkLifecycle {
+        work: work.clone(),
+        session_id: "shell-session".to_string(),
+    };
+
+    {
+        let _guard = ShellSpawnIntentGuard::new(
+            Some(lifecycle.clone()),
+            "shell_spawn_failure",
+            "missing-program",
+        )
+        .expect("register spawn intent");
+    }
+    lifecycle
+        .register("shell_silent", "sleep 30")
+        .expect("register silent shell");
+    lifecycle
+        .observe("shell_silent", &ShellStatus::Running, 1, 0)
+        .expect("live owner observation");
+    lifecycle
+        .observe("shell_silent", &ShellStatus::Running, 2, 512)
+        .expect("growing output observation");
+
+    let graph = work
+        .capture(Some("shell-session"))
+        .expect("capture")
+        .expect("graph")
+        .graph;
+    let operation = |external: &str| {
+        graph.nodes.iter().find(|node| {
+            node.binding
+                .as_ref()
+                .is_some_and(|binding| binding.external == external)
+        })
+    };
+    assert_eq!(
+        operation("shell:shell_spawn_failure").map(|node| node.state),
+        Some(crate::work_graph::NodeState::Failed),
+        "dropping an armed spawn guard must terminalize pre-spawn failure"
+    );
+    let silent = operation("shell:shell_silent").expect("silent shell operation");
+    assert_eq!(silent.state, crate::work_graph::NodeState::Active);
+    let observation = silent
+        .binding
+        .as_ref()
+        .and_then(|binding| binding.last_observation.as_ref())
+        .expect("last shell observation");
+    assert_eq!(observation.seq, 2);
+    assert_eq!(
+        observation
+            .output
+            .as_ref()
+            .and_then(crate::work_graph::EvidenceRef::raw_bytes),
+        Some(512)
+    );
+}
+
+#[test]
 fn exec_shell_parallel_flags_are_input_aware() {
     let tool = BashTool::new("Bash");
     let readonly = json!({"command": "git status -s"});
@@ -166,10 +260,32 @@ fn exec_shell_parallel_flags_are_input_aware() {
     );
 
     for input in [
+        json!({"command": "fd -e rs ."}),
+        json!({"command": "fd -H --type f src"}),
+        json!({"command": "git grep TODO crates/tui/src/tools"}),
+        json!({"command": "bash -lc 'fd -e toml .'"}),
+        json!({"command": "bash -lc 'git grep TODO crates/tui/src/tools'"}),
+    ] {
+        assert!(tool.supports_parallel_for(&input), "{input:?}");
+        assert!(tool.is_read_only_for(&input), "{input:?}");
+        assert_eq!(
+            tool.approval_requirement_for(&input),
+            ApprovalRequirement::Auto,
+            "{input:?}"
+        );
+    }
+
+    for input in [
         json!({"command": "git status -s", "background": true}),
         json!({"command": "git status -s", "stdin": ""}),
         json!({"command": "cargo build"}),
         json!({"command": "bash -lc 'rg TODO crates | head'"}),
+        json!({"command": "fd -x ./pwn.sh"}),
+        json!({"command": "fd --exec ./pwn.sh"}),
+        json!({"command": "fd -uHtx ./pwn.sh"}),
+        json!({"command": "rg --pre /tmp/evil.sh needle ."}),
+        json!({"command": "git grep -O needle"}),
+        json!({"command": "git grep -nO needle"}),
     ] {
         assert!(!tool.supports_parallel_for(&input), "{input:?}");
         assert!(!tool.is_read_only_for(&input), "{input:?}");
@@ -862,6 +978,35 @@ fn shell_delta_result_surfaces_network_restricted_hint() {
             .and_then(Value::as_bool),
         Some(true)
     );
+}
+
+#[test]
+fn shell_delta_result_exposes_lossless_high_exit_code_and_hex() {
+    let tmp = tempdir().expect("tempdir");
+    let ctx = ToolContext::new(tmp.path());
+    let mut result = failed_network_shell_result("", "");
+    result.exit_code = Some(0xC000_0005);
+
+    let tool_result = build_shell_delta_tool_result(
+        ShellDeltaResult {
+            command: "echo probe".to_string(),
+            result,
+            stdout_total_len: 0,
+            stderr_total_len: 0,
+        },
+        &ctx,
+    );
+
+    assert!(
+        tool_result
+            .content
+            .contains("exit code 3221225477 (0xC0000005)"),
+        "{}",
+        tool_result.content
+    );
+    let metadata = tool_result.metadata.expect("metadata");
+    assert_eq!(metadata["exit_code"], json!(3221225477_i64));
+    assert_eq!(metadata["exit_code_hex"], json!("0xC0000005"));
 }
 
 #[test]
@@ -1614,6 +1759,52 @@ fn windows_job_kill_on_close_releases_reader_threads_when_terminate_denied() {
     assert_eq!(done.status, ShellStatus::Completed);
 }
 
+#[cfg(windows)]
+#[test]
+fn killed_shell_does_not_wait_for_blocked_reader_threads() {
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let stdout_thread = std::thread::spawn(move || {
+        let _ = release_rx.recv();
+    });
+    let now = std::time::Instant::now();
+    let mut shell = BackgroundShell {
+        id: "killed-reader".to_string(),
+        command: "test".to_string(),
+        working_dir: std::path::PathBuf::from("."),
+        status: ShellStatus::Killed,
+        exit_code: None,
+        started_at: now,
+        last_output_at: now,
+        last_observed_output_len: 0,
+        sandbox_type: SandboxType::None,
+        linked_task_id: None,
+        owner_agent: None,
+        stdout_buffer: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        stderr_buffer: None,
+        stdout_cursor: 0,
+        stderr_cursor: 0,
+        completion_reported: false,
+        stdin: None,
+        child: None,
+        windows_job: None,
+        stdout_thread: Some(stdout_thread),
+        stderr_thread: None,
+        work_lifecycle: None,
+        lifecycle_seq: 0,
+        last_lifecycle_status: None,
+        last_lifecycle_bytes: 0,
+    };
+
+    let started = std::time::Instant::now();
+    shell.collect_output();
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "killed shell must not synchronously join a blocked reader"
+    );
+    release_tx.send(()).expect("release detached reader");
+}
+
 #[test]
 fn test_list_jobs_cleans_up_completed_old_processes() {
     let tmp = tempdir().expect("tempdir");
@@ -1650,40 +1841,27 @@ fn issue_1691_quoted_commit_message_round_trips() {
 
     let dispatcher = crate::shell_dispatcher::global_dispatcher();
     // The whole command (with quotes) is a single argv entry. The actual
-    // shell binary can vary by platform, but the payload itself must stay
-    // intact in one shell arg. We never split the command string ourselves.
+    // shell binary can vary by platform — and the dispatcher may wrap the
+    // payload (encoding prefix, exit-code capture) — but the payload itself
+    // must stay intact in ONE shell arg. We never split the command string
+    // ourselves. This single-line ASCII command never takes the PowerShell
+    // temp `-File` path, so the payload stays on the argv.
     assert_eq!(spec.program, dispatcher.kind().binary());
-    if dispatcher.kind().is_powershell() {
-        assert_eq!(
-            spec.args,
-            [
-                dispatcher.kind().command_flag().to_string(),
-                "-Command".to_string(),
-                format!("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {cmd}")
-            ]
-        );
-    } else if matches!(dispatcher.kind(), crate::shell_dispatcher::ShellKind::Cmd) {
-        assert_eq!(
-            spec.args,
-            ["/C".to_string(), format!("chcp 65001 >NUL & {cmd}")]
-        );
-    } else {
-        assert_eq!(
-            spec.args,
-            [
-                dispatcher.kind().command_flag().to_string(),
-                cmd.to_string()
-            ]
-        );
-    }
-    assert_eq!(
-        spec.args.len(),
-        if dispatcher.kind().is_powershell() {
-            3
-        } else {
-            2
-        }
+    let carriers = spec
+        .args
+        .iter()
+        .filter(|arg| arg.contains(r#""feat: complete sub-pages""#))
+        .count();
+    assert_eq!(carriers, 1, "args: {:?}", spec.args);
+    assert!(
+        !spec
+            .args
+            .iter()
+            .any(|arg| arg == "feat:" || arg == "complete" || arg == "sub-pages\""),
+        "args: {:?}",
+        spec.args
     );
+    assert_eq!(spec.display_command(), cmd);
 
     let mut built = Command::new(&spec.program);
     push_shell_args(&mut built, &spec.program, &spec.args);

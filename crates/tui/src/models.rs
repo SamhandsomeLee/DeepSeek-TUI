@@ -6,6 +6,28 @@ use serde::{Deserialize, Serialize};
 /// newer V4 alias and do not carry an explicit `*k` suffix.
 pub const LEGACY_DEEPSEEK_CONTEXT_WINDOW_TOKENS: u32 = 128_000;
 pub const DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS: u32 = 1_000_000;
+/// Conservative Kimi Code K3 context baseline. The membership route's real
+/// context is plan-tier dependent (verified 2026-07-20 from
+/// https://www.kimi.com/code/docs/en/kimi-code/models): Moderato gets 256K,
+/// while Allegretto and above get up to 1M. Bare `k3` therefore keeps this
+/// safe floor everywhere; higher plan entitlements must come from an explicit
+/// provider `context_window` configuration or fresh provider facts while
+/// preserving the `k3` wire id.
+pub const KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS: u32 = 262_144;
+/// Kimi K3 context window on the open platform (`kimi-k3` pay-as-you-go).
+/// Verified 2026-07-20 from https://platform.kimi.ai/docs/guide/kimi-k3-quickstart
+/// (1,048,576 tokens). Max output is a separate fact below and must never be
+/// conflated with this window.
+pub const KIMI_K3_CONTEXT_WINDOW_TOKENS: u32 = 1_048_576;
+/// Conservative K3 default generation ceiling. The direct Kimi API defaults
+/// `max_completion_tokens` to 131,072, while its documented route maximum is
+/// a separate exact-route fact below. Membership and neighboring routes do
+/// not inherit that direct-platform maximum.
+pub const KIMI_K3_DEFAULT_MAX_COMPLETION_TOKENS: u32 = 131_072;
+/// Documented maximum output for the exact direct Kimi K3 API route.
+///
+/// Source: https://platform.kimi.ai/docs/guide/kimi-k3-quickstart (verified 2026-07-20).
+pub const DIRECT_KIMI_K3_MAX_OUTPUT_TOKENS: u32 = 1_048_576;
 /// Last-resort compaction trigger when [`context_window_for_model`] returns
 /// `None` (an unrecognised model id). v0.8.11 raised this from `50_000` to
 /// `102_400` (80% of [`LEGACY_DEEPSEEK_CONTEXT_WINDOW_TOKENS`]) so unknown
@@ -213,6 +235,10 @@ pub struct Usage {
     pub prompt_cache_hit_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_miss_tokens: Option<u32>,
+    /// Cache-creation / cache-write tokens (Anthropic `cache_creation_input_tokens`).
+    /// Billed at the cache-write rate when the pricing row publishes one (#4318).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_write_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_tokens: Option<u32>,
     /// Approximate input tokens spent re-sending prior `reasoning_content`
@@ -292,8 +318,19 @@ fn known_context_window_for_model(model_lower: &str) -> Option<u32> {
         | "qwen/qwen3.6-35b-a3b"
         | "qwen/qwen3.6-max-preview"
         | "qwen/qwen3.6-27b"
-        | "tencent/hy3-preview"
-        | "moonshotai/kimi-k2.7-code"
+        | "tencent/hy3-preview" => Some(262_144),
+        // Official Kimi K3 platform pricing (2026-07-20):
+        // https://platform.kimi.ai/docs/guide/kimi-k3-quickstart — 1,048,576 context
+        // for the open platform.
+        "moonshotai/kimi-k3" | "kimi-k3" | "opencode-go/kimi-k3" => {
+            Some(KIMI_K3_CONTEXT_WINDOW_TOKENS)
+        }
+        // Bare `k3` is the Kimi Code membership route id whose context is
+        // plan-tier dependent (256K on lower tiers, up to 1M on higher ones)
+        // — keep the safe floor, and never fall through to the 128K legacy
+        // default.
+        "k3" => Some(KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS),
+        "moonshotai/kimi-k2.7-code"
         | "moonshotai/kimi-k2.6"
         | "moonshotai/kimi-k2.6:free"
         | "kimi-k2.7-code"
@@ -360,16 +397,31 @@ pub fn max_output_tokens_for_model(model: &str) -> Option<u32> {
             Some(128_000)
         }
         "claude-haiku-4-5" => Some(64_000),
-        "arcee-ai/trinity-large-thinking"
-        | "trinity-large-thinking"
-        | "moonshotai/kimi-k2.7-code"
+        "arcee-ai/trinity-large-thinking" | "trinity-large-thinking" => Some(262_144),
+        // Keep the generic/model-id lookup at K3's conservative documented
+        // default generation ceiling. The exact direct route's 1M maximum is
+        // applied later with endpoint-aware provenance; membership and
+        // neighboring routes must not inherit it.
+        "moonshotai/kimi-k3" | "kimi-k3" | "k3" | "opencode-go/kimi-k3" => {
+            Some(KIMI_K3_DEFAULT_MAX_COMPLETION_TOKENS)
+        }
+        // Kimi K2.7 Code has a 256K context window but its documented default
+        // maximum generation is 32K. Keeping those separate prevents the
+        // input budget from collapsing to the 1K emergency floor (#4368).
+        "moonshotai/kimi-k2.7-code"
         | "moonshotai/kimi-k2.6"
         | "kimi-k2.7-code"
         | "kimi-k2.6"
-        | "kimi-for-coding" => Some(262_144),
+        | "kimi-for-coding" => Some(32_768),
         "minimax/minimax-m3" | "minimax-m3" => Some(524_288),
-        "qwen/qwen3.6-35b-a3b" | "qwen/qwen3.6-27b" => Some(262_140),
-        "qwen/qwen3.6-flash" | "qwen/qwen3.6-max-preview" | "qwen/qwen3.6-plus" => Some(65_536),
+        // Alibaba's published limit is 65,536 output tokens; the earlier
+        // 262,140 mirrored the context window (data-entry smell flagged by
+        // MODEL_PROVIDER_AUDIT A2/D-7, vendor-verified 2026-07-12).
+        "qwen/qwen3.6-35b-a3b"
+        | "qwen/qwen3.6-27b"
+        | "qwen/qwen3.6-flash"
+        | "qwen/qwen3.6-max-preview"
+        | "qwen/qwen3.6-plus" => Some(65_536),
         "z-ai/glm-5.1" | "z-ai/glm-5.2" | "z-ai/glm-5-turbo" | "glm-5.1" | "glm-5.2"
         | "glm-5-turbo" => Some(131_072),
         "xiaomi/mimo-v2.5-pro"
@@ -415,8 +467,10 @@ pub fn model_supports_reasoning(model: &str) -> bool {
             | "claude-fable-5"
             | "gpt-5-codex"
             | "gpt-5.3-codex"
+            | "trinity-mini"
             | "arcee-ai/trinity-large-thinking"
             | "trinity-large-thinking"
+            | "thinkingmachines/inkling"
             | "google/gemma-4-31b-it"
             | "google/gemma-4-31b-it:free"
             | "google/gemma-4-26b-a4b-it"
@@ -445,6 +499,7 @@ pub fn model_supports_reasoning(model: &str) -> bool {
             | "qwen/qwen3.6-max-preview"
             | "qwen/qwen3.6-27b"
             | "qwen/qwen3.6-plus"
+            | "qwen/qwen3.7-plus"
             | "tencent/hy3-preview"
             | "xiaomi/mimo-v2.5-pro"
             | "xiaomi/mimo-v2.5"
@@ -506,7 +561,7 @@ fn is_openai_codex_model(model_lower: &str) -> bool {
     )
 }
 
-fn has_date_snapshot_suffix(model_lower: &str, prefix: &str) -> bool {
+pub(crate) fn has_date_snapshot_suffix(model_lower: &str, prefix: &str) -> bool {
     let Some(rest) = model_lower.strip_prefix(prefix) else {
         return false;
     };
@@ -900,14 +955,24 @@ mod tests {
     }
 
     #[test]
-    fn arcee_direct_models_have_static_windows_without_reasoning_flag() {
+    fn arcee_direct_models_preserve_verified_capabilities_only() {
         assert_eq!(
             context_window_for_model("trinity-large-preview"),
             Some(262_144)
         );
         assert!(!model_supports_reasoning("trinity-large-preview"));
         assert_eq!(context_window_for_model("trinity-mini"), Some(128_000));
-        assert!(!model_supports_reasoning("trinity-mini"));
+        assert_eq!(max_output_tokens_for_model("trinity-mini"), None);
+        assert!(model_supports_reasoning("trinity-mini"));
+    }
+
+    #[test]
+    fn qwen37_plus_and_inkling_reasoning_do_not_invent_limits() {
+        for model in ["qwen/qwen3.7-plus", "thinkingmachines/inkling"] {
+            assert_eq!(context_window_for_model(model), None, "{model}");
+            assert_eq!(max_output_tokens_for_model(model), None, "{model}");
+            assert!(model_supports_reasoning(model), "{model}");
+        }
     }
 
     #[test]
@@ -956,11 +1021,37 @@ mod tests {
     }
 
     #[test]
+    fn k3_route_ids_use_verified_contracts_not_legacy_128k() {
+        // Open-platform K3 carries the verified 1M contract.
+        assert_eq!(context_window_for_model("kimi-k3"), Some(1_048_576));
+        assert_eq!(
+            context_window_for_model("opencode-go/kimi-k3"),
+            Some(1_048_576)
+        );
+        // Bare `k3` (Kimi Code membership) is plan-tier dependent, so it
+        // keeps the documented safe floor — and must never fall through to
+        // the 128K legacy default.
+        assert_eq!(context_window_for_model("k3"), Some(262_144));
+        assert_eq!(max_output_tokens_for_model("k3"), Some(131_072));
+        assert_eq!(max_output_tokens_for_model("kimi-k3"), Some(131_072));
+        // Never project max output as the context window.
+        assert_ne!(
+            context_window_for_model("k3"),
+            max_output_tokens_for_model("k3")
+        );
+        assert_ne!(
+            context_window_for_model("kimi-k3"),
+            max_output_tokens_for_model("kimi-k3")
+        );
+    }
+
+    #[test]
     fn bare_provider_model_ids_mirror_vendor_prefixed_rows() {
         // Direct-provider routes (Moonshot, MiniMax, Z.ai) serve bare model
         // ids without the OpenRouter vendor prefix; both spellings must
         // resolve identical metadata (#1310 ride-along on #3023).
         for (model, expected_window) in [
+            ("kimi-k3", 1_048_576),
             ("kimi-k2.7-code", 262_144),
             ("kimi-k2.6", 262_144),
             ("minimax-m3", 1_000_000),
@@ -982,12 +1073,14 @@ mod tests {
         // vision model): same compact window as 5.1 but reasoning-capable.
         assert_eq!(context_window_for_model("z-ai/glm-5-turbo"), Some(202_752));
         assert!(model_supports_reasoning("z-ai/glm-5-turbo"));
-        assert_eq!(max_output_tokens_for_model("kimi-k2.7-code"), Some(262_144));
-        assert_eq!(max_output_tokens_for_model("kimi-k2.6"), Some(262_144));
         assert_eq!(
-            max_output_tokens_for_model("kimi-for-coding"),
-            Some(262_144)
+            crate::model_catalog::resolved_max_output("kimi-k2.7-code"),
+            Some(32_768)
         );
+        assert_eq!(max_output_tokens_for_model("kimi-k2.7-code"), Some(32_768));
+        assert_eq!(max_output_tokens_for_model("kimi-k2.6"), Some(32_768));
+        assert_eq!(max_output_tokens_for_model("kimi-for-coding"), Some(32_768));
+        assert_eq!(max_output_tokens_for_model("kimi-k3"), Some(131_072));
         assert_eq!(max_output_tokens_for_model("minimax-m3"), Some(524_288));
         assert_eq!(max_output_tokens_for_model("glm-5.1"), Some(131_072));
         assert_eq!(max_output_tokens_for_model("glm-5.2"), Some(131_072));

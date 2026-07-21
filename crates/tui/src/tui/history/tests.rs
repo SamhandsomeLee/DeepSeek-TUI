@@ -2,15 +2,40 @@ use super::{
     ASSISTANT_GLYPH, ExecCell, ExecSource, GenericToolCell, HistoryCell, PlanUpdateCell,
     REASONING_CURSOR, REASONING_OPENER, REASONING_RAIL, TOOL_RUNNING_SYMBOLS,
     TOOL_STATUS_SYMBOL_MS, ToolCell, ToolStatus, TranscriptRenderOptions, USER_GLYPH,
-    assistant_label_style_for, extract_reasoning_summary, render_thinking,
+    WebSearchCell, assistant_label_style_for, extract_reasoning_summary, render_thinking,
     running_status_label_with_elapsed,
 };
 use crate::deepseek_theme::Theme;
 use crate::models::{ContentBlock, Message};
 use crate::palette;
 use crate::tools::plan::{PlanSnapshot, StepStatus};
+use crate::tui::ui_text::{line_to_plain, slice_text, text_display_width};
 use ratatui::style::Modifier;
 use std::time::{Duration, Instant};
+
+#[test]
+fn web_search_cell_renders_receipt_source_degradation_and_citations() {
+    let cell = WebSearchCell {
+        query: "current release".to_string(),
+        status: ToolStatus::Success,
+        summary: Some("Found 2 results".to_string()),
+        source: Some("provider-native/xai/grok-4.5".to_string()),
+        degraded: Some("provider_native -> duckduckgo".to_string()),
+        ref_count: 2,
+    };
+    let rendered = cell
+        .lines_with_motion(120, true)
+        .iter()
+        .map(line_to_plain)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(rendered.contains("source"));
+    assert!(rendered.contains("provider-native/xai/grok-4.5"));
+    assert!(rendered.contains("degraded"));
+    assert!(rendered.contains("provider_native -> duckduckgo"));
+    assert!(rendered.contains("citations"));
+}
 
 // ---- elapsed-seconds badge for long-running tools ----
 //
@@ -844,6 +869,24 @@ fn archived_context_metadata_preserves_spaces_in_attributes() {
 }
 
 #[test]
+fn tool_history_repair_receipt_renders_as_system_history() {
+    let msg = Message {
+        role: "assistant".to_string(),
+        content: vec![ContentBlock::Text {
+            text: "[tool_history_repair] Repaired 1 crashed tool call(s); quarantined 0 duplicate and 0 orphan terminal result(s).".to_string(),
+            cache_control: None,
+        }],
+    };
+
+    let cells = super::history_cells_from_message(&msg);
+
+    assert!(matches!(
+        cells.as_slice(),
+        [HistoryCell::System { content }] if content.starts_with("[tool_history_repair]")
+    ));
+}
+
+#[test]
 fn history_replays_update_plan_tool_use_as_plan_card() {
     let msg = Message {
         role: "assistant".to_string(),
@@ -1029,7 +1072,12 @@ fn tool_lines_with_options_respects_low_motion_in_default_path() {
     // platforms with coarse timer resolution (Windows ≈ 15.6 ms) and
     // gives several frame intervals of headroom before the index could
     // wrap back to 0.
-    let started_at = Some(Instant::now() - Duration::from_millis(TOOL_STATUS_SYMBOL_MS * 2));
+    let started_at = Some(
+        Instant::now()
+            - Duration::from_millis(
+                crate::tui::spinner::LIVE_MARKER_DELAY_MS + TOOL_STATUS_SYMBOL_MS * 2,
+            ),
+    );
     let cell = HistoryCell::Tool(ToolCell::Exec(ExecCell {
         command: "echo hi".to_string(),
         status: ToolStatus::Running,
@@ -1058,8 +1106,9 @@ fn tool_lines_with_options_respects_low_motion_in_default_path() {
     let animated_symbol = animated[0].spans[1].content.trim();
     let low_motion_symbol = low_motion[0].spans[1].content.trim();
 
-    // low_motion always pins to the first (static) frame.
-    assert_eq!(low_motion_symbol, TOOL_RUNNING_SYMBOLS[0]);
+    // Reduced motion freezes at a filled, legible bubble rather than an
+    // invisible blank braille cell.
+    assert_eq!(low_motion_symbol, "⣤");
     // The animated path should be on a different frame (index 2).
     assert_ne!(animated_symbol, TOOL_RUNNING_SYMBOLS[0]);
 }
@@ -1176,6 +1225,134 @@ fn assistant_cell_renders_with_bullet_glyph_not_literal_label() {
     );
     assert!(visible.contains("ready"));
     assert_ne!(head.style.bg, Some(palette::SURFACE_ELEVATED));
+}
+
+#[test]
+fn copy_metadata_strips_tool_receipt_chrome_but_keeps_text() {
+    let cell = HistoryCell::Tool(ToolCell::Exec(ExecCell {
+        command: "printf 'receipt'".to_string(),
+        status: ToolStatus::Success,
+        output: Some("receipt".to_string()),
+        live_output: None,
+        shell_task_id: None,
+        owner_agent_id: None,
+        owner_agent_name: None,
+        started_at: None,
+        duration_ms: None,
+        source: ExecSource::Assistant,
+        interaction: None,
+        output_summary: None,
+    }));
+    let rendered = cell.lines_with_copy_metadata(80, TranscriptRenderOptions::default());
+    let header = rendered.first().expect("tool receipt header");
+    assert!(
+        header.copy_prefix_width >= 4,
+        "missing status/family chrome width"
+    );
+    assert!(
+        header
+            .line
+            .spans
+            .iter()
+            .any(|span| span.content.contains("receipt")),
+        "receipt text must remain in the rendered copy source"
+    );
+    let header_text = line_to_plain(&ratatui::text::Line::from(
+        header
+            .line
+            .spans
+            .iter()
+            .skip(1)
+            .cloned()
+            .collect::<Vec<_>>(),
+    ));
+    let copied = slice_text(
+        &header_text,
+        header.copy_prefix_width,
+        text_display_width(&header_text),
+    );
+    assert!(
+        !copied.contains('✓'),
+        "status chrome leaked into copy: {copied:?}"
+    );
+    assert!(
+        !copied.contains('●'),
+        "family chrome leaked into copy: {copied:?}"
+    );
+    assert!(
+        copied.contains("run done"),
+        "receipt text was clipped: {copied:?}"
+    );
+}
+
+#[test]
+fn copy_metadata_tracks_wrapped_assistant_code_prefix_in_display_columns() {
+    let cell = HistoryCell::Assistant {
+        content: "```text\n  中文 = 1\n```".to_string(),
+        streaming: false,
+    };
+    let rendered = cell.lines_with_copy_metadata(24, TranscriptRenderOptions::default());
+    let code_line = rendered
+        .iter()
+        .find(|line| {
+            line.line
+                .spans
+                .iter()
+                .any(|span| span.content.contains("中文"))
+        })
+        .expect("wrapped fenced code line");
+    assert_eq!(
+        code_line.copy_prefix_width, 2,
+        "code continuation prefix uses the role marker's two display columns"
+    );
+    let code = line_to_plain(&code_line.line);
+    let copied = slice_text(
+        &code,
+        code_line.copy_prefix_width,
+        text_display_width(&code),
+    );
+    assert!(
+        copied.contains("中文 = 1"),
+        "code text was clipped: {copied:?}"
+    );
+    assert!(
+        copied.starts_with("    中文"),
+        "code indentation or visual prefix was wrong: {copied:?}"
+    );
+}
+
+#[test]
+fn copy_metadata_keeps_fenced_code_indentation_after_prefix_removal() {
+    let cell = HistoryCell::Assistant {
+        content: "```rust\n    let answer = 42;\n```".to_string(),
+        streaming: false,
+    };
+    let rendered = cell.lines_with_copy_metadata(40, TranscriptRenderOptions::default());
+    let code_line = rendered
+        .iter()
+        .find(|line| {
+            line.line
+                .spans
+                .iter()
+                .any(|span| span.content.contains("answer"))
+        })
+        .expect("fenced code body");
+    let text = line_to_plain(&code_line.line);
+    let content = slice_text(
+        &text,
+        code_line.copy_prefix_width,
+        text_display_width(&text),
+    );
+    assert!(
+        content.contains("    let answer = 42;"),
+        "code indentation was not preserved: {content:?}"
+    );
+    for glyph in ['╎', '▎', '●', '│', '┃'] {
+        assert!(
+            !content.contains(glyph),
+            "decorative glyph leaked: {content:?}"
+        );
+    }
 }
 
 #[test]

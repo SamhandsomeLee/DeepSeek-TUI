@@ -27,8 +27,9 @@ use crate::tools::shell::{SharedShellManager, new_shared_shell_manager};
 use crate::worker_profile::ShellPolicy;
 #[allow(unused_imports)]
 pub use codewhale_tools::{
-    ApprovalRequirement, ToolCapability, ToolError, ToolResult, optional_bool, optional_str,
-    optional_u64, required_str, required_u64,
+    ApprovalRequirement, PreparedToolCall, ResourceClaim, ToolCapability, ToolError,
+    ToolExecutionOutcome, ToolResult, ToolTerminalStatus, optional_bool, optional_str,
+    optional_u64, required_str, required_u64, schedule_non_conflicting,
 };
 
 #[async_trait]
@@ -57,6 +58,8 @@ pub struct RuntimeToolServices {
     pub active_task_id: Option<String>,
     pub active_thread_id: Option<String>,
     pub dynamic_tool_executor: Option<Arc<dyn DynamicToolExecutor>>,
+    /// Active-session Work Graph authority plus its legacy Plan/To-do views.
+    pub work: Option<crate::work_graph::SharedWorkRuntime>,
     /// Hook executor for `shell_env` injection (#456) and any future
     /// tool-side hook events. `None` outside the live engine — test
     /// contexts that don't care about hooks get a no-op.
@@ -78,6 +81,7 @@ impl Default for RuntimeToolServices {
             active_task_id: None,
             active_thread_id: None,
             dynamic_tool_executor: None,
+            work: None,
             hook_executor: None,
             handle_store: new_shared_handle_store(),
             rlm_sessions: new_shared_rlm_session_store(),
@@ -98,6 +102,7 @@ impl std::fmt::Debug for RuntimeToolServices {
                 "dynamic_tool_executor",
                 &self.dynamic_tool_executor.is_some(),
             )
+            .field("work", &self.work.is_some())
             .field("hook_executor", &self.hook_executor.is_some())
             .field("handle_store", &true)
             .field("rlm_sessions", &true)
@@ -118,7 +123,7 @@ pub struct FileReadTracker {
 
 pub type SharedFileReadTracker = Arc<Mutex<FileReadTracker>>;
 
-fn new_shared_file_read_tracker() -> SharedFileReadTracker {
+pub(crate) fn new_shared_file_read_tracker() -> SharedFileReadTracker {
     Arc::new(Mutex::new(FileReadTracker::default()))
 }
 
@@ -170,6 +175,8 @@ pub struct ToolContext {
     pub skills_dir: Option<PathBuf>,
     /// Restrict skill discovery to CodeWhale-owned roots plus `skills_dir`.
     pub skills_scan_codewhale_only: bool,
+    /// Immutable registry snapshot for this workspace/engine context.
+    pub plugin_registry: Option<Arc<crate::plugins::PluginRegistry>>,
     /// Elevated sandbox policy override (used when retrying after sandbox denial).
     /// This overrides the default sandbox behavior for shell commands.
     pub elevated_sandbox_policy: Option<crate::sandbox::SandboxPolicy>,
@@ -179,12 +186,18 @@ pub struct ToolContext {
     /// Whether tools should auto-approve without safety checks (YOLO mode).
     /// When true, command safety analysis is skipped for shell execution.
     pub auto_approve: bool,
+    /// Plan-mode `update_plan` calls must create a validated, reviewable graph
+    /// proposal. Other modes may update ordinary progress directly.
+    pub review_plan_changes: bool,
     /// Effective shell policy for this execution context.
     pub shell_policy: ShellPolicy,
     /// Effective feature flag set for the running session.
     pub features: Features,
     /// Namespace for tool state that should be scoped to the current session/thread.
     pub state_namespace: String,
+    /// Effective context window for the active provider/model route. Web tools
+    /// use this to keep inline page content below three percent of the route.
+    pub route_context_window: Option<u32>,
     /// User-trusted external paths the agent may read/write even when they
     /// fall outside `workspace`. Loaded from `~/.deepseek/workspace-trust.json`
     /// and refreshed when the user runs `/trust add <path>`. Distinct from
@@ -234,12 +247,19 @@ pub struct ToolContext {
     /// Which search backend `web_search` should use. Default: DuckDuckGo. Set via
     /// `[search] provider` in config.toml.
     pub search_provider: crate::config::SearchProvider,
-    /// API key for Tavily, Bocha, Metaso, or Baidu. `None` for Bing or DuckDuckGo.
-    /// Metaso also falls back to `METASO_API_KEY` env var, then a built-in key.
+    /// API key for Tavily, Bocha, Metaso, Baidu, Volcengine, or Sofya.
+    /// `None` for Bing, DuckDuckGo, or SearXNG.
+    /// Metaso also falls back to the `METASO_API_KEY` env var.
     /// Baidu also falls back to `BAIDU_SEARCH_API_KEY`.
     pub search_api_key: Option<String>,
     /// Optional DuckDuckGo-compatible HTML endpoint override for `web_search`.
     pub search_base_url: Option<String>,
+    /// Opaque client for the active route's documented first-party search
+    /// tool. It owns provider authentication internally and is attached only
+    /// when the exact route capability says server-side search is supported.
+    pub(crate) provider_native_search: Option<crate::client::ProviderNativeSearchClient>,
+    /// Exact active route capability facts. Unknown stays fail-closed.
+    pub(crate) route_capabilities: codewhale_config::route::RouteCapabilities,
 
     /// Per-session workshop variable store (#548). Holds the raw content of
     /// the most recent large-tool routing event so the parent can call
@@ -274,12 +294,15 @@ impl ToolContext {
             mcp_config_path,
             skills_dir: None,
             skills_scan_codewhale_only: false,
+            plugin_registry: None,
             elevated_sandbox_policy: None,
             shell_network_denied_hint: None,
             auto_approve: false,
+            review_plan_changes: false,
             shell_policy: ShellPolicy::Full,
             features: Features::with_defaults(),
             state_namespace: "workspace".to_string(),
+            route_context_window: None,
             trusted_external_paths: Vec::new(),
             follow_symlinks: false,
             network_policy: None,
@@ -293,6 +316,8 @@ impl ToolContext {
             search_provider: crate::config::SearchProvider::default(),
             search_api_key: None,
             search_base_url: None,
+            provider_native_search: None,
+            route_capabilities: codewhale_config::route::RouteCapabilities::default(),
             workshop_vars: None,
         }
     }
@@ -319,12 +344,15 @@ impl ToolContext {
             mcp_config_path: mcp_config_path.into(),
             skills_dir: None,
             skills_scan_codewhale_only: false,
+            plugin_registry: None,
             elevated_sandbox_policy: None,
             shell_network_denied_hint: None,
             auto_approve: false,
+            review_plan_changes: false,
             shell_policy: ShellPolicy::Full,
             features: Features::with_defaults(),
             state_namespace: "workspace".to_string(),
+            route_context_window: None,
             trusted_external_paths: Vec::new(),
             follow_symlinks: false,
             network_policy: None,
@@ -338,6 +366,8 @@ impl ToolContext {
             search_provider: crate::config::SearchProvider::default(),
             search_api_key: None,
             search_base_url: None,
+            provider_native_search: None,
+            route_capabilities: codewhale_config::route::RouteCapabilities::default(),
             workshop_vars: None,
         }
     }
@@ -364,12 +394,15 @@ impl ToolContext {
             mcp_config_path: mcp_config_path.into(),
             skills_dir: None,
             skills_scan_codewhale_only: false,
+            plugin_registry: None,
             elevated_sandbox_policy: None,
             shell_network_denied_hint: None,
             auto_approve,
+            review_plan_changes: false,
             shell_policy: ShellPolicy::Full,
             features: Features::with_defaults(),
             state_namespace: "workspace".to_string(),
+            route_context_window: None,
             trusted_external_paths: Vec::new(),
             follow_symlinks: false,
             network_policy: None,
@@ -383,6 +416,8 @@ impl ToolContext {
             search_provider: crate::config::SearchProvider::default(),
             search_api_key: None,
             search_base_url: None,
+            provider_native_search: None,
+            route_capabilities: codewhale_config::route::RouteCapabilities::default(),
             workshop_vars: None,
         }
     }
@@ -398,6 +433,14 @@ impl ToolContext {
     #[must_use]
     pub fn with_runtime_services(mut self, runtime: RuntimeToolServices) -> Self {
         self.runtime = runtime;
+        self
+    }
+
+    /// Require plan updates in this turn to remain pending until the user
+    /// accepts their graph diff from the Plan review surface.
+    #[must_use]
+    pub fn with_review_plan_changes(mut self, review: bool) -> Self {
+        self.review_plan_changes = review;
         self
     }
 
@@ -425,6 +468,12 @@ impl ToolContext {
     ) -> Self {
         self.skills_dir = Some(skills_dir.into());
         self.skills_scan_codewhale_only = scan_codewhale_only;
+        self
+    }
+
+    #[must_use]
+    pub fn with_plugin_registry(mut self, registry: Arc<crate::plugins::PluginRegistry>) -> Self {
+        self.plugin_registry = Some(registry);
         self
     }
 
@@ -745,6 +794,14 @@ impl ToolContext {
         self
     }
 
+    /// Reuse the engine's session-scoped read snapshots across tool-context
+    /// rebuilds. A fresh context is assembled for each turn, but successful
+    /// reads must remain authoritative until the observed file changes.
+    pub fn with_file_read_tracker(mut self, tracker: SharedFileReadTracker) -> Self {
+        self.file_read_tracker = tracker;
+        self
+    }
+
     /// Set the elevated sandbox policy override.
     ///
     /// This is used when retrying a tool after a sandbox denial, to run
@@ -763,6 +820,13 @@ impl ToolContext {
     /// Set the namespace used for session-scoped tool state.
     pub fn with_state_namespace(mut self, namespace: impl Into<String>) -> Self {
         self.state_namespace = namespace.into();
+        self
+    }
+
+    /// Attach the active route's effective context window.
+    #[must_use]
+    pub fn with_route_context_window(mut self, context_window: u32) -> Self {
+        self.route_context_window = (context_window > 0).then_some(context_window);
         self
     }
 
@@ -922,6 +986,24 @@ pub trait ToolSpec: Send + Sync {
     /// turns they do not need to block neighboring read-only inspections.
     fn starts_detached_for(&self, _input: &Value) -> bool {
         false
+    }
+
+    /// Resolve input-specific policy without performing external side effects.
+    ///
+    /// Resource claims deliberately default to global exclusivity until a
+    /// first-party tool opts into narrower, canonicalized claims. The initial
+    /// seam records this decision but leaves the existing scheduler unchanged.
+    fn prepare(&self, input: Value, _context: &ToolContext) -> Result<PreparedToolCall, ToolError> {
+        Ok(PreparedToolCall {
+            name: self.name().to_string(),
+            description: self.description().to_string(),
+            read_only: self.is_read_only_for(&input),
+            supports_parallel: self.supports_parallel_for(&input),
+            starts_detached: self.starts_detached_for(&input),
+            approval: self.approval_requirement_for(&input),
+            resources: vec![ResourceClaim::GlobalExclusive],
+            input,
+        })
     }
 
     /// Returns whether this tool should be excluded from the model-visible

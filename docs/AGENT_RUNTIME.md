@@ -150,3 +150,35 @@ CodeWhale should converge with Claude Code on **shape**, not on branding:
 
 The litmus test for any new agent surface: *does it launch and observe the one
 runtime, or does it invent a second one?* Only the former is allowed.
+
+## What remains after v0.9.0
+
+Refreshed 2026-07-15 from a full audit of the older 0.9-era documents. Those
+plans are evidence, not a second source of truth. v0.9.0 consolidates the
+underwater shell, message-first Operate, permission postures, the wired
+Workflow engine and durable run journal, Lane CLI/runtime, setup with
+`operate_ready`, constitution rebalance, and ProviderLake/Models.dev. The
+remaining work belongs to later releases:
+
+1. **Rebrand completion** — the only hard-dated obligations: remove the
+   `deepseek`/`deepseek-tui` binary shims and shim release assets; finish the
+   Homebrew `codewhale` formula rollout (`docs/REBRAND.md`).
+2. **Operate as a value stream** — a control-board surface over the underwater
+   shell (WIP, queue age, bottleneck); model-visible Work state (#3983); phase
+   ledger (#4039); Workrooms Phase 2 (#3209/#3210) as the inbox substrate;
+   receipt reconciliation.
+3. **Flow control** — real WIP limits and visible queues (#4015, #4016),
+   reconciled with the shipped 16-concurrent/1k-run access model (#4292).
+4. **Fleet/Workflow convergence residuals** — live tmux/verifier-gate dogfood
+   closing #4175/#4177/#4178/#4179; Fleet consuming canonical AgentProfiles;
+   Conductor/topology (#4010, #4012) as stretch.
+5. **TTC_DESIGN implementation** — approved and now unblocked after v0.9.0.
+6. **HarnessProfile completion** — the status/UX display lane
+   (`docs/rfcs/HARNESS_PROFILE_CUTLINE.md`).
+7. **File decomposition, re-scoped** — `ui.rs` (~13.6k lines) and `main.rs`
+   (~12.1k) are the current offenders (`docs/rfcs/FILE_DECOMPOSITION_0_9_0.md`).
+
+Explicitly deferred by their own documents: external workflow memory (boundary
+only), automatic harness evolution, hosted workrooms, `constitution_modules`
+(needs sign-off), permission profiles (#3211, needs design), and plan-ceiling
+probing (needs a product decision).

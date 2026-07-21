@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use tiny_http::{Response, Server};
 use tokio::sync::{Mutex, oneshot};
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 use urlencoding::decode;
 
 use super::McpServerConfig;
@@ -147,6 +148,9 @@ impl McpOAuthRuntime {
         server: &McpServerConfig,
         default_headers: HeaderMap,
     ) -> Result<Option<Self>> {
+        if server.reviewed_plugin.is_some() {
+            return Ok(None);
+        }
         let Some(url) = server.url.as_deref() else {
             return Ok(None);
         };
@@ -292,7 +296,7 @@ impl McpOAuthRuntime {
 }
 
 pub async fn auth_status_for_server(name: &str, server: &McpServerConfig) -> McpAuthStatus {
-    if !server.is_enabled() || server.url.is_none() {
+    if server.reviewed_plugin.is_some() || !server.is_enabled() || server.url.is_none() {
         return McpAuthStatus::Unsupported;
     }
     if server_has_manual_authorization(server) {
@@ -328,6 +332,9 @@ pub async fn auth_status_for_server(name: &str, server: &McpServerConfig) -> Mcp
 }
 
 pub async fn oauth_login_support(server: &McpServerConfig) -> Result<Option<McpOAuthDiscovery>> {
+    if server.reviewed_plugin.is_some() {
+        return Ok(None);
+    }
     let Some(url) = server.url.as_deref() else {
         return Ok(None);
     };
@@ -397,6 +404,66 @@ pub fn resolve_oauth_scopes(
 }
 
 pub async fn perform_oauth_login_for_server(
+    name: &str,
+    server: &McpServerConfig,
+    explicit_scopes: Option<Vec<String>>,
+    callback_port: Option<u16>,
+    callback_url: Option<&str>,
+) -> Result<()> {
+    perform_oauth_login_for_server_with_cancel(
+        name,
+        server,
+        explicit_scopes,
+        callback_port,
+        callback_url,
+        CancellationToken::new(),
+    )
+    .await
+}
+
+/// Run an MCP OAuth login that can be stopped by the caller.
+///
+/// Cancellation drops the in-flight OAuth future before this function returns,
+/// which also closes its callback listener. A caller that replaces one login
+/// with another should await the cancelled call before starting the replacement.
+pub async fn perform_oauth_login_for_server_with_cancel(
+    name: &str,
+    server: &McpServerConfig,
+    explicit_scopes: Option<Vec<String>>,
+    callback_port: Option<u16>,
+    callback_url: Option<&str>,
+    cancellation_token: CancellationToken,
+) -> Result<()> {
+    if server.reviewed_plugin.is_some() {
+        bail!(
+            "OAuth is disabled for plugin-contributed MCP servers in v0.9.1; use a reviewed environment-backed header or bearer token"
+        );
+    }
+    run_cancellable_oauth(
+        &cancellation_token,
+        perform_oauth_login_for_server_inner(
+            name,
+            server,
+            explicit_scopes,
+            callback_port,
+            callback_url,
+        ),
+    )
+    .await
+}
+
+async fn run_cancellable_oauth<F, T>(cancellation_token: &CancellationToken, future: F) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    tokio::select! {
+        biased;
+        _ = cancellation_token.cancelled() => bail!("OAuth login was cancelled"),
+        result = future => result,
+    }
+}
+
+async fn perform_oauth_login_for_server_inner(
     name: &str,
     server: &McpServerConfig,
     explicit_scopes: Option<Vec<String>>,
@@ -486,6 +553,9 @@ async fn perform_oauth_login(
 }
 
 pub fn delete_oauth_tokens_for_server(name: &str, server: &McpServerConfig) -> Result<bool> {
+    if server.reviewed_plugin.is_some() {
+        bail!("OAuth storage is disabled for plugin-contributed MCP servers in v0.9.1");
+    }
     let Some(url) = server.url.as_deref() else {
         bail!("OAuth logout is only supported for URL-based MCP servers");
     };
@@ -569,10 +639,17 @@ fn load_oauth_tokens(server_name: &str, url: &str) -> Result<Option<StoredMcpOAu
     else {
         return Ok(None);
     };
-    let mut tokens: StoredMcpOAuthTokens = serde_json::from_str(&serialized)
-        .with_context(|| format!("parsing stored MCP OAuth token for '{server_name}'"))?;
+    let mut tokens = parse_stored_oauth_tokens(&serialized, server_name)?;
     refresh_expires_in_from_timestamp(&mut tokens);
     Ok(Some(tokens))
+}
+
+fn parse_stored_oauth_tokens(serialized: &str, server_name: &str) -> Result<StoredMcpOAuthTokens> {
+    serde_json::from_str(serialized).map_err(|_| {
+        anyhow!(
+            "stored MCP OAuth token for '{server_name}' is not valid credential JSON; contents were omitted"
+        )
+    })
 }
 
 fn save_oauth_tokens(tokens: &StoredMcpOAuthTokens) -> Result<()> {
@@ -1013,6 +1090,7 @@ impl McpServerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn resolve_oauth_scopes_prefers_explicit() {
@@ -1049,6 +1127,19 @@ mod tests {
     }
 
     #[test]
+    fn malformed_stored_oauth_diagnostic_omits_secret_contents_and_keys() {
+        let secret = "cw-secret-mcp-oauth-4507";
+        let serialized =
+            format!(r#"{{"token_response":{{"access_token":"{secret}"}} trailing-junk}}"#);
+        let error = parse_stored_oauth_tokens(&serialized, "private")
+            .expect_err("malformed credential JSON must fail");
+        let diagnostic = format!("{error:#}");
+        assert!(!diagnostic.contains(secret), "{diagnostic}");
+        assert!(!diagnostic.contains("access_token"), "{diagnostic}");
+        assert!(diagnostic.contains("contents were omitted"), "{diagnostic}");
+    }
+
+    #[test]
     fn auth_required_classifier_matches_http_401_shapes() {
         let err = anyhow!("MCP Streamable HTTP rejected status=401 Unauthorized");
         assert!(error_looks_auth_required(&err));
@@ -1065,5 +1156,38 @@ mod tests {
         let hint = auth_required_login_hint("nordic-mcp");
         assert!(hint.contains("nordic-mcp"));
         assert!(hint.contains("codewhale mcp login nordic-mcp"));
+    }
+
+    #[tokio::test]
+    async fn cancellable_oauth_drops_in_flight_flow_before_returning() {
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let cancellation_token = CancellationToken::new();
+        let cancel_from_task = cancellation_token.clone();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let flow_dropped = Arc::clone(&dropped);
+        let pending_flow = async move {
+            let _guard = DropFlag(flow_dropped);
+            std::future::pending::<Result<()>>().await
+        };
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            cancel_from_task.cancel();
+        });
+
+        let error = run_cancellable_oauth(&cancellation_token, pending_flow)
+            .await
+            .expect_err("cancellation should stop the pending OAuth flow");
+
+        assert!(error.to_string().contains("OAuth login was cancelled"));
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the callback-server guard must be dropped before cancellation returns"
+        );
     }
 }

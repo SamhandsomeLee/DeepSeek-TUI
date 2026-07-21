@@ -20,7 +20,7 @@ pub fn lines(app: &App) -> Vec<Line<'static>> {
         Line::from(Span::styled(
             "codewhale",
             Style::default()
-                .fg(palette::WHALE_ACCENT_PRIMARY)
+                .fg(palette::WHALE_HUMAN)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
@@ -64,6 +64,10 @@ fn welcome_step_labels(app: &App) -> Vec<String> {
     if !app.trust_mode && super::needs_trust(&app.workspace) {
         steps.push(app.tr(MessageId::OnboardWelcomeStepTrust).to_string());
     }
+    steps.push(
+        app.tr(MessageId::OnboardWelcomeStepMentalModels)
+            .to_string(),
+    );
     steps.push(app.tr(MessageId::OnboardWelcomeStepTips).to_string());
     steps
 }
@@ -127,10 +131,20 @@ mod tests {
         assert!(body.contains("Code means two things"));
         assert!(body.contains("the law this agent works under"));
         assert!(body.contains("only these screens will appear"));
-        assert!(body.contains("Next: choose language -> setup tips."));
+        assert!(
+            body.contains("Next: choose language -> learn modes and permissions -> setup tips.")
+        );
         assert!(body.contains("/constitution"));
         assert!(!body.contains("add an API key"));
         assert!(!body.contains("land in the chat"));
+    }
+
+    #[test]
+    fn welcome_wordmark_uses_the_human_brand_lane() {
+        let app = test_app_with_locale(Locale::En);
+        let welcome = lines(&app);
+        assert_eq!(welcome[0].spans[0].style.fg, Some(palette::WHALE_HUMAN));
+        assert_ne!(palette::WHALE_HUMAN, palette::WHALE_ACTION);
     }
 
     #[test]
@@ -144,7 +158,7 @@ mod tests {
         let body = body(&app);
 
         assert!(body.contains(
-            "Next: choose language -> connect API key -> trust workspace -> setup tips."
+            "Next: choose language -> connect API key -> trust workspace -> learn modes and permissions -> setup tips."
         ));
     }
 
@@ -156,8 +170,9 @@ mod tests {
 
         let body = body(&app);
 
-        assert!(body.contains("代码在这里有两层含义"));
-        assert!(body.contains("接下来：选择语言 -> 设置提示。"));
+        assert!(body.contains("Codewhale 会与你协作完成工作"));
+        assert!(!body.contains("代码在这里有两层含义"));
+        assert!(body.contains("接下来：选择语言 -> 了解模式与权限 -> 设置提示。"));
         assert!(!body.contains("Press Enter"));
     }
 }

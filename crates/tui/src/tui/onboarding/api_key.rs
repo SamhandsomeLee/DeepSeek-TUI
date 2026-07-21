@@ -26,14 +26,39 @@ pub fn lines(app: &App) -> Vec<Line<'static>> {
             Style::default().fg(palette::TEXT_PRIMARY),
         )),
     ];
-    if let Some(url) = provider.credential_url() {
+    let credential_help = provider.credential_help();
+    if app.onboarding_uses_kimi_code_plan() {
+        lines.push(Line::from(Span::styled(
+            app.tr(MessageId::KimiCodePlanApiKeyHint).replace(
+                "{console}",
+                crate::config::KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL,
+            ),
+            Style::default().fg(palette::TEXT_MUTED),
+        )));
+        lines.push(Line::from(Span::styled(
+            app.tr(MessageId::KimiCodePlanRouteHint)
+                .replace("{route}", crate::config::DEFAULT_KIMI_CODE_BASE_URL),
+            Style::default().fg(palette::TEXT_MUTED),
+        )));
+        lines.push(Line::from(Span::styled(
+            app.tr(MessageId::KimiCodePlanNoImportHint),
+            Style::default().fg(palette::TEXT_MUTED),
+        )));
+    } else if let Some(url) = credential_help.credential_url {
         lines.push(Line::from(Span::styled(
             url.to_string(),
             Style::default().fg(palette::TEXT_MUTED),
         )));
-    } else {
+    } else if credential_help.acquisition
+        == codewhale_config::provider::CredentialAcquisition::LocalOptional
+    {
         lines.push(Line::from(Span::styled(
             app.tr(MessageId::OnboardApiKeyLocalHint).to_string(),
+            Style::default().fg(palette::TEXT_MUTED),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            credential_help.guidance.to_string(),
             Style::default().fg(palette::TEXT_MUTED),
         )));
     }
@@ -231,7 +256,7 @@ mod tests {
             "expected zh-Hans 'key' label, got: {body}"
         );
         assert!(
-            body.contains("Enter 保存"),
+            body.contains("按 Enter 继续"),
             "expected zh-Hans footer, got: {body}"
         );
 
@@ -253,8 +278,61 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            body.contains("Press Enter to save"),
+            body.contains("Press Enter to continue"),
             "expected en footer, got: {body}"
         );
+    }
+
+    #[test]
+    fn local_provider_copy_makes_the_key_optional() {
+        let mut app = test_app_with_locale(Locale::En);
+        app.onboarding_provider = ApiProvider::Ollama;
+        let body = lines(&app)
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(body.contains("Local runtimes usually need no pasted key"));
+        assert!(body.contains("If this provider requires a key"));
+        assert!(body.contains("paste key here if required"));
+        assert!(body.contains("Press Enter to continue"));
+    }
+
+    #[test]
+    fn kimi_onboarding_points_to_the_api_key_console_and_paste_path() {
+        let mut app = test_app_with_locale(Locale::En);
+        app.onboarding_provider = ApiProvider::Moonshot;
+        let body = lines(&app)
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(body.contains("https://platform.kimi.ai/console/api-keys"));
+        assert!(body.contains("paste it below"));
+        assert!(body.contains("paste key here if required"));
+        assert!(!body.contains("OAuth"));
+        assert!(!body.contains("device login"));
+    }
+
+    #[test]
+    fn kimi_code_plan_onboarding_uses_membership_key_guidance() {
+        let mut app = test_app_with_locale(Locale::En);
+        app.api_provider = ApiProvider::Moonshot;
+        app.onboarding_provider = ApiProvider::Moonshot;
+        app.active_route_base_url = crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string();
+        app.model = crate::config::KIMI_CODE_K3_MODEL.to_string();
+        let body = lines(&app)
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(body.contains("https://www.kimi.com/code/console"));
+        assert!(body.contains("api.kimi.com/coding/v1"));
+        assert!(body.contains("does not import Kimi CLI credentials"));
+        assert!(!body.contains("https://platform.kimi.ai/console/api-keys"));
+        assert!(!body.contains("OAuth"));
     }
 }

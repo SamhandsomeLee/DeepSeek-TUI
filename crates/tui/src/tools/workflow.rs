@@ -43,6 +43,16 @@ use crate::tools::workflow_plan_approval::{
     workflow_approval_requirement_for,
 };
 use crate::utils::spawn_supervised;
+use crate::work_graph::{
+    CancelOutcome, EvidenceKind, EvidenceRef, OperationIntent, OperationObservation,
+    OperationOwnerSnapshot, OwnerState, SharedWorkRuntime,
+};
+
+/// Keep promoted artifacts compact without clipping ordinary evidence reports.
+/// A 900-character cap cut six-line source receipts in half during live Fleet
+/// acceptance, so downstream roles could not evaluate evidence the host had
+/// already approved.
+const WORKFLOW_HANDOFF_MAX_CHARS: usize = 4_000;
 
 #[derive(Clone)]
 pub struct WorkflowTool {
@@ -72,6 +82,122 @@ impl WorkflowTool {
 
 type SharedWorkflowRuns = Arc<Mutex<HashMap<String, WorkflowRunRecord>>>;
 type SharedWorkflowControllers = Arc<Mutex<HashMap<String, Arc<WorkflowRunController>>>>;
+type SharedWorkflowLifecycles = Arc<Mutex<HashMap<String, WorkflowWorkLifecycle>>>;
+
+#[derive(Clone)]
+struct WorkflowWorkLifecycle {
+    work: SharedWorkRuntime,
+    session_id: String,
+    external: String,
+}
+
+impl WorkflowWorkLifecycle {
+    fn register(
+        context: &ToolContext,
+        run_id: &str,
+        title: &str,
+    ) -> Result<Option<Self>, ToolError> {
+        let Some(work) = context.runtime.work.clone() else {
+            return Ok(None);
+        };
+        let lifecycle = Self {
+            work,
+            session_id: context.state_namespace.clone(),
+            external: format!("workflow:{run_id}"),
+        };
+        lifecycle
+            .work
+            .register_operation(
+                &lifecycle.session_id,
+                OperationIntent::new(
+                    lifecycle.external.clone(),
+                    title,
+                    true,
+                    "workflow",
+                    format!("workflow:{run_id}:start"),
+                ),
+            )
+            .map_err(ToolError::execution_failed)?;
+        Ok(Some(lifecycle))
+    }
+
+    fn for_bound(context: &ToolContext, run_id: &str) -> Option<Self> {
+        let work = context.runtime.work.clone()?;
+        let external = format!("workflow:{run_id}");
+        work.has_operation_binding(Some(&context.state_namespace), &external)
+            .then(|| Self {
+                work,
+                session_id: context.state_namespace.clone(),
+                external,
+            })
+    }
+
+    fn reconcile_record(&self, record: &WorkflowRunRecord) -> Result<bool, String> {
+        let output = record.result.as_ref().and_then(|result| {
+            serde_json::to_vec(result).ok().and_then(|bytes| {
+                EvidenceRef::new(
+                    EvidenceKind::Receipt {
+                        owner: "workflow".to_string(),
+                    },
+                    format!("workflow:{}:result", record.run_id),
+                    Some(u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
+                    false,
+                )
+                .ok()
+            })
+        });
+        let state = match record.status {
+            WorkflowRunStatus::Running => OwnerState::Running,
+            WorkflowRunStatus::Completed => OwnerState::Completed,
+            WorkflowRunStatus::Failed => OwnerState::Failed,
+            WorkflowRunStatus::Cancelled => OwnerState::Cancelled,
+        };
+        let mut snapshot = OperationOwnerSnapshot::new(
+            self.external.clone(),
+            state,
+            record.lifecycle_seq,
+            i64::try_from(record.completed_at_ms.unwrap_or(record.started_at_ms))
+                .unwrap_or(i64::MAX),
+        );
+        if let Some(output) = output {
+            snapshot = snapshot.with_output(output);
+        }
+        self.work.reconcile_operation(&self.session_id, snapshot)
+    }
+
+    fn reconcile_cancel(&self, outcome: CancelOutcome) -> Result<bool, String> {
+        self.work.reconcile_observation(
+            &self.session_id,
+            &self.external,
+            OperationObservation::CancelUpdate {
+                outcome,
+                at: i64::try_from(now_ms()).unwrap_or(i64::MAX),
+            },
+        )
+    }
+
+    fn reconcile_spawn_failure(&self) {
+        let _ = self.work.reconcile_operation(
+            &self.session_id,
+            OperationOwnerSnapshot::new(
+                self.external.clone(),
+                OwnerState::Failed,
+                1,
+                i64::try_from(now_ms()).unwrap_or(i64::MAX),
+            ),
+        );
+    }
+
+    fn reconcile_missing(&self) {
+        let _ = self.work.reconcile_observation(
+            &self.session_id,
+            &self.external,
+            OperationObservation::OwnerMissing {
+                checked_at: i64::try_from(now_ms()).unwrap_or(i64::MAX),
+            },
+        );
+    }
+}
 
 struct WorkflowRunController {
     driver: Arc<SubAgentWorkflowDriver>,
@@ -110,6 +236,7 @@ impl WorkflowRunController {
 struct WorkflowRunSummary {
     run_id: String,
     status: WorkflowRunStatus,
+    lifecycle_seq: u64,
     started_at_ms: u64,
     completed_at_ms: Option<u64>,
     source_path: Option<PathBuf>,
@@ -194,6 +321,21 @@ enum WorkflowUiEventKind {
         blocked_role: Option<String>,
         blocked_reason: Option<String>,
     },
+    HandoffPromoted {
+        artifact_id: String,
+        gate_id: String,
+        kind: String,
+        from_role: String,
+        to_role: String,
+        producer_task_id: String,
+    },
+    HandoffConsumed {
+        artifact_id: String,
+        kind: String,
+        from_role: String,
+        to_role: String,
+        consumer_task_id: String,
+    },
     TaskSchemaValidationFailed {
         task_id: String,
         message: String,
@@ -250,6 +392,8 @@ impl WorkflowUiEventKind {
             Self::TaskStarted(_) => "task_started",
             Self::TaskCompleted { .. } => "task_completed",
             Self::GateUpdated { .. } => "gate_updated",
+            Self::HandoffPromoted { .. } => "handoff_promoted",
+            Self::HandoffConsumed { .. } => "handoff_consumed",
             Self::TaskSchemaValidationFailed { .. } => "task_schema_validation_failed",
             Self::BudgetUpdated { .. } => "budget_updated",
             Self::Log { .. } => "log",
@@ -261,6 +405,8 @@ impl WorkflowUiEventKind {
 struct WorkflowRunRecord {
     run_id: String,
     status: WorkflowRunStatus,
+    #[serde(default)]
+    lifecycle_seq: u64,
     started_at_ms: u64,
     completed_at_ms: Option<u64>,
     source_path: Option<PathBuf>,
@@ -300,6 +446,7 @@ impl WorkflowRunRecord {
         Self {
             run_id,
             status: WorkflowRunStatus::Running,
+            lifecycle_seq: 1,
             started_at_ms: now_ms(),
             completed_at_ms: None,
             source_path,
@@ -324,6 +471,7 @@ impl WorkflowRunRecord {
         WorkflowRunSummary {
             run_id: self.run_id.clone(),
             status: self.status,
+            lifecycle_seq: self.lifecycle_seq,
             started_at_ms: self.started_at_ms,
             completed_at_ms: self.completed_at_ms,
             source_path: self.source_path.clone(),
@@ -417,6 +565,7 @@ impl ToolSpec for WorkflowTool {
     fn description(&self) -> &'static str {
         concat!(
             "Start, run, inspect, or cancel a Workflow. Workflows execute deterministic JS with args, phase/log progress, and task(...) calls that dispatch real sub-agents through Fleet/sub-agent scheduling. ",
+            "For parallel fan-out, pass an array of zero-argument thunks exactly like `await parallel([() => task({...}), () => task({...})])`; do not pass task promises as variadic arguments. ",
             "Provide exactly one of script, source_path, or plan (structured planner JSON). ",
             "Use action=start for detached orchestration and action=status with run_id to inspect progress. Use action=run when the model needs the final result before continuing."
         )
@@ -437,7 +586,7 @@ impl ToolSpec for WorkflowTool {
                 },
                 "script": {
                     "type": "string",
-                    "description": "Workflow JS source. The runtime provides args, task(...), parallel(...), pipeline(...), log(...), phase(...), and budget."
+                    "description": "Workflow JS source. The runtime provides args, task(...), parallel(thunks), pipeline(thunks), log(...), phase(...), and budget. Fan-out syntax: await parallel([() => task({...}), () => task({...})]). parallel() requires one array of zero-argument thunks, not variadic task promises."
                 },
                 "source_path": {
                     "type": "string",
@@ -449,15 +598,27 @@ impl ToolSpec for WorkflowTool {
                 },
                 "plan": {
                     "type": "object",
-                    "description": "Structured planner plan JSON (#4124). Alternative to script/source_path. Accepts goal, risk, max_children, token_budget, phases[], and/or children[] (or IR nodes). Lowered to Workflow JS with parallel() partial-success semantics."
+                    "description": "Structured planner plan JSON (#4124). Alternative to script/source_path. Accepts goal, risk, max_children, token_budget, phases[], and/or children[] (or IR nodes). risk must be exactly read_only, writes, or elevated. For a child, prefer role/profile without an explicit type; do not combine a role/profile with a conflicting type. Lowered to Workflow JS with parallel() partial-success semantics."
                 },
                 "args": {
+                    "anyOf": [
+                        { "type": "null" },
+                        { "type": "boolean" },
+                        { "type": "integer" },
+                        { "type": "number" },
+                        { "type": "string" },
+                        { "type": "array" },
+                        {
+                            "type": "object",
+                            "additionalProperties": {}
+                        }
+                    ],
                     "description": "JSON value exposed to the script as args. Defaults to null."
                 },
                 "token_budget": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Optional shared Workflow budget hint and default child token budget ceiling."
+                    "description": "Optional shared Workflow admission hint. Usage is reconciled when children report completion; already-running parallel children can take aggregate spent past the hint, while later and descendant spawns are rejected once exhausted."
                 },
                 "wait": {
                     "type": "boolean",
@@ -509,6 +670,7 @@ impl ToolSpec for WorkflowTool {
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
         let state = shared_workflow_state(&context.workspace);
+        attach_bound_workflow_lifecycles(context, &state)?;
         match parse_workflow_action(&input)? {
             WorkflowAction::Start => {
                 let wait = optional_bool(&input, "wait", false);
@@ -539,6 +701,56 @@ impl ToolSpec for WorkflowTool {
             WorkflowAction::Cancel => cancel_workflow(input, state).await,
         }
     }
+}
+
+fn attach_bound_workflow_lifecycles(
+    context: &ToolContext,
+    state: &Arc<WorkflowWorkspaceState>,
+) -> Result<(), ToolError> {
+    let records = lock_mutex(&state.runs)?
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    for record in records {
+        if let Some(lifecycle) = WorkflowWorkLifecycle::for_bound(context, &record.run_id) {
+            state.attach_lifecycle(&record.run_id, lifecycle);
+            state.reconcile_snapshot(&record);
+        }
+    }
+    Ok(())
+}
+
+fn fail_workflow_start(state: &Arc<WorkflowWorkspaceState>, run_id: &str, message: String) {
+    let snapshot = state.runs.lock().ok().and_then(|mut runs| {
+        let record = runs.get_mut(run_id)?;
+        record.status = WorkflowRunStatus::Failed;
+        record.lifecycle_seq = record.lifecycle_seq.saturating_add(1);
+        record.completed_at_ms = Some(now_ms());
+        record.error = Some(message);
+        Some(record.clone())
+    });
+    let Some(snapshot) = snapshot else {
+        state.mark_owner_missing(run_id);
+        return;
+    };
+    if state.try_record_snapshot(&snapshot).is_ok() {
+        state.reconcile_snapshot(&snapshot);
+    } else {
+        state.mark_owner_missing(run_id);
+    }
+}
+
+fn fail_workflow_after_controller_registration(
+    state: &Arc<WorkflowWorkspaceState>,
+    run_id: &str,
+    controller: &Arc<WorkflowRunController>,
+    message: String,
+) {
+    controller.cancel();
+    if let Ok(mut controllers) = state.controllers.lock() {
+        controllers.remove(run_id);
+    }
+    fail_workflow_start(state, run_id, message);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -578,9 +790,29 @@ async fn start_workflow(
         approval_decision
     };
     let plan_approval = summary.to_receipt(approval_decision, now_ms());
+    let workflow_title = source
+        .spec
+        .as_ref()
+        .map(|spec| spec.goal.as_str())
+        .or_else(|| {
+            source
+                .path
+                .as_ref()
+                .and_then(|path| path.file_name()?.to_str())
+        })
+        .unwrap_or("Workflow run");
+    let lifecycle = WorkflowWorkLifecycle::register(context, &run_id, workflow_title)?;
 
     {
-        let mut runs_guard = lock_mutex(&state.runs)?;
+        let mut runs_guard = match lock_mutex(&state.runs) {
+            Ok(guard) => guard,
+            Err(err) => {
+                if let Some(lifecycle) = lifecycle.as_ref() {
+                    lifecycle.reconcile_spawn_failure();
+                }
+                return Err(err);
+            }
+        };
         let mut record = WorkflowRunRecord::new(
             run_id.clone(),
             source.path.clone(),
@@ -600,7 +832,15 @@ async fn start_workflow(
         );
         record.events.push(started.clone());
         runs_guard.insert(run_id.clone(), record.clone());
-        state.record_snapshot(&record);
+        if let Err(err) = state.try_record_snapshot(&record) {
+            runs_guard.remove(&run_id);
+            if let Some(lifecycle) = lifecycle.as_ref() {
+                lifecycle.reconcile_spawn_failure();
+            }
+            return Err(ToolError::execution_failed(format!(
+                "workflow journal snapshot failed before launch: {err}"
+            )));
+        }
         // #4122: emit RunStarted immediately so the panel + history card open
         // before the first task/phase (including wait:false fire-and-forget).
         if let Some(tx) = runtime.event_tx.as_ref()
@@ -614,6 +854,9 @@ async fn start_workflow(
                 event: value,
             });
         }
+    }
+    if let Some(lifecycle) = lifecycle {
+        state.attach_lifecycle(&run_id, lifecycle);
     }
 
     let driver = SubAgentWorkflowDriver::new(
@@ -631,10 +874,52 @@ async fn start_workflow(
         driver.clone(),
         vm_cancel.clone(),
     ));
-    {
-        let mut controllers_guard = lock_mutex(&state.controllers)?;
+    if let Err(err) = lock_mutex(&state.controllers).map(|mut controllers_guard| {
         controllers_guard.insert(run_id.clone(), controller.clone());
+    }) {
+        fail_workflow_start(&state, &run_id, err.to_string());
+        return Err(err);
     }
+    let running_snapshot = {
+        let mut runs_guard = match lock_mutex(&state.runs) {
+            Ok(guard) => guard,
+            Err(err) => {
+                fail_workflow_after_controller_registration(
+                    &state,
+                    &run_id,
+                    &controller,
+                    err.to_string(),
+                );
+                return Err(err);
+            }
+        };
+        let Some(record) = runs_guard.get_mut(&run_id) else {
+            drop(runs_guard);
+            fail_workflow_after_controller_registration(
+                &state,
+                &run_id,
+                &controller,
+                "workflow owner record disappeared before launch".to_string(),
+            );
+            return Err(ToolError::execution_failed(
+                "workflow owner record disappeared before launch",
+            ));
+        };
+        record.lifecycle_seq = record.lifecycle_seq.saturating_add(1);
+        record.clone()
+    };
+    if let Err(err) = state.try_record_snapshot(&running_snapshot) {
+        fail_workflow_after_controller_registration(
+            &state,
+            &run_id,
+            &controller,
+            format!("workflow journal failed while activating owner: {err}"),
+        );
+        return Err(ToolError::execution_failed(format!(
+            "workflow journal failed while activating owner: {err}"
+        )));
+    }
+    state.reconcile_snapshot(&running_snapshot);
 
     let run = run_workflow_vm(
         run_id.clone(),
@@ -689,19 +974,36 @@ async fn cancel_workflow(
         let mut controllers_guard = lock_mutex(&state.controllers)?;
         controllers_guard.remove(run_id)
     };
-    let already_cancelled = {
+    let current_status = {
         let runs_guard = lock_mutex(&state.runs)?;
         let record = runs_guard.get(run_id).ok_or_else(|| {
             ToolError::invalid_input(format!("Unknown workflow run_id '{run_id}'"))
         })?;
-        record.status == WorkflowRunStatus::Cancelled
+        record.status
     };
-    if already_cancelled {
+    if current_status != WorkflowRunStatus::Running {
+        state.reconcile_cancel(run_id, CancelOutcome::AlreadyFinished);
+        if let Ok(runs_guard) = state.runs.lock()
+            && let Some(record) = runs_guard.get(run_id)
+        {
+            state.reconcile_snapshot(record);
+        }
         return workflow_result_for(run_id, state);
     }
-    if let Some(controller) = controller.as_ref() {
-        controller.cancel();
-    }
+    state.reconcile_cancel(
+        run_id,
+        if controller.is_some() {
+            CancelOutcome::Requested
+        } else {
+            CancelOutcome::StaleUnknown
+        },
+    );
+    let Some(controller) = controller else {
+        return Err(ToolError::execution_failed(
+            "workflow controller missing; cancellation outcome is unknown",
+        ));
+    };
+    controller.cancel();
     let cancelled_event = WorkflowUiEvent::new(WorkflowUiEventKind::RunCancelled {
         reason: "cancelled by workflow tool".to_string(),
     });
@@ -711,19 +1013,24 @@ async fn cancel_workflow(
             ToolError::invalid_input(format!("Unknown workflow run_id '{run_id}'"))
         })?;
         record.status = WorkflowRunStatus::Cancelled;
+        record.lifecycle_seq = record.lifecycle_seq.saturating_add(1);
         record.completed_at_ms = Some(now_ms());
         let reason = "cancelled by workflow tool".to_string();
         record.error = Some(reason);
         record.events.push(cancelled_event.clone());
         record.clone()
     };
-    state.record_snapshot(&snapshot);
+    if let Err(err) = state.try_record_snapshot(&snapshot) {
+        state.mark_owner_missing(run_id);
+        return Err(ToolError::execution_failed(format!(
+            "workflow cancellation journal failed: {err}"
+        )));
+    }
+    state.reconcile_snapshot(&snapshot);
     // The VM may publish its terminal `run_completed` event while cancellation
     // is racing it. Always stream the authoritative cancellation afterward so
     // the live panel finalizes running rows and cannot remain visually failed.
-    if let Some(controller) = controller.as_ref() {
-        controller.driver.emit_ui_event(&cancelled_event);
-    }
+    controller.driver.emit_ui_event(&cancelled_event);
     workflow_result_for(run_id, state)
 }
 
@@ -815,7 +1122,14 @@ async fn run_workflow_vm(
     let mut output = None;
     let mut error = None;
     match result {
-        Ok(value) => output = Some(value),
+        Ok(value) => {
+            if let Some(gate_error) = driver.terminal_gate_failure() {
+                status = WorkflowRunStatus::Failed;
+                error = Some(gate_error);
+            } else {
+                output = Some(value);
+            }
+        }
         Err(err) => {
             status = WorkflowRunStatus::Failed;
             error = Some(err.to_string());
@@ -824,9 +1138,13 @@ async fn run_workflow_vm(
     let snapshot = {
         let mut runs_guard = match state.runs.lock() {
             Ok(guard) => guard,
-            Err(_) => return,
+            Err(_) => {
+                state.mark_owner_missing(&run_id);
+                return;
+            }
         };
         let Some(record) = runs_guard.get_mut(&run_id) else {
+            state.mark_owner_missing(&run_id);
             return;
         };
         if record.status != WorkflowRunStatus::Cancelled {
@@ -873,6 +1191,7 @@ async fn run_workflow_vm(
         .and_then(|mut guard| {
             let record = guard.get_mut(&run_id)?;
             if record.status != WorkflowRunStatus::Cancelled {
+                record.lifecycle_seq = record.lifecycle_seq.saturating_add(1);
                 let budget_event = WorkflowUiEvent::new(budget_event_kind(final_budget));
                 let completed = WorkflowUiEvent::new(WorkflowUiEventKind::RunCompleted {
                     status: record.status,
@@ -888,7 +1207,11 @@ async fn run_workflow_vm(
             Some(record.clone())
         })
         .unwrap_or(snapshot);
-    state.record_snapshot(&snapshot);
+    if state.try_record_snapshot(&snapshot).is_ok() {
+        state.reconcile_snapshot(&snapshot);
+    } else {
+        state.mark_owner_missing(&run_id);
+    }
     if let Ok(mut controllers_guard) = state.controllers.lock() {
         controllers_guard.remove(&run_id);
     }
@@ -1521,10 +1844,12 @@ impl DeclarativeWorkflowLowerer {
                     "{} + \"\\n\\nInputs:\\n\" + {inputs}",
                     js_string(&spec.prompt)
                 ),
-                "general",
+                Some("general"),
                 None,
                 None,
                 false,
+                None,
+                None,
                 None,
                 &spec.id,
                 Some("reduce"),
@@ -1592,13 +1917,15 @@ fn leaf_task_options_expression(
     validate_leaf_runtime_contract(spec)?;
     Ok(task_options_expression(
         leaf_description_expression(spec),
-        leaf_subagent_type(spec)?,
+        leaf_subagent_type(spec),
         spec.role.as_deref(),
         spec.profile.as_deref(),
         // Parallel write-capable children default to worktree isolation (#4120).
         // Explicit isolation: shared is the approved same-worktree override.
         leaf_wants_worktree(spec, parallel),
         spec.budget.max_tokens,
+        spec.budget.max_steps,
+        spec.budget.timeout_secs,
         &spec.id,
         phase,
         leaf_allowed_tools(spec)?,
@@ -1612,12 +1939,11 @@ fn validate_leaf_runtime_contract(spec: &LeafSpec) -> Result<(), ToolError> {
             spec.id
         )));
     }
-    if spec.mode == TaskMode::ReadOnly && matches!(spec.agent_type, AgentType::Implementer) {
-        return Err(ToolError::invalid_input(format!(
-            "Workflow leaf '{}' is read_only but uses implementer agent_type",
-            spec.id
-        )));
-    }
+    // A Fleet role and its authority posture are independent. In particular,
+    // acceptance workflows must be able to resolve the `implementer` role to
+    // its saved profile while narrowing that child to the read-only tool set.
+    // `leaf_allowed_tools` enforces the mode below; rejecting the combination
+    // made verification-only role/gate dogfood impossible.
     if spec.mode == TaskMode::ReadWrite
         && matches!(
             spec.agent_type,
@@ -1639,6 +1965,12 @@ fn validate_leaf_runtime_contract(spec: &LeafSpec) -> Result<(), ToolError> {
     {
         return Err(ToolError::invalid_input(format!(
             "Workflow leaf '{}' is read_only but requests write/shell allowed_tools",
+            spec.id
+        )));
+    }
+    if spec.permissions.deny_all_tools && !spec.permissions.allowed_tools.is_empty() {
+        return Err(ToolError::invalid_input(format!(
+            "Workflow leaf '{}' cannot combine deny_all_tools with allowed_tools",
             spec.id
         )));
     }
@@ -1665,14 +1997,25 @@ fn result_inputs_expression(inputs: &[String]) -> String {
     )
 }
 
-fn leaf_subagent_type(spec: &LeafSpec) -> Result<&'static str, ToolError> {
-    if spec.mode == TaskMode::ReadOnly && spec.agent_type == AgentType::General {
-        return Ok("review");
+fn leaf_subagent_type(spec: &LeafSpec) -> Option<&'static str> {
+    // A named Fleet profile owns the child's runtime type. Emitting the IR's
+    // default `general` here makes role-only leaves look like an explicit type
+    // override and can conflict with the resolved roster member (for example,
+    // scout -> explore). Preserve non-General types because those represent an
+    // authored override and the spawn path must still validate compatibility.
+    if (spec.role.is_some() || spec.profile.is_some()) && spec.agent_type == AgentType::General {
+        return None;
     }
-    Ok(agent_type_name(spec.agent_type))
+    if spec.mode == TaskMode::ReadOnly && spec.agent_type == AgentType::General {
+        return Some("review");
+    }
+    Some(agent_type_name(spec.agent_type))
 }
 
 fn leaf_allowed_tools(spec: &LeafSpec) -> Result<Option<Vec<String>>, ToolError> {
+    if spec.permissions.deny_all_tools {
+        return Ok(Some(Vec::new()));
+    }
     if !spec.permissions.allowed_tools.is_empty() {
         return Ok(Some(spec.permissions.allowed_tools.clone()));
     }
@@ -1713,20 +2056,22 @@ fn is_write_or_shell_tool(tool: &str) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn task_options_expression(
     description_expr: String,
-    subagent_type: &str,
+    subagent_type: Option<&str>,
     role: Option<&str>,
     profile: Option<&str>,
     worktree: bool,
     token_budget: Option<u64>,
+    max_steps: Option<u32>,
+    wall_time_secs: Option<u64>,
     label: &str,
     phase: Option<&str>,
     allowed_tools: Option<Vec<String>>,
 ) -> String {
-    let mut fields = vec![
-        format!("description: {description_expr}"),
-        format!("type: {}", js_string(subagent_type)),
-        format!("label: {}", js_string(label)),
-    ];
+    let mut fields = vec![format!("description: {description_expr}")];
+    if let Some(subagent_type) = subagent_type {
+        fields.push(format!("type: {}", js_string(subagent_type)));
+    }
+    fields.push(format!("label: {}", js_string(label)));
     if let Some(phase) = phase {
         fields.push(format!("phase: {}", js_string(phase)));
     }
@@ -1741,6 +2086,12 @@ fn task_options_expression(
     }
     if let Some(token_budget) = token_budget {
         fields.push(format!("tokenBudget: {token_budget}"));
+    }
+    if let Some(max_steps) = max_steps {
+        fields.push(format!("maxSteps: {max_steps}"));
+    }
+    if let Some(wall_time_secs) = wall_time_secs {
+        fields.push(format!("wallTimeSecs: {wall_time_secs}"));
     }
     if let Some(allowed_tools) = allowed_tools {
         fields.push(format!(
@@ -1770,6 +2121,94 @@ fn task_mode_name(mode: TaskMode) -> &'static str {
     match mode {
         TaskMode::ReadOnly => "read_only",
         TaskMode::ReadWrite => "read_write",
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExplicitGateVerdict {
+    Approve,
+    Reject,
+}
+
+/// Recognize only a standalone verdict token on the first non-empty line.
+///
+/// This deliberately does not interpret prose, Markdown bullets, or verdict
+/// words later in an otherwise successful child response. Existing workflows
+/// whose children return ordinary prose therefore remain pass-on-success,
+/// while review-style children can fail closed with `BLOCK` or `FAIL`.
+fn explicit_gate_verdict(output: Option<&str>) -> Option<ExplicitGateVerdict> {
+    let first_meaningful = output?
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    if first_meaningful.eq_ignore_ascii_case("APPROVE")
+        || first_meaningful.eq_ignore_ascii_case("PASS")
+    {
+        Some(ExplicitGateVerdict::Approve)
+    } else if first_meaningful.eq_ignore_ascii_case("BLOCK")
+        || first_meaningful.eq_ignore_ascii_case("FAIL")
+    {
+        Some(ExplicitGateVerdict::Reject)
+    } else {
+        None
+    }
+}
+
+fn has_gate_artifact_body(output: Option<&str>) -> bool {
+    let Some(output) = output else {
+        return false;
+    };
+    let mut meaningful_lines = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    // A declared artifact needs both a body label and at least one concrete
+    // entry after the verdict. This keeps `APPROVE\nok` from promoting a
+    // placeholder while remaining format-agnostic for arbitrary artifact kinds.
+    meaningful_lines.next();
+    meaningful_lines.next().is_some() && meaningful_lines.next().is_some()
+}
+
+fn gate_outcome_for_completed_role(
+    record: &RuntimeTaskRecord,
+    require_explicit_verdict: bool,
+    artifact_kind: Option<&str>,
+) -> GateOutcome {
+    match record.status {
+        IrWorkflowRunStatus::Succeeded => match explicit_gate_verdict(record.output.as_deref()) {
+            Some(ExplicitGateVerdict::Reject) => GateOutcome::Fail {
+                reason: record
+                    .output
+                    .clone()
+                    .unwrap_or_else(|| "child returned an explicit rejection verdict".into()),
+            },
+            Some(ExplicitGateVerdict::Approve)
+                if require_explicit_verdict
+                    && artifact_kind.is_some()
+                    && !has_gate_artifact_body(record.output.as_deref()) =>
+            {
+                GateOutcome::Fail {
+                    reason: format!(
+                        "task {} approved without the required {} artifact body",
+                        record.agent_id,
+                        artifact_kind.unwrap_or("gate")
+                    ),
+                }
+            }
+            Some(ExplicitGateVerdict::Approve) => GateOutcome::Pass,
+            None if require_explicit_verdict => GateOutcome::Fail {
+                reason: format!(
+                    "task {} completed without the required first-line gate verdict; expected exactly APPROVE, PASS, BLOCK, or FAIL",
+                    record.agent_id
+                ),
+            },
+            None => GateOutcome::Pass,
+        },
+        _ => GateOutcome::Fail {
+            reason: record.output.clone().unwrap_or_else(|| {
+                format!("task {} ended as {:?}", record.agent_id, record.status)
+            }),
+        },
     }
 }
 
@@ -1906,6 +2345,32 @@ impl SubAgentWorkflowDriver {
         }
     }
 
+    /// Return the first authoritative gate failure after the VM has no more
+    /// children to admit. Intermediate blocks already reject the downstream
+    /// spawn; this final check gives a terminal role's BLOCK verdict the same
+    /// fail-closed semantics.
+    fn terminal_gate_failure(&self) -> Option<String> {
+        let board = match self.gate_board.lock() {
+            Ok(board) => board,
+            Err(_) => {
+                return Some(
+                    "workflow gate board was unavailable during terminal finalization".to_string(),
+                );
+            }
+        };
+        self.gate_specs.iter().find_map(|spec| {
+            let state = board.gates.get(&spec.id)?;
+            state.is_blocking().then(|| {
+                format!(
+                    "workflow gate `{}` ended {}: {}",
+                    spec.id,
+                    state.as_str(),
+                    gate_state_reason(state)
+                )
+            })
+        })
+    }
+
     fn record_run_event(&self, event: WorkflowUiEvent) {
         let recorded = if let Ok(mut runs) = self.state.runs.lock()
             && let Some(record) = runs.get_mut(&self.run_id)
@@ -1956,12 +2421,15 @@ impl SubAgentWorkflowDriver {
         }
     }
 
-    fn prepare_request_for_gates(&self, request: &mut TaskRequest) -> Result<(), DriverError> {
+    fn prepare_request_for_gates(
+        &self,
+        request: &mut TaskRequest,
+    ) -> Result<Vec<HandoffArtifact>, DriverError> {
         let Some(role) = request.role.as_deref().filter(|role| !role.is_empty()) else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         if self.gate_specs.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let (blocked, handoffs) = {
@@ -1991,7 +2459,7 @@ impl SubAgentWorkflowDriver {
         if !handoffs.is_empty() {
             append_handoff_context(request, &handoffs);
         }
-        Ok(())
+        Ok(handoffs)
     }
 
     fn update_gate_status(&self, status: Vec<GateStatusLine>) {
@@ -2025,38 +2493,67 @@ impl SubAgentWorkflowDriver {
             return;
         }
 
-        let outcome = match record.status {
-            IrWorkflowRunStatus::Succeeded => GateOutcome::Pass,
-            _ => GateOutcome::Fail {
-                reason: record.output.clone().unwrap_or_else(|| {
-                    format!("task {} ended as {:?}", record.agent_id, record.status)
-                }),
-            },
-        };
-
         let mut events = Vec::new();
         let mut next_status = Vec::new();
         if let Ok(mut board) = self.gate_board.lock() {
             for spec in specs {
-                if matches!(outcome, GateOutcome::Pass)
+                let outcome = gate_outcome_for_completed_role(
+                    record,
+                    spec.require_explicit_verdict,
+                    spec.artifact_kind.as_deref(),
+                );
+                let mut state = match board.evaluate(&spec, outcome.clone()) {
+                    Ok(state) => state,
+                    Err(err) => {
+                        let state = GateState::Blocked {
+                            reason: err.to_string(),
+                        };
+                        // Evaluation errors must become authoritative board state.
+                        // Otherwise the emitted receipt can say `blocked` while the
+                        // admission check still sees the gate as pending.
+                        board.gates.insert(spec.id.clone(), state.clone());
+                        state
+                    }
+                };
+                let mut promotion = None;
+                if matches!(state, GateState::Passed)
                     && let (Some(kind), Some(to_role)) =
                         (spec.artifact_kind.as_deref(), spec.blocks_role.as_deref())
                 {
-                    let _ = board.record_handoff(HandoffArtifact {
-                        id: format!("{}:{}:{kind}", self.run_id, record.agent_id),
+                    let artifact = HandoffArtifact {
+                        // Gate ids are authored input and are not guaranteed unique.
+                        // Use an opaque id so every promotion has a stable, distinct
+                        // identity even when a malformed workflow repeats a gate id.
+                        id: format!("handoff_{}", Uuid::new_v4()),
                         lane_id: self.run_id.clone(),
                         from_role: spec.role.clone(),
                         to_role: to_role.to_string(),
                         kind: kind.to_string(),
                         payload: record.output.clone().unwrap_or_default(),
                         created_at: now_ms().to_string(),
-                    });
+                    };
+                    match board.record_handoff(artifact.clone()) {
+                        Ok(()) => {
+                            promotion =
+                                Some(WorkflowUiEvent::new(WorkflowUiEventKind::HandoffPromoted {
+                                    artifact_id: artifact.id,
+                                    gate_id: spec.id.clone(),
+                                    kind: artifact.kind,
+                                    from_role: artifact.from_role,
+                                    to_role: artifact.to_role,
+                                    producer_task_id: record.agent_id.clone(),
+                                }));
+                        }
+                        Err(err) => {
+                            state = GateState::Blocked {
+                                reason: format!(
+                                    "gate passed but its handoff could not be recorded: {err}"
+                                ),
+                            };
+                            board.gates.insert(spec.id.clone(), state.clone());
+                        }
+                    }
                 }
-                let state = board
-                    .evaluate(&spec, outcome.clone())
-                    .unwrap_or_else(|err| GateState::Blocked {
-                        reason: err.to_string(),
-                    });
                 events.push(WorkflowUiEvent::new(WorkflowUiEventKind::GateUpdated {
                     gate_id: spec.id.clone(),
                     role: spec.role.clone(),
@@ -2065,6 +2562,9 @@ impl SubAgentWorkflowDriver {
                     blocked_role: spec.blocks_role.clone(),
                     blocked_reason: state.blocked_reason().map(str::to_string),
                 }));
+                if let Some(event) = promotion {
+                    events.push(event);
+                }
             }
             next_status = board.status_summary();
         }
@@ -2165,11 +2665,13 @@ impl SubAgentWorkflowDriver {
                 completed_record = Some(record.clone());
             }
         }
-        if let Some(record) = completed_record.as_ref() {
-            self.evaluate_gates_for_completed_role(record);
-        }
         if let Some(event) = terminal_event {
             self.record_run_event(event);
+        }
+        if let Some(record) = completed_record.as_ref() {
+            // A role-complete gate is caused by this terminal transition, so its
+            // durable task receipt must precede gate evaluation and promotion.
+            self.evaluate_gates_for_completed_role(record);
         }
     }
 
@@ -2237,7 +2739,7 @@ impl WorkflowDriver for SubAgentWorkflowDriver {
                 }
             },
         )?;
-        self.prepare_request_for_gates(&mut request)?;
+        let consumed_handoffs = self.prepare_request_for_gates(&mut request)?;
         // Wait for a concurrent slot (max 16 live children per run).
         let permit = self
             .concurrent_gate
@@ -2289,6 +2791,15 @@ impl WorkflowDriver for SubAgentWorkflowDriver {
         }
         self.record_child(&task_id);
         self.record_task_started(&task_id, &request_record, &result.metadata, &result.result);
+        for artifact in consumed_handoffs {
+            self.record_run_event(WorkflowUiEvent::new(WorkflowUiEventKind::HandoffConsumed {
+                artifact_id: artifact.id,
+                kind: artifact.kind,
+                from_role: artifact.from_role,
+                to_role: artifact.to_role,
+                consumer_task_id: task_id.clone(),
+            }));
+        }
         self.record_task_request(&task_id, &request_record);
         if let Some(limit) = self.total_budget {
             let mut manager = self.manager.write().await;
@@ -2393,7 +2904,7 @@ fn append_handoff_context(request: &mut TaskRequest, handoffs: &[HandoffArtifact
             artifact.kind,
             artifact.from_role,
             artifact.to_role,
-            compact_handoff_payload(&artifact.payload, 900)
+            compact_handoff_payload(&artifact.payload, WORKFLOW_HANDOFF_MAX_CHARS)
         ));
     }
 }
@@ -2766,8 +3277,8 @@ fn now_ms() -> u64 {
 
 mod journal {
     use super::{
-        SharedWorkflowControllers, SharedWorkflowRuns, WorkflowRunRecord, WorkflowRunStatus,
-        WorkflowUiEvent,
+        SharedWorkflowControllers, SharedWorkflowLifecycles, SharedWorkflowRuns, WorkflowRunRecord,
+        WorkflowRunStatus, WorkflowUiEvent, WorkflowWorkLifecycle,
     };
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
@@ -2784,6 +3295,7 @@ mod journal {
     pub(super) struct WorkflowWorkspaceState {
         pub runs: SharedWorkflowRuns,
         pub controllers: SharedWorkflowControllers,
+        lifecycles: SharedWorkflowLifecycles,
         journal: WorkflowRunJournal,
     }
 
@@ -2794,12 +3306,70 @@ mod journal {
             Arc::new(Self {
                 runs,
                 controllers: Arc::new(Mutex::new(HashMap::new())),
+                lifecycles: Arc::new(Mutex::new(HashMap::new())),
                 journal,
             })
         }
 
+        pub fn attach_lifecycle(&self, run_id: &str, lifecycle: WorkflowWorkLifecycle) {
+            self.lifecycles
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .entry(run_id.to_string())
+                .or_insert(lifecycle);
+        }
+
+        pub fn reconcile_snapshot(&self, record: &WorkflowRunRecord) {
+            let lifecycle = self
+                .lifecycles
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .get(&record.run_id)
+                .cloned();
+            if let Some(lifecycle) = lifecycle
+                && let Err(err) = lifecycle.reconcile_record(record)
+            {
+                warn!(
+                    run_id = record.run_id,
+                    "workflow Work reconciliation failed: {err}"
+                );
+            }
+        }
+
+        pub fn reconcile_cancel(&self, run_id: &str, outcome: super::CancelOutcome) {
+            let lifecycle = self
+                .lifecycles
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .get(run_id)
+                .cloned();
+            if let Some(lifecycle) = lifecycle
+                && let Err(err) = lifecycle.reconcile_cancel(outcome)
+            {
+                warn!(run_id, "workflow cancellation reconciliation failed: {err}");
+            }
+        }
+
+        pub fn mark_owner_missing(&self, run_id: &str) {
+            let lifecycle = self
+                .lifecycles
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .get(run_id)
+                .cloned();
+            if let Some(lifecycle) = lifecycle {
+                lifecycle.reconcile_missing();
+            }
+        }
+
+        pub fn try_record_snapshot(&self, record: &WorkflowRunRecord) -> Result<(), String> {
+            self.journal
+                .append_snapshot(record)
+                .map_err(|err| err.to_string())
+        }
+
         pub fn record_snapshot(&self, record: &WorkflowRunRecord) {
-            if let Err(err) = self.journal.append_snapshot(record) {
+            if let Err(err) = self.try_record_snapshot(record) {
                 warn!("workflow journal snapshot failed: {err}");
             }
         }
@@ -2917,12 +3487,27 @@ mod journal {
             }
             // A run journaled as Running belongs to a process that is gone;
             // without this it would show as live forever after a restart.
+            let mut recovered = Vec::new();
             for run in runs.values_mut() {
                 if run.status == WorkflowRunStatus::Running {
                     run.status = WorkflowRunStatus::Failed;
+                    run.lifecycle_seq = run.lifecycle_seq.saturating_add(1);
+                    run.completed_at_ms.get_or_insert_with(super::now_ms);
                     run.error = Some(
                         "process exited before the run completed (recovered on startup)"
                             .to_string(),
+                    );
+                    recovered.push(run.clone());
+                }
+            }
+            // The recovery decision is owner truth, not a presentation-only
+            // repair. Append it so another restart replays the same terminal
+            // sequence instead of rediscovering and incrementing it again.
+            for run in recovered {
+                if let Err(err) = self.append_snapshot(&run) {
+                    warn!(
+                        run_id = run.run_id,
+                        "workflow recovery snapshot append failed: {err}"
                     );
                 }
             }
@@ -2972,6 +3557,7 @@ mod journal {
             WorkflowRunRecord {
                 run_id: run_id.to_string(),
                 status,
+                lifecycle_seq: 1,
                 started_at_ms: 1,
                 completed_at_ms: None,
                 source_path: None,
@@ -3022,6 +3608,33 @@ mod journal {
                 ..sample_record("workflow_abc", WorkflowRunStatus::Completed)
             };
             state.record_snapshot(&completed);
+            state.record_event(
+                "workflow_abc",
+                &WorkflowUiEvent::at(
+                    6,
+                    WorkflowUiEventKind::HandoffPromoted {
+                        artifact_id: "workflow_abc:scout-1:scout-gate:findings".to_string(),
+                        gate_id: "scout-gate".to_string(),
+                        kind: "findings".to_string(),
+                        from_role: "scout".to_string(),
+                        to_role: "implementer".to_string(),
+                        producer_task_id: "scout-1".to_string(),
+                    },
+                ),
+            );
+            state.record_event(
+                "workflow_abc",
+                &WorkflowUiEvent::at(
+                    7,
+                    WorkflowUiEventKind::HandoffConsumed {
+                        artifact_id: "workflow_abc:scout-1:scout-gate:findings".to_string(),
+                        kind: "findings".to_string(),
+                        from_role: "scout".to_string(),
+                        to_role: "implementer".to_string(),
+                        consumer_task_id: "implementer-1".to_string(),
+                    },
+                ),
+            );
 
             let reloaded = WorkflowWorkspaceState::open(tmp.path());
             let runs = reloaded
@@ -3033,9 +3646,43 @@ mod journal {
                 .expect("hydrated run");
             assert_eq!(runs.status, WorkflowRunStatus::Completed);
             assert_eq!(runs.progress, vec!["phase: scan"]);
-            assert_eq!(runs.events.len(), 1);
+            assert_eq!(runs.events.len(), 3);
             assert_eq!(runs.events[0].event_type(), "phase_started");
+            let promoted = serde_json::to_value(&runs.events[1]).expect("promoted receipt");
+            assert_eq!(promoted["type"], "handoff_promoted");
+            assert_eq!(
+                promoted["artifact_id"],
+                "workflow_abc:scout-1:scout-gate:findings"
+            );
+            assert_eq!(promoted["gate_id"], "scout-gate");
+            assert_eq!(promoted["producer_task_id"], "scout-1");
+            assert!(promoted.get("payload").is_none(), "{promoted}");
+            let consumed = serde_json::to_value(&runs.events[2]).expect("consumed receipt");
+            assert_eq!(consumed["type"], "handoff_consumed");
+            assert_eq!(consumed["artifact_id"], promoted["artifact_id"]);
+            assert_eq!(consumed["consumer_task_id"], "implementer-1");
+            assert!(consumed.get("payload").is_none(), "{consumed}");
             assert_eq!(runs.completed_at_ms, Some(99));
+
+            // The event-line replay above must also survive compaction into a
+            // final Snapshot record containing both handoff variants.
+            reloaded.record_snapshot(&runs);
+            let reopened = WorkflowWorkspaceState::open(tmp.path());
+            let compacted = reopened
+                .runs
+                .lock()
+                .expect("runs lock")
+                .get("workflow_abc")
+                .cloned()
+                .expect("snapshot with handoff receipts");
+            assert_eq!(
+                compacted
+                    .events
+                    .iter()
+                    .map(WorkflowUiEvent::event_type)
+                    .collect::<Vec<_>>(),
+                vec!["phase_started", "handoff_promoted", "handoff_consumed"]
+            );
         }
 
         #[test]
@@ -3056,6 +3703,14 @@ mod journal {
                 .cloned()
                 .expect("hydrated run");
             assert_eq!(run.status, WorkflowRunStatus::Failed);
+            assert_eq!(
+                run.lifecycle_seq, 2,
+                "restart recovery is a durable owner lifecycle transition"
+            );
+            assert!(
+                run.completed_at_ms.is_some(),
+                "restart recovery must terminalize the durable owner record"
+            );
             assert!(
                 run.error
                     .as_deref()
@@ -3063,11 +3718,73 @@ mod journal {
                 "expected orphan recovery error, got {:?}",
                 run.error
             );
+
+            let reopened = WorkflowWorkspaceState::open(tmp.path());
+            let replayed = reopened
+                .runs
+                .lock()
+                .expect("runs lock")
+                .get("workflow_orphan")
+                .cloned()
+                .expect("durably recovered run");
+            assert_eq!(replayed.status, WorkflowRunStatus::Failed);
+            assert_eq!(
+                replayed.lifecycle_seq, 2,
+                "reopening must replay the recovery snapshot without another transition"
+            );
         }
     }
 }
 
 use journal::{WorkflowWorkspaceState, shared_workflow_state};
+
+/// Reconcile workflow bindings after the journal has replayed restart
+/// recovery. The journal owns lifecycle truth; the graph only receives its
+/// monotonic projection.
+pub(crate) fn reconcile_persisted_workflow_bindings(
+    work: &SharedWorkRuntime,
+    session_id: &str,
+    workspace: &Path,
+) -> Result<usize, String> {
+    let state = shared_workflow_state(workspace);
+    let records = state
+        .runs
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    let candidates = work
+        .reconcilable_durable_bindings(Some(session_id))
+        .into_iter()
+        .filter(|external| external.starts_with("workflow:"))
+        .collect::<std::collections::HashSet<_>>();
+    let mut seen = std::collections::HashSet::new();
+    let mut changed = 0usize;
+    for record in records {
+        let external = format!("workflow:{}", record.run_id);
+        if !candidates.contains(&external) {
+            continue;
+        }
+        seen.insert(external.clone());
+        let lifecycle = WorkflowWorkLifecycle {
+            work: work.clone(),
+            session_id: session_id.to_string(),
+            external,
+        };
+        changed += usize::from(lifecycle.reconcile_record(&record)?);
+    }
+    for external in candidates.difference(&seen) {
+        changed += usize::from(work.reconcile_observation(
+            session_id,
+            external,
+            OperationObservation::OwnerMissing {
+                checked_at: i64::try_from(now_ms()).unwrap_or(i64::MAX),
+            },
+        )?);
+    }
+    Ok(changed)
+}
 
 #[cfg(test)]
 mod tests {
@@ -3078,6 +3795,189 @@ mod tests {
     use axum::{Json, Router, routing::post};
     use codewhale_workflow::{IsolationMode, leaf_is_write_capable};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn restored_workflow_binding_consumes_journal_recovery() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = WorkflowWorkspaceState::open(tmp.path());
+        let record = WorkflowRunRecord::new("workflow_restore".to_string(), None, None, None);
+        state.record_snapshot(&record);
+
+        let work = crate::work_graph::new_shared_work_runtime(
+            crate::tools::todo::new_shared_todo_list(),
+            crate::tools::plan::new_shared_plan_state(),
+        );
+        work.register_operation(
+            "restored-workflow-session",
+            OperationIntent::new(
+                "workflow:workflow_restore",
+                "restored workflow",
+                true,
+                "workflow",
+                "restore-test",
+            ),
+        )
+        .expect("register saved workflow binding");
+        work.reconcile_operation(
+            "restored-workflow-session",
+            OperationOwnerSnapshot::new("workflow:workflow_restore", OwnerState::Running, 1, 1),
+        )
+        .expect("saved running owner state");
+        work.register_operation(
+            "restored-workflow-session",
+            OperationIntent::new(
+                "workflow:workflow_absent",
+                "absent workflow",
+                true,
+                "workflow",
+                "absent-restore-test",
+            ),
+        )
+        .expect("register absent workflow binding");
+        work.reconcile_operation(
+            "restored-workflow-session",
+            OperationOwnerSnapshot::new("workflow:workflow_absent", OwnerState::Running, 1, 1),
+        )
+        .expect("saved absent owner state");
+
+        assert_eq!(
+            reconcile_persisted_workflow_bindings(&work, "restored-workflow-session", tmp.path(),),
+            Ok(2)
+        );
+        let graph = work
+            .capture(Some("restored-workflow-session"))
+            .expect("capture restored workflow")
+            .expect("graph")
+            .graph;
+        let operation = graph
+            .nodes
+            .iter()
+            .find(|node| {
+                node.binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.external == "workflow:workflow_restore")
+            })
+            .expect("workflow operation");
+        assert_eq!(operation.state, crate::work_graph::NodeState::Failed);
+        assert_eq!(
+            operation
+                .binding
+                .as_ref()
+                .and_then(|binding| binding.last_observation.as_ref())
+                .map(|observation| observation.seq),
+            Some(2),
+            "journal replay must advance the lost live owner before graph reconciliation"
+        );
+        let absent = graph
+            .nodes
+            .iter()
+            .find(|node| {
+                node.binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.external == "workflow:workflow_absent")
+            })
+            .expect("absent workflow operation");
+        assert_eq!(absent.state, crate::work_graph::NodeState::Stale);
+        assert_eq!(
+            reconcile_persisted_workflow_bindings(&work, "restored-workflow-session", tmp.path(),),
+            Ok(0),
+            "rechecking an already stale missing owner must be idempotent"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_without_controller_fails_closed_as_stale() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = WorkflowWorkspaceState::open(tmp.path());
+        let record =
+            WorkflowRunRecord::new("workflow_missing_controller".to_string(), None, None, None);
+        state
+            .runs
+            .lock()
+            .expect("runs lock")
+            .insert(record.run_id.clone(), record.clone());
+        state.record_snapshot(&record);
+
+        let work = crate::work_graph::new_shared_work_runtime(
+            crate::tools::todo::new_shared_todo_list(),
+            crate::tools::plan::new_shared_plan_state(),
+        );
+        work.register_operation(
+            "missing-controller-session",
+            OperationIntent::new(
+                "workflow:workflow_missing_controller",
+                "missing controller",
+                true,
+                "workflow",
+                "missing-controller-test",
+            ),
+        )
+        .expect("register workflow");
+        work.reconcile_operation(
+            "missing-controller-session",
+            OperationOwnerSnapshot::new(
+                "workflow:workflow_missing_controller",
+                OwnerState::Running,
+                1,
+                1,
+            ),
+        )
+        .expect("running workflow");
+        state.attach_lifecycle(
+            "workflow_missing_controller",
+            WorkflowWorkLifecycle {
+                work: work.clone(),
+                session_id: "missing-controller-session".to_string(),
+                external: "workflow:workflow_missing_controller".to_string(),
+            },
+        );
+
+        let error = cancel_workflow(
+            json!({"run_id": "workflow_missing_controller"}),
+            state.clone(),
+        )
+        .await
+        .expect_err("missing controller cannot acknowledge cancellation");
+        assert!(error.to_string().contains("outcome is unknown"), "{error}");
+        let record = state
+            .runs
+            .lock()
+            .expect("runs lock")
+            .get("workflow_missing_controller")
+            .cloned()
+            .expect("workflow owner");
+        assert_eq!(record.status, WorkflowRunStatus::Running);
+        assert_eq!(record.lifecycle_seq, 1);
+        let operation = work
+            .capture(Some("missing-controller-session"))
+            .expect("capture")
+            .expect("graph")
+            .graph
+            .nodes
+            .into_iter()
+            .find(|node| node.kind == crate::work_graph::NodeKind::Operation)
+            .expect("workflow operation");
+        assert_eq!(operation.state, crate::work_graph::NodeState::Stale);
+    }
+
+    #[test]
+    fn handoff_compaction_preserves_release_sized_evidence() {
+        let payload = format!("APPROVE\n{}\nterminal: RunCompleted", "e".repeat(1_500));
+
+        assert_eq!(
+            compact_handoff_payload(&payload, WORKFLOW_HANDOFF_MAX_CHARS),
+            payload
+        );
+    }
+
+    #[test]
+    fn handoff_compaction_still_caps_oversized_artifacts() {
+        let payload = "e".repeat(WORKFLOW_HANDOFF_MAX_CHARS + 1);
+        let compacted = compact_handoff_payload(&payload, WORKFLOW_HANDOFF_MAX_CHARS);
+
+        assert_eq!(compacted.chars().count(), WORKFLOW_HANDOFF_MAX_CHARS + 3);
+        assert!(compacted.ends_with("..."));
+    }
 
     #[test]
     fn declarative_detection_matches_indented_and_nonleading_workflow_calls() {
@@ -3132,6 +4032,8 @@ mod tests {
             allowed_tools: None,
             max_depth: None,
             token_budget: None,
+            max_steps: None,
+            wall_time_secs: None,
             response_schema: None,
             label: Some("fix".to_string()),
             phase: Some("implement".to_string()),
@@ -3158,6 +4060,8 @@ mod tests {
             allowed_tools: None,
             max_depth: None,
             token_budget: None,
+            max_steps: None,
+            wall_time_secs: None,
             response_schema: None,
             label: None,
             phase: None,
@@ -3168,6 +4072,261 @@ mod tests {
         assert!(
             err.to_string().contains("unknown fleet role `wizard`"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn declarative_leaf_budget_reaches_task_runtime_options() {
+        let source = r#"
+workflow({
+  "goal": "bound one child",
+  "nodes": [{
+    "agent": {
+      "id": "bounded",
+      "prompt": "Inspect bounded evidence.",
+      "budget": { "max_tokens": 5000, "max_steps": 4, "timeout_secs": 90 }
+    }
+  }]
+});
+"#;
+
+        let adapted = adapt_workflow_source(source, None).expect("lower bounded leaf");
+        assert!(
+            adapted.source.contains("tokenBudget: 5000"),
+            "{}",
+            adapted.source
+        );
+        assert!(adapted.source.contains("maxSteps: 4"), "{}", adapted.source);
+        assert!(
+            adapted.source.contains("wallTimeSecs: 90"),
+            "{}",
+            adapted.source
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn declarative_max_steps_zero_stops_before_provider_call() {
+        let _retry_guard = workflow_test_retry_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
+        let (client, calls) = fake_chat_client("must not be called").await;
+        let runtime = SubAgentRuntime::new(
+            client,
+            "deepseek-v4-flash".to_string(),
+            ctx.clone(),
+            true,
+            None,
+            manager.clone(),
+        );
+        let tool = WorkflowTool::new(manager, runtime);
+
+        let result = tool
+            .execute(
+                json!({
+                    "action": "run",
+                    "script": r#"
+                    workflow({
+                      "goal": "prove the child step cap reaches runtime",
+                      "nodes": [{
+                        "agent": {
+                          "id": "zero-step",
+                          "prompt": "Do not start a model turn.",
+                          "budget": { "max_steps": 0, "timeout_secs": 90 }
+                        }
+                      }]
+                    });
+                    "#
+                }),
+                &ctx,
+            )
+            .await
+            .expect("failed workflow still returns its terminal receipt");
+        let payload: Value = serde_json::from_str(&result.content).expect("workflow JSON");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "provider must not be called"
+        );
+        assert_eq!(payload["status"], "failed", "{payload}");
+        assert_eq!(
+            payload["execution"]["leaf_results"][0]["status"], "failed",
+            "{payload}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn role_only_leaf_omits_type_and_resolves_through_named_fleet() {
+        let _retry_guard = workflow_test_retry_guard();
+        let _env_lock = crate::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
+        let fleet_dir = tmp.path().join("fleets");
+        std::fs::create_dir_all(&fleet_dir).expect("fleet dir");
+        std::fs::write(
+            fleet_dir.join("role-only-test.toml"),
+            r#"
+name = "role-only-test"
+
+[roles]
+scout = "scout"
+reviewer = "reviewer"
+"#,
+        )
+        .expect("role-only fleet");
+        let source = r#"
+export default workflow({
+  "goal": "resolve a role-only child",
+  "nodes": [
+    {
+      "agent": {
+        "id": "scout-source",
+        "prompt": "Inspect the source without editing.",
+        "role": "scout",
+        "mode": "read_only"
+      }
+    }
+  ]
+});
+"#;
+
+        let adapted = adapt_workflow_source(source, None).expect("lower role-only workflow");
+        assert!(adapted.source.contains("role: \"scout\""));
+        assert!(
+            !adapted.source.contains("type:"),
+            "Fleet-addressed leaves must defer runtime type to the roster:\n{}",
+            adapted.source
+        );
+        let non_role = adapt_workflow_source(
+            r#"workflow({
+              "goal": "default non-role child",
+              "nodes": [{ "agent": { "id": "audit", "prompt": "Audit only." } }]
+            });"#,
+            None,
+        )
+        .expect("lower non-role workflow");
+        assert!(
+            non_role.source.contains("type: \"review\""),
+            "non-role read-only leaves retain the review default:\n{}",
+            non_role.source
+        );
+        let explicit_type_source = r#"
+workflow({
+  "goal": "preserve an authored role type",
+  "nodes": [{
+    "agent": {
+      "id": "review-source",
+      "prompt": "Review the source without editing.",
+      "agent_type": "review",
+      "role": "reviewer",
+      "mode": "read_only"
+    }
+  }]
+});
+"#;
+        let explicit_type = adapt_workflow_source(explicit_type_source, None)
+            .expect("lower explicitly typed Fleet role");
+        assert!(
+            explicit_type.source.contains("type: \"review\""),
+            "an authored non-General type must remain a validated override:\n{}",
+            explicit_type.source
+        );
+
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
+        let (client, calls) = fake_chat_client("scout evidence").await;
+        let runtime = SubAgentRuntime::new(
+            client,
+            "deepseek-v4-flash".to_string(),
+            ctx.clone(),
+            true,
+            None,
+            manager,
+        );
+        let tool = WorkflowTool::new(runtime.manager.clone(), runtime);
+        let result = tool
+            .execute(
+                json!({
+                    "action": "run",
+                    "script": source,
+                    "fleet": "role-only-test"
+                }),
+                &ctx,
+            )
+            .await
+            .expect("role-only workflow should resolve through its named Fleet");
+        let payload: Value = serde_json::from_str(&result.content).expect("workflow JSON");
+
+        assert_eq!(payload["status"], "completed", "{payload}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let started = payload["events"]
+            .as_array()
+            .expect("typed events")
+            .iter()
+            .find(|event| event["type"] == "task_started")
+            .expect("task_started receipt");
+        assert_eq!(started["role"], "scout");
+        assert_eq!(started["profile"], "scout");
+        assert_eq!(started["resolved_profile"], "scout");
+
+        let explicit_result = tool
+            .execute(
+                json!({
+                    "action": "run",
+                    "script": explicit_type_source,
+                    "fleet": "role-only-test"
+                }),
+                &ctx,
+            )
+            .await
+            .expect("matching explicit role type should remain valid");
+        let explicit_payload: Value =
+            serde_json::from_str(&explicit_result.content).expect("workflow JSON");
+        assert_eq!(
+            explicit_payload["status"], "completed",
+            "{explicit_payload}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let conflicting_result = tool
+            .execute(
+                json!({
+                    "action": "run",
+                    "script": r#"workflow({
+                      "goal": "reject a conflicting authored type",
+                      "nodes": [{ "agent": {
+                        "id": "bad-scout",
+                        "prompt": "Review as a scout.",
+                        "agent_type": "review",
+                        "role": "scout",
+                        "mode": "read_only"
+                      } }]
+                    });"#,
+                    "fleet": "role-only-test"
+                }),
+                &ctx,
+            )
+            .await
+            .expect("conflicting type returns a terminal workflow record");
+        let conflicting_payload: Value =
+            serde_json::from_str(&conflicting_result.content).expect("workflow JSON");
+        assert_eq!(
+            conflicting_payload["status"], "failed",
+            "{conflicting_payload}"
+        );
+        assert!(
+            conflicting_payload["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("conflicting explicit type")),
+            "{conflicting_payload}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "conflicting explicit type must fail before the provider"
         );
     }
 
@@ -3603,6 +4762,11 @@ export default workflow({
 
         assert!(registry.contains("workflow"));
         assert!(registry.contains("agent"));
+        assert!(registry.contains("agents/list"));
+        assert!(registry.contains("agents/message"));
+        assert!(registry.contains("agents/followup"));
+        assert!(registry.contains("agents/interrupt"));
+        assert!(registry.contains("agents/wait"));
         assert!(
             registry
                 .to_api_tools()
@@ -4025,6 +5189,7 @@ reviewer = "reviewer"
             blocks_role: Some("implementer".to_string()),
             max_retries: 0,
             artifact_kind: Some("findings".to_string()),
+            require_explicit_verdict: false,
         }];
         let spec = WorkflowSpec {
             id: Some("gate-fixture".to_string()),
@@ -4073,13 +5238,19 @@ reviewer = "reviewer"
             allowed_tools: Some(Vec::new()),
             max_depth: None,
             token_budget: None,
+            max_steps: None,
+            wall_time_secs: None,
             response_schema: None,
             label: Some("fix".to_string()),
             phase: None,
         };
-        driver
+        let handoffs = driver
             .prepare_request_for_gates(&mut implementer)
             .expect("passed gate should admit implementer");
+        assert_eq!(handoffs.len(), 1, "{handoffs:?}");
+        assert_eq!(handoffs[0].kind, "findings");
+        assert_eq!(handoffs[0].from_role, "scout");
+        assert_eq!(handoffs[0].to_role, "implementer");
         assert!(
             implementer
                 .description
@@ -4134,6 +5305,561 @@ reviewer = "reviewer"
             "{:?}",
             run.events
         );
+        assert_eq!(
+            run.events
+                .iter()
+                .filter(|event| event.event_type() == "handoff_promoted")
+                .count(),
+            1,
+            "a later blocked gate must not publish another handoff: {:?}",
+            run.events
+        );
+        assert!(
+            run.events
+                .iter()
+                .all(|event| event.event_type() != "handoff_consumed"),
+            "request preparation alone must not claim consumption: {:?}",
+            run.events
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_gate_evaluation_error_persists_blocked_and_denies_target_role() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
+        let runtime = SubAgentRuntime::new(
+            stub_client(),
+            "deepseek-v4-flash".to_string(),
+            ctx,
+            true,
+            None,
+            manager.clone(),
+        );
+        let state = WorkflowWorkspaceState::open(tmp.path());
+        let run_id = "workflow_malformed_gate".to_string();
+        let gates = vec![GateSpec {
+            id: String::new(),
+            role: "scout".to_string(),
+            on: GateOn::RoleComplete,
+            gate: GateKind::Approve,
+            on_fail: codewhale_workflow::GateOnFail::Block,
+            blocks_role: Some("implementer".to_string()),
+            max_retries: 0,
+            artifact_kind: Some("findings".to_string()),
+            require_explicit_verdict: false,
+        }];
+        let spec = WorkflowSpec {
+            id: Some("malformed-gate-fixture".to_string()),
+            goal: "malformed gate must fail closed".to_string(),
+            description: None,
+            budget: BudgetSpec::default(),
+            permissions: Default::default(),
+            model_policy: Default::default(),
+            promotion_policy: Default::default(),
+            gates: gates.clone(),
+            nodes: Vec::new(),
+        };
+        state.runs.lock().expect("runs").insert(
+            run_id.clone(),
+            WorkflowRunRecord::new(run_id.clone(), None, None, Some(&spec)),
+        );
+        let driver = SubAgentWorkflowDriver::new(
+            run_id.clone(),
+            manager,
+            runtime,
+            state.clone(),
+            None,
+            None,
+            None,
+            gates,
+        );
+
+        driver.evaluate_gates_for_completed_role(&RuntimeTaskRecord {
+            agent_id: "scout-agent".to_string(),
+            label: Some("scout".to_string()),
+            role: Some("scout".to_string()),
+            status: IrWorkflowRunStatus::Succeeded,
+            output: Some("findings".to_string()),
+            schema_error: None,
+        });
+
+        let mut request = TaskRequest {
+            description: "Must not be admitted.".to_string(),
+            subagent_type: Some("implementer".to_string()),
+            role: Some("implementer".to_string()),
+            profile: None,
+            model: None,
+            model_strength: None,
+            thinking: None,
+            worktree: false,
+            allowed_tools: Some(Vec::new()),
+            max_depth: None,
+            token_budget: None,
+            max_steps: None,
+            wall_time_secs: None,
+            response_schema: None,
+            label: Some("blocked".to_string()),
+            phase: None,
+        };
+        let error = driver
+            .prepare_request_for_gates(&mut request)
+            .expect_err("malformed gate must deny its target role");
+        assert!(
+            error.to_string().contains("gate id must not be empty"),
+            "{error}"
+        );
+        let board = driver.gate_board.lock().expect("gate board");
+        assert!(matches!(
+            board.gates.get(""),
+            Some(GateState::Blocked { reason }) if reason.contains("gate id must not be empty")
+        ));
+        assert!(board.artifacts.is_empty(), "{:?}", board.artifacts);
+        drop(board);
+        let run = state
+            .runs
+            .lock()
+            .expect("runs")
+            .get(&run_id)
+            .cloned()
+            .expect("run");
+        assert!(run.gate_status.iter().any(|line| {
+            line.gate_id.is_empty()
+                && line.state == "blocked"
+                && line
+                    .blocked_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("gate id must not be empty"))
+        }));
+        assert!(
+            run.events
+                .iter()
+                .all(|event| event.event_type() != "handoff_promoted"),
+            "{:?}",
+            run.events
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_handoff_record_error_changes_pass_to_blocked() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
+        let runtime = SubAgentRuntime::new(
+            stub_client(),
+            "deepseek-v4-flash".to_string(),
+            ctx,
+            true,
+            None,
+            manager.clone(),
+        );
+        let state = WorkflowWorkspaceState::open(tmp.path());
+        let run_id = "workflow_handoff_record_error".to_string();
+        let gates = vec![GateSpec {
+            id: "scout-findings".to_string(),
+            role: "scout".to_string(),
+            on: GateOn::RoleComplete,
+            gate: GateKind::Approve,
+            on_fail: codewhale_workflow::GateOnFail::Block,
+            blocks_role: Some("implementer".to_string()),
+            max_retries: 0,
+            artifact_kind: Some("findings".to_string()),
+            require_explicit_verdict: false,
+        }];
+        let spec = WorkflowSpec {
+            id: Some("handoff-record-error-fixture".to_string()),
+            goal: "failed handoff recording must fail closed".to_string(),
+            description: None,
+            budget: BudgetSpec::default(),
+            permissions: Default::default(),
+            model_policy: Default::default(),
+            promotion_policy: Default::default(),
+            gates: gates.clone(),
+            nodes: Vec::new(),
+        };
+        state.runs.lock().expect("runs").insert(
+            run_id.clone(),
+            WorkflowRunRecord::new(run_id.clone(), None, None, Some(&spec)),
+        );
+        let driver = SubAgentWorkflowDriver::new(
+            run_id.clone(),
+            manager,
+            runtime,
+            state.clone(),
+            None,
+            None,
+            None,
+            gates,
+        );
+        driver.gate_board.lock().expect("gate board").lane_id = "wrong-lane".to_string();
+
+        driver.evaluate_gates_for_completed_role(&RuntimeTaskRecord {
+            agent_id: "scout-agent".to_string(),
+            label: Some("scout".to_string()),
+            role: Some("scout".to_string()),
+            status: IrWorkflowRunStatus::Succeeded,
+            output: Some("findings".to_string()),
+            schema_error: None,
+        });
+
+        let mut request = TaskRequest {
+            description: "Must not be admitted.".to_string(),
+            subagent_type: Some("implementer".to_string()),
+            role: Some("implementer".to_string()),
+            profile: None,
+            model: None,
+            model_strength: None,
+            thinking: None,
+            worktree: false,
+            allowed_tools: Some(Vec::new()),
+            max_depth: None,
+            token_budget: None,
+            max_steps: None,
+            wall_time_secs: None,
+            response_schema: None,
+            label: Some("blocked".to_string()),
+            phase: None,
+        };
+        let error = driver
+            .prepare_request_for_gates(&mut request)
+            .expect_err("unrecorded handoff must deny its target role");
+        assert!(
+            error.to_string().contains("handoff could not be recorded"),
+            "{error}"
+        );
+        let board = driver.gate_board.lock().expect("gate board");
+        assert!(matches!(
+            board.gates.get("scout-findings"),
+            Some(GateState::Blocked { reason }) if reason.contains("does not match board lane")
+        ));
+        assert!(board.artifacts.is_empty(), "{:?}", board.artifacts);
+        drop(board);
+        let run = state
+            .runs
+            .lock()
+            .expect("runs")
+            .get(&run_id)
+            .cloned()
+            .expect("run");
+        assert!(run.events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                WorkflowUiEventKind::GateUpdated {
+                    state,
+                    blocked_reason: Some(reason),
+                    ..
+                } if state == "blocked" && reason.contains("handoff could not be recorded")
+            )
+        }));
+        assert!(
+            run.events
+                .iter()
+                .all(|event| event.event_type() != "handoff_promoted"),
+            "{:?}",
+            run.events
+        );
+    }
+
+    #[test]
+    fn explicit_gate_verdict_only_reads_first_standalone_token() {
+        assert_eq!(
+            explicit_gate_verdict(Some("\n  APPROVE  \nreview complete")),
+            Some(ExplicitGateVerdict::Approve)
+        );
+        assert_eq!(
+            explicit_gate_verdict(Some("PASS\nverification complete")),
+            Some(ExplicitGateVerdict::Approve)
+        );
+        assert_eq!(
+            explicit_gate_verdict(Some("BLOCK\nmissing receipt")),
+            Some(ExplicitGateVerdict::Reject)
+        );
+        assert_eq!(
+            explicit_gate_verdict(Some("\nFAIL\nmissing receipt")),
+            Some(ExplicitGateVerdict::Reject)
+        );
+        assert_eq!(
+            explicit_gate_verdict(Some("Review result: BLOCK")),
+            None,
+            "prose remains backward-compatible success output"
+        );
+        assert_eq!(
+            explicit_gate_verdict(Some("review notes\nBLOCK")),
+            None,
+            "later verdict words must not override the first meaningful line"
+        );
+    }
+
+    #[test]
+    fn required_explicit_gate_verdict_fails_closed_when_missing_or_malformed() {
+        let mut record = RuntimeTaskRecord {
+            agent_id: "reviewer-malformed".to_string(),
+            label: Some("reviewer".to_string()),
+            role: Some("reviewer".to_string()),
+            status: IrWorkflowRunStatus::Succeeded,
+            output: Some("Review result: BLOCK".to_string()),
+            schema_error: None,
+        };
+
+        match gate_outcome_for_completed_role(&record, true, None) {
+            GateOutcome::Fail { reason } => {
+                assert!(
+                    reason.contains("required first-line gate verdict"),
+                    "{reason}"
+                );
+            }
+            outcome => panic!("required malformed verdict must fail closed: {outcome:?}"),
+        }
+        assert_eq!(
+            gate_outcome_for_completed_role(&record, false, None),
+            GateOutcome::Pass,
+            "legacy gates retain pass-on-success behavior"
+        );
+
+        record.output = None;
+        assert!(matches!(
+            gate_outcome_for_completed_role(&record, true, None),
+            GateOutcome::Fail { .. }
+        ));
+    }
+
+    #[test]
+    fn required_gate_artifact_rejects_bare_or_placeholder_approval() {
+        let mut record = RuntimeTaskRecord {
+            agent_id: "implementer-bare".to_string(),
+            label: Some("implementer".to_string()),
+            role: Some("implementer".to_string()),
+            status: IrWorkflowRunStatus::Succeeded,
+            output: Some("APPROVE".to_string()),
+            schema_error: None,
+        };
+
+        match gate_outcome_for_completed_role(&record, true, Some("verification_plan")) {
+            GateOutcome::Fail { reason } => {
+                assert!(
+                    reason.contains("verification_plan artifact body"),
+                    "{reason}"
+                );
+            }
+            outcome => panic!("bare approval must not promote an empty artifact: {outcome:?}"),
+        }
+
+        record.output = Some("APPROVE\nacceptance evidence".to_string());
+        match gate_outcome_for_completed_role(&record, true, Some("verification_plan")) {
+            GateOutcome::Fail { reason } => {
+                assert!(
+                    reason.contains("verification_plan artifact body"),
+                    "{reason}"
+                );
+            }
+            outcome => {
+                panic!("one placeholder line must not count as an artifact: {outcome:?}");
+            }
+        }
+
+        record.output = Some("APPROVE\nPLAN\n- verify the typed receipt".to_string());
+        assert_eq!(
+            gate_outcome_for_completed_role(&record, true, Some("verification_plan")),
+            GateOutcome::Pass
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn terminal_blocked_gate_fails_workflow_finalization() {
+        let _retry_guard = workflow_test_retry_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
+        let (client, calls) =
+            fake_chat_client("BLOCK\nFINAL RECEIPT\n- missing terminal evidence").await;
+        let runtime = SubAgentRuntime::new(
+            client,
+            "deepseek-v4-flash".to_string(),
+            ctx.clone(),
+            true,
+            None,
+            manager,
+        );
+        let tool = WorkflowTool::new(runtime.manager.clone(), runtime);
+
+        let result = tool
+            .execute(
+                json!({
+                    "action": "run",
+                    "script": r#"export default workflow({
+                        "goal": "fail closed on the terminal release verdict",
+                        "gates": [
+                            {
+                                "id": "terminal-release",
+                                "role": "release_lead",
+                                "on": "role_complete",
+                                "gate": "approve",
+                                "on_fail": "block",
+                                "max_retries": 0,
+                                "artifact_kind": "final_receipt",
+                                "require_explicit_verdict": true
+                            }
+                        ],
+                        "nodes": [
+                            {
+                                "agent": {
+                                    "id": "release-receipt",
+                                    "prompt": "Return the terminal verdict and receipt.",
+                                    "agent_type": "general",
+                                    "role": "release_lead",
+                                    "mode": "read_only",
+                                    "permissions": { "deny_all_tools": true },
+                                    "budget": { "max_steps": 1 }
+                                }
+                            }
+                        ]
+                    });"#
+                }),
+                &ctx,
+            )
+            .await
+            .expect("blocked terminal gate should return its failed run record");
+        let payload: Value = serde_json::from_str(&result.content).expect("workflow JSON");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "{payload}");
+        assert_eq!(payload["status"], "failed", "{payload}");
+        assert_eq!(payload["execution"]["status"], "failed", "{payload}");
+        assert!(
+            payload["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("terminal-release")
+                    && error.contains("ended blocked")
+                    && error.contains("missing terminal evidence")),
+            "{payload}"
+        );
+        assert!(payload["gate_status"].as_array().is_some_and(|gates| {
+            gates
+                .iter()
+                .any(|gate| gate["gate_id"] == "terminal-release" && gate["state"] == "blocked")
+        }));
+        assert!(payload["events"].as_array().is_some_and(|events| {
+            events
+                .iter()
+                .any(|event| event["type"] == "run_completed" && event["status"] == "failed")
+        }));
+    }
+
+    #[tokio::test]
+    async fn workflow_runtime_gate_honors_explicit_reviewer_verdicts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
+        let runtime = SubAgentRuntime::new(
+            stub_client(),
+            "deepseek-v4-flash".to_string(),
+            ctx,
+            true,
+            None,
+            manager.clone(),
+        );
+        let state = WorkflowWorkspaceState::open(tmp.path());
+        let run_id = "workflow_explicit_verdict".to_string();
+        let gates = vec![GateSpec {
+            id: "review-findings".to_string(),
+            role: "reviewer".to_string(),
+            on: GateOn::RoleComplete,
+            gate: GateKind::Review,
+            on_fail: codewhale_workflow::GateOnFail::Block,
+            blocks_role: Some("verifier".to_string()),
+            max_retries: 0,
+            artifact_kind: Some("review_report".to_string()),
+            require_explicit_verdict: true,
+        }];
+        let spec = WorkflowSpec {
+            id: Some("explicit-verdict-fixture".to_string()),
+            goal: "honor reviewer verdict".to_string(),
+            description: None,
+            budget: BudgetSpec::default(),
+            permissions: Default::default(),
+            model_policy: Default::default(),
+            promotion_policy: Default::default(),
+            gates: gates.clone(),
+            nodes: Vec::new(),
+        };
+        state.runs.lock().expect("runs").insert(
+            run_id.clone(),
+            WorkflowRunRecord::new(run_id.clone(), None, None, Some(&spec)),
+        );
+        let driver =
+            SubAgentWorkflowDriver::new(run_id, manager, runtime, state, None, None, None, gates);
+
+        driver.evaluate_gates_for_completed_role(&RuntimeTaskRecord {
+            agent_id: "reviewer-block".to_string(),
+            label: Some("reviewer".to_string()),
+            role: Some("reviewer".to_string()),
+            status: IrWorkflowRunStatus::Succeeded,
+            output: Some("\nBLOCK\nmissing terminal receipt".to_string()),
+            schema_error: None,
+        });
+
+        let verifier_request = || TaskRequest {
+            description: "Verify the accepted review.".to_string(),
+            subagent_type: Some("verifier".to_string()),
+            role: Some("verifier".to_string()),
+            profile: None,
+            model: None,
+            model_strength: None,
+            thinking: None,
+            worktree: false,
+            allowed_tools: Some(Vec::new()),
+            max_depth: None,
+            token_budget: None,
+            max_steps: None,
+            wall_time_secs: None,
+            response_schema: None,
+            label: Some("verify".to_string()),
+            phase: None,
+        };
+        let mut blocked_verifier = verifier_request();
+        let error = driver
+            .prepare_request_for_gates(&mut blocked_verifier)
+            .expect_err("successful reviewer BLOCK must not admit verifier");
+        assert!(error.to_string().contains("BLOCK"), "{error}");
+        {
+            let board = driver.gate_board.lock().expect("gate board");
+            assert!(
+                board.artifacts.is_empty(),
+                "rejected output must not produce a handoff: {:?}",
+                board.artifacts
+            );
+            assert!(matches!(
+                board.gates.get("review-findings"),
+                Some(GateState::Blocked { .. })
+            ));
+        }
+
+        driver.evaluate_gates_for_completed_role(&RuntimeTaskRecord {
+            agent_id: "reviewer-approve".to_string(),
+            label: Some("reviewer".to_string()),
+            role: Some("reviewer".to_string()),
+            status: IrWorkflowRunStatus::Succeeded,
+            output: Some("APPROVE\nEVIDENCE REVIEW\n- all receipt owners confirmed".to_string()),
+            schema_error: None,
+        });
+
+        let mut admitted_verifier = verifier_request();
+        driver
+            .prepare_request_for_gates(&mut admitted_verifier)
+            .expect("explicit reviewer APPROVE should admit verifier");
+        assert!(
+            admitted_verifier
+                .description
+                .contains("all receipt owners confirmed"),
+            "{}",
+            admitted_verifier.description
+        );
+        let board = driver.gate_board.lock().expect("gate board");
+        assert_eq!(board.artifacts.len(), 1, "{:?}", board.artifacts);
+        assert!(matches!(
+            board.gates.get("review-findings"),
+            Some(GateState::Passed)
+        ));
     }
 
     #[tokio::test]
@@ -4408,6 +6134,291 @@ reviewer = "reviewer"
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn stopship_acceptance_fixture_emits_role_gate_and_terminal_receipts() {
+        let _retry_guard = workflow_test_retry_guard();
+        let _env_lock = crate::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
+        let workflow_dir = tmp.path().join("workflows");
+        let fleet_dir = tmp.path().join("fleets");
+        std::fs::create_dir_all(&workflow_dir).expect("workflow dir");
+        std::fs::create_dir_all(&fleet_dir).expect("fleet dir");
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        std::fs::copy(
+            repo_root.join("workflows/stopship.workflow.js"),
+            workflow_dir.join("stopship.workflow.js"),
+        )
+        .expect("copy stopship acceptance fixture");
+        std::fs::copy(
+            repo_root.join("fleets/stopship.toml"),
+            fleet_dir.join("stopship.toml"),
+        )
+        .expect("copy stopship fleet");
+
+        let source = std::fs::read_to_string(workflow_dir.join("stopship.workflow.js"))
+            .expect("read stopship acceptance fixture");
+        let compiled =
+            codewhale_workflow::compile_javascript_workflow("stopship.workflow.js", &source)
+                .expect("compile stopship acceptance fixture");
+        let codewhale_workflow::WorkflowNode::Sequence(sequence) = &compiled.nodes[0] else {
+            panic!("stopship fixture should be one ordered role chain");
+        };
+        for (index, node) in sequence.children.iter().enumerate() {
+            let codewhale_workflow::WorkflowNode::Leaf(leaf) = node else {
+                panic!("stopship role chain must contain only leaves");
+            };
+            let tools = leaf_allowed_tools(leaf).expect("lower stopship child tools");
+            if index == 0 {
+                assert!(tools.as_ref().is_some_and(|tools| !tools.is_empty()));
+            } else {
+                assert_eq!(
+                    tools,
+                    Some(Vec::<String>::new()),
+                    "downstream handoff consumer {} must receive no tools",
+                    leaf.id
+                );
+            }
+        }
+
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 8);
+        let responses = [
+            r#"APPROVE
+SOURCE EVIDENCE
+- crates/cli/src/lib.rs: load_named_fleet
+- crates/workflow/src/role_resolve.rs: resolve_workflow_agent
+- crates/cli/src/lib.rs: start_lane
+- crates/tui/src/tools/workflow.rs: record_task_started
+- crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::GateUpdated
+- crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::RunCompleted -> terminal_completed_receipt
+- crates/lane/src/runtime.rs: process_exit_receipt -> lane_reconciled"#,
+            r#"APPROVE
+PLAN
+- fleets/stopship.toml: name = "stopship" -> named Fleet loading
+- crates/workflow/src/role_resolve.rs: resolve_workflow_agent -> role resolution
+- crates/cli/src/lib.rs: start_lane -> tmux Lane launch
+- crates/tui/src/tools/workflow.rs: record_task_started -> typed task_started
+- crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::GateUpdated -> gate promotion
+- crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::RunCompleted -> terminal_completed_receipt
+- crates/lane/src/runtime.rs: process_exit_receipt -> tmux Lane reconciliation"#,
+            r#"APPROVE
+EVIDENCE REVIEW
+- fleets/stopship.toml: name = "stopship"
+- crates/workflow/src/role_resolve.rs: resolve_workflow_agent
+- crates/cli/src/lib.rs: start_lane
+- crates/tui/src/tools/workflow.rs: record_task_started
+- crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::GateUpdated
+- crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::RunCompleted -> terminal_completed_receipt
+- crates/lane/src/runtime.rs: process_exit_receipt -> lane_reconciled"#,
+            r#"APPROVE
+EVIDENCE MATRIX
+- fleet_load: fleets/stopship.toml: name = "stopship"
+- role_resolution: crates/workflow/src/role_resolve.rs: resolve_workflow_agent
+- lane_launch: crates/cli/src/lib.rs: start_lane
+- task_started: crates/tui/src/tools/workflow.rs: record_task_started
+- gate_updated: crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::GateUpdated
+- run_completed: crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::RunCompleted -> terminal_completed_receipt
+- lane_exit: crates/lane/src/runtime.rs: process_exit_receipt -> lane_reconciled"#,
+            r#"APPROVE
+FINAL RECEIPT
+- fleet_load: fleets/stopship.toml: name = "stopship"
+- role_resolution: crates/workflow/src/role_resolve.rs: resolve_workflow_agent
+- lane_launch: crates/cli/src/lib.rs: start_lane
+- task_started: crates/tui/src/tools/workflow.rs: record_task_started
+- gate_updated: crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::GateUpdated
+- run_completed: crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::RunCompleted -> terminal_completed_receipt
+- lane_exit: crates/lane/src/runtime.rs: process_exit_receipt -> lane_reconciled"#,
+        ];
+        let (client, calls) = fake_chat_client_responses(&responses).await;
+        let runtime = SubAgentRuntime::new(
+            client,
+            "deepseek-v4-flash".to_string(),
+            ctx.clone(),
+            true,
+            None,
+            manager,
+        );
+        let tool = WorkflowTool::new(runtime.manager.clone(), runtime);
+
+        let result = tool
+            .execute(
+                json!({
+                    "action": "run",
+                    "source_path": "workflows/stopship.workflow.js",
+                    "fleet": "stopship",
+                    "token_budget": 60_000
+                }),
+                &ctx,
+            )
+            .await
+            .expect("stopship acceptance workflow returns a terminal record");
+        let payload: Value = serde_json::from_str(&result.content).expect("workflow JSON");
+
+        assert_eq!(payload["status"], "completed", "{payload}");
+        assert_eq!(payload["execution"]["status"], "succeeded", "{payload}");
+        assert_eq!(calls.load(Ordering::SeqCst), 5, "one child per Fleet role");
+        let approval = &payload["plan_approval"];
+        assert_eq!(approval["decision"], "auto_read_only", "{approval}");
+        assert_eq!(approval["token_budget"], 60_000, "{approval}");
+        assert_eq!(approval["writes"], false, "{approval}");
+        assert_eq!(approval["shell"], false, "{approval}");
+        assert_eq!(approval["network"], false, "{approval}");
+        assert_eq!(approval["high_budget"], false, "{approval}");
+        assert_eq!(approval["elevated"], false, "{approval}");
+        assert!(
+            approval["reasons"].as_array().is_some_and(Vec::is_empty),
+            "{approval}"
+        );
+
+        let events = payload["events"].as_array().expect("typed events");
+        let started = events
+            .iter()
+            .filter(|event| event["type"] == "task_started")
+            .collect::<Vec<_>>();
+        let expected_roles = [
+            ("scout", "scout"),
+            ("implementer", "builder"),
+            ("reviewer", "reviewer"),
+            ("verifier", "verifier"),
+            ("release_lead", "manager"),
+        ];
+        assert_eq!(started.len(), expected_roles.len(), "{started:#?}");
+        for (event, (role, profile)) in started.iter().zip(expected_roles) {
+            assert_eq!(event["role"], role);
+            assert_eq!(event["profile"], profile);
+            assert_eq!(event["resolved_profile"], profile);
+            assert_eq!(event["workflow_run_id"], payload["run_id"]);
+        }
+
+        let gates = events
+            .iter()
+            .filter(|event| event["type"] == "gate_updated")
+            .collect::<Vec<_>>();
+        assert_eq!(gates.len(), 5, "{gates:#?}");
+        assert!(gates.iter().all(|event| event["state"] == "passed"));
+        assert_eq!(gates[0]["role"], "scout");
+        assert_eq!(gates[0]["blocked_role"], "implementer");
+        assert_eq!(gates[3]["role"], "verifier");
+        assert_eq!(gates[3]["blocked_role"], "release_lead");
+        assert_eq!(gates[4]["role"], "release_lead");
+        assert!(gates[4]["blocked_role"].is_null());
+
+        let promoted = events
+            .iter()
+            .filter(|event| event["type"] == "handoff_promoted")
+            .collect::<Vec<_>>();
+        let consumed = events
+            .iter()
+            .filter(|event| event["type"] == "handoff_consumed")
+            .collect::<Vec<_>>();
+        let expected_handoffs = [
+            ("scout", "implementer", "source_evidence"),
+            ("implementer", "reviewer", "verification_plan"),
+            ("reviewer", "verifier", "review_report"),
+            ("verifier", "release_lead", "verification_report"),
+        ];
+        assert_eq!(promoted.len(), expected_handoffs.len(), "{promoted:#?}");
+        assert_eq!(consumed.len(), expected_handoffs.len(), "{consumed:#?}");
+        let artifact_ids = promoted
+            .iter()
+            .map(|event| {
+                event["artifact_id"]
+                    .as_str()
+                    .filter(|id| id.starts_with("handoff_") && id.len() > "handoff_".len())
+                    .expect("opaque non-empty handoff artifact id")
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            artifact_ids.len(),
+            promoted.len(),
+            "every promotion must have a unique artifact id: {promoted:#?}"
+        );
+        for (index, (from_role, to_role, kind)) in expected_handoffs.into_iter().enumerate() {
+            assert_eq!(promoted[index]["from_role"], from_role);
+            assert_eq!(promoted[index]["to_role"], to_role);
+            assert_eq!(promoted[index]["kind"], kind);
+            assert_eq!(promoted[index]["gate_id"], gates[index]["gate_id"]);
+            assert_eq!(
+                promoted[index]["producer_task_id"],
+                started[index]["task_id"]
+            );
+            assert!(
+                promoted[index].get("payload").is_none(),
+                "{:#?}",
+                promoted[index]
+            );
+
+            assert_eq!(
+                consumed[index]["artifact_id"],
+                promoted[index]["artifact_id"]
+            );
+            assert_eq!(consumed[index]["from_role"], from_role);
+            assert_eq!(consumed[index]["to_role"], to_role);
+            assert_eq!(consumed[index]["kind"], kind);
+            assert_eq!(
+                consumed[index]["consumer_task_id"],
+                started[index + 1]["task_id"]
+            );
+            assert!(
+                consumed[index].get("payload").is_none(),
+                "{:#?}",
+                consumed[index]
+            );
+
+            let producer_task_id = promoted[index]["producer_task_id"]
+                .as_str()
+                .expect("producer task id");
+            let consumer_task_id = consumed[index]["consumer_task_id"]
+                .as_str()
+                .expect("consumer task id");
+            let gate_id = promoted[index]["gate_id"].as_str().expect("gate id");
+            let artifact_id = promoted[index]["artifact_id"]
+                .as_str()
+                .expect("artifact id");
+            let task_completed_index = events
+                .iter()
+                .position(|event| {
+                    event["type"] == "task_completed" && event["task_id"] == producer_task_id
+                })
+                .expect("producer completion receipt");
+            let gate_updated_index = events
+                .iter()
+                .position(|event| event["type"] == "gate_updated" && event["gate_id"] == gate_id)
+                .expect("gate update receipt");
+            let promoted_index = events
+                .iter()
+                .position(|event| {
+                    event["type"] == "handoff_promoted" && event["artifact_id"] == artifact_id
+                })
+                .expect("handoff promotion receipt");
+            let consumer_started_index = events
+                .iter()
+                .position(|event| {
+                    event["type"] == "task_started" && event["task_id"] == consumer_task_id
+                })
+                .expect("consumer start receipt");
+            let consumed_index = events
+                .iter()
+                .position(|event| {
+                    event["type"] == "handoff_consumed" && event["artifact_id"] == artifact_id
+                })
+                .expect("handoff consumption receipt");
+            assert!(
+                task_completed_index < gate_updated_index
+                    && gate_updated_index < promoted_index
+                    && promoted_index < consumer_started_index
+                    && consumer_started_index < consumed_index,
+                "causal receipt order must be task_completed -> gate_updated -> handoff_promoted -> task_started -> handoff_consumed: {events:#?}"
+            );
+        }
+        let terminal_completed_receipt = events
+            .iter()
+            .any(|event| event["type"] == "run_completed" && event["status"] == "completed");
+        assert!(terminal_completed_receipt, "{events:#?}");
+    }
+
+    #[tokio::test]
     async fn completion_from_manager_fails_closed_when_status_stays_running() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
@@ -4590,24 +6601,60 @@ reviewer = "reviewer"
         (client, calls)
     }
 
+    async fn fake_chat_client_responses(
+        response_texts: &[&str],
+    ) -> (DeepSeekClient, Arc<AtomicUsize>) {
+        let (client, calls, _) = fake_chat_client_capturing_responses(response_texts).await;
+        (client, calls)
+    }
+
     async fn fake_chat_client_capturing(
         response_text: &str,
     ) -> (DeepSeekClient, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
+        fake_chat_client_capturing_responses(&[response_text]).await
+    }
+
+    async fn fake_chat_client_capturing_responses(
+        response_texts: &[&str],
+    ) -> (DeepSeekClient, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
+        assert!(
+            !response_texts.is_empty(),
+            "fake chat client needs at least one response"
+        );
         let calls = Arc::new(AtomicUsize::new(0));
         let bodies = Arc::new(Mutex::new(Vec::new()));
-        let response_text = response_text.to_string();
+        let response_texts = Arc::new(
+            response_texts
+                .iter()
+                .map(|response| (*response).to_string())
+                .collect::<Vec<_>>(),
+        );
         let app = Router::new().route(
             "/{*path}",
             post({
                 let calls = Arc::clone(&calls);
                 let bodies = Arc::clone(&bodies);
+                let response_texts = Arc::clone(&response_texts);
                 move |Json(body): Json<Value>| {
                     let calls = Arc::clone(&calls);
                     let bodies = Arc::clone(&bodies);
-                    let response_text = response_text.clone();
+                    let response_texts = Arc::clone(&response_texts);
                     async move {
                         bodies.lock().expect("capture body").push(body);
                         let attempt = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                        let response_text = if response_texts.len() == 1 {
+                            response_texts[0].clone()
+                        } else {
+                            response_texts
+                                .get(attempt - 1)
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "fake chat server received call {attempt} but only {} responses were supplied",
+                                        response_texts.len()
+                                    )
+                                })
+                                .clone()
+                        };
                         Json(json!({
                             "id": format!("chatcmpl-workflow-test-{attempt}"),
                             "model": "deepseek-v4-flash",

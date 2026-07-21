@@ -1,10 +1,10 @@
 # Contributors
 
-CodeWhale is built in the open with a growing community of contributors. Every
+Codewhale is built in the open with a growing community of contributors. Every
 issue report and pull request is real project work — welcome at any experience
-level. This is the full per-PR contributor record in **chronological order**
-(newest first), collapsed into time bands so it stays scannable. Expand any band
-to see everyone.
+level. This is the full per-PR contributor record, grouped into release/time
+bands with the newest band first so it stays scannable. Expand any band to see
+everyone.
 
 For the live list, see the
 [GitHub contributors page](https://github.com/Hmbown/CodeWhale/graphs/contributors),
@@ -15,7 +15,7 @@ and [CHANGELOG.md](../CHANGELOG.md).
 
 - **[DeepSeek](https://github.com/deepseek-ai)** — the models and support that got this project started. 感谢 DeepSeek 提供模型与支持。
 - **[DataWhale](https://github.com/datawhalechina)** 🐋 — for the support and for welcoming us into the Whale Brother family. 感谢 DataWhale 的支持。
-- **[OpenWarp](https://github.com/zerx-lab/warp)** — for prioritizing codewhale support and collaborating on a better terminal-agent experience.
+- **[OpenWarp](https://github.com/zerx-lab/warp)** — for prioritizing Codewhale support and collaborating on a better terminal-agent experience.
 - **[Open Design](https://github.com/nexu-io/open-design)** — for support and collaboration around design-forward agent workflows.
 
 The maintainer rule: reports and PRs are real project work, even when the final
@@ -28,11 +28,111 @@ notes, and relevant issue/PR comments.
 ## Contributors by time
 
 <details open>
-<summary><strong>v0.8.68 — maintenance sweep, runtime persistence &amp; release evidence</strong></summary>
+<summary><strong>v0.9.1 — provider and runtime hardening</strong></summary>
 
-The v0.8.68 maintenance lane started with post-release cleanup on `main`: runtime
-thread persistence, terminal selection, UTF-8 edit handling, README discovery,
-and dead-code removal landed alongside Cursor dogfood evidence for v0.8.67.
+- **[h3c-hexin](https://github.com/h3c-hexin)** — calendar-anchored hourly
+  automation recurrence across DST and lifecycle transitions (PR #4381)
+- **[zhangweiii](https://github.com/zhangweiii)** and
+  **[Sterne Lee / sternelee](https://github.com/sternelee)** — the original
+  first-class OpenCode Go implementations in PRs #773 and #1050, harvested
+  into the current provider architecture with co-authorship planned for the
+  landing commit
+- **[Sean Tse / seanthefuturegorilla](https://github.com/seanthefuturegorilla)**
+  — the canonical OpenCode Go/Zen provider request and acceptance direction in
+  #1481
+- **[nightt5879](https://github.com/nightt5879)** — the Solarized Light
+  background preservation fix for the underwater shell (PR #4471)
+- **[AiurArtanis](https://github.com/AiurArtanis)** — the Solarized Light
+  v0.9.0 regression report and reproduction (#4457)
+- **[shenjackyuanjie](https://github.com/shenjackyuanjie)** — the HarmonyOS
+  workflow-js bindgen, portable-pty gating, and SDK environment work
+  (PR #4470)
+- **[shenyongqing](https://github.com/shenyongqing)** — the original HarmonyOS
+  workflow-js bindgen approach (PR #4384), carried into the landed
+  implementation with credit
+- **[Luis Mateus Vargas / luismateusvargas](https://github.com/luismateusvargas)**
+  — the Windows hook-process leak reproduction, process-tree analysis, and EOF
+  fix direction (#4489)
+- **[redjade75723](https://github.com/redjade75723)** — the persistent Windows
+  PTY failure report that exposed lossy high-bit exit-status handling (#4100)
+- **[w1w218](https://github.com/w1w218)** — the Windows ARM64 release request
+  and cross-compilation report that led to native release, npm, updater, and
+  archive support (#4267)
+- **[Sh1Zuku / SparkofSpike](https://github.com/SparkofSpike)** — the Windows
+  Ctrl+O reproduction that exposed pre-pager result truncation and conflicting
+  composer shortcut routing (#4482)
+
+</details>
+
+<details open>
+<summary><strong>v0.9.0 — underwater shell, runtime persistence &amp; release evidence</strong></summary>
+
+The v0.9.0 lane grew from a maintenance sweep into the underwater shell,
+message-first Operate, broader Fleet and Workflow behavior, runtime-thread
+persistence, terminal selection, UTF-8 handling, internationalization, and
+release evidence. The reports and pull requests below materially shaped it.
+
+- **[Amuthan / amuthantamil](https://github.com/amuthantamil)** — approval-time
+  transcript review report that led to live Page Up/Down, modified-arrow,
+  Home/End, and mouse-wheel navigation while the decision card stays active
+  (#4371)
+- **[Angel-Hair](https://github.com/Angel-Hair)** — reports that restored the
+  opt-in `remember` tool to the first-turn catalog, made required user
+  confirmation a real goal blocker, and added a clear recovery notice for
+  cached approval denials (#4373, #4374, #4375)
+- **[Bruce / bruce6135](https://github.com/bruce6135)** — Kimi Coding Plan
+  reproduction that exposed the false 1K emergency-compaction budget (#4368)
+- **[Matt Van Horn / mvanhorn](https://github.com/mvanhorn)** — first-turn
+  `remember` regression coverage and the Kimi output-budget correction that
+  prevents false emergency compaction (#4377, #4378)
+- **[郝某人BH / hmr-BH](https://github.com/hmr-BH)** — native Simplified
+  Chinese review that replaced literal legal/doctrinal metaphors with clear
+  collaboration terminology across setup and `/constitution` (#4369)
+- **[WavesMan](https://github.com/WavesMan)** — large-tree `@` completion
+  reproduction that led to bounded background discovery and exact-path
+  resolution on send (#4365)
+- **[SamhandsomeLee](https://github.com/SamhandsomeLee)** — input-budget-aware
+  compaction work harvested from PR #4293 with co-authorship preserved
+- **[idling11](https://github.com/idling11)** — keyboard-driven keyword search
+  for the docs and FAQ surfaces (PR #4364)
+- **[LeoLin990405](https://github.com/LeoLin990405)** — initial bounded
+  workspace-walk approach and root-cause analysis for large-tree `@` mention
+  discovery (PR #4367), harvested into the final fail-soft background
+  implementation for #4365
+- **[octo-patch](https://github.com/octo-patch)** — MiniMax Messages provider
+  support for MiniMax-M3 and MiniMax-M2.7 across OpenAI-compatible and Messages
+  routes, regional endpoints, catalog metadata, pricing, and request coverage
+  (PR #4354)
+- **[Wenshan Deng / findshan](https://github.com/findshan)** — original offline
+  token/cache/cost scorecard and regression gate (#3388), extended with
+  provider-aware provenance in #4335
+- **[hongqitai](https://github.com/hongqitai)** — localization extraction and
+  English-locale enforcement that keep UI copy on the typed translation path
+  (#4225, #4194)
+- **[nsfoxer](https://github.com/nsfoxer)** — bounded, fail-soft MCP capability
+  discovery with advertised/legacy `tools/list` handling and Unicode-safe
+  description formatting (#4308, harvested with co-authorship)
+- **[maple / yekern](https://github.com/yekern)** — root-cause analysis and fix
+  direction for age-evicting terminal worker records from long-lived
+  sub-agent state ledgers (#4217)
+- **[moduvoice](https://github.com/moduvoice)** — Korean (ko) UI locale with
+  full key parity and onboarding/setup wiring (PR #4347)
+- **[qinlinwang](https://github.com/qinlinwang)** — Anthropic tool-schema
+  sanitization for top-level oneOf/anyOf/allOf failures (PR #4346)
+- **[knqiufan](https://github.com/knqiufan)** — Anthropic cache-write token
+  pricing at published rates (PR #4348, #4318)
+- **[Chavdar Ivanov / ci4ic4](https://github.com/ci4ic4)** — NetBSD QuickJS
+  bindgen support for codewhale-workflow-js (PR #4349)
+- **[eugenicum](https://github.com/eugenicum)** — copy-paste rail-pollution
+  report with code-aware fix direction (#4208)
+- **[JayBeest](https://github.com/JayBeest)** — parent
+  `--disallowed-tools` inheritance through sub-agents and Fleet workers,
+  harvested from PR #4096 with authorship preserved (#4042)
+- **[wuisabel-gif](https://github.com/wuisabel-gif)** — move runtime-thread
+  coordination onto `parking_lot::Mutex` to remove async lock contention
+  (#4243, #4149)
+- **[cyq1017](https://github.com/cyq1017)** — Windows Python stdio UTF-8
+  handling and richer active-tool summaries (#4281/#4202, #3818)
 
 - **[Jeffrey Luna / Mr-Moon121](https://github.com/Mr-Moon121)** — anti-polling
   constitution for sub-agent waiting (harvested into #4097 / PR #4229 from
@@ -42,13 +142,20 @@ and dead-code removal landed alongside Cursor dogfood evidence for v0.8.67.
   into thread records so `/v1` engine reloads keep compacted context (#4091)
 - **[nightt5879](https://github.com/nightt5879)** — keep native terminal
   selection usable when mouse capture is disabled, and advance fuzzy edit
-  matches on UTF-8 character boundaries (#4088, #4045)
+  matches on UTF-8 character boundaries; preserve inline skill task text in
+  PR #4372 (#4088, #4045, #3915)
 - **[gaord](https://github.com/gaord)** — add the community-maintained
   CodeWhale for VS Code GUI frontend to the English and Chinese READMEs (#4035)
 - **[Darrell Thomas](https://github.com/DarrellThomas)** — remove the unused
   whale route taxonomy module and its dead tests (#4041)
 - **[Taixin Guo](https://github.com/taixinguo)** — CJK fuzzy-edit panic report
   and fix direction credited in the UTF-8 boundary patch (#3971, #4045)
+- **[CCChisato](https://github.com/CCChisato)** — preserve task text when
+  sending dollar, unified-slash, and explicit skill invocations (#3915,
+  co-authored)
+- **[Sun Zhenyuan / bistack](https://github.com/bistack)** — dynamic MCP server
+  infrastructure and approval-gated model-started MCP servers from chat
+  context (#3869, #3866, harvested with authorship preserved)
 
 </details>
 
@@ -71,9 +178,16 @@ in several community provider and bridge contributions with release credit.
 - **[noaft](https://github.com/noaft)** — OpenModel provider support across
   config, CLI, TUI provider picker, docs, and registry checks (#3585,
   harvested)
-- **[pkeging](https://github.com/pkeging)** — WeCom Bridge deployment and
-  security documentation, including the approval-timeout configuration surface
-  (#3640, harvested)
+- **[pkeging](https://github.com/pkeging)** — original plugin manifest,
+  discovery, CLI, and MCP foundation (#3708, #3709, #3710, merged), plus WeCom
+  Bridge deployment and security documentation, including the approval-timeout
+  configuration surface (#3640, harvested)
+- **[codepgq](https://github.com/codepgq)** — cross-client plugin-workflow
+  migration request that shaped the explicit compatibility and trust boundary
+  (#1172)
+- **[Wenshan Deng / findshan](https://github.com/findshan)** — original offline
+  token/cache/cost scorecard and regression gate (#3388), extended with
+  provider-aware provenance in #4335
 - **[buko](https://github.com/buko)** — precise Ctrl+O external-editor freeze
   reproduction that shaped the terminal input-pump fix (#3657)
 - **[cyq1017](https://github.com/cyq1017)** — sub-agent progress-event
@@ -348,7 +462,8 @@ patches, and TUI fixes landed alongside first-time and returning contributor wor
 - **[lihuan215](https://github.com/lihuan215)** — Unix socket hook sink design harvested into the opt-in hook event path (#2333, #2430)
 - **[AdityaVG13](https://github.com/AdityaVG13)** — Xiaomi MiMo provider support (#2246)
 - **[New2Niu](https://github.com/New2Niu)** — macOS display notifications (#2260)
-- **[AiurArtanis](https://github.com/AiurArtanis)** — Solarized Light theme (#2270)
+- **[AiurArtanis](https://github.com/AiurArtanis)** — Solarized Light theme and
+  canonical-background regression report (#2270, #4457)
 - **[Lee-take](https://github.com/Lee-take)** — task migration and session environment isolation fixes (#2272)
 - **[LeoAlex0](https://github.com/LeoAlex0)** — session persistence fixes for message counts and tool-output cache preservation (#2388, #2395)
 - **[jimmyzhuu](https://github.com/jimmyzhuu)** — Baidu AI Search backend for `web_search` (#2371)
@@ -423,7 +538,9 @@ was dropped. Restoring them here — every one shipped real code:_
 - **[MMMarcinho](https://github.com/MMMarcinho)** — `image_analyze` vision tool (#1467)
 - **[MeAiRobot](https://github.com/MeAiRobot)** — toast-stack overlay z-order fix (#1485)
 - **[NorethSea](https://github.com/NorethSea)** — `update` refreshing the sibling TUI binary (#1492)
-- **[SamhandsomeLee](https://github.com/SamhandsomeLee)** — bundled v4-best-practices skill (#1448)
+- **[SamhandsomeLee](https://github.com/SamhandsomeLee)** — bundled
+  v4-best-practices skill (#1448) and input-budget-aware compaction trigger
+  (#4293)
 - **[YaYII](https://github.com/YaYII)** — opt-in `/translate` command (#1462)
 - **[sandofree](https://github.com/sandofree)** — Tavily and Bocha `web_search` backends (#1294)
 - **[tiger-dog](https://github.com/tiger-dog)** — approval one-line banner and Markdown underscore handling (#1455)

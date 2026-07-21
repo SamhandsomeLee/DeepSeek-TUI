@@ -7,6 +7,8 @@
 //! - Managing session lifecycle
 
 use crate::artifacts::ArtifactRecord;
+use crate::config::ApiProvider;
+use crate::model_routing::AutoRouteReceipt;
 use crate::models::{ContentBlock, Message, SystemPrompt};
 use crate::tools::plan::PlanSnapshot;
 use crate::tools::todo::TodoListSnapshot;
@@ -21,6 +23,7 @@ use uuid::Uuid;
 
 /// Maximum number of sessions to retain
 const MAX_SESSIONS: usize = 50;
+const WORK_GRAPH_IMPORT_ARCHIVE_DIR: &str = ".work-graph-import-archive";
 const CURRENT_SESSION_SCHEMA_VERSION: u32 = 1;
 const CURRENT_QUEUE_SCHEMA_VERSION: u32 = 1;
 
@@ -63,6 +66,8 @@ pub struct QueuedSessionMessage {
     pub display: String,
     #[serde(default)]
     pub skill_instruction: Option<String>,
+    #[serde(default)]
+    pub skill_provenance: Option<crate::plugins::types::PluginAuthority>,
 }
 
 /// Persisted queue state for recovery after restart/crash.
@@ -118,6 +123,11 @@ pub struct SessionMetadata {
     /// Provider used for the session model. Defaults for legacy saved sessions.
     #[serde(default = "default_model_provider")]
     pub model_provider: String,
+    /// Exact configured provider key. This is separate from `model_provider`
+    /// so old consumers can keep treating that field as the built-in provider
+    /// kind (`custom` for every named custom route).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider_id: Option<String>,
     /// Workspace directory
     pub workspace: PathBuf,
     /// Optional mode label (agent/plan/etc.)
@@ -142,6 +152,13 @@ pub struct SessionMetadata {
 
 fn default_model_provider() -> String {
     "deepseek".to_string()
+}
+
+impl SessionMetadata {
+    pub(crate) fn set_model_provider_route(&mut self, kind: &str, identity: Option<&str>) {
+        self.model_provider = kind.to_string();
+        self.model_provider_id = identity.map(str::to_string);
+    }
 }
 
 /// Cost and high-water-mark fields persisted with each session.
@@ -196,8 +213,12 @@ impl SessionMetadata {
 
 /// Durable Work-panel state. Optional on [`SavedSession`] so every session
 /// written before v0.8.68 remains loadable without migration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SessionWorkState {
+    /// Authoritative Work Graph. Optional so pre-Work-Graph sessions and old
+    /// binaries continue to exchange fully populated Plan/To-do views.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<crate::work_graph::WorkGraphSnapshot>,
     #[serde(default, skip_serializing_if = "TodoListSnapshot::is_empty")]
     pub todos: TodoListSnapshot,
     #[serde(default, skip_serializing_if = "PlanSnapshot::is_empty")]
@@ -207,8 +228,24 @@ pub struct SessionWorkState {
 impl SessionWorkState {
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.todos.is_empty() && self.plan.is_empty()
+        self.graph
+            .as_ref()
+            .is_none_or(crate::work_graph::WorkGraphSnapshot::is_empty)
+            && self.todos.is_empty()
+            && self.plan.is_empty()
     }
+}
+
+/// Latest concrete Auto route and the decision receipt that produced it.
+///
+/// This is additive, optional session metadata: sessions written before
+/// v0.9.1 deserialize with no receipt and keep their legacy restore behavior.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SavedAutoRouteReceipt {
+    pub(crate) provider: ApiProvider,
+    pub(crate) provider_identity: String,
+    pub(crate) model: String,
+    pub(crate) receipt: AutoRouteReceipt,
 }
 
 /// A saved session containing full conversation history
@@ -234,6 +271,10 @@ pub struct SavedSession {
     /// To-do and plan state shown in the Work sidebar.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_state: Option<SessionWorkState>,
+    /// Most recent accepted/completed Auto decision, when the saved model mode
+    /// is `auto`. Optional for backward-compatible session loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_auto_route: Option<SavedAutoRouteReceipt>,
 }
 
 /// Manager for session persistence operations
@@ -243,8 +284,30 @@ pub struct SessionManager {
     sessions_dir: PathBuf,
 }
 
+/// Origin of a crash-recovery checkpoint file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointSource {
+    /// Per-session checkpoint file `checkpoints/<session_id>.json`.
+    Session(String),
+    /// Legacy single-slot checkpoint file `checkpoints/latest.json`.
+    Legacy,
+}
+
+/// A crash-recovery checkpoint file discovered on disk (metadata only —
+/// callers load the session content separately).
+#[derive(Debug, Clone)]
+pub struct CheckpointRef {
+    pub source: CheckpointSource,
+    pub path: PathBuf,
+    pub modified: std::time::SystemTime,
+}
+
+/// File names in `checkpoints/` that are never per-session checkpoints.
+const LEGACY_CHECKPOINT_FILE: &str = "latest.json";
+const OFFLINE_QUEUE_FILE: &str = "offline_queue.json";
+
 impl SessionManager {
-    fn validated_session_path(&self, id: &str) -> std::io::Result<PathBuf> {
+    fn validated_session_id<'a>(&self, id: &'a str) -> std::io::Result<&'a str> {
         let trimmed = id.trim();
         if trimmed.is_empty() {
             return Err(std::io::Error::new(
@@ -261,7 +324,31 @@ impl SessionManager {
                 format!("Invalid session id '{id}'"),
             ));
         }
+        Ok(trimmed)
+    }
+
+    fn validated_session_path(&self, id: &str) -> std::io::Result<PathBuf> {
+        let trimmed = self.validated_session_id(id)?;
         Ok(self.sessions_dir.join(format!("{trimmed}.json")))
+    }
+
+    fn checkpoints_dir(&self) -> PathBuf {
+        self.sessions_dir.join("checkpoints")
+    }
+
+    fn validated_checkpoint_path(&self, session_id: &str) -> std::io::Result<PathBuf> {
+        let trimmed = self.validated_session_id(session_id)?;
+        // Reserved file names inside `checkpoints/` must never collide with a
+        // per-session checkpoint file.
+        if format!("{trimmed}.json") == LEGACY_CHECKPOINT_FILE
+            || format!("{trimmed}.json") == OFFLINE_QUEUE_FILE
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Session id '{trimmed}' collides with a reserved checkpoint file"),
+            ));
+        }
+        Ok(self.checkpoints_dir().join(format!("{trimmed}.json")))
     }
 
     /// Create a new `SessionManager` with the specified sessions directory
@@ -286,6 +373,8 @@ impl SessionManager {
     pub fn save_session(&self, session: &SavedSession) -> std::io::Result<PathBuf> {
         let path = self.validated_session_path(&session.metadata.id)?;
 
+        self.archive_before_first_graph_write(session, &path)?;
+
         let content = serde_json::to_string_pretty(&session)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
@@ -299,23 +388,61 @@ impl SessionManager {
     }
 
     /// Save a crash-recovery checkpoint for in-flight turns.
+    ///
+    /// Checkpoints are keyed per session (`checkpoints/<session_id>.json`) so
+    /// concurrent sessions never overwrite each other's crash-recovery state.
     pub fn save_checkpoint(&self, session: &SavedSession) -> std::io::Result<PathBuf> {
-        let checkpoints = self.sessions_dir.join("checkpoints");
-        fs::create_dir_all(&checkpoints)?;
-        let path = checkpoints.join("latest.json");
+        let path = self.validated_checkpoint_path(&session.metadata.id)?;
+        let session_path = self.validated_session_path(&session.metadata.id)?;
+        self.archive_before_first_graph_write(session, &session_path)?;
+        fs::create_dir_all(self.checkpoints_dir())?;
         let content = serde_json::to_string_pretty(&session)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         write_atomic(&path, content.as_bytes())?;
         Ok(path)
     }
 
-    /// Load the most recent crash-recovery checkpoint if present.
-    pub fn load_checkpoint(&self) -> std::io::Result<Option<SavedSession>> {
-        let path = self.sessions_dir.join("checkpoints").join("latest.json");
+    /// Preserve the exact pre-import session once, before the first graph-
+    /// bearing session or checkpoint write can replace it.
+    fn archive_before_first_graph_write(
+        &self,
+        session: &SavedSession,
+        source: &Path,
+    ) -> std::io::Result<()> {
+        let writes_graph = session
+            .work_state
+            .as_ref()
+            .and_then(|state| state.graph.as_ref())
+            .is_some_and(|graph| !graph.is_empty());
+        if !writes_graph || !source.exists() {
+            return Ok(());
+        }
+        let bytes = fs::read(source)?;
+        let already_graph_backed = serde_json::from_slice::<SavedSession>(&bytes)
+            .ok()
+            .and_then(|saved| saved.work_state)
+            .and_then(|state| state.graph)
+            .is_some_and(|graph| !graph.is_empty());
+        if already_graph_backed {
+            return Ok(());
+        }
+        let archive_dir = self.sessions_dir.join(WORK_GRAPH_IMPORT_ARCHIVE_DIR);
+        fs::create_dir_all(&archive_dir)?;
+        let archive =
+            archive_dir.join(source.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid session path")
+            })?);
+        if !archive.exists() {
+            write_atomic(&archive, &bytes)?;
+        }
+        Ok(())
+    }
+
+    fn read_checkpoint_file(&self, path: &Path) -> std::io::Result<Option<SavedSession>> {
         if !path.exists() {
             return Ok(None);
         }
-        let content = fs::read_to_string(&path)?;
+        let content = fs::read_to_string(path)?;
         let mut session: SavedSession = serde_json::from_str(&content)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         if session.schema_version > CURRENT_SESSION_SCHEMA_VERSION {
@@ -331,13 +458,100 @@ impl SessionManager {
         Ok(Some(session))
     }
 
-    /// Clear any crash-recovery checkpoint.
-    pub fn clear_checkpoint(&self) -> std::io::Result<()> {
-        let path = self.sessions_dir.join("checkpoints").join("latest.json");
+    /// Load a specific session's crash-recovery checkpoint if present.
+    pub fn load_session_checkpoint(
+        &self,
+        session_id: &str,
+    ) -> std::io::Result<Option<SavedSession>> {
+        let path = self.validated_checkpoint_path(session_id)?;
+        self.read_checkpoint_file(&path)
+    }
+
+    /// Load the legacy single-slot checkpoint (`checkpoints/latest.json`) if
+    /// present. Compatibility read only — this release no longer writes it.
+    pub fn load_legacy_checkpoint(&self) -> std::io::Result<Option<SavedSession>> {
+        let path = self.checkpoints_dir().join(LEGACY_CHECKPOINT_FILE);
+        self.read_checkpoint_file(&path)
+    }
+
+    /// Clear one session's crash-recovery checkpoint. Scoped: this can never
+    /// remove another session's checkpoint file or the legacy slot.
+    pub fn clear_session_checkpoint(&self, session_id: &str) -> std::io::Result<()> {
+        let path = self.validated_checkpoint_path(session_id)?;
         if path.exists() {
             fs::remove_file(path)?;
         }
         Ok(())
+    }
+
+    /// Remove the legacy single-slot checkpoint file.
+    pub fn clear_legacy_checkpoint(&self) -> std::io::Result<()> {
+        let path = self.checkpoints_dir().join(LEGACY_CHECKPOINT_FILE);
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    /// Enumerate all crash-recovery checkpoint files (per-session files plus
+    /// the legacy single slot), sorted most recently modified first. Only
+    /// file metadata is read here; callers load content per candidate.
+    pub fn list_checkpoints(&self) -> std::io::Result<Vec<CheckpointRef>> {
+        let dir = self.checkpoints_dir();
+        let mut refs = Vec::new();
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(refs),
+            Err(err) => return Err(err),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_file() || path.extension().is_none_or(|ext| ext != "json") {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let source = if name == LEGACY_CHECKPOINT_FILE {
+                CheckpointSource::Legacy
+            } else if name == OFFLINE_QUEUE_FILE {
+                continue;
+            } else {
+                let session_id = name.trim_end_matches(".json").to_string();
+                if self.validated_checkpoint_path(&session_id).is_err() {
+                    continue;
+                }
+                CheckpointSource::Session(session_id)
+            };
+            let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+                continue;
+            };
+            refs.push(CheckpointRef {
+                source,
+                path,
+                modified,
+            });
+        }
+        refs.sort_by_key(|r| std::cmp::Reverse(r.modified));
+        Ok(refs)
+    }
+
+    /// Migrate a session recovered from the legacy single-slot checkpoint to
+    /// a per-session checkpoint file. Never overwrites an existing
+    /// per-session file and leaves the legacy file in place (older binaries
+    /// still read it; the legacy writer is already gone). Returns whether a
+    /// file was written.
+    pub fn write_session_checkpoint_if_absent(
+        &self,
+        session: &SavedSession,
+    ) -> std::io::Result<bool> {
+        let path = self.validated_checkpoint_path(&session.metadata.id)?;
+        if path.exists() {
+            return Ok(false);
+        }
+        self.save_checkpoint(session)?;
+        Ok(true)
     }
 
     /// Save offline queue state (queued + draft messages).
@@ -411,6 +625,18 @@ impl SessionManager {
         }
 
         session.system_prompt = strip_legacy_truncation_note(session.system_prompt);
+
+        let repair = crate::tool_history_repair::repair_tool_call_pairs(&mut session.messages);
+        if !repair.is_empty() {
+            session.metadata.message_count = session.messages.len();
+            tracing::warn!(
+                session_id = %session.metadata.id,
+                repaired_call_ids = ?repair.repaired_call_ids,
+                duplicate_result_ids = ?repair.duplicate_result_ids,
+                orphan_result_ids = ?repair.orphan_result_ids,
+                "repaired persisted tool call/result history"
+            );
+        }
 
         Ok(session)
     }
@@ -546,8 +772,9 @@ impl SessionManager {
     /// on boot; today the user-facing entry point is the
     /// `/sessions prune <days>` slash command.
     ///
-    /// Crash-recovery safety: skips the running checkpoint
-    /// (`checkpoints/latest.json`) and any file under `checkpoints/`
+    /// Crash-recovery safety: skips the per-session checkpoint files
+    /// (`checkpoints/<session_id>.json`), the legacy single-slot
+    /// checkpoint (`checkpoints/latest.json`), and any file under `checkpoints/`
     /// — those are owned by the checkpoint subsystem and live with
     /// stricter durability rules. Only top-level `<session_id>.json`
     /// files are candidates.
@@ -858,6 +1085,7 @@ pub fn create_saved_session_with_id_and_mode(
             total_tokens,
             model: model.to_string(),
             model_provider: default_model_provider(),
+            model_provider_id: None,
             workspace: workspace.to_path_buf(),
             mode: mode.map(str::to_string),
             cost: SessionCostSnapshot::default(),
@@ -870,6 +1098,7 @@ pub fn create_saved_session_with_id_and_mode(
         context_references: Vec::new(),
         artifacts: Vec::new(),
         work_state: None,
+        last_auto_route: None,
     }
 }
 
@@ -1174,6 +1403,7 @@ mod tests {
                 total_tokens: 0,
                 model: "deepseek-v4-flash".to_string(),
                 model_provider: "deepseek".to_string(),
+                model_provider_id: None,
                 workspace: workspace.to_path_buf(),
                 mode: None,
                 cost: SessionCostSnapshot::default(),
@@ -1185,6 +1415,7 @@ mod tests {
             context_references: Vec::new(),
             artifacts: Vec::new(),
             work_state: None,
+            last_auto_route: None,
         };
         manager.save_session(&session).expect("save");
     }
@@ -1207,6 +1438,7 @@ mod tests {
                 total_tokens: 0,
                 model: "deepseek-v4-pro".to_string(),
                 model_provider: "deepseek".to_string(),
+                model_provider_id: None,
                 workspace: workspace.to_path_buf(),
                 mode: Some("yolo".to_string()),
                 cost: SessionCostSnapshot::default(),
@@ -1218,6 +1450,7 @@ mod tests {
             context_references: Vec::new(),
             artifacts: Vec::new(),
             work_state: None,
+            last_auto_route: None,
         };
         manager.save_session(&session).expect("save empty");
     }
@@ -1248,6 +1481,51 @@ mod tests {
         let loaded = manager.load_session(&session_id).expect("load");
         assert_eq!(loaded.metadata.id, session_id);
         assert_eq!(loaded.messages.len(), 2);
+    }
+
+    #[test]
+    fn load_session_repairs_dangling_tool_call_with_visible_receipt() {
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("new");
+        let messages = vec![Message {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::ToolUse {
+                id: "call-crashed".to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": "README.md"}),
+                caller: None,
+            }],
+        }];
+        let session = create_saved_session(&messages, "test-model", tmp.path(), 0, None);
+        let session_id = session.metadata.id.clone();
+        manager.save_session(&session).expect("save");
+
+        let loaded = manager.load_session(&session_id).expect("load");
+
+        assert_eq!(loaded.metadata.message_count, loaded.messages.len());
+        assert!(loaded.messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error: Some(true),
+                        ..
+                    } if tool_use_id == "call-crashed" && content.contains("crashed_and_repaired")
+                )
+            })
+        }));
+        assert!(loaded.messages.iter().any(|message| {
+            message.role == "assistant"
+                && message.content.iter().any(|block| {
+                    matches!(
+                        block,
+                        ContentBlock::Text { text, .. }
+                            if text.contains("[tool_history_repair]")
+                    )
+                })
+        }));
     }
 
     #[test]
@@ -1854,21 +2132,215 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let manager = SessionManager::new(tmp.path().join("sessions")).expect("new");
         let messages = vec![make_test_message("user", "checkpoint me")];
-        let session = create_saved_session(&messages, "test-model", tmp.path(), 12, None);
+        let mut session = create_saved_session(&messages, "test-model", tmp.path(), 12, None);
+        session.work_state = Some(SessionWorkState {
+            todos: crate::tools::todo::TodoListSnapshot {
+                items: vec![crate::tools::todo::TodoItem {
+                    id: 1,
+                    content: "verify checkpoint durability".to_string(),
+                    status: crate::tools::todo::TodoStatus::InProgress,
+                }],
+                completion_pct: 0,
+                in_progress_id: Some(1),
+            },
+            ..SessionWorkState::default()
+        });
 
-        manager.save_checkpoint(&session).expect("save checkpoint");
+        let path = manager.save_checkpoint(&session).expect("save checkpoint");
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some(format!("{}.json", session.metadata.id).as_str()),
+            "checkpoint file must be keyed by session id"
+        );
         let loaded = manager
-            .load_checkpoint()
+            .load_session_checkpoint(&session.metadata.id)
             .expect("load checkpoint")
             .expect("checkpoint exists");
         assert_eq!(loaded.metadata.id, session.metadata.id);
+        assert_eq!(loaded.messages, session.messages);
+        assert_eq!(
+            loaded.work_state, session.work_state,
+            "work state must survive the checkpoint round trip"
+        );
 
-        manager.clear_checkpoint().expect("clear checkpoint");
+        manager
+            .clear_session_checkpoint(&session.metadata.id)
+            .expect("clear checkpoint");
         assert!(
             manager
-                .load_checkpoint()
+                .load_session_checkpoint(&session.metadata.id)
                 .expect("load checkpoint")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn graph_backed_work_state_remains_readable_by_legacy_shape() {
+        #[derive(serde::Deserialize)]
+        struct LegacyWorkState {
+            #[serde(default)]
+            todos: crate::tools::todo::TodoListSnapshot,
+            #[serde(default)]
+            plan: crate::tools::plan::PlanSnapshot,
+        }
+
+        let fixture = include_bytes!("../tests/fixtures/work_graph_session_v1_reader.json");
+        let current: SavedSession = serde_json::from_slice(fixture).expect("current reader");
+        let state = current.work_state.expect("fixture Work state");
+        let legacy: LegacyWorkState = serde_json::from_value(
+            serde_json::from_slice::<serde_json::Value>(fixture)
+                .expect("fixture JSON")["work_state"]
+                .clone(),
+        )
+        .expect("v1 reader ignores graph");
+        assert_eq!(legacy.todos, state.todos);
+        assert_eq!(legacy.plan, state.plan);
+        let graph = state.graph.expect("fixture graph");
+        crate::work_graph::validate(&graph).expect("valid fixture graph");
+        assert_eq!(crate::work_graph::project_todos(&graph), state.todos);
+        assert_eq!(crate::work_graph::project_plan(&graph), state.plan);
+    }
+
+    #[test]
+    fn first_graph_write_archives_exact_legacy_session_once() {
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("new");
+        let mut session = create_saved_session(
+            &[make_test_message("user", "archive before import")],
+            "test-model",
+            tmp.path(),
+            0,
+            None,
+        );
+        let plan = crate::tools::plan::PlanSnapshot {
+            items: vec![crate::tools::plan::PlanItemArg {
+                step: "Import".to_string(),
+                status: crate::tools::plan::StepStatus::Pending,
+            }],
+            ..crate::tools::plan::PlanSnapshot::default()
+        };
+        let todos = crate::tools::todo::TodoListSnapshot::default();
+        session.work_state = Some(SessionWorkState {
+            graph: None,
+            todos: todos.clone(),
+            plan: plan.clone(),
+        });
+        let path = manager.save_session(&session).expect("save legacy session");
+        let legacy_bytes = fs::read(&path).expect("read legacy bytes");
+
+        let graph = crate::work_graph::import_legacy(&session.metadata.id, &plan, &todos)
+            .expect("import graph");
+        session.work_state = Some(SessionWorkState {
+            graph: Some(graph),
+            todos,
+            plan,
+        });
+        manager.save_session(&session).expect("first graph write");
+        let archive = manager
+            .sessions_dir
+            .join(WORK_GRAPH_IMPORT_ARCHIVE_DIR)
+            .join(path.file_name().expect("session filename"));
+        assert_eq!(fs::read(&archive).expect("archive exists"), legacy_bytes);
+
+        session.metadata.title = "later graph write".to_string();
+        manager.save_session(&session).expect("second graph write");
+        assert_eq!(
+            fs::read(&archive).expect("archive still exists"),
+            legacy_bytes,
+            "later graph writes must not replace the pre-import receipt"
+        );
+    }
+
+    #[test]
+    fn checkpoints_are_independent_per_session() {
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("new");
+        let first = create_saved_session(
+            &[make_test_message("user", "session one")],
+            "test-model",
+            tmp.path(),
+            0,
+            None,
+        );
+        let second = create_saved_session(
+            &[make_test_message("user", "session two")],
+            "test-model",
+            tmp.path(),
+            0,
+            None,
+        );
+
+        manager.save_checkpoint(&first).expect("save first");
+        manager.save_checkpoint(&second).expect("save second");
+        manager
+            .clear_session_checkpoint(&first.metadata.id)
+            .expect("clear first");
+
+        assert!(
+            manager
+                .load_session_checkpoint(&first.metadata.id)
+                .expect("load first")
+                .is_none(),
+            "clearing one session must remove only that session's file"
+        );
+        let survivor = manager
+            .load_session_checkpoint(&second.metadata.id)
+            .expect("load second")
+            .expect("second checkpoint survives");
+        assert_eq!(survivor.metadata.id, second.metadata.id);
+    }
+
+    #[test]
+    fn list_checkpoints_includes_legacy_slot_and_skips_offline_queue() {
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("new");
+        let session = create_saved_session(
+            &[make_test_message("user", "list me")],
+            "test-model",
+            tmp.path(),
+            0,
+            None,
+        );
+        manager.save_checkpoint(&session).expect("save checkpoint");
+        let checkpoints = tmp.path().join("sessions").join("checkpoints");
+        fs::write(checkpoints.join("latest.json"), "{}").expect("write legacy slot");
+        fs::write(checkpoints.join("offline_queue.json"), "{}").expect("write offline queue");
+
+        let refs = manager.list_checkpoints().expect("list checkpoints");
+        assert_eq!(refs.len(), 2, "offline queue must not be a candidate");
+        assert!(
+            refs.iter()
+                .any(|r| r.source == CheckpointSource::Session(session.metadata.id.clone()))
+        );
+        assert!(refs.iter().any(|r| r.source == CheckpointSource::Legacy));
+    }
+
+    #[test]
+    fn legacy_migration_never_overwrites_existing_per_session_checkpoint() {
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("new");
+        let mut session = create_saved_session(
+            &[make_test_message("user", "original")],
+            "test-model",
+            tmp.path(),
+            0,
+            None,
+        );
+        manager.save_checkpoint(&session).expect("save checkpoint");
+
+        session.messages = vec![make_test_message("user", "stale legacy copy")];
+        let written = manager
+            .write_session_checkpoint_if_absent(&session)
+            .expect("migration attempt");
+        assert!(!written, "migration must not overwrite an existing file");
+        let loaded = manager
+            .load_session_checkpoint(&session.metadata.id)
+            .expect("load")
+            .expect("checkpoint exists");
+        assert_eq!(
+            loaded.messages,
+            vec![make_test_message("user", "original")],
+            "existing per-session checkpoint content must be preserved"
         );
     }
 
@@ -1905,10 +2377,12 @@ mod tests {
             messages: vec![QueuedSessionMessage {
                 display: "queued message".to_string(),
                 skill_instruction: Some("Use skill".to_string()),
+                skill_provenance: None,
             }],
             draft: Some(QueuedSessionMessage {
                 display: "draft message".to_string(),
                 skill_instruction: None,
+                skill_provenance: None,
             }),
             ..OfflineQueueState::default()
         };
@@ -1949,6 +2423,7 @@ mod tests {
             messages: vec![QueuedSessionMessage {
                 display: "first parked".to_string(),
                 skill_instruction: None,
+                skill_provenance: None,
             }],
             ..OfflineQueueState::default()
         };
@@ -2049,7 +2524,16 @@ mod tests {
         )
         .expect("write checkpoint");
 
-        let err = manager.load_checkpoint().expect_err("should reject schema");
+        let err = manager
+            .load_legacy_checkpoint()
+            .expect_err("should reject schema");
+        assert!(err.to_string().contains("newer than supported"));
+
+        // The same guard applies to per-session checkpoint files.
+        fs::rename(&path, checkpoints.join("sid.json")).expect("rename to per-session file");
+        let err = manager
+            .load_session_checkpoint("sid")
+            .expect_err("should reject schema");
         assert!(err.to_string().contains("newer than supported"));
     }
 
@@ -2171,6 +2655,7 @@ mod tests {
 
         let session: SavedSession = serde_json::from_str(json).expect("legacy session loads");
         assert!(session.artifacts.is_empty());
+        assert!(session.last_auto_route.is_none());
         assert!(session.metadata.parent_session_id.is_none());
         assert!(session.metadata.forked_from_message_count.is_none());
     }

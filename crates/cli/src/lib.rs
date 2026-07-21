@@ -17,8 +17,8 @@ use codewhale_app_server::{
     AppServerOptions, run as run_app_server, run_stdio as run_app_server_stdio,
 };
 use codewhale_config::{
-    CliRuntimeOverrides, ConfigStore, ProviderKind, ProviderSource, ResolvedRuntimeOptions,
-    RuntimeApiKeySource,
+    CliRuntimeOverrides, ConfigStore, ConfigToml, ProviderKind, ProviderSource,
+    ResolvedRuntimeOptions, RuntimeApiKeySource, provider_base_url_is_official,
 };
 use codewhale_execpolicy::{AskForApproval, ExecPolicyContext, ExecPolicyEngine};
 use codewhale_mcp::{McpServerDefinition, run_stdio_server};
@@ -61,12 +61,20 @@ enum ProviderArg {
     Zai,
     Stepfun,
     Minimax,
+    #[value(
+        alias = "minimax_anthropic",
+        alias = "mini-max-anthropic",
+        alias = "mini_max_anthropic"
+    )]
+    MinimaxAnthropic,
     #[value(alias = "deep-infra", alias = "deep_infra")]
     Deepinfra,
     #[value(alias = "fugu", alias = "sakana-ai", alias = "sakana_ai")]
     Sakana,
     #[value(alias = "long-cat", alias = "meituan-longcat", alias = "meituan")]
     LongCat,
+    #[value(alias = "opencode_go", alias = "opencodego")]
+    OpencodeGo,
     #[value(
         alias = "meta-ai",
         alias = "meta_ai",
@@ -107,13 +115,34 @@ impl From<ProviderArg> for ProviderKind {
             ProviderArg::Zai => ProviderKind::Zai,
             ProviderArg::Stepfun => ProviderKind::Stepfun,
             ProviderArg::Minimax => ProviderKind::Minimax,
+            ProviderArg::MinimaxAnthropic => ProviderKind::MinimaxAnthropic,
             ProviderArg::Deepinfra => ProviderKind::Deepinfra,
             ProviderArg::Sakana => ProviderKind::Sakana,
             ProviderArg::LongCat => ProviderKind::LongCat,
+            ProviderArg::OpencodeGo => ProviderKind::OpencodeGo,
             ProviderArg::Meta => ProviderKind::Meta,
             ProviderArg::Xai => ProviderKind::Xai,
         }
     }
+}
+
+fn builtin_provider_arg(value: &str) -> Option<ProviderArg> {
+    ProviderArg::from_str(value, false).ok()
+}
+
+fn parse_provider_identifier(value: &str) -> std::result::Result<String, String> {
+    if value.is_empty()
+        || value == "__custom__"
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return Err(
+            "provider must be a simple identifier using letters, numbers, '-', '_', or '.'"
+                .to_string(),
+        );
+    }
+    Ok(value.to_string())
 }
 
 #[derive(Debug, Parser)]
@@ -130,10 +159,11 @@ struct Cli {
     profile: Option<String>,
     #[arg(
         long,
-        value_enum,
-        help = "Advanced provider selector for non-TUI registry/config commands"
+        value_name = "PROVIDER",
+        value_parser = parse_provider_identifier,
+        help = "Provider selector; exec/fleet also accept configured custom provider identifiers"
     )]
-    provider: Option<ProviderArg>,
+    provider: Option<String>,
     #[arg(long)]
     model: Option<String>,
     #[arg(long = "output-mode")]
@@ -167,8 +197,8 @@ struct Cli {
     no_mouse_capture: bool,
     #[arg(long = "skip-onboarding")]
     skip_onboarding: bool,
-    /// YOLO mode: auto-approve all tools
-    #[arg(long)]
+    /// Legacy compatibility alias for Act + Full Access.
+    #[arg(long, hide = true)]
     yolo: bool,
     /// Continue the most recent interactive session for this workspace.
     #[arg(short = 'c', long = "continue")]
@@ -189,7 +219,7 @@ struct Cli {
 enum Commands {
     /// Run interactive/non-interactive flows via the TUI binary.
     Run(RunArgs),
-    /// Run CodeWhale diagnostics.
+    /// Run Codewhale diagnostics.
     Doctor(TuiPassthroughArgs),
     /// List live provider API models via the TUI binary.
     Models(TuiPassthroughArgs),
@@ -206,7 +236,7 @@ enum Commands {
     Init(TuiPassthroughArgs),
     /// Bootstrap MCP config and/or skills directories.
     Setup(TuiPassthroughArgs),
-    /// Generate a remote CodeWhale agent deploy bundle (cloud + chat bridge).
+    /// Generate a remote Codewhale agent deploy bundle (cloud + chat bridge).
     RemoteSetup(RemoteSetupArgs),
     /// Run a non-interactive prompt through the TUI runtime.
     #[command(after_help = "\
@@ -239,8 +269,8 @@ path used by stream-json wrappers.
     /// Run checked-in Workflows through a Lane Runtime backend.
     #[command(after_help = "\
 Examples:
-  codewhale workflow run stopship --issue 4090 --fleet v0868-stopship --runtime tmux
-  codewhale workflow run stopship --fleet v0868-stopship --runtime inline --verify
+  codewhale workflow run stopship --fleet stopship --runtime tmux --goal verify-release-candidate
+  codewhale workflow run stopship --fleet stopship --runtime inline --verify
 
 `workflow run` validates the checked-in Workflow source and named Fleet roster,
 creates a Lane record, then dispatches the Workflow tool directly through the
@@ -255,13 +285,13 @@ Examples:
   codewhale lane attach <lane-id>
   codewhale lane logs <lane-id>
   codewhale lane stop <lane-id>
-  codewhale lane start --workflow stopship --fleet v0868-stopship --runtime tmux --issue 4090 -- echo hello
+  codewhale lane start --workflow stopship --fleet stopship --runtime tmux --goal verify-release-candidate -- echo hello
 
 Lane records persist under $CODEWHALE_HOME/lanes/. tmux durability belongs to
 Runtime, not Fleet.
 ")]
     Lane(LaneArgs),
-    /// Run a CodeWhale-powered code review over a git diff.
+    /// Run a Codewhale-powered code review over a git diff.
     Review(TuiPassthroughArgs),
     /// Apply a patch file or stdin to the working tree.
     Apply(TuiPassthroughArgs),
@@ -277,6 +307,7 @@ Forwarded serve options:
       --mcp                 Start MCP server over stdio
       --http                Start runtime HTTP/SSE API server
       --mobile              Start runtime HTTP/SSE API server with the mobile control page
+      --web                 Start the embedded loopback-only browser client
       --qr                  Show a QR code for the mobile URL (requires --mobile)
       --acp                 Start ACP server over stdio for editor clients
       --host <HOST>         Bind host (default 127.0.0.1; --mobile defaults to 0.0.0.0)
@@ -290,6 +321,11 @@ Forwarded serve options:
 aliases for `codewhale app-server --http` and `codewhale app-server --mobile`.
 New integrations should prefer `codewhale app-server`.")]
     Serve(TuiPassthroughArgs),
+    /// Open the first-class local browser client over the canonical Runtime API.
+    #[command(
+        after_help = "The browser receives a one-time loopback bootstrap capability, never the Runtime token.\nThe capability is exchanged for a bounded, process-local HttpOnly, SameSite=Strict web session and then invalidated."
+    )]
+    Web(WebArgs),
     /// Generate shell completions for the TUI binary.
     Completions(TuiPassthroughArgs),
     /// Configure provider credentials.
@@ -357,6 +393,63 @@ The command prints the completion script to stdout; redirect it to a path your s
     Update(UpdateArgs),
 }
 
+fn command_accepts_raw_provider(command: Option<&Commands>) -> bool {
+    matches!(command, Some(Commands::Exec(_) | Commands::Fleet(_)))
+}
+
+fn top_level_provider_override(
+    provider: Option<&str>,
+    command: Option<&Commands>,
+) -> Result<Option<ProviderKind>> {
+    let Some(provider) = provider else {
+        return Ok(None);
+    };
+    if let Some(provider) = builtin_provider_arg(provider) {
+        return Ok(Some(provider.into()));
+    }
+    if command_accepts_raw_provider(command) {
+        return Ok(None);
+    }
+
+    let expected = ProviderArg::value_variants()
+        .iter()
+        .filter_map(ValueEnum::to_possible_value)
+        .map(|value| value.get_name().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!(
+        "invalid value '{provider}' for '--provider <PROVIDER>': expected one of {expected}; configured custom providers are accepted only by exec and fleet"
+    )
+}
+
+fn prepare_raw_provider_tui_dispatch(
+    cli: &Cli,
+    command: Option<&Commands>,
+    runtime_overrides: &CliRuntimeOverrides,
+) -> Result<Option<(ResolvedRuntimeOptions, Vec<String>)>> {
+    let Some(provider) = cli.provider.as_deref() else {
+        return Ok(None);
+    };
+    if builtin_provider_arg(provider).is_some() || !command_accepts_raw_provider(command) {
+        return Ok(None);
+    }
+
+    let passthrough = match command {
+        Some(Commands::Exec(args)) => {
+            reject_exec_global_flags(&args.args)?;
+            tui_args("exec", args.clone())
+        }
+        Some(Commands::Fleet(args)) => tui_args("fleet", args.clone()),
+        _ => unreachable!("raw provider validation only permits Exec and Fleet"),
+    };
+
+    // Dynamic provider config belongs to the TUI schema. Do not parse it
+    // through the dispatcher's enum-backed ConfigStore or recover credentials
+    // for an unrelated fallback provider before the TUI sees the raw id.
+    let resolved_runtime = ConfigToml::default().resolve_runtime_options(runtime_overrides);
+    Ok(Some((resolved_runtime, passthrough)))
+}
+
 #[derive(Debug, Args)]
 struct UpdateArgs {
     /// Update to the latest beta release instead of the latest stable release.
@@ -393,6 +486,13 @@ struct TuiPassthroughArgs {
 }
 
 #[derive(Debug, Args)]
+struct WebArgs {
+    /// Loopback port for the local Runtime API and embedded client.
+    #[arg(long, default_value_t = 7878)]
+    port: u16,
+}
+
+#[derive(Debug, Args)]
 struct LaneLogProxyArgs {
     #[arg(long, value_name = "PATH")]
     log_path: PathBuf,
@@ -416,6 +516,10 @@ struct LaneArgs {
 }
 
 #[derive(Debug, Subcommand)]
+// Clap constructs this command enum once at process startup. Keeping the
+// fields inline makes the generated CLI shape explicit; boxing them only to
+// reduce this transient value would add indirection without runtime benefit.
+#[allow(clippy::large_enum_variant)]
 enum LaneCommand {
     /// List known lanes (newest first).
     List {
@@ -454,7 +558,7 @@ enum LaneCommand {
         /// Workflow name (e.g. `stopship`).
         #[arg(long)]
         workflow: Option<String>,
-        /// Fleet roster name (e.g. `v0868-stopship`).
+        /// Fleet roster name (e.g. `stopship`).
         #[arg(long)]
         fleet: Option<String>,
         /// Issue id binding.
@@ -495,9 +599,9 @@ struct WorkflowArgs {
 enum WorkflowCommand {
     /// Run a checked-in Workflow through a Runtime-backed Lane.
     Run {
-        /// Workflow name or path. `stopship` maps to workflows/v0868_stopship_lane.workflow.js.
+        /// Workflow name or path. `stopship` maps to workflows/stopship.workflow.js.
         workflow: String,
-        /// Named Fleet roster (e.g. v0868-stopship). Required for role-resolved Workflow runs.
+        /// Named Fleet roster (e.g. stopship). Required for role-resolved Workflow runs.
         #[arg(long)]
         fleet: String,
         /// Issue id binding recorded on the Lane and passed into workflow args.
@@ -865,7 +969,7 @@ fn run_workflow_command(
             let roots = named_fleet_search_roots(&workspace);
             let named_fleet = codewhale_workflow::load_named_fleet(&fleet, &roots)
                 .with_context(|| format!("load fleet `{fleet}` from {}", display_roots(&roots)))?;
-            if workflow == "stopship" || fleet == "v0868-stopship" {
+            if workflow == "stopship" || fleet == "stopship" || fleet == "v0868-stopship" {
                 named_fleet
                     .validate_stopship_roles()
                     .with_context(|| format!("validate stopship roles in fleet `{fleet}`"))?;
@@ -969,8 +1073,6 @@ fn workflow_source_candidates(
     for rel in [
         format!("workflows/{raw}.workflow.js"),
         format!("workflows/{normalized}.workflow.js"),
-        format!("workflows/v0868_{normalized}_lane.workflow.js"),
-        format!("workflows/v0868_{normalized}.workflow.js"),
     ] {
         let path = workspace.join(rel);
         if !candidates.iter().any(|existing| existing == &path) {
@@ -1236,7 +1338,30 @@ enum AuthCommand {
     /// Sign in to xAI/Grok with an SSH-friendly device code.
     #[command(name = "xai-device")]
     XaiDevice,
-    /// Show current provider and credential source state.
+    /// Explicitly allow read-only access to one credential file owned by
+    /// another CLI. Managed mutation is currently unsupported and fails closed.
+    #[command(name = "external-consent")]
+    ExternalConsent {
+        #[arg(long, value_enum)]
+        provider: ProviderArg,
+        #[arg(long, value_enum)]
+        mode: ExternalCredentialModeArg,
+        /// Exact credential file path. Defaults to the selected CLI's resolved
+        /// path without probing whether the file exists.
+        #[arg(long, value_name = "PATH")]
+        path: Option<PathBuf>,
+        /// Confirm the disclosed exact read-only grant without an interactive
+        /// prompt. Required when stdin is not a terminal.
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+    },
+    /// Revoke access to another CLI's credential file for one provider.
+    #[command(name = "external-revoke")]
+    ExternalRevoke {
+        #[arg(long, value_enum)]
+        provider: ProviderArg,
+    },
+    /// Show current provider and runtime-effective credential route state.
     /// Without `--provider`, shows all known providers.
     /// With `--provider`, shows detailed status for that provider.
     Status {
@@ -1257,8 +1382,8 @@ enum AuthCommand {
         #[arg(long = "api-key-stdin", default_value_t = false)]
         api_key_stdin: bool,
     },
-    /// Report whether a provider has a key configured. Never prints
-    /// the value; just `set` / `not set` plus the source layer.
+    /// Report the effective credential route for a provider. Never prints a
+    /// credential; reports the source layer or structural OAuth/repair state.
     Get {
         #[arg(long, value_enum)]
         provider: ProviderArg,
@@ -1268,8 +1393,8 @@ enum AuthCommand {
         #[arg(long, value_enum)]
         provider: ProviderArg,
     },
-    /// List all known providers with their auth state, without
-    /// revealing keys.
+    /// List all known providers with their runtime-effective auth state,
+    /// without revealing credentials.
     List,
     /// Advanced: migrate config-file keys into a platform credential store.
     #[command(hide = true)]
@@ -1278,6 +1403,12 @@ enum AuthCommand {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ExternalCredentialModeArg {
+    ReadOnly,
+    Managed,
 }
 
 #[derive(Debug, Args)]
@@ -1477,9 +1608,10 @@ fn run() -> Result<()> {
         return run_lane_log_proxy_command(args);
     }
 
-    let mut store = ConfigStore::load(cli.config.clone())?;
+    let runtime_provider = top_level_provider_override(cli.provider.as_deref(), command.as_ref())?;
+    let uses_raw_tui_provider = cli.provider.is_some() && runtime_provider.is_none();
     let runtime_overrides = CliRuntimeOverrides {
-        provider: cli.provider.map(Into::into),
+        provider: runtime_provider,
         model: cli.model.clone(),
         api_key: cli.api_key.clone(),
         base_url: cli.base_url.clone(),
@@ -1492,13 +1624,22 @@ fn run() -> Result<()> {
         yolo: Some(cli.yolo),
         verbosity: cli.verbosity.clone(),
     };
+    if uses_raw_tui_provider
+        && let Some((resolved_runtime, passthrough)) =
+            prepare_raw_provider_tui_dispatch(&cli, command.as_ref(), &runtime_overrides)?
+    {
+        return delegate_to_tui(&cli, &resolved_runtime, passthrough);
+    }
+
+    let mut store = ConfigStore::load(cli.config.clone())?;
     match command {
         Some(Commands::Run(args)) => {
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
             delegate_to_tui(&cli, &resolved_runtime, args.args)
         }
         Some(Commands::Doctor(args)) => {
-            let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
+            let resolved_runtime =
+                resolve_runtime_for_diagnostic_dispatch(&store, &runtime_overrides);
             delegate_to_tui(&cli, &resolved_runtime, tui_args("doctor", args))
         }
         Some(Commands::Models(args)) => {
@@ -1526,7 +1667,11 @@ fn run() -> Result<()> {
             delegate_to_tui(&cli, &resolved_runtime, tui_args("init", args))
         }
         Some(Commands::Setup(args)) => {
-            let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
+            let resolved_runtime = if setup_is_status_report(&args) {
+                resolve_runtime_for_diagnostic_dispatch(&store, &runtime_overrides)
+            } else {
+                resolve_runtime_for_dispatch(&mut store, &runtime_overrides)
+            };
             delegate_to_tui(&cli, &resolved_runtime, tui_args("setup", args))
         }
         Some(Commands::RemoteSetup(args)) => {
@@ -1579,6 +1724,10 @@ fn run() -> Result<()> {
             // delegated child so it is torn down with the dispatcher (#3259).
             delegate_server_to_tui(&cli, &resolved_runtime, tui_args("serve", args))
         }
+        Some(Commands::Web(args)) => {
+            let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
+            delegate_server_to_tui(&cli, &resolved_runtime, web_serve_passthrough(&args))
+        }
         Some(Commands::Completions(args)) => {
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
             delegate_to_tui(&cli, &resolved_runtime, tui_args("completions", args))
@@ -1594,7 +1743,7 @@ fn run() -> Result<()> {
                     vec!["auth".to_string(), "xai-device".to_string()],
                 )
             }
-            command => run_auth_command(&mut store, command),
+            command => run_auth_command_with_runtime(&mut store, command, &runtime_overrides),
         },
         Some(Commands::McpServer) => run_mcp_server_command(&mut store),
         Some(Commands::Config(args)) => run_config_command(&mut store, args.command),
@@ -1678,38 +1827,28 @@ fn resolve_runtime_for_dispatch(
     resolve_runtime_for_dispatch_with_secrets(store, runtime_overrides, &runtime_secrets)
 }
 
+/// Resolve enough routing state to delegate a static diagnostic without
+/// reading or migrating the durable secret store.
+///
+/// The TUI's doctor/setup-status path performs its own read-only source check,
+/// so this dispatcher must not recover and export a credential merely to start
+/// that report. Regular runtime and authentication commands keep using
+/// [`resolve_runtime_for_dispatch`].
+fn resolve_runtime_for_diagnostic_dispatch(
+    store: &ConfigStore,
+    runtime_overrides: &CliRuntimeOverrides,
+) -> ResolvedRuntimeOptions {
+    store.config.resolve_runtime_options(runtime_overrides)
+}
+
 fn resolve_runtime_for_dispatch_with_secrets(
     store: &mut ConfigStore,
     runtime_overrides: &CliRuntimeOverrides,
     secrets: &Secrets,
 ) -> ResolvedRuntimeOptions {
-    let mut resolved = store
+    store
         .config
-        .resolve_runtime_options_with_secrets(runtime_overrides, secrets);
-
-    if resolved.api_key_source == Some(RuntimeApiKeySource::Keyring)
-        && !provider_config_set(store, resolved.provider)
-        && let Some(api_key) = resolved.api_key.clone()
-    {
-        write_provider_api_key_to_config(store, resolved.provider, &api_key);
-        match store.save() {
-            Ok(()) => {
-                eprintln!(
-                    "info: recovered API key from secret store and saved it to {}",
-                    store.path().display()
-                );
-                resolved.api_key_source = Some(RuntimeApiKeySource::ConfigFile);
-            }
-            Err(err) => {
-                eprintln!(
-                    "warning: recovered API key from secret store but failed to save {}: {err}",
-                    store.path().display()
-                );
-            }
-        }
-    }
-
-    resolved
+        .resolve_runtime_options_with_secrets(runtime_overrides, secrets)
 }
 
 fn tui_args(command: &str, args: TuiPassthroughArgs) -> Vec<String> {
@@ -1717,6 +1856,10 @@ fn tui_args(command: &str, args: TuiPassthroughArgs) -> Vec<String> {
     forwarded.push(command.to_string());
     forwarded.extend(args.args);
     forwarded
+}
+
+fn setup_is_status_report(args: &TuiPassthroughArgs) -> bool {
+    args.args.iter().any(|arg| arg == "--status")
 }
 
 fn reject_exec_global_flags(args: &[String]) -> Result<()> {
@@ -1753,13 +1896,11 @@ fn run_login_command_with_secrets(
         Some(v) => v,
         None => read_api_key_from_stdin()?,
     };
-    write_provider_api_key_to_config(store, provider, &api_key);
-    let keyring_saved = write_provider_api_key_to_keyring(secrets, provider, &api_key);
-    store.save()?;
-    let destination = if keyring_saved {
-        format!("{} and {}", store.path().display(), secrets.backend_name())
+    let secret_store_saved = persist_provider_api_key(store, secrets, provider, &api_key)?;
+    let destination = if secret_store_saved {
+        secrets.backend_name().to_string()
     } else {
-        store.path().display().to_string()
+        codewhale_config::quote_os_path(store.path())
     };
     if provider == ProviderKind::Deepseek {
         println!("logged in using API key mode (deepseek); saved key to {destination}");
@@ -1777,14 +1918,35 @@ fn run_logout_command(store: &mut ConfigStore) -> Result<()> {
 }
 
 fn run_logout_command_with_secrets(store: &mut ConfigStore, secrets: &Secrets) -> Result<()> {
+    codewhale_config::with_xai_oauth_revocation_transaction(|| {
+        run_logout_command_with_secrets_unlocked(store, secrets)
+    })
+}
+
+fn run_logout_command_with_secrets_unlocked(
+    store: &mut ConfigStore,
+    secrets: &Secrets,
+) -> Result<()> {
+    let original_config = store.config.clone();
     let active_provider = store.config.provider;
     store.config.api_key = None;
     for provider in ProviderKind::ALL {
         clear_provider_api_key_from_config(store, provider);
+        store
+            .config
+            .providers
+            .for_provider_mut(provider)
+            .external_credentials = None;
+    }
+    let xai = store.config.providers.for_provider_mut(ProviderKind::Xai);
+    xai.oauth_credential_generation = None;
+    xai.auth_mode = None;
+    store.config.auth_mode = None;
+    if let Err(error) = store.save() {
+        store.config = original_config;
+        return Err(error);
     }
     clear_provider_api_key_from_keyring(secrets, active_provider);
-    store.config.auth_mode = None;
-    store.save()?;
     println!("logged out");
     Ok(())
 }
@@ -1810,22 +1972,135 @@ fn write_provider_api_key_to_config(
     provider: ProviderKind,
     api_key: &str,
 ) {
-    store.config.auth_mode = Some("api_key".to_string());
+    prepare_provider_api_key_metadata(store, provider);
     store.config.providers.for_provider_mut(provider).api_key = Some(api_key.to_string());
     if provider == ProviderKind::Deepseek {
         store.config.api_key = Some(api_key.to_string());
-        if store.config.default_text_model.is_none() {
-            store.config.default_text_model = Some(
-                store
-                    .config
-                    .providers
-                    .deepseek
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| "deepseek-v4-pro".to_string()),
-            );
-        }
     }
+}
+
+fn prepare_provider_api_key_metadata(store: &mut ConfigStore, provider: ProviderKind) {
+    store.config.auth_mode = Some("api_key".to_string());
+    let provider_config = store.config.providers.for_provider_mut(provider);
+    provider_config.auth_mode = Some("api_key".to_string());
+    provider_config.external_credentials = None;
+    if provider == ProviderKind::Xai {
+        provider_config.oauth_credential_generation = None;
+    }
+    if provider == ProviderKind::Deepseek && store.config.default_text_model.is_none() {
+        store.config.default_text_model = Some(
+            store
+                .config
+                .providers
+                .deepseek
+                .model
+                .clone()
+                .unwrap_or_else(|| "deepseek-v4-pro".to_string()),
+        );
+    }
+}
+
+/// Persist a provider credential to the durable secret store first. A
+/// plaintext config slot is used only when that write fails.
+fn persist_provider_api_key(
+    store: &mut ConfigStore,
+    secrets: &Secrets,
+    provider: ProviderKind,
+    api_key: &str,
+) -> Result<bool> {
+    if provider == ProviderKind::Xai {
+        return codewhale_config::with_xai_oauth_revocation_transaction(|| {
+            persist_provider_api_key_unlocked(store, secrets, provider, api_key)
+        });
+    }
+    persist_provider_api_key_unlocked(store, secrets, provider, api_key)
+}
+
+fn persist_provider_api_key_unlocked(
+    store: &mut ConfigStore,
+    secrets: &Secrets,
+    provider: ProviderKind,
+    api_key: &str,
+) -> Result<bool> {
+    let original_config = store.config.clone();
+    prepare_provider_api_key_metadata(store, provider);
+    let slot = provider_slot(provider);
+    // A readable prior value is required before a secret-store write so a
+    // later config failure can restore the exact prior state. If the backend
+    // cannot provide that snapshot, use the owner-only config fallback.
+    let prior_secret = secrets.get(slot);
+    let secret_store_saved = match prior_secret.as_ref().map_err(|error| error.to_string()) {
+        Ok(_) => match secrets.set(slot, api_key) {
+            Ok(()) => {
+                clear_provider_api_key_from_config(store, provider);
+                true
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: secret-store write failed for {}; using owner-only config fallback: {err}",
+                    provider_slot(provider)
+                );
+                write_provider_api_key_to_config(store, provider, api_key);
+                false
+            }
+        },
+        Err(error) => {
+            eprintln!(
+                "warning: secret-store snapshot failed for {slot}; using owner-only config fallback: {error}"
+            );
+            write_provider_api_key_to_config(store, provider, api_key);
+            false
+        }
+    };
+    if let Err(error) = store.save() {
+        store.config = original_config;
+        if secret_store_saved {
+            let current = secrets
+                .get(slot)
+                .map_err(|rollback| anyhow::anyhow!(
+                    "{error}; additionally could not verify secret-store rollback for {slot}: {rollback}"
+                ))?;
+            if current.as_deref() == Some(api_key) {
+                match prior_secret.expect("snapshot succeeded before secret write") {
+                    Some(previous) => secrets.set(slot, &previous),
+                    None => secrets.delete(slot),
+                }
+                .map_err(|rollback| anyhow::anyhow!(
+                    "{error}; additionally failed to restore prior secret-store state for {slot}: {rollback}"
+                ))?;
+            }
+        }
+        return Err(error);
+    }
+    codewhale_config::scrub_plaintext_api_keys_from_config_backup(store.path())?;
+    Ok(secret_store_saved)
+}
+
+fn clear_auth_provider(
+    store: &mut ConfigStore,
+    secrets: &Secrets,
+    provider: ProviderKind,
+) -> Result<()> {
+    let slot = provider_slot(provider);
+    let original_config = store.config.clone();
+    clear_provider_api_key_from_config(store, provider);
+    if provider == ProviderKind::Xai {
+        let xai = store.config.providers.for_provider_mut(provider);
+        xai.oauth_credential_generation = None;
+        xai.auth_mode = None;
+        xai.external_credentials = None;
+    }
+    if let Err(error) = store.save() {
+        store.config = original_config;
+        return Err(error);
+    }
+    clear_provider_api_key_from_keyring(secrets, provider);
+    if provider == ProviderKind::Xai {
+        println!("cleared xAI credentials from config, secret store, and owned OAuth storage");
+    } else {
+        println!("cleared API key for {slot} from config and secret store");
+    }
+    Ok(())
 }
 
 fn clear_provider_api_key_from_config(store: &mut ConfigStore, provider: ProviderKind) {
@@ -1856,7 +2131,7 @@ fn openai_codex_auth_file_path() -> PathBuf {
     if let Ok(path) = std::env::var("OPENAI_CODEX_AUTH_FILE") {
         let path = PathBuf::from(path);
         if !path.as_os_str().is_empty() {
-            return path;
+            return codewhale_config::resolve_external_credential_path(&path).unwrap_or(path);
         }
     }
 
@@ -1867,11 +2142,57 @@ fn openai_codex_auth_file_path() -> PathBuf {
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join(".codex")
         });
-    codex_home.join("auth.json")
+    let path = codex_home.join("auth.json");
+    codewhale_config::resolve_external_credential_path(&path).unwrap_or(path)
 }
 
-fn provider_oauth_file_path(provider: ProviderKind) -> Option<PathBuf> {
-    (provider == ProviderKind::OpenaiCodex).then(openai_codex_auth_file_path)
+fn grok_auth_file_path() -> PathBuf {
+    for key in ["GROK_AUTH_PATH", "XAI_AUTH_PATH"] {
+        if let Ok(path) = std::env::var(key) {
+            let path = PathBuf::from(path.trim());
+            if !path.as_os_str().is_empty() {
+                return codewhale_config::resolve_external_credential_path(&path).unwrap_or(path);
+            }
+        }
+    }
+    if let Ok(home) = std::env::var("GROK_HOME") {
+        let home = PathBuf::from(home.trim());
+        if !home.as_os_str().is_empty() {
+            let path = home.join("auth.json");
+            return codewhale_config::resolve_external_credential_path(&path).unwrap_or(path);
+        }
+    }
+    let path = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".grok")
+        .join("auth.json");
+    codewhale_config::resolve_external_credential_path(&path).unwrap_or(path)
+}
+
+fn external_credential_target(
+    provider: ProviderKind,
+    path_override: Option<PathBuf>,
+) -> Result<(codewhale_config::ExternalCredentialSource, PathBuf)> {
+    let (source, default_path) = match provider {
+        ProviderKind::OpenaiCodex => (
+            codewhale_config::ExternalCredentialSource::CodexCli,
+            openai_codex_auth_file_path(),
+        ),
+        ProviderKind::Xai => (
+            codewhale_config::ExternalCredentialSource::GrokCli,
+            grok_auth_file_path(),
+        ),
+        ProviderKind::Moonshot => bail!(
+            "Kimi is API-key-only in Codewhale. Create a key at https://platform.kimi.ai/console/api-keys; Kimi CLI OAuth import is unsupported."
+        ),
+        _ => bail!(
+            "{} has no supported external CLI credential source",
+            provider.as_str()
+        ),
+    };
+    let path =
+        codewhale_config::resolve_external_credential_path(path_override.unwrap_or(default_path))?;
+    Ok((source, path))
 }
 
 fn provider_config_api_key(store: &ConfigStore, provider: ProviderKind) -> Option<&str> {
@@ -1903,19 +2224,463 @@ fn provider_keyring_set(secrets: &Secrets, provider: ProviderKind) -> bool {
     provider_keyring_api_key(secrets, provider).is_some()
 }
 
-fn write_provider_api_key_to_keyring(
-    secrets: &Secrets,
-    provider: ProviderKind,
-    api_key: &str,
-) -> bool {
-    secrets.set(provider_slot(provider), api_key).is_ok()
-}
-
 fn clear_provider_api_key_from_keyring(secrets: &Secrets, provider: ProviderKind) {
     let _ = secrets.delete(provider_slot(provider));
 }
 
+fn external_consent(
+    store: &ConfigStore,
+    provider: ProviderKind,
+) -> Option<&codewhale_config::ExternalCredentialConsentToml> {
+    store
+        .config
+        .providers
+        .for_provider(provider)
+        .external_credentials
+        .as_ref()
+}
+
+fn external_read_consent(
+    store: &ConfigStore,
+    provider: ProviderKind,
+) -> Option<&codewhale_config::ExternalCredentialConsentToml> {
+    let (source, expected_path) = external_credential_target(provider, None).ok()?;
+    external_consent(store, provider)
+        .filter(|consent| consent.read_grant(provider, source, &expected_path).is_ok())
+}
+
+fn external_oauth_selected(store: &ConfigStore, provider: ProviderKind) -> bool {
+    if external_read_consent(store, provider).is_none() {
+        return false;
+    }
+    if provider == ProviderKind::OpenaiCodex {
+        return true;
+    }
+    provider == ProviderKind::Xai
+        && xai_oauth_mode_selected(store.config.providers.xai.auth_mode.as_deref())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XaiOAuthGenerationPointer {
+    Absent,
+    Valid,
+    Invalid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XaiAuthDiagnosticRoute {
+    /// Normal API-key diagnostics apply. This includes custom endpoints, where
+    /// xAI OAuth is intentionally inactive.
+    ApiKey,
+    /// A syntactically valid Codewhale-owned generation pointer selects the
+    /// owned OAuth route. Diagnostics deliberately do not inspect the file.
+    OwnedOAuth,
+    /// A configured but unsafe/malformed generation pointer blocks external
+    /// Grok CLI access. The runtime can still fall back to API-key sources.
+    NeedsRepair,
+    /// With no configured generation, an exact read-only Grok CLI consent can
+    /// be selected structurally. The external file is never probed here.
+    ExternalConsent,
+}
+
+#[derive(Debug, Clone)]
+struct XaiAuthDiagnostics {
+    base_url: String,
+    official_endpoint: bool,
+    auth_mode: Option<String>,
+    oauth_selected: bool,
+    generation: XaiOAuthGenerationPointer,
+    route: XaiAuthDiagnosticRoute,
+}
+
+impl XaiAuthDiagnostics {
+    /// API-key routes are reported from the same endpoint-bound resolver that
+    /// dispatch uses. Owned OAuth and consent-only routes remain structural so
+    /// diagnostics cannot turn into a credential-store probe.
+    fn evaluates_runtime_api_key(&self) -> bool {
+        matches!(
+            self.route,
+            XaiAuthDiagnosticRoute::ApiKey | XaiAuthDiagnosticRoute::NeedsRepair
+        )
+    }
+
+    fn is_custom_endpoint(&self) -> bool {
+        !self.official_endpoint
+    }
+}
+
+/// Source and redacted tail from the shared runtime resolver. Keeping only a
+/// redacted tail prevents the presentation layer from accidentally retaining a
+/// plaintext credential after it has derived the effective route.
+#[derive(Debug, Clone, Default)]
+struct XaiRuntimeApiKey {
+    source: Option<RuntimeApiKeySource>,
+    last4: Option<String>,
+}
+
+impl XaiRuntimeApiKey {
+    fn source_name(&self) -> Option<&'static str> {
+        match self.source {
+            Some(RuntimeApiKeySource::Cli) => Some("cli"),
+            Some(RuntimeApiKeySource::ConfigFile) => Some("config"),
+            Some(RuntimeApiKeySource::Keyring) => Some("secret store"),
+            Some(RuntimeApiKeySource::Env) => Some("env"),
+            None => None,
+        }
+    }
+
+    fn source_with_last4(&self) -> Option<String> {
+        self.source_name()
+            .map(|source| match self.last4.as_deref() {
+                Some(last4) => format!("{source} (last4: {last4})"),
+                None => source.to_string(),
+            })
+    }
+
+    fn uses(&self, source: RuntimeApiKeySource) -> bool {
+        self.source == Some(source)
+    }
+}
+
+fn runtime_overrides_for_provider(
+    runtime_overrides: &CliRuntimeOverrides,
+    provider: ProviderKind,
+) -> CliRuntimeOverrides {
+    let mut overrides = runtime_overrides.clone();
+    overrides.provider = Some(provider);
+    overrides
+}
+
+fn xai_oauth_mode_selected(auth_mode: Option<&str>) -> bool {
+    auth_mode.is_some_and(|mode| {
+        matches!(
+            mode.trim()
+                .to_ascii_lowercase()
+                .replace(['-', ' '], "_")
+                .as_str(),
+            "oauth"
+                | "xai_oauth"
+                | "xai"
+                | "grok"
+                | "grok_oauth"
+                | "grok_cli"
+                | "device"
+                | "device_code"
+                | "device_auth"
+        )
+    })
+}
+
+fn xai_oauth_generation_pointer(store: &ConfigStore) -> XaiOAuthGenerationPointer {
+    match store
+        .config
+        .providers
+        .xai
+        .oauth_credential_generation
+        .as_deref()
+    {
+        None => XaiOAuthGenerationPointer::Absent,
+        Some(generation) if codewhale_config::is_valid_xai_oauth_generation(generation) => {
+            XaiOAuthGenerationPointer::Valid
+        }
+        Some(_) => XaiOAuthGenerationPointer::Invalid,
+    }
+}
+
+/// Resolve the same xAI route facts the runtime uses, without asking the
+/// durable credential store for a secret. `ConfigToml::resolve_runtime_options`
+/// deliberately uses an in-memory store, so this is safe for diagnostic output
+/// that must remain structural/non-probing.
+fn xai_auth_diagnostics(
+    store: &ConfigStore,
+    runtime_overrides: &CliRuntimeOverrides,
+) -> XaiAuthDiagnostics {
+    // We only need the effective endpoint here. Suppressing API-key
+    // resolution keeps valid-owned and consent-only diagnostics structural:
+    // they must not read ambient credential state merely to describe a route.
+    let mut route_overrides = runtime_overrides_for_provider(runtime_overrides, ProviderKind::Xai);
+    route_overrides.api_key = None;
+    route_overrides.auth_mode = Some("none".to_string());
+    let resolved = store.config.resolve_runtime_options(&route_overrides);
+    let official_endpoint =
+        provider_base_url_is_official(ProviderKind::Xai, resolved.base_url.as_str());
+    // The TUI activates xAI OAuth only from `[providers.xai] auth_mode`; a
+    // root-level auth mode may influence generic API-key policy but must never
+    // turn an inert xAI generation pointer into an OAuth route.
+    let auth_mode = store.config.providers.xai.auth_mode.clone();
+    let generation = xai_oauth_generation_pointer(store);
+    let oauth_selected = xai_oauth_mode_selected(auth_mode.as_deref());
+    let route = if !official_endpoint || !oauth_selected {
+        XaiAuthDiagnosticRoute::ApiKey
+    } else {
+        match generation {
+            XaiOAuthGenerationPointer::Valid => XaiAuthDiagnosticRoute::OwnedOAuth,
+            XaiOAuthGenerationPointer::Invalid => XaiAuthDiagnosticRoute::NeedsRepair,
+            XaiOAuthGenerationPointer::Absent
+                if external_read_consent(store, ProviderKind::Xai).is_some() =>
+            {
+                XaiAuthDiagnosticRoute::ExternalConsent
+            }
+            XaiOAuthGenerationPointer::Absent => XaiAuthDiagnosticRoute::ApiKey,
+        }
+    };
+
+    XaiAuthDiagnostics {
+        base_url: resolved.base_url,
+        official_endpoint,
+        auth_mode,
+        oauth_selected,
+        generation,
+        route,
+    }
+}
+
+/// Return the API-key route exactly as the dispatcher would resolve it. This
+/// is the critical distinction for a global `--base-url` or `XAI_BASE_URL`:
+/// official-provider config, keyring, and ambient keys must not cross onto an
+/// unrelated custom endpoint.
+fn xai_runtime_api_key(
+    store: &ConfigStore,
+    secrets: &Secrets,
+    runtime_overrides: &CliRuntimeOverrides,
+) -> XaiRuntimeApiKey {
+    let resolved = store.config.resolve_runtime_options_with_secrets(
+        &runtime_overrides_for_provider(runtime_overrides, ProviderKind::Xai),
+        secrets,
+    );
+    debug_assert_eq!(resolved.provider, ProviderKind::Xai);
+    XaiRuntimeApiKey {
+        source: resolved.api_key_source,
+        last4: resolved.api_key.as_deref().map(last4_label),
+    }
+}
+
+fn api_key_source_name(
+    config_key: Option<&str>,
+    keyring_key: Option<&str>,
+    env_key: Option<&(&'static str, String)>,
+) -> Option<&'static str> {
+    if config_key.is_some() {
+        Some("config")
+    } else if keyring_key.is_some() {
+        Some("secret store")
+    } else if env_key.is_some() {
+        Some("env")
+    } else {
+        None
+    }
+}
+
+fn xai_status_summary_source(
+    diagnostics: &XaiAuthDiagnostics,
+    api_key: Option<&XaiRuntimeApiKey>,
+) -> String {
+    match diagnostics.route {
+        XaiAuthDiagnosticRoute::OwnedOAuth => {
+            "Codewhale-owned OAuth configured/unprobed (valid generation pointer)".to_string()
+        }
+        XaiAuthDiagnosticRoute::NeedsRepair => {
+            let api_key = api_key
+                .and_then(XaiRuntimeApiKey::source_name)
+                .unwrap_or("no runtime-effective API key");
+            format!("needs repair (invalid OAuth generation pointer; API-key fallback: {api_key})")
+        }
+        XaiAuthDiagnosticRoute::ExternalConsent => {
+            "external consent configured/unprobed".to_string()
+        }
+        XaiAuthDiagnosticRoute::ApiKey => api_key
+            .and_then(XaiRuntimeApiKey::source_name)
+            .unwrap_or("unset")
+            .to_string(),
+    }
+}
+
+fn xai_credential_route_label(
+    diagnostics: &XaiAuthDiagnostics,
+    api_key: Option<&XaiRuntimeApiKey>,
+) -> String {
+    match diagnostics.route {
+        XaiAuthDiagnosticRoute::OwnedOAuth => {
+            "Codewhale-owned OAuth configured/unprobed (valid generation pointer; storage unprobed)"
+                .to_string()
+        }
+        XaiAuthDiagnosticRoute::NeedsRepair => {
+            let api_key = api_key
+                .and_then(XaiRuntimeApiKey::source_with_last4)
+                .unwrap_or_else(|| "no runtime-effective API key".to_string());
+            format!(
+                "xAI OAuth needs repair (invalid Codewhale-owned generation pointer; Grok CLI consent blocked; API-key fallback: {api_key})"
+            )
+        }
+        XaiAuthDiagnosticRoute::ExternalConsent => {
+            "external read-only consent configured/unprobed".to_string()
+        }
+        XaiAuthDiagnosticRoute::ApiKey => api_key
+            .and_then(XaiRuntimeApiKey::source_with_last4)
+            .unwrap_or_else(|| "missing".to_string()),
+    }
+}
+
+fn xai_table_storage_status(
+    api_key: Option<&XaiRuntimeApiKey>,
+    source: RuntimeApiKeySource,
+) -> &'static str {
+    match api_key {
+        Some(api_key) if api_key.uses(source) => "set",
+        Some(_) => "-",
+        // The selected structural OAuth/consent route intentionally does not
+        // establish whether any API-key storage is populated.
+        None => "unprobed",
+    }
+}
+
+fn xai_list_storage_status(
+    api_key: Option<&XaiRuntimeApiKey>,
+    source: RuntimeApiKeySource,
+) -> &'static str {
+    match api_key {
+        Some(api_key) if api_key.uses(source) => "yes",
+        Some(_) => "no",
+        None => "?",
+    }
+}
+
+fn xai_list_route(
+    diagnostics: &XaiAuthDiagnostics,
+    api_key: Option<&XaiRuntimeApiKey>,
+) -> &'static str {
+    match diagnostics.route {
+        XaiAuthDiagnosticRoute::OwnedOAuth => "owned-oauth-configured",
+        XaiAuthDiagnosticRoute::NeedsRepair => "needs-repair",
+        XaiAuthDiagnosticRoute::ExternalConsent => "external-consent-configured",
+        XaiAuthDiagnosticRoute::ApiKey => match api_key.and_then(|api_key| api_key.source) {
+            Some(RuntimeApiKeySource::Cli) => "cli",
+            Some(RuntimeApiKeySource::ConfigFile) => "config",
+            Some(RuntimeApiKeySource::Keyring) => "store",
+            Some(RuntimeApiKeySource::Env) => "env",
+            None => "missing",
+        },
+    }
+}
+
+fn xai_storage_detail(
+    diagnostics: &XaiAuthDiagnostics,
+    api_key: Option<&XaiRuntimeApiKey>,
+    source: RuntimeApiKeySource,
+) -> String {
+    match api_key {
+        Some(api_key) if api_key.uses(source) => api_key
+            .last4
+            .as_deref()
+            .map(|last4| format!("runtime-effective, last4: {last4}"))
+            .unwrap_or_else(|| "runtime-effective".to_string()),
+        Some(_) if diagnostics.is_custom_endpoint() => {
+            "not eligible for this custom xAI endpoint".to_string()
+        }
+        Some(_) => "not selected by the runtime resolver".to_string(),
+        None if diagnostics.evaluates_runtime_api_key() && diagnostics.is_custom_endpoint() => {
+            "not eligible for this custom xAI endpoint".to_string()
+        }
+        None if diagnostics.evaluates_runtime_api_key() => {
+            "not set for this runtime route".to_string()
+        }
+        None => "unprobed (structural OAuth/consent route)".to_string(),
+    }
+}
+
+fn xai_lookup_order(diagnostics: &XaiAuthDiagnostics) -> String {
+    match diagnostics.route {
+        XaiAuthDiagnosticRoute::OwnedOAuth => {
+            "lookup order: configured Codewhale-owned OAuth generation (storage unprobed); Grok CLI consent blocked".to_string()
+        }
+        XaiAuthDiagnosticRoute::NeedsRepair => {
+            "lookup order: invalid Codewhale-owned OAuth generation blocks Grok CLI consent; runtime-effective API-key fallback: CLI -> config -> secret store -> env".to_string()
+        }
+        XaiAuthDiagnosticRoute::ExternalConsent => {
+            "lookup order: configured consent-gated exact Grok CLI file (availability unprobed)".to_string()
+        }
+        XaiAuthDiagnosticRoute::ApiKey if diagnostics.is_custom_endpoint() => {
+            "lookup order: endpoint-bound API key only for this custom xAI endpoint (explicit CLI key or route-bound config key)".to_string()
+        }
+        XaiAuthDiagnosticRoute::ApiKey => {
+            "lookup order: CLI -> config -> secret store -> env".to_string()
+        }
+    }
+}
+
+fn xai_get_line(diagnostics: &XaiAuthDiagnostics, api_key: Option<&XaiRuntimeApiKey>) -> String {
+    match diagnostics.route {
+        XaiAuthDiagnosticRoute::OwnedOAuth => {
+            "xai: configured (source: Codewhale-owned OAuth generation; valid pointer; storage unprobed)".to_string()
+        }
+        XaiAuthDiagnosticRoute::NeedsRepair => {
+            let api_key = match api_key.and_then(XaiRuntimeApiKey::source_name) {
+                Some("config") => "config-file".to_string(),
+                Some("secret store") => "secret-store".to_string(),
+                Some("env") => "env".to_string(),
+                Some("cli") => "cli".to_string(),
+                Some(other) => other.to_string(),
+                None => "no runtime-effective API key".to_string(),
+            };
+            format!(
+                "xai: needs repair (invalid Codewhale-owned OAuth generation pointer; Grok CLI consent blocked; API-key fallback: {api_key})"
+            )
+        }
+        XaiAuthDiagnosticRoute::ExternalConsent => {
+            "xai: configured (source: external read-only consent; availability unprobed)".to_string()
+        }
+        XaiAuthDiagnosticRoute::ApiKey => match api_key.and_then(XaiRuntimeApiKey::source_name) {
+                Some("config") => "xai: set (source: config-file)".to_string(),
+                Some("secret store") => "xai: set (source: secret-store)".to_string(),
+                Some("env") => "xai: set (source: env)".to_string(),
+                Some("cli") => "xai: set (source: cli)".to_string(),
+                Some(other) => format!("xai: set (source: {other})"),
+                None => "xai: not set".to_string(),
+            },
+    }
+}
+
+fn auth_get_line_with_runtime(
+    store: &ConfigStore,
+    secrets: &Secrets,
+    provider: ProviderKind,
+    runtime_overrides: &CliRuntimeOverrides,
+) -> String {
+    let slot = provider_slot(provider);
+    if provider == ProviderKind::Xai {
+        let diagnostics = xai_auth_diagnostics(store, runtime_overrides);
+        let api_key = diagnostics
+            .evaluates_runtime_api_key()
+            .then(|| xai_runtime_api_key(store, secrets, runtime_overrides));
+        return xai_get_line(&diagnostics, api_key.as_ref());
+    }
+
+    let config_key = provider_config_api_key(store, provider);
+    let keyring_key = config_key
+        .is_none()
+        .then(|| provider_keyring_api_key(secrets, provider))
+        .flatten();
+    let env_key = provider_env_value(provider);
+
+    match api_key_source_name(config_key, keyring_key.as_deref(), env_key.as_ref()) {
+        Some("config") => format!("{slot}: set (source: config-file)"),
+        Some("secret store") => format!("{slot}: set (source: secret-store)"),
+        Some("env") => format!("{slot}: set (source: env)"),
+        Some(other) => format!("{slot}: set (source: {other})"),
+        None => format!("{slot}: not set"),
+    }
+}
+
+#[cfg(test)]
 fn auth_status_all_providers(store: &ConfigStore, secrets: &Secrets) -> Vec<String> {
+    auth_status_all_providers_with_runtime(store, secrets, &CliRuntimeOverrides::default())
+}
+
+fn auth_status_all_providers_with_runtime(
+    store: &ConfigStore,
+    secrets: &Secrets,
+    runtime_overrides: &CliRuntimeOverrides,
+) -> Vec<String> {
     let active_provider = store.config.provider;
     let mut lines = Vec::new();
     lines.push(format!(
@@ -1930,10 +2695,32 @@ fn auth_status_all_providers(store: &ConfigStore, secrets: &Secrets) -> Vec<Stri
     lines.push("-".repeat(70));
 
     for provider in ProviderKind::ALL {
+        if provider == ProviderKind::Xai {
+            let diagnostics = xai_auth_diagnostics(store, runtime_overrides);
+            let api_key = diagnostics
+                .evaluates_runtime_api_key()
+                .then(|| xai_runtime_api_key(store, secrets, runtime_overrides));
+            let active_marker = if provider == active_provider {
+                " *"
+            } else {
+                ""
+            };
+            lines.push(format!(
+                "{:<14} {:<8} {:<10} {:<8} {}{}",
+                provider.as_str(),
+                xai_table_storage_status(api_key.as_ref(), RuntimeApiKeySource::ConfigFile),
+                xai_table_storage_status(api_key.as_ref(), RuntimeApiKeySource::Keyring),
+                xai_table_storage_status(api_key.as_ref(), RuntimeApiKeySource::Env),
+                xai_status_summary_source(&diagnostics, api_key.as_ref()),
+                active_marker
+            ));
+            continue;
+        }
+
         let config_key = provider_config_api_key(store, provider);
         let keyring_key = provider_keyring_api_key(secrets, provider);
         let env_key = provider_env_value(provider);
-        let oauth_file_present = provider_oauth_file_path(provider).is_some_and(|p| p.exists());
+        let external_selected = external_oauth_selected(store, provider);
 
         let config_status = config_key.map(|_| "set").unwrap_or("-");
         let keyring_status = keyring_key.as_ref().map(|_| "set").unwrap_or("-");
@@ -1944,22 +2731,22 @@ fn auth_status_all_providers(store: &ConfigStore, secrets: &Secrets) -> Vec<Stri
             // OAuth-file (or env token) based — config/keyring keys are not
             // consulted for it.
             if env_key.is_some() {
-                "env"
-            } else if oauth_file_present {
-                "oauth file"
+                "env".to_string()
+            } else if external_selected {
+                "external consent (not probed)".to_string()
             } else {
-                "unset"
+                "unset".to_string()
             }
+        } else if external_selected {
+            "external consent (not probed)".to_string()
         } else if config_key.is_some() {
-            "config"
+            "config".to_string()
         } else if keyring_key.is_some() {
-            "keyring"
+            "keyring".to_string()
         } else if env_key.is_some() {
-            "env"
-        } else if oauth_file_present {
-            "oauth file"
+            "env".to_string()
         } else {
-            "unset"
+            "unset".to_string()
         };
 
         let active_marker = if provider == active_provider {
@@ -1985,23 +2772,49 @@ fn auth_status_all_providers(store: &ConfigStore, secrets: &Secrets) -> Vec<Stri
     lines
 }
 
+#[cfg(test)]
 fn auth_list_lines(store: &ConfigStore, secrets: &Secrets) -> Vec<String> {
+    auth_list_lines_with_runtime(store, secrets, &CliRuntimeOverrides::default())
+}
+
+fn auth_list_lines_with_runtime(
+    store: &ConfigStore,
+    secrets: &Secrets,
+    runtime_overrides: &CliRuntimeOverrides,
+) -> Vec<String> {
     let mut lines = Vec::new();
-    lines.push("provider     config store env  active".to_string());
+    lines.push("provider     config store env  route".to_string());
     for provider in ProviderKind::ALL {
         let slot = provider_slot(provider);
+        if provider == ProviderKind::Xai {
+            let diagnostics = xai_auth_diagnostics(store, runtime_overrides);
+            let api_key = diagnostics
+                .evaluates_runtime_api_key()
+                .then(|| xai_runtime_api_key(store, secrets, runtime_overrides));
+            lines.push(format!(
+                "{slot:<12}  {}     {}      {}   {}",
+                xai_list_storage_status(api_key.as_ref(), RuntimeApiKeySource::ConfigFile),
+                xai_list_storage_status(api_key.as_ref(), RuntimeApiKeySource::Keyring),
+                xai_list_storage_status(api_key.as_ref(), RuntimeApiKeySource::Env),
+                xai_list_route(&diagnostics, api_key.as_ref())
+            ));
+            continue;
+        }
+
         let file = provider_config_set(store, provider);
         let keyring = (!file).then(|| provider_keyring_set(secrets, provider));
         let env = provider_env_set(provider);
-        let oauth_file = provider_oauth_file_path(provider).is_some_and(|p| p.exists());
+        let external_selected = external_oauth_selected(store, provider);
         let active = if provider == ProviderKind::OpenaiCodex {
             if env {
                 "env"
-            } else if oauth_file {
-                "oauth"
+            } else if external_selected {
+                "external-consent"
             } else {
                 "missing"
             }
+        } else if external_selected {
+            "external-consent"
         } else if file {
             "config"
         } else if keyring == Some(true) {
@@ -2021,45 +2834,68 @@ fn auth_list_lines(store: &ConfigStore, secrets: &Secrets) -> Vec<String> {
     lines
 }
 
+#[cfg(test)]
 fn auth_status_lines_for_provider(
     store: &ConfigStore,
     secrets: &Secrets,
     provider: ProviderKind,
 ) -> Vec<String> {
+    auth_status_lines_for_provider_with_runtime(
+        store,
+        secrets,
+        provider,
+        &CliRuntimeOverrides::default(),
+    )
+}
+
+fn auth_status_lines_for_provider_with_runtime(
+    store: &ConfigStore,
+    secrets: &Secrets,
+    provider: ProviderKind,
+    runtime_overrides: &CliRuntimeOverrides,
+) -> Vec<String> {
+    if provider == ProviderKind::Xai {
+        return xai_auth_status_lines_for_provider(store, secrets, runtime_overrides);
+    }
+
     let config_key = provider_config_api_key(store, provider);
     let keyring_key = provider_keyring_api_key(secrets, provider);
     let env_key = provider_env_value(provider);
-    let oauth_file = provider_oauth_file_path(provider);
-    let oauth_file_present = oauth_file.as_ref().is_some_and(|path| path.exists());
+    let external = external_consent(store, provider);
+    let external_selected = external_oauth_selected(store, provider);
 
-    let active_source = if provider == ProviderKind::OpenaiCodex {
-        if env_key.is_some() {
+    let active_label = {
+        let active_source = if provider == ProviderKind::OpenaiCodex {
+            if env_key.is_some() {
+                "env"
+            } else if external_selected {
+                "external read-only consent (availability not probed)"
+            } else {
+                "missing"
+            }
+        } else if external_selected {
+            "external read-only consent (availability not probed)"
+        } else if config_key.is_some() {
+            "config"
+        } else if keyring_key.is_some() {
+            "secret store"
+        } else if env_key.is_some() {
             "env"
-        } else if oauth_file_present {
-            "Codex OAuth file"
         } else {
             "missing"
-        }
-    } else if config_key.is_some() {
-        "config"
-    } else if keyring_key.is_some() {
-        "secret store"
-    } else if env_key.is_some() {
-        "env"
-    } else {
-        "missing"
+        };
+        let active_last4 = if provider == ProviderKind::OpenaiCodex {
+            env_key.as_ref().map(|(_, value)| last4_label(value))
+        } else {
+            config_key
+                .map(last4_label)
+                .or_else(|| keyring_key.as_deref().map(last4_label))
+                .or_else(|| env_key.as_ref().map(|(_, value)| last4_label(value)))
+        };
+        active_last4
+            .map(|last4| format!("{active_source} (last4: {last4})"))
+            .unwrap_or_else(|| active_source.to_string())
     };
-    let active_last4 = if provider == ProviderKind::OpenaiCodex {
-        env_key.as_ref().map(|(_, value)| last4_label(value))
-    } else {
-        config_key
-            .map(last4_label)
-            .or_else(|| keyring_key.as_deref().map(last4_label))
-            .or_else(|| env_key.as_ref().map(|(_, value)| last4_label(value)))
-    };
-    let active_label = active_last4
-        .map(|last4| format!("{active_source} (last4: {last4})"))
-        .unwrap_or_else(|| active_source.to_string());
 
     let env_var_label = env_key
         .as_ref()
@@ -2078,14 +2914,19 @@ fn auth_status_lines_for_provider(
     let model = provider_cfg.model.as_deref().unwrap_or("(default)");
 
     let lookup_order = if provider == ProviderKind::OpenaiCodex {
-        "lookup order: env -> Codex OAuth file".to_string()
+        "lookup order: env -> consent-gated exact Codex CLI file".to_string()
     } else {
         "lookup order: config -> secret store -> env".to_string()
     };
     let auth_mode = if provider == ProviderKind::OpenaiCodex {
-        "codex_oauth"
+        "codex_oauth".to_string()
     } else {
-        store.config.auth_mode.as_deref().unwrap_or("api_key")
+        provider_cfg
+            .auth_mode
+            .as_deref()
+            .or(store.config.auth_mode.as_deref())
+            .unwrap_or("api_key")
+            .to_string()
     };
 
     let mut lines = vec![
@@ -2097,7 +2938,7 @@ fn auth_status_lines_for_provider(
         lookup_order,
         format!(
             "config file: {} ({})",
-            store.path().display(),
+            codewhale_config::quote_os_path(store.path()),
             source_status(config_key, "missing")
         ),
         format!(
@@ -2107,9 +2948,175 @@ fn auth_status_lines_for_provider(
         ),
         format!("env var: {env_var_label} ({env_status})"),
     ];
-    if let Some(path) = oauth_file {
-        let status = if path.exists() { "present" } else { "missing" };
-        lines.push(format!("Codex OAuth file: {} ({status})", path.display()));
+
+    if let Ok((source, expected_path)) = external_credential_target(provider, None) {
+        let status = codewhale_config::external_credential_consent_status(
+            external,
+            provider,
+            source,
+            &expected_path,
+            store.config.provider,
+        );
+        lines.push(format!(
+            "external credentials: {} (provider={}, source={}, owner={}, path={}, consent_version={}, state={}, scope_valid={}, ambient_path_changed={}; file not probed)",
+            status.access.as_str(),
+            status.provider,
+            status.source.as_str(),
+            status.owner,
+            codewhale_config::quote_os_path(&status.path),
+            status.consent_version,
+            status.route_state,
+            status.scope_valid,
+            status.ambient_path_changed,
+        ));
+        lines.push(format!("semantics: {}", status.semantics));
+        lines.push(format!("revoke: {}", status.revoke_command));
+        if let Some(warning) = status.ambient_path_warning() {
+            lines.push(warning);
+        }
+    } else {
+        lines.push("external credentials: disabled (no file was probed)".to_string());
+    }
+    lines
+}
+
+fn xai_auth_status_lines_for_provider(
+    store: &ConfigStore,
+    secrets: &Secrets,
+    runtime_overrides: &CliRuntimeOverrides,
+) -> Vec<String> {
+    let diagnostics = xai_auth_diagnostics(store, runtime_overrides);
+    let api_key = diagnostics
+        .evaluates_runtime_api_key()
+        .then(|| xai_runtime_api_key(store, secrets, runtime_overrides));
+    let external = external_consent(store, ProviderKind::Xai);
+    let selected_marker = if store.config.provider == ProviderKind::Xai {
+        " (selected provider)"
+    } else {
+        ""
+    };
+    let provider_cfg = &store.config.providers.xai;
+    let model = provider_cfg.model.as_deref().unwrap_or("(default)");
+    let auth_mode = diagnostics.auth_mode.as_deref().unwrap_or("api_key");
+
+    let mut lines = vec![
+        format!("provider: xai{selected_marker}"),
+        format!("route: {}", diagnostics.base_url),
+        format!("model: {model}"),
+        format!("auth mode: {auth_mode}"),
+        format!(
+            "credential route: {}",
+            xai_credential_route_label(&diagnostics, api_key.as_ref())
+        ),
+        xai_lookup_order(&diagnostics),
+        format!(
+            "config file: {} ({})",
+            codewhale_config::quote_os_path(store.path()),
+            xai_storage_detail(
+                &diagnostics,
+                api_key.as_ref(),
+                RuntimeApiKeySource::ConfigFile
+            )
+        ),
+        format!(
+            "secret store: {} ({})",
+            secrets.backend_name(),
+            xai_storage_detail(&diagnostics, api_key.as_ref(), RuntimeApiKeySource::Keyring)
+        ),
+        format!(
+            "env var: {} ({})",
+            provider_env_vars(ProviderKind::Xai).join("/"),
+            xai_storage_detail(&diagnostics, api_key.as_ref(), RuntimeApiKeySource::Env)
+        ),
+        format!(
+            "endpoint policy: {}",
+            if diagnostics.official_endpoint {
+                "official xAI endpoint"
+            } else {
+                "custom xAI endpoint; API-key-only (owned and external OAuth are inactive)"
+            }
+        ),
+    ];
+
+    lines.push(match diagnostics.generation {
+        XaiOAuthGenerationPointer::Absent => "xAI OAuth generation: absent".to_string(),
+        XaiOAuthGenerationPointer::Valid
+            if diagnostics.route == XaiAuthDiagnosticRoute::OwnedOAuth =>
+        {
+            "xAI OAuth generation: configured Codewhale-owned pointer (storage unprobed)"
+                .to_string()
+        }
+        XaiOAuthGenerationPointer::Valid => {
+            "xAI OAuth generation: valid but inactive for this route".to_string()
+        }
+        XaiOAuthGenerationPointer::Invalid => {
+            "xAI OAuth generation: invalid Codewhale-owned pointer".to_string()
+        }
+    });
+
+    match diagnostics.route {
+        XaiAuthDiagnosticRoute::OwnedOAuth => {
+            lines.push(
+                "external credentials: blocked by the configured Codewhale-owned xAI OAuth generation (file not probed)"
+                    .to_string(),
+            );
+            return lines;
+        }
+        XaiAuthDiagnosticRoute::NeedsRepair => {
+            lines.push(
+                "external credentials: blocked by the invalid Codewhale-owned xAI OAuth generation pointer (file not probed)"
+                    .to_string(),
+            );
+            lines.push(
+                "repair: run `codewhale auth xai-device` to replace the owned generation, or switch [providers.xai] auth_mode to \"api_key\" and remove oauth_credential_generation. Grok CLI consent remains blocked until the pointer is absent."
+                    .to_string(),
+            );
+            return lines;
+        }
+        XaiAuthDiagnosticRoute::ApiKey if diagnostics.is_custom_endpoint() => {
+            lines.push(
+                "external credentials: unavailable on a custom xAI endpoint (API-key-only; file not probed)"
+                    .to_string(),
+            );
+            return lines;
+        }
+        XaiAuthDiagnosticRoute::ApiKey if !diagnostics.oauth_selected && external.is_some() => {
+            lines.push(
+                "external credentials: configured but inactive because xAI OAuth mode is not selected (file not probed)"
+                    .to_string(),
+            );
+            return lines;
+        }
+        XaiAuthDiagnosticRoute::ApiKey | XaiAuthDiagnosticRoute::ExternalConsent => {}
+    }
+
+    if let Ok((source, expected_path)) = external_credential_target(ProviderKind::Xai, None) {
+        let status = codewhale_config::external_credential_consent_status(
+            external,
+            ProviderKind::Xai,
+            source,
+            &expected_path,
+            store.config.provider,
+        );
+        lines.push(format!(
+            "external credentials: {} (provider={}, source={}, owner={}, path={}, consent_version={}, state={}, scope_valid={}, ambient_path_changed={}; file not probed)",
+            status.access.as_str(),
+            status.provider,
+            status.source.as_str(),
+            status.owner,
+            codewhale_config::quote_os_path(&status.path),
+            status.consent_version,
+            status.route_state,
+            status.scope_valid,
+            status.ambient_path_changed,
+        ));
+        lines.push(format!("semantics: {}", status.semantics));
+        lines.push(format!("revoke: {}", status.revoke_command));
+        if let Some(warning) = status.ambient_path_warning() {
+            lines.push(warning);
+        }
+    } else {
+        lines.push("external credentials: disabled (no file was probed)".to_string());
     }
     lines
 }
@@ -2130,29 +3137,153 @@ fn last4_label(value: &str) -> String {
     format!("...{last4}")
 }
 
-fn run_auth_command(store: &mut ConfigStore, command: AuthCommand) -> Result<()> {
-    run_auth_command_with_secrets(store, command, &Secrets::auto_detect())
+fn run_auth_command_with_runtime(
+    store: &mut ConfigStore,
+    command: AuthCommand,
+    runtime_overrides: &CliRuntimeOverrides,
+) -> Result<()> {
+    run_auth_command_with_secrets_and_runtime(
+        store,
+        command,
+        &Secrets::auto_detect(),
+        runtime_overrides,
+    )
 }
 
+#[cfg(test)]
 fn run_auth_command_with_secrets(
     store: &mut ConfigStore,
     command: AuthCommand,
     secrets: &Secrets,
 ) -> Result<()> {
+    run_auth_command_with_secrets_and_runtime(
+        store,
+        command,
+        secrets,
+        &CliRuntimeOverrides::default(),
+    )
+}
+
+fn run_auth_command_with_secrets_and_runtime(
+    store: &mut ConfigStore,
+    command: AuthCommand,
+    secrets: &Secrets,
+    runtime_overrides: &CliRuntimeOverrides,
+) -> Result<()> {
     match command {
         AuthCommand::XaiDevice => {
             bail!("xAI device authentication must be delegated to codewhale-tui")
+        }
+        AuthCommand::ExternalConsent {
+            provider,
+            mode,
+            path,
+            yes,
+        } => {
+            let provider: ProviderKind = provider.into();
+            let (source, path) = external_credential_target(provider, path)?;
+            let preview = external_consent_preview_lines(provider, source, &path);
+            for line in &preview {
+                println!("{line}");
+            }
+            if mode == ExternalCredentialModeArg::Managed {
+                bail!(
+                    "managed external credential access is unsupported in v0.9.1: no provider has a reviewed schema-safe preservation adapter. Use --mode read-only, or use Codewhale-owned login/API-key storage."
+                );
+            }
+            confirm_external_consent(yes)?;
+            let path_value = path.to_str().context(
+                "external credential path cannot be persisted losslessly because it is not valid UTF-8",
+            )?;
+            let provider_key = provider.provider().provider_config_key();
+            codewhale_config::mutate_config_document(store.path(), |document| {
+                if matches!(provider, ProviderKind::OpenaiCodex | ProviderKind::Xai) {
+                    codewhale_config::set_config_document_value(
+                        document,
+                        &["providers", provider_key, "auth_mode"],
+                        "oauth",
+                    )?;
+                }
+                let prefix = &["providers", provider_key, "external_credentials"];
+                codewhale_config::set_config_document_value(
+                    document,
+                    &[prefix[0], prefix[1], prefix[2], "access"],
+                    "read_only",
+                )?;
+                codewhale_config::set_config_document_value(
+                    document,
+                    &[prefix[0], prefix[1], prefix[2], "provider"],
+                    provider.as_str(),
+                )?;
+                codewhale_config::set_config_document_value(
+                    document,
+                    &[prefix[0], prefix[1], prefix[2], "source"],
+                    source.as_str(),
+                )?;
+                codewhale_config::set_config_document_value(
+                    document,
+                    &[prefix[0], prefix[1], prefix[2], "path"],
+                    path_value,
+                )?;
+                codewhale_config::set_config_document_value(
+                    document,
+                    &[prefix[0], prefix[1], prefix[2], "consent_version"],
+                    i64::from(codewhale_config::EXTERNAL_CREDENTIAL_CONSENT_VERSION),
+                )
+            })?;
+            store
+                .reload()
+                .context("external consent was saved, but config reload failed")?;
+            println!(
+                "saved read-only external credential consent: provider={}, owner={}, path={}, consent_version={} ({})",
+                provider.as_str(),
+                source.as_str(),
+                codewhale_config::quote_os_path(&path),
+                codewhale_config::EXTERNAL_CREDENTIAL_CONSENT_VERSION,
+                codewhale_config::EXTERNAL_CREDENTIAL_READ_ONLY_SEMANTICS,
+            );
+            println!(
+                "revoke with: codewhale auth external-revoke --provider {}",
+                provider.as_str()
+            );
+            Ok(())
+        }
+        AuthCommand::ExternalRevoke { provider } => {
+            let provider: ProviderKind = provider.into();
+            let provider_key = provider.provider().provider_config_key();
+            codewhale_config::mutate_config_document(store.path(), |document| {
+                codewhale_config::unset_config_document_value(
+                    document,
+                    &["providers", provider_key, "external_credentials"],
+                )?;
+                Ok(())
+            })?;
+            store
+                .reload()
+                .context("external consent was revoked, but config reload failed")?;
+            println!(
+                "external credential access disabled for {}",
+                provider.as_str()
+            );
+            Ok(())
         }
         AuthCommand::Status { provider } => {
             match provider {
                 Some(p) => {
                     let provider: ProviderKind = p.into();
-                    for line in auth_status_lines_for_provider(store, secrets, provider) {
+                    for line in auth_status_lines_for_provider_with_runtime(
+                        store,
+                        secrets,
+                        provider,
+                        runtime_overrides,
+                    ) {
                         println!("{line}");
                     }
                 }
                 None => {
-                    for line in auth_status_all_providers(store, secrets) {
+                    for line in
+                        auth_status_all_providers_with_runtime(store, secrets, runtime_overrides)
+                    {
                         println!("{line}");
                     }
                 }
@@ -2183,15 +3314,12 @@ fn run_auth_command_with_secrets(
                 (None, true) => read_api_key_from_stdin()?,
                 (None, false) => prompt_api_key(slot)?,
             };
-            write_provider_api_key_to_config(store, provider, &api_key);
-            let keyring_saved = write_provider_api_key_to_keyring(secrets, provider, &api_key);
-            store.save()?;
+            let secret_store_saved = persist_provider_api_key(store, secrets, provider, &api_key)?;
             // Don't print the key. Don't echo length.
-            if keyring_saved {
+            if secret_store_saved {
                 println!(
-                    "saved API key for {slot} to {} and {}",
-                    store.path().display(),
-                    secrets.backend_name()
+                    "saved API key for {slot} to {} (config contains metadata only)",
+                    secrets.backend_name(),
                 );
             } else {
                 println!("saved API key for {slot} to {}", store.path().display());
@@ -2200,43 +3328,89 @@ fn run_auth_command_with_secrets(
         }
         AuthCommand::Get { provider } => {
             let provider: ProviderKind = provider.into();
-            let slot = provider_slot(provider);
-            let in_file = provider_config_set(store, provider);
-            let in_keyring = !in_file && provider_keyring_set(secrets, provider);
-            let in_env = provider_env_set(provider);
-            // Report the highest-priority source that has it.
-            let source = if in_file {
-                Some("config-file")
-            } else if in_keyring {
-                Some("secret-store")
-            } else if in_env {
-                Some("env")
-            } else {
-                None
-            };
-            match source {
-                Some(source) => println!("{slot}: set (source: {source})"),
-                None => println!("{slot}: not set"),
-            }
+            println!(
+                "{}",
+                auth_get_line_with_runtime(store, secrets, provider, runtime_overrides)
+            );
             Ok(())
         }
         AuthCommand::Clear { provider } => {
             let provider: ProviderKind = provider.into();
-            let slot = provider_slot(provider);
-            clear_provider_api_key_from_config(store, provider);
-            clear_provider_api_key_from_keyring(secrets, provider);
-            store.save()?;
-            println!("cleared API key for {slot} from config and secret store");
-            Ok(())
+            if provider == ProviderKind::Xai {
+                codewhale_config::with_xai_oauth_revocation_transaction(|| {
+                    clear_auth_provider(store, secrets, provider)
+                })
+            } else {
+                clear_auth_provider(store, secrets, provider)
+            }
         }
         AuthCommand::List => {
-            for line in auth_list_lines(store, secrets) {
+            for line in auth_list_lines_with_runtime(store, secrets, runtime_overrides) {
                 println!("{line}");
             }
             Ok(())
         }
         AuthCommand::Migrate { dry_run } => run_auth_migrate(store, secrets, dry_run),
     }
+}
+
+fn external_consent_preview_lines(
+    provider: ProviderKind,
+    source: codewhale_config::ExternalCredentialSource,
+    path: &Path,
+) -> Vec<String> {
+    vec![
+        "External credential consent preview (nothing has been saved):".to_string(),
+        format!("  provider: {}", provider.as_str()),
+        format!(
+            "  owning CLI: {} ({})",
+            source.owner_label(),
+            source.as_str()
+        ),
+        format!(
+            "  exact resolved path: {}",
+            codewhale_config::quote_os_path(path)
+        ),
+        format!(
+            "  access: read_only ({})",
+            codewhale_config::EXTERNAL_CREDENTIAL_READ_ONLY_SEMANTICS
+        ),
+        "  managed: unavailable (no reviewed schema-safe preservation adapter)".to_string(),
+        format!(
+            "  revoke: codewhale auth external-revoke --provider {}",
+            provider.as_str()
+        ),
+    ]
+}
+
+fn confirm_external_consent(yes: bool) -> Result<()> {
+    use std::io::IsTerminal;
+
+    if yes {
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "external credential consent was not saved: non-interactive use requires explicit --yes after reviewing the preview"
+        );
+    }
+    confirm_external_consent_answer(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())
+}
+
+fn confirm_external_consent_answer(
+    reader: &mut impl std::io::BufRead,
+    writer: &mut impl std::io::Write,
+) -> Result<()> {
+    write!(writer, "Type 'yes' to grant this exact read-only access: ")?;
+    writer.flush()?;
+    let mut answer = String::new();
+    reader
+        .read_line(&mut answer)
+        .context("reading external credential consent confirmation")?;
+    if answer.trim() != "yes" {
+        bail!("external credential consent cancelled; no configuration was changed");
+    }
+    Ok(())
 }
 
 fn yes_no(b: bool) -> &'static str {
@@ -2318,6 +3492,10 @@ fn run_auth_migrate(store: &mut ConfigStore, secrets: &Secrets, dry_run: bool) -
         store
             .save()
             .context("failed to write updated config.toml")?;
+    }
+    if !dry_run {
+        codewhale_config::scrub_plaintext_api_keys_from_config_backup(store.path())
+            .context("failed to remove plaintext API keys from config backup")?;
     }
 
     println!("secret store backend: {}", secrets.backend_name());
@@ -2597,6 +3775,15 @@ fn app_server_serve_passthrough(args: &AppServerArgs) -> Vec<String> {
     forwarded
 }
 
+fn web_serve_passthrough(args: &WebArgs) -> Vec<String> {
+    vec![
+        "serve".to_string(),
+        "--web".to_string(),
+        "--port".to_string(),
+        args.port.to_string(),
+    ]
+}
+
 fn app_server_token_from_env() -> Option<String> {
     std::env::var("CODEWHALE_APP_SERVER_TOKEN")
         .ok()
@@ -2630,10 +3817,13 @@ fn parse_mcp_server_definitions(raw: &str) -> Result<Vec<McpServerDefinition>> {
         return Ok(parsed);
     }
 
-    let unwrapped: String = serde_json::from_str(raw)
-        .with_context(|| format!("invalid JSON payload at key {MCP_SERVER_DEFINITIONS_KEY}"))?;
-    serde_json::from_str::<Vec<McpServerDefinition>>(&unwrapped).with_context(|| {
-        format!("invalid MCP server definition list in key {MCP_SERVER_DEFINITIONS_KEY}")
+    let unwrapped: String = serde_json::from_str(raw).map_err(|_| {
+        anyhow!("invalid JSON payload at key {MCP_SERVER_DEFINITIONS_KEY}; contents were omitted")
+    })?;
+    serde_json::from_str::<Vec<McpServerDefinition>>(&unwrapped).map_err(|_| {
+        anyhow!(
+            "invalid MCP server definition list in key {MCP_SERVER_DEFINITIONS_KEY}; contents were omitted"
+        )
     })
 }
 
@@ -3055,15 +4245,29 @@ fn build_tui_command_with_paths(
     }
     cmd.args(passthrough);
 
+    let uses_raw_tui_provider = cli
+        .provider
+        .as_deref()
+        .is_some_and(|provider| builtin_provider_arg(provider).is_none());
     let keyring_bridge_provider = resolved_runtime.provider;
     let keyring_bridge_api_key = resolved_runtime.api_key.as_ref();
     let keyring_bridge_source = resolved_runtime.api_key_source;
 
-    if let Some(provider) = cli.provider.map(ProviderKind::from) {
-        cmd.env("DEEPSEEK_PROVIDER", provider.as_str());
+    if let Some(provider) = cli.provider.as_deref() {
+        let provider = builtin_provider_arg(provider)
+            .map(ProviderKind::from)
+            .map_or_else(
+                || provider.to_string(),
+                |provider| provider.as_str().to_string(),
+            );
+        // Set both names so an inherited CODEWHALE_PROVIDER cannot outrank the
+        // explicit CLI pin when the TUI applies its environment overrides.
+        cmd.env("CODEWHALE_PROVIDER", &provider);
+        cmd.env("DEEPSEEK_PROVIDER", provider);
     }
-    if !(cli.profile.is_some()
-        && matches!(resolved_runtime.provider_source, ProviderSource::Config))
+    if !(uses_raw_tui_provider
+        || (cli.profile.is_some()
+            && matches!(resolved_runtime.provider_source, ProviderSource::Config)))
         && matches!(keyring_bridge_source, Some(RuntimeApiKeySource::Keyring))
         && let Some(api_key) = keyring_bridge_api_key
     {
@@ -3082,10 +4286,16 @@ fn build_tui_command_with_paths(
         );
     }
 
+    // For every forwarded flag below, set both the canonical CODEWHALE_* name
+    // and the legacy DEEPSEEK_* alias so an inherited CODEWHALE_* shell export
+    // cannot outrank the explicit CLI flag when the TUI applies its
+    // CODEWHALE-first environment overrides.
     if let Some(model) = cli.model.as_ref() {
+        cmd.env("CODEWHALE_MODEL", model);
         cmd.env("DEEPSEEK_MODEL", model);
     }
     if let Some(output_mode) = cli.output_mode.as_ref() {
+        cmd.env("CODEWHALE_OUTPUT_MODE", output_mode);
         cmd.env("DEEPSEEK_OUTPUT_MODE", output_mode);
     }
     if let Some(v) = verbosity.as_ref() {
@@ -3093,18 +4303,23 @@ fn build_tui_command_with_paths(
         cmd.env("DEEPSEEK_VERBOSITY", v);
     }
     if let Some(log_level) = cli.log_level.as_ref() {
+        cmd.env("CODEWHALE_LOG_LEVEL", log_level);
         cmd.env("DEEPSEEK_LOG_LEVEL", log_level);
     }
     if let Some(telemetry) = cli.telemetry {
+        cmd.env("CODEWHALE_TELEMETRY", telemetry.to_string());
         cmd.env("DEEPSEEK_TELEMETRY", telemetry.to_string());
     }
     if let Some(policy) = cli.approval_policy.as_ref() {
+        cmd.env("CODEWHALE_APPROVAL_POLICY", policy);
         cmd.env("DEEPSEEK_APPROVAL_POLICY", policy);
     }
     if let Some(mode) = cli.sandbox_mode.as_ref() {
+        cmd.env("CODEWHALE_SANDBOX_MODE", mode);
         cmd.env("DEEPSEEK_SANDBOX_MODE", mode);
     }
     if cli.yolo {
+        cmd.env("CODEWHALE_YOLO", "true");
         cmd.env("DEEPSEEK_YOLO", "true");
     }
     if let Some(api_key) = cli.api_key.as_ref() {
@@ -3115,7 +4330,7 @@ fn build_tui_command_with_paths(
         // saved API-key slots. Preserve legacy provider envs only when their
         // identity is already unambiguous here.
         cmd.env("CODEWHALE_CLI_API_KEY", api_key);
-        if cli.profile.is_none() || cli.provider.is_some() {
+        if !uses_raw_tui_provider && (cli.profile.is_none() || cli.provider.is_some()) {
             cmd.env("DEEPSEEK_API_KEY", api_key);
             for var in provider_env_vars(resolved_runtime.provider) {
                 if *var != "DEEPSEEK_API_KEY" {
@@ -3126,6 +4341,7 @@ fn build_tui_command_with_paths(
         cmd.env("DEEPSEEK_API_KEY_SOURCE", "cli");
     }
     if let Some(base_url) = cli.base_url.as_ref() {
+        cmd.env("CODEWHALE_BASE_URL", base_url);
         cmd.env("DEEPSEEK_BASE_URL", base_url);
     }
 
@@ -3177,8 +4393,8 @@ to execute it. Common fixes:\n\
 come from the same install directory.\n\
   - If you downloaded release assets manually, keep both `codewhale` and \
 `codewhale-tui` binaries together and make sure the TUI binary is executable.\n\
-  - Set DEEPSEEK_TUI_BIN to the absolute path of a working `codewhale-tui` \
-binary.",
+  - Set CODEWHALE_TUI_BIN (legacy alias: DEEPSEEK_TUI_BIN) to the absolute \
+path of a working `codewhale-tui` binary.",
         tui.display()
     )
 }
@@ -3188,20 +4404,22 @@ binary.",
 /// the npm-distributed Windows package — which ships
 /// `bin/downloads/codewhale-tui.exe` — is found by `Path::exists` (#247).
 ///
-/// `DEEPSEEK_TUI_BIN` is consulted first as an explicit override for
-/// custom installs and CI test layouts. On Windows we additionally try
-/// the suffix-less name as a fallback for users who already manually
-/// renamed the file before this fix landed.
+/// `CODEWHALE_TUI_BIN` (legacy alias: `DEEPSEEK_TUI_BIN`) is consulted first
+/// as an explicit override for custom installs and CI test layouts. On
+/// Windows we additionally try the suffix-less name as a fallback for users
+/// who already manually renamed the file before this fix landed.
 fn locate_sibling_tui_binary() -> Result<PathBuf> {
-    if let Ok(override_path) = std::env::var("DEEPSEEK_TUI_BIN") {
-        let candidate = PathBuf::from(override_path);
-        if candidate.is_file() {
-            return Ok(candidate);
+    for var in ["CODEWHALE_TUI_BIN", "DEEPSEEK_TUI_BIN"] {
+        if let Ok(override_path) = std::env::var(var) {
+            let candidate = PathBuf::from(override_path);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+            bail!(
+                "{var} points at {}, which is not a regular file.",
+                candidate.display()
+            );
         }
-        bail!(
-            "DEEPSEEK_TUI_BIN points at {}, which is not a regular file.",
-            candidate.display()
-        );
     }
 
     let current = std::env::current_exe().context("failed to locate current executable path")?;
@@ -3223,7 +4441,8 @@ The `codewhale` dispatcher delegates interactive sessions to a sibling \
 `codewhale-tui-<platform>` from https://github.com/Hmbown/CodeWhale/releases/latest \
 and place them in the same directory.\n\
 \n\
-Or set DEEPSEEK_TUI_BIN to the absolute path of an existing `codewhale-tui` binary.",
+Or set CODEWHALE_TUI_BIN (legacy alias: DEEPSEEK_TUI_BIN) to the absolute path \
+of an existing `codewhale-tui` binary.",
         expected.display()
     );
 }
@@ -3347,13 +4566,71 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingKeyringStore {
+        gets: Mutex<Vec<String>>,
+        values: Mutex<std::collections::BTreeMap<String, String>>,
+    }
+
+    impl RecordingKeyringStore {
+        fn set_value(&self, key: &str, value: &str) {
+            self.values
+                .lock()
+                .expect("recording values lock")
+                .insert(key.to_string(), value.to_string());
+        }
+
+        fn queried(&self) -> Vec<String> {
+            self.gets.lock().expect("recording gets lock").clone()
+        }
+    }
+
+    impl codewhale_secrets::KeyringStore for RecordingKeyringStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> std::result::Result<Option<String>, codewhale_secrets::SecretsError> {
+            self.gets
+                .lock()
+                .expect("recording gets lock")
+                .push(key.to_string());
+            Ok(self
+                .values
+                .lock()
+                .expect("recording values lock")
+                .get(key)
+                .cloned())
+        }
+
+        fn set(
+            &self,
+            key: &str,
+            value: &str,
+        ) -> std::result::Result<(), codewhale_secrets::SecretsError> {
+            self.set_value(key, value);
+            Ok(())
+        }
+
+        fn delete(&self, key: &str) -> std::result::Result<(), codewhale_secrets::SecretsError> {
+            self.values
+                .lock()
+                .expect("recording values lock")
+                .remove(key);
+            Ok(())
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "recording"
+        }
+    }
+
     fn install_fake_tui_binary() -> (tempfile::TempDir, ScopedEnvVar) {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let custom = dir
             .path()
             .join(format!("custom-tui{}", std::env::consts::EXE_SUFFIX));
         std::fs::write(&custom, b"").unwrap();
-        let custom_str = custom.to_string_lossy().into_owned();
+        let custom_str = custom.to_string_lossy();
         let bin = ScopedEnvVar::set("DEEPSEEK_TUI_BIN", &custom_str);
         (dir, bin)
     }
@@ -3410,6 +4687,18 @@ mod tests {
         // What the `for cause in err.chain().skip(1)` loop iterates over.
         let causes: Vec<String> = err.chain().skip(1).map(ToString::to_string).collect();
         assert_eq!(causes, vec!["TOML parse error at line 1, column 20"]);
+    }
+
+    #[test]
+    fn malformed_persisted_mcp_json_omits_secret_contents_and_keys() {
+        let secret = "sentinel";
+        let raw =
+            format!(r#"[{{"name":"private","env":{{"PRIVATE_TOKEN":"{secret}"}} trailing-junk}}]"#);
+        let error = parse_mcp_server_definitions(&raw).expect_err("malformed JSON must fail");
+        let diagnostic = format!("{error:#}");
+        assert!(!diagnostic.contains(secret), "{diagnostic}");
+        assert!(!diagnostic.contains("PRIVATE_TOKEN"), "{diagnostic}");
+        assert!(diagnostic.contains("contents were omitted"), "{diagnostic}");
     }
 
     #[test]
@@ -3564,7 +4853,7 @@ mod tests {
         assert_eq!(model_command_provider_hint(None, None), None);
 
         let cli = parse_ok(&["codewhale", "--provider", "zai", "model", "list"]);
-        assert_eq!(cli.provider, Some(ProviderArg::Zai));
+        assert_eq!(cli.provider.as_deref(), Some("zai"));
         assert!(matches!(
             cli.command,
             Some(Commands::Model(ModelArgs {
@@ -3806,9 +5095,35 @@ mod tests {
     }
 
     #[test]
+    fn web_command_is_typed_and_delegates_without_auth_material() {
+        let cli = parse_ok(&["codewhale", "web", "--port", "9091"]);
+        let args = match cli.command {
+            Some(Commands::Web(args)) => args,
+            other => panic!("expected web command, got {other:?}"),
+        };
+        assert_eq!(args.port, 9091);
+        let forwarded = web_serve_passthrough(&args);
+        assert_eq!(forwarded, ["serve", "--web", "--port", "9091"]);
+        assert!(!forwarded.iter().any(|arg| arg.contains("token")));
+    }
+
+    #[test]
+    fn web_command_defaults_to_runtime_port_and_documents_bootstrap_boundary() {
+        let cli = parse_ok(&["codewhale", "web"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Web(WebArgs { port: 7878 }))
+        ));
+        let help = help_for(&["codewhale", "web", "--help"]);
+        assert!(help.contains("--port"));
+        assert!(help.contains("one-time loopback bootstrap"));
+        assert!(!help.contains("--auth-token"));
+    }
+
+    #[test]
     fn serve_help_documents_forwarded_runtime_modes() {
         let help = help_for(&["codewhale", "serve", "--help"]);
-        for flag in ["--http", "--mobile", "--mcp", "--acp"] {
+        for flag in ["--http", "--mobile", "--web", "--mcp", "--acp"] {
             assert!(
                 help.contains(flag),
                 "serve help should document forwarded flag {flag}; help was:\n{help}"
@@ -3872,11 +5187,11 @@ mod tests {
             "run",
             "stopship",
             "--fleet",
-            "v0868-stopship",
+            "stopship",
             "--runtime",
             "tmux",
             "--issue",
-            "4090",
+            "4375",
         ]);
         assert!(matches!(
             cli.command,
@@ -3889,10 +5204,115 @@ mod tests {
                     ..
                 }
             })) if workflow == "stopship"
-                && fleet == "v0868-stopship"
+                && fleet == "stopship"
                 && runtime == "tmux"
-                && issue.as_deref() == Some("4090")
+                && issue.as_deref() == Some("4375")
         ));
+    }
+
+    #[test]
+    fn exec_and_fleet_accept_builtin_and_raw_provider_identifiers() {
+        let builtin = parse_ok(&["codewhale", "--provider", "openrouter", "exec", "Reply OK"]);
+        assert_eq!(builtin.provider.as_deref(), Some("openrouter"));
+        assert_eq!(
+            top_level_provider_override(builtin.provider.as_deref(), builtin.command.as_ref())
+                .expect("built-in Exec provider"),
+            Some(ProviderKind::Openrouter)
+        );
+
+        for (provider, command) in [
+            ("qianfan", vec!["exec", "Reply OK"]),
+            ("lm-studio", vec!["exec", "Reply OK"]),
+            ("lm-studio", vec!["fleet", "status"]),
+        ] {
+            let argv = std::iter::once("codewhale")
+                .chain(["--provider", provider])
+                .chain(command.iter().copied())
+                .collect::<Vec<_>>();
+            let cli = parse_ok(&argv);
+            assert_eq!(cli.provider.as_deref(), Some(provider));
+            assert_eq!(
+                top_level_provider_override(cli.provider.as_deref(), cli.command.as_ref())
+                    .expect("raw TUI provider"),
+                None,
+                "{argv:?} should defer the raw provider id to the TUI"
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_go_provider_aliases_parse_as_builtin() {
+        for alias in ["opencode-go", "opencode_go", "opencodego"] {
+            assert_eq!(builtin_provider_arg(alias), Some(ProviderArg::OpencodeGo));
+        }
+    }
+
+    #[test]
+    fn raw_provider_ids_remain_restricted_to_exec_and_fleet() {
+        let cli = parse_ok(&["codewhale", "--provider", "lm-studio", "model", "list"]);
+        let err = top_level_provider_override(cli.provider.as_deref(), cli.command.as_ref())
+            .expect_err("model registry commands still require a built-in provider");
+        assert!(
+            err.to_string()
+                .contains("configured custom providers are accepted only by exec and fleet")
+        );
+
+        let err = Cli::try_parse_from(["codewhale", "auth", "set", "--provider", "lm-studio"])
+            .expect_err("auth keeps enum-only provider validation");
+        assert_eq!(err.kind(), ErrorKind::InvalidValue);
+
+        let err = Cli::try_parse_from([
+            "codewhale",
+            "--provider",
+            "../../lm-studio",
+            "exec",
+            "Reply OK",
+        ])
+        .expect_err("provider ids must stay simple tokens");
+        assert!(
+            err.to_string()
+                .contains("provider must be a simple identifier")
+        );
+    }
+
+    #[test]
+    fn raw_provider_dispatch_defers_dynamic_config_to_the_tui() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"provider = "lm-studio"
+
+[providers.lm-studio]
+kind = "openai-compatible"
+base_url = "http://127.0.0.1:1234/v1"
+model = "qwen-2.5-7b"
+"#,
+        )
+        .expect("custom provider config fixture");
+        assert!(
+            ConfigStore::load(Some(config_path.clone())).is_err(),
+            "the enum-backed dispatcher store must not be the owner of dynamic provider config"
+        );
+
+        let config = config_path.to_string_lossy().into_owned();
+        let cli = parse_ok(&[
+            "codewhale",
+            "--config",
+            &config,
+            "--provider",
+            "lm-studio",
+            "exec",
+            "Reply OK",
+        ]);
+        let prepared = prepare_raw_provider_tui_dispatch(
+            &cli,
+            cli.command.as_ref(),
+            &CliRuntimeOverrides::default(),
+        )
+        .expect("prepare raw provider dispatch")
+        .expect("Exec with a raw provider should bypass dispatcher config resolution");
+        assert_eq!(prepared.1, ["exec", "Reply OK"].map(str::to_string));
     }
 
     #[test]
@@ -3936,6 +5356,28 @@ mod tests {
     }
 
     #[test]
+    fn short_workflow_names_do_not_resolve_historical_v0868_files() {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let candidates = workflow_source_candidates("issue-sweep", None, &workspace);
+        assert!(candidates.iter().all(|path| {
+            !path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("v0868_"))
+        }));
+        assert!(resolve_workflow_source_path("issue-sweep", None, &workspace).is_err());
+
+        let historical = resolve_workflow_source_path(
+            "workflows/v0868_issue_sweep.workflow.js",
+            None,
+            &workspace,
+        )
+        .expect("explicit historical workflow path");
+        assert!(historical.ends_with("workflows/v0868_issue_sweep.workflow.js"));
+    }
+
+    #[test]
     fn workflow_run_resolves_stopship_alias_and_payload() {
         let _lock = env_lock();
         let (_dir, _tui) = install_fake_tui_binary();
@@ -3961,7 +5403,7 @@ mod tests {
         let resolved = resolved_runtime_for_test(ProviderKind::Deepseek, ProviderSource::Config);
         let source = resolve_workflow_source_path("stopship", None, &workspace)
             .expect("stopship workflow source");
-        assert!(source.ends_with("workflows/v0868_stopship_lane.workflow.js"));
+        assert!(source.ends_with("workflows/stopship.workflow.js"));
 
         let process = workflow_exec_command(WorkflowExecSpec {
             cli: &cli,
@@ -3970,8 +5412,8 @@ mod tests {
             source_root: &workspace,
             source_path: &source,
             workflow: "stopship",
-            fleet: "v0868-stopship",
-            issue: Some("4090"),
+            fleet: "stopship",
+            issue: Some("4375"),
             goal: Some("fix stopship"),
             token_budget: Some(25_000),
             verify: true,
@@ -3990,9 +5432,9 @@ mod tests {
                 .any(|pair| pair == ["--profile", "workflow-profile"])
         );
         assert!(!joined.contains("Run the CodeWhale"));
-        assert!(joined.contains("\"source_path\":\"workflows/v0868_stopship_lane.workflow.js\""));
-        assert!(joined.contains("\"fleet\":\"v0868-stopship\""));
-        assert!(joined.contains("\"issue\":\"4090\""));
+        assert!(joined.contains("\"source_path\":\"workflows/stopship.workflow.js\""));
+        assert!(joined.contains("\"fleet\":\"stopship\""));
+        assert!(joined.contains("\"issue\":\"4375\""));
         assert!(joined.contains("\"token_budget\":25000"));
         assert!(joined.contains("\"verify\":true"));
         assert!(
@@ -4131,14 +5573,16 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_login_writes_shared_config_and_preserves_tui_defaults() {
-        let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
-        let path = std::env::temp_dir().join(format!(
-            "deepseek-cli-login-test-{}-{nanos}.toml",
-            std::process::id()
-        ));
+    fn deepseek_login_uses_isolated_file_store_and_preserves_tui_defaults() {
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let codewhale_home = dir.path().join("codewhale-home");
+        let codewhale_home_value = codewhale_home.to_string_lossy().into_owned();
+        let _home = ScopedEnvVar::set("CODEWHALE_HOME", &codewhale_home_value);
+        let _backend = ScopedEnvVar::set("CODEWHALE_SECRET_BACKEND", "file");
+        let path = codewhale_home.join("config.toml");
         let mut store = ConfigStore::load(Some(path.clone())).expect("store should load");
-        let secrets = no_keyring_secrets();
+        let secrets = Secrets::auto_detect();
 
         run_login_command_with_secrets(
             &mut store,
@@ -4148,22 +5592,26 @@ mod tests {
             },
             &secrets,
         )
-        .expect("login should write config");
+        .expect("login should persist credential");
 
-        assert_eq!(store.config.api_key.as_deref(), Some("sk-test"));
-        assert_eq!(
-            store.config.providers.deepseek.api_key.as_deref(),
-            Some("sk-test")
-        );
+        assert!(store.config.api_key.is_none());
+        assert!(store.config.providers.deepseek.api_key.is_none());
         assert_eq!(
             store.config.default_text_model.as_deref(),
             Some("deepseek-v4-pro")
         );
         let saved = std::fs::read_to_string(&path).expect("config should be written");
-        assert!(saved.contains("api_key = \"sk-test\""));
+        assert!(!saved.contains("sk-test"), "{saved}");
+        assert!(
+            !saved
+                .lines()
+                .any(|line| line.trim_start().starts_with("api_key ="))
+        );
         assert!(saved.contains("default_text_model = \"deepseek-v4-pro\""));
-
-        let _ = std::fs::remove_file(path);
+        assert_eq!(
+            secrets.get("deepseek").expect("read secret").as_deref(),
+            Some("sk-test")
+        );
     }
 
     #[test]
@@ -4173,6 +5621,40 @@ mod tests {
             cli.command,
             Some(Commands::Auth(AuthArgs {
                 command: AuthCommand::XaiDevice
+            }))
+        ));
+
+        let cli = parse_ok(&[
+            "deepseek",
+            "auth",
+            "external-consent",
+            "--provider",
+            "openai-codex",
+            "--mode",
+            "read-only",
+            "--path",
+            "/tmp/codex-auth.json",
+            "--yes",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Auth(AuthArgs {
+                command: AuthCommand::ExternalConsent {
+                    provider: ProviderArg::OpenaiCodex,
+                    mode: ExternalCredentialModeArg::ReadOnly,
+                    path: Some(_),
+                    yes: true,
+                }
+            }))
+        ));
+
+        let cli = parse_ok(&["deepseek", "auth", "external-revoke", "--provider", "xai"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Auth(AuthArgs {
+                command: AuthCommand::ExternalRevoke {
+                    provider: ProviderArg::Xai,
+                }
             }))
         ));
 
@@ -4336,6 +5818,8 @@ mod tests {
             ("zai", ProviderArg::Zai),
             ("stepfun", ProviderArg::Stepfun),
             ("minimax", ProviderArg::Minimax),
+            ("minimax-anthropic", ProviderArg::MinimaxAnthropic),
+            ("minimax_anthropic", ProviderArg::MinimaxAnthropic),
             ("deepinfra", ProviderArg::Deepinfra),
             ("deep-infra", ProviderArg::Deepinfra),
             ("siliconflow-cn", ProviderArg::SiliconflowCn),
@@ -4388,7 +5872,23 @@ mod tests {
     }
 
     #[test]
-    fn auth_set_writes_to_shared_config_file() {
+    fn auth_help_describes_runtime_effective_diagnostics() {
+        let get = help_for(&["codewhale", "auth", "get", "--help"]);
+        assert!(get.contains("effective credential route"), "{get}");
+        assert!(get.contains("structural OAuth/repair state"), "{get}");
+
+        let status = help_for(&["codewhale", "auth", "status", "--help"]);
+        assert!(
+            status.contains("runtime-effective credential route state"),
+            "{status}"
+        );
+
+        let list = help_for(&["codewhale", "auth", "list", "--help"]);
+        assert!(list.contains("runtime-effective auth state"), "{list}");
+    }
+
+    #[test]
+    fn auth_set_writes_secret_store_and_keeps_config_credential_free() {
         use codewhale_secrets::{InMemoryKeyringStore, KeyringStore};
         use std::sync::Arc;
 
@@ -4412,19 +5912,70 @@ mod tests {
         )
         .expect("set should succeed");
 
-        assert_eq!(store.config.api_key.as_deref(), Some("sk-keyring"));
-        assert_eq!(
-            store.config.providers.deepseek.api_key.as_deref(),
-            Some("sk-keyring")
-        );
+        assert!(store.config.api_key.is_none());
+        assert!(store.config.providers.deepseek.api_key.is_none());
         let saved = std::fs::read_to_string(&path).unwrap_or_default();
-        assert!(saved.contains("api_key = \"sk-keyring\""));
+        assert!(!saved.contains("sk-keyring"), "{saved}");
+        assert!(
+            !saved
+                .lines()
+                .any(|line| line.trim_start().starts_with("api_key ="))
+        );
         assert_eq!(
             inner.get("deepseek").unwrap().as_deref(),
             Some("sk-keyring")
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn auth_set_uses_plaintext_config_only_when_secret_store_write_fails() {
+        use codewhale_secrets::{KeyringStore, SecretsError};
+        use std::sync::Arc;
+
+        struct FailingStore;
+
+        impl KeyringStore for FailingStore {
+            fn get(&self, _key: &str) -> Result<Option<String>, SecretsError> {
+                Ok(None)
+            }
+
+            fn set(&self, _key: &str, _value: &str) -> Result<(), SecretsError> {
+                Err(SecretsError::Keyring("test write failure".to_string()))
+            }
+
+            fn delete(&self, _key: &str) -> Result<(), SecretsError> {
+                Ok(())
+            }
+
+            fn backend_name(&self) -> &'static str {
+                "failing test store"
+            }
+        }
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let mut store = ConfigStore::load(Some(path.clone())).expect("load config");
+        let secrets = Secrets::new(Arc::new(FailingStore));
+
+        run_auth_command_with_secrets(
+            &mut store,
+            AuthCommand::Set {
+                provider: ProviderArg::Openrouter,
+                api_key: Some("fallback-test-credential".to_string()),
+                api_key_stdin: false,
+            },
+            &secrets,
+        )
+        .expect("config fallback");
+
+        assert_eq!(
+            store.config.providers.openrouter.api_key.as_deref(),
+            Some("fallback-test-credential")
+        );
+        let saved = std::fs::read_to_string(path).expect("config fallback file");
+        assert!(saved.contains("fallback-test-credential"));
     }
 
     #[test]
@@ -4450,16 +6001,18 @@ mod tests {
         .expect("set should succeed");
 
         assert_eq!(store.config.provider, ProviderKind::Deepseek);
+        assert!(store.config.providers.arcee.api_key.is_none());
         assert_eq!(
-            store.config.providers.arcee.api_key.as_deref(),
-            Some("arcee-key")
+            store.config.providers.arcee.auth_mode.as_deref(),
+            Some("api_key")
         );
 
         let reloaded = ConfigStore::load(Some(path.clone())).expect("store should reload");
         assert_eq!(reloaded.config.provider, ProviderKind::Deepseek);
+        assert!(reloaded.config.providers.arcee.api_key.is_none());
         assert_eq!(
-            reloaded.config.providers.arcee.api_key.as_deref(),
-            Some("arcee-key")
+            reloaded.config.providers.arcee.auth_mode.as_deref(),
+            Some("api_key")
         );
 
         let _ = std::fs::remove_file(path);
@@ -4679,7 +6232,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_status_openai_codex_reports_codex_oauth_file() {
+    fn auth_status_never_probes_codex_file_and_reports_exact_consent() {
         use codewhale_secrets::InMemoryKeyringStore;
         use std::sync::Arc;
 
@@ -4704,17 +6257,549 @@ mod tests {
 
         assert!(output.contains("provider: openai-codex"));
         assert!(output.contains("auth mode: codex_oauth"));
-        assert!(output.contains("active source: Codex OAuth file"));
-        assert!(output.contains("lookup order: env -> Codex OAuth file"));
-        assert!(output.contains(&format!(
-            "Codex OAuth file: {} (present)",
-            auth_path.display()
-        )));
+        assert!(output.contains("active source: missing"));
+        assert!(output.contains("lookup order: env -> consent-gated exact Codex CLI file"));
+        assert!(output.contains("external credentials: disabled"));
+        assert!(output.contains("scope_valid=false"));
+        assert!(output.contains("disabled; no external-credential probing, reading"));
+        assert!(output.contains("file not probed"));
         assert!(!output.contains("secret-token"));
+
+        store.config.providers.openai_codex.external_credentials =
+            Some(codewhale_config::ExternalCredentialConsentToml::read_only(
+                ProviderKind::OpenaiCodex,
+                codewhale_config::ExternalCredentialSource::CodexCli,
+                auth_path.clone(),
+            ));
+        let output =
+            auth_status_lines_for_provider(&store, &secrets, ProviderKind::OpenaiCodex).join("\n");
+        assert!(
+            output.contains("active source: external read-only consent (availability not probed)")
+        );
+        assert!(output.contains("external credentials: read_only"));
+        assert!(output.contains("provider=openai-codex"));
+        assert!(output.contains("source=codex_cli"));
+        assert!(output.contains(&format!(
+            "path={}",
+            codewhale_config::quote_os_path(&auth_path)
+        )));
+        assert!(output.contains(&format!(
+            "consent_version={}",
+            codewhale_config::EXTERNAL_CREDENTIAL_CONSENT_VERSION
+        )));
+        assert!(output.contains("file not probed"));
+        assert!(!output.contains("secret-token"));
+
+        let ambient_path = dir.path().join("new-ambient-auth.json");
+        let ambient_path_str = ambient_path.to_string_lossy().into_owned();
+        let _ambient_file = ScopedEnvVar::set("OPENAI_CODEX_AUTH_FILE", &ambient_path_str);
+        let changed =
+            auth_status_lines_for_provider(&store, &secrets, ProviderKind::OpenaiCodex).join("\n");
+        assert!(changed.contains("state=active"), "{changed}");
+        assert!(changed.contains("ambient_path_changed=true"), "{changed}");
+        assert!(changed.contains("consent remains pinned"), "{changed}");
+        assert!(
+            changed.contains(&codewhale_config::quote_os_path(&auth_path)),
+            "{changed}"
+        );
+        assert!(!changed.contains(&ambient_path_str), "{changed}");
     }
 
     #[test]
-    fn auth_list_treats_openai_codex_oauth_file_as_active() {
+    fn xai_valid_owned_generation_blocks_external_consent_without_storage_probes() {
+        use std::sync::Arc;
+
+        let _lock = env_lock();
+        let _xai_key = ScopedEnvVar::remove("XAI_API_KEY");
+        let _xai_base = ScopedEnvVar::remove("XAI_BASE_URL");
+        let _auth_mode = ScopedEnvVar::remove("DEEPSEEK_AUTH_MODE");
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let external_path = dir.path().join("grok-auth.json");
+        let external_raw = "external owner bytes must not be read";
+        std::fs::write(&external_path, external_raw).expect("external auth trap");
+        let _grok_auth_path = ScopedEnvVar::set("GROK_AUTH_PATH", &external_path.to_string_lossy());
+
+        let mut store = ConfigStore::load(Some(config_path)).expect("store should load");
+        store.config.provider = ProviderKind::Xai;
+        store.config.providers.xai.auth_mode = Some("oauth".to_string());
+        store.config.providers.xai.oauth_credential_generation =
+            Some("xai-auth-0123456789abcdef0123456789abcdef.json".to_string());
+        store.config.providers.xai.external_credentials =
+            Some(codewhale_config::ExternalCredentialConsentToml::read_only(
+                ProviderKind::Xai,
+                codewhale_config::ExternalCredentialSource::GrokCli,
+                external_path.clone(),
+            ));
+        let keyring = Arc::new(RecordingKeyringStore::default());
+        let secrets = Secrets::new(keyring.clone());
+
+        let scoped = auth_status_lines_for_provider(&store, &secrets, ProviderKind::Xai).join("\n");
+        assert!(
+            scoped.contains(
+                "credential route: Codewhale-owned OAuth configured/unprobed (valid generation pointer; storage unprobed)"
+            ),
+            "{scoped}"
+        );
+        assert!(scoped.contains("external credentials: blocked by the configured Codewhale-owned xAI OAuth generation"), "{scoped}");
+        assert!(
+            scoped.contains(
+                "xAI OAuth generation: configured Codewhale-owned pointer (storage unprobed)"
+            ),
+            "{scoped}"
+        );
+        assert!(
+            !scoped.contains("active source: Codewhale-owned OAuth"),
+            "a valid pointer is configured/unprobed, not an active credential: {scoped}"
+        );
+        assert!(
+            !scoped.contains("fallback"),
+            "an owned generation must never advertise Grok CLI fallback: {scoped}"
+        );
+
+        let all = auth_status_all_providers(&store, &secrets).join("\n");
+        let xai_row = all
+            .lines()
+            .find(|line| line.starts_with("xai"))
+            .expect("xAI status row");
+        assert!(
+            xai_row.contains("Codewhale-owned OAuth configured/unprobed"),
+            "{xai_row}"
+        );
+
+        let list = auth_list_lines(&store, &secrets).join("\n");
+        let xai_list_row = list
+            .lines()
+            .find(|line| line.starts_with("xai"))
+            .expect("xAI list row");
+        assert!(
+            xai_list_row.ends_with("owned-oauth-configured"),
+            "{xai_list_row}"
+        );
+
+        let get = auth_get_line_with_runtime(
+            &store,
+            &secrets,
+            ProviderKind::Xai,
+            &CliRuntimeOverrides::default(),
+        );
+        assert!(
+            get.starts_with("xai: configured (source: Codewhale-owned OAuth generation"),
+            "{get}"
+        );
+        assert!(!get.starts_with("xai: set"), "{get}");
+        assert!(!get.contains("fallback"), "{get}");
+        assert!(
+            !keyring.queried().iter().any(|slot| slot == "xai"),
+            "owned OAuth diagnostics must not query the xAI API-key store: {:?}",
+            keyring.queried()
+        );
+        assert_eq!(
+            std::fs::read_to_string(external_path).expect("external trap unchanged"),
+            external_raw
+        );
+
+        store.config.providers.xai.auth_mode = None;
+        store.config.auth_mode = Some("oauth".to_string());
+        assert_eq!(
+            xai_auth_diagnostics(&store, &CliRuntimeOverrides::default()).route,
+            XaiAuthDiagnosticRoute::ApiKey,
+            "a root auth mode must not select the xAI OAuth runtime route"
+        );
+    }
+
+    #[test]
+    fn xai_invalid_generation_requires_repair_blocks_external_and_keeps_api_key_diagnostics() {
+        use std::sync::Arc;
+
+        let _lock = env_lock();
+        let _xai_key = ScopedEnvVar::remove("XAI_API_KEY");
+        let _xai_base = ScopedEnvVar::remove("XAI_BASE_URL");
+        let _auth_mode = ScopedEnvVar::remove("DEEPSEEK_AUTH_MODE");
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let external_path = dir.path().join("grok-auth.json");
+        let external_raw = "external owner bytes must remain unread";
+        std::fs::write(&external_path, external_raw).expect("external auth trap");
+        let _grok_auth_path = ScopedEnvVar::set("GROK_AUTH_PATH", &external_path.to_string_lossy());
+
+        let mut store = ConfigStore::load(Some(config_path)).expect("store should load");
+        store.config.provider = ProviderKind::Xai;
+        store.config.providers.xai.auth_mode = Some("oauth".to_string());
+        store.config.providers.xai.api_key = Some("fake-cfg-key-1234".to_string());
+        store.config.providers.xai.oauth_credential_generation = Some("../unsafe.json".to_string());
+        store.config.providers.xai.external_credentials =
+            Some(codewhale_config::ExternalCredentialConsentToml::read_only(
+                ProviderKind::Xai,
+                codewhale_config::ExternalCredentialSource::GrokCli,
+                external_path.clone(),
+            ));
+        let keyring = Arc::new(RecordingKeyringStore::default());
+        let secrets = Secrets::new(keyring.clone());
+
+        let scoped = auth_status_lines_for_provider(&store, &secrets, ProviderKind::Xai).join("\n");
+        assert!(
+            scoped.contains("credential route: xAI OAuth needs repair"),
+            "{scoped}"
+        );
+        assert!(
+            scoped.contains("API-key fallback: config (last4: ...1234)"),
+            "{scoped}"
+        );
+        assert!(scoped.contains("external credentials: blocked by the invalid Codewhale-owned xAI OAuth generation pointer"), "{scoped}");
+        assert!(
+            scoped.contains("repair: run `codewhale auth xai-device`"),
+            "{scoped}"
+        );
+        assert!(
+            !scoped.contains("external read-only consent (availability not probed)"),
+            "invalid owned pointers must not activate Grok CLI consent: {scoped}"
+        );
+
+        let all = auth_status_all_providers(&store, &secrets).join("\n");
+        let xai_row = all
+            .lines()
+            .find(|line| line.starts_with("xai"))
+            .expect("xAI status row");
+        assert!(xai_row.contains("needs repair"), "{xai_row}");
+        assert!(xai_row.contains("API-key fallback: config"), "{xai_row}");
+
+        let list = auth_list_lines(&store, &secrets).join("\n");
+        let xai_list_row = list
+            .lines()
+            .find(|line| line.starts_with("xai"))
+            .expect("xAI list row");
+        assert!(xai_list_row.ends_with("needs-repair"), "{xai_list_row}");
+
+        let get = auth_get_line_with_runtime(
+            &store,
+            &secrets,
+            ProviderKind::Xai,
+            &CliRuntimeOverrides::default(),
+        );
+        assert!(get.contains("xai: needs repair"), "{get}");
+        assert!(get.contains("API-key fallback: config-file"), "{get}");
+        assert!(
+            !keyring.queried().iter().any(|slot| slot == "xai"),
+            "an invalid owned pointer must not query the xAI API-key store: {:?}",
+            keyring.queried()
+        );
+        assert_eq!(
+            std::fs::read_to_string(external_path).expect("external trap unchanged"),
+            external_raw
+        );
+    }
+
+    #[test]
+    fn xai_cli_custom_endpoint_rejects_inherited_api_key_sources() {
+        use std::sync::Arc;
+
+        let _lock = env_lock();
+        let _xai_key = ScopedEnvVar::set("XAI_API_KEY", "fake-ambient-key-3333");
+        let _xai_base = ScopedEnvVar::remove("XAI_BASE_URL");
+        let _auth_mode = ScopedEnvVar::remove("DEEPSEEK_AUTH_MODE");
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let external_path = dir.path().join("grok-auth.json");
+        let external_raw = "external owner bytes must remain unprobed";
+        std::fs::write(&external_path, external_raw).expect("external auth trap");
+        let _grok_auth_path = ScopedEnvVar::set("GROK_AUTH_PATH", &external_path.to_string_lossy());
+
+        let mut store = ConfigStore::load(Some(config_path)).expect("store should load");
+        store.config.provider = ProviderKind::Xai;
+        store.config.providers.xai.api_key = Some("fake-cfg-key-1111".to_string());
+        store.config.providers.xai.auth_mode = Some("oauth".to_string());
+        store.config.providers.xai.oauth_credential_generation =
+            Some("xai-auth-0123456789abcdef0123456789abcdef.json".to_string());
+        store.config.providers.xai.external_credentials =
+            Some(codewhale_config::ExternalCredentialConsentToml::read_only(
+                ProviderKind::Xai,
+                codewhale_config::ExternalCredentialSource::GrokCli,
+                external_path.clone(),
+            ));
+        let keyring = Arc::new(RecordingKeyringStore::default());
+        keyring.set_value("xai", "fake-store-key-2222");
+        let secrets = Secrets::new(keyring.clone());
+        let runtime_overrides = CliRuntimeOverrides {
+            base_url: Some("https://gateway.example.test/v1".to_string()),
+            ..CliRuntimeOverrides::default()
+        };
+
+        let scoped = auth_status_lines_for_provider_with_runtime(
+            &store,
+            &secrets,
+            ProviderKind::Xai,
+            &runtime_overrides,
+        )
+        .join("\n");
+        assert!(
+            scoped.contains("route: https://gateway.example.test/v1"),
+            "{scoped}"
+        );
+        assert!(scoped.contains("credential route: missing"), "{scoped}");
+        assert!(
+            scoped.contains("custom xAI endpoint; API-key-only"),
+            "{scoped}"
+        );
+        assert!(
+            scoped.contains("not eligible for this custom xAI endpoint"),
+            "{scoped}"
+        );
+        assert!(
+            scoped.contains("external credentials: unavailable on a custom xAI endpoint"),
+            "{scoped}"
+        );
+        for redacted_tail in ["...1111", "...2222", "...3333"] {
+            assert!(
+                !scoped.contains(redacted_tail),
+                "custom CLI route must not advertise an inherited credential: {scoped}"
+            );
+        }
+
+        let all =
+            auth_status_all_providers_with_runtime(&store, &secrets, &runtime_overrides).join("\n");
+        let xai_row = all
+            .lines()
+            .find(|line| line.starts_with("xai"))
+            .expect("xAI status row");
+        assert!(xai_row.contains("unset"), "{xai_row}");
+        assert!(
+            !xai_row.contains("config") && !xai_row.contains("keyring") && !xai_row.contains("env"),
+            "xAI summary must show runtime-effective sources only: {xai_row}"
+        );
+
+        let list = auth_list_lines_with_runtime(&store, &secrets, &runtime_overrides).join("\n");
+        let xai_list_row = list
+            .lines()
+            .find(|line| line.starts_with("xai"))
+            .expect("xAI list row");
+        assert!(xai_list_row.ends_with("missing"), "{xai_list_row}");
+
+        let get =
+            auth_get_line_with_runtime(&store, &secrets, ProviderKind::Xai, &runtime_overrides);
+        assert_eq!(get, "xai: not set");
+        assert!(
+            !keyring.queried().iter().any(|slot| slot == "xai"),
+            "a global custom endpoint must not query xAI keyring state: {:?}",
+            keyring.queried()
+        );
+        assert_eq!(
+            std::fs::read_to_string(external_path).expect("external trap unchanged"),
+            external_raw
+        );
+    }
+
+    #[test]
+    fn xai_env_custom_endpoint_rejects_inherited_api_key_sources() {
+        use std::sync::Arc;
+
+        let _lock = env_lock();
+        let _xai_key = ScopedEnvVar::set("XAI_API_KEY", "fake-ambient-key-6666");
+        let _xai_base = ScopedEnvVar::set("XAI_BASE_URL", "https://env-gateway.example.test/v1");
+        let _auth_mode = ScopedEnvVar::remove("DEEPSEEK_AUTH_MODE");
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let external_path = dir.path().join("grok-auth.json");
+        let external_raw = "external owner bytes must remain unprobed";
+        std::fs::write(&external_path, external_raw).expect("external auth trap");
+        let _grok_auth_path = ScopedEnvVar::set("GROK_AUTH_PATH", &external_path.to_string_lossy());
+
+        let mut store = ConfigStore::load(Some(config_path)).expect("store should load");
+        store.config.provider = ProviderKind::Xai;
+        store.config.providers.xai.api_key = Some("fake-cfg-key-4444".to_string());
+        store.config.providers.xai.auth_mode = Some("oauth".to_string());
+        store.config.providers.xai.oauth_credential_generation =
+            Some("xai-auth-0123456789abcdef0123456789abcdef.json".to_string());
+        store.config.providers.xai.external_credentials =
+            Some(codewhale_config::ExternalCredentialConsentToml::read_only(
+                ProviderKind::Xai,
+                codewhale_config::ExternalCredentialSource::GrokCli,
+                external_path.clone(),
+            ));
+        let keyring = Arc::new(RecordingKeyringStore::default());
+        keyring.set_value("xai", "fake-store-key-5555");
+        let secrets = Secrets::new(keyring.clone());
+
+        let scoped = auth_status_lines_for_provider(&store, &secrets, ProviderKind::Xai).join("\n");
+        assert!(
+            scoped.contains("route: https://env-gateway.example.test/v1"),
+            "{scoped}"
+        );
+        assert!(scoped.contains("credential route: missing"), "{scoped}");
+        assert!(
+            scoped.contains("custom xAI endpoint; API-key-only"),
+            "{scoped}"
+        );
+        for redacted_tail in ["...4444", "...5555", "...6666"] {
+            assert!(
+                !scoped.contains(redacted_tail),
+                "custom env route must not advertise an inherited credential: {scoped}"
+            );
+        }
+
+        let all = auth_status_all_providers(&store, &secrets).join("\n");
+        let xai_row = all
+            .lines()
+            .find(|line| line.starts_with("xai"))
+            .expect("xAI status row");
+        assert!(xai_row.contains("unset"), "{xai_row}");
+
+        let list = auth_list_lines(&store, &secrets).join("\n");
+        let xai_list_row = list
+            .lines()
+            .find(|line| line.starts_with("xai"))
+            .expect("xAI list row");
+        assert!(xai_list_row.ends_with("missing"), "{xai_list_row}");
+
+        assert_eq!(
+            auth_get_line_with_runtime(
+                &store,
+                &secrets,
+                ProviderKind::Xai,
+                &CliRuntimeOverrides::default(),
+            ),
+            "xai: not set"
+        );
+        assert!(
+            !keyring.queried().iter().any(|slot| slot == "xai"),
+            "an XAI_BASE_URL custom route must not query xAI keyring state: {:?}",
+            keyring.queried()
+        );
+        assert_eq!(
+            std::fs::read_to_string(external_path).expect("external trap unchanged"),
+            external_raw
+        );
+    }
+
+    #[test]
+    fn xai_config_bound_custom_endpoint_uses_its_route_key() {
+        use std::sync::Arc;
+
+        let _lock = env_lock();
+        let _xai_key = ScopedEnvVar::remove("XAI_API_KEY");
+        let _xai_base = ScopedEnvVar::remove("XAI_BASE_URL");
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let mut store = ConfigStore::load(Some(config_path)).expect("store should load");
+        store.config.provider = ProviderKind::Xai;
+        store.config.providers.xai.base_url =
+            Some("https://bound-gateway.example.test/v1".to_string());
+        store.config.providers.xai.api_key = Some("fake-bound-key-7777".to_string());
+        let keyring = Arc::new(RecordingKeyringStore::default());
+        keyring.set_value("xai", "fake-store-key-8888");
+        let secrets = Secrets::new(keyring.clone());
+
+        let scoped = auth_status_lines_for_provider(&store, &secrets, ProviderKind::Xai).join("\n");
+        assert!(
+            scoped.contains("credential route: config (last4: ...7777)"),
+            "{scoped}"
+        );
+        assert!(
+            scoped.contains("config file:") && scoped.contains("runtime-effective, last4: ...7777"),
+            "{scoped}"
+        );
+        assert_eq!(
+            auth_get_line_with_runtime(
+                &store,
+                &secrets,
+                ProviderKind::Xai,
+                &CliRuntimeOverrides::default(),
+            ),
+            "xai: set (source: config-file)"
+        );
+        assert!(
+            !keyring.queried().iter().any(|slot| slot == "xai"),
+            "an endpoint-bound config key should resolve before the xAI keyring: {:?}",
+            keyring.queried()
+        );
+    }
+
+    #[test]
+    fn xai_absent_generation_with_consent_is_external_configured_and_unprobed() {
+        use std::sync::Arc;
+
+        let _lock = env_lock();
+        let _xai_key = ScopedEnvVar::remove("XAI_API_KEY");
+        let _xai_base = ScopedEnvVar::remove("XAI_BASE_URL");
+        let _auth_mode = ScopedEnvVar::remove("DEEPSEEK_AUTH_MODE");
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let external_path = dir.path().join("grok-auth.json");
+        let external_raw = "external owner bytes remain unprobed";
+        std::fs::write(&external_path, external_raw).expect("external auth trap");
+        let _grok_auth_path = ScopedEnvVar::set("GROK_AUTH_PATH", &external_path.to_string_lossy());
+
+        let mut store = ConfigStore::load(Some(config_path)).expect("store should load");
+        store.config.provider = ProviderKind::Xai;
+        store.config.providers.xai.auth_mode = Some("oauth".to_string());
+        store.config.providers.xai.external_credentials =
+            Some(codewhale_config::ExternalCredentialConsentToml::read_only(
+                ProviderKind::Xai,
+                codewhale_config::ExternalCredentialSource::GrokCli,
+                external_path.clone(),
+            ));
+        let keyring = Arc::new(RecordingKeyringStore::default());
+        let secrets = Secrets::new(keyring.clone());
+
+        let scoped = auth_status_lines_for_provider(&store, &secrets, ProviderKind::Xai).join("\n");
+        assert!(
+            scoped.contains("credential route: external read-only consent configured/unprobed"),
+            "{scoped}"
+        );
+        assert!(
+            scoped.contains("external credentials: read_only"),
+            "{scoped}"
+        );
+        assert!(
+            scoped.contains(
+                "lookup order: configured consent-gated exact Grok CLI file (availability unprobed)"
+            ),
+            "{scoped}"
+        );
+
+        let all = auth_status_all_providers(&store, &secrets).join("\n");
+        let xai_row = all
+            .lines()
+            .find(|line| line.starts_with("xai"))
+            .expect("xAI status row");
+        assert!(
+            xai_row.contains("external consent configured/unprobed"),
+            "{xai_row}"
+        );
+
+        let list = auth_list_lines(&store, &secrets).join("\n");
+        let xai_list_row = list
+            .lines()
+            .find(|line| line.starts_with("xai"))
+            .expect("xAI list row");
+        assert!(
+            xai_list_row.ends_with("external-consent-configured"),
+            "{xai_list_row}"
+        );
+
+        let get = auth_get_line_with_runtime(
+            &store,
+            &secrets,
+            ProviderKind::Xai,
+            &CliRuntimeOverrides::default(),
+        );
+        assert!(
+            get.contains("source: external read-only consent; availability unprobed"),
+            "{get}"
+        );
+        assert!(
+            !keyring.queried().iter().any(|slot| slot == "xai"),
+            "external-consent diagnostics must not query the xAI API-key store: {:?}",
+            keyring.queried()
+        );
+        assert_eq!(
+            std::fs::read_to_string(external_path).expect("external trap unchanged"),
+            external_raw
+        );
+    }
+
+    #[test]
+    fn auth_list_uses_persisted_consent_without_probing_codex_file() {
         use codewhale_secrets::InMemoryKeyringStore;
         use std::sync::Arc;
 
@@ -4732,6 +6817,12 @@ mod tests {
 
         let mut store = ConfigStore::load(Some(config_path)).expect("store should load");
         store.config.provider = ProviderKind::OpenaiCodex;
+        store.config.providers.openai_codex.external_credentials =
+            Some(codewhale_config::ExternalCredentialConsentToml::read_only(
+                ProviderKind::OpenaiCodex,
+                codewhale_config::ExternalCredentialSource::CodexCli,
+                auth_path,
+            ));
         let secrets = Secrets::new(Arc::new(InMemoryKeyringStore::new()));
 
         let output = auth_list_lines(&store, &secrets).join("\n");
@@ -4739,8 +6830,295 @@ mod tests {
             .lines()
             .find(|line| line.starts_with("openai-codex"))
             .unwrap_or_else(|| panic!("missing openai-codex row:\n{output}"));
-        assert!(row.ends_with("oauth"), "{row}");
+        assert!(row.ends_with("external-consent"), "{row}");
         assert!(!output.contains("secret-token"));
+    }
+
+    #[test]
+    fn external_consent_persists_exact_scope_and_api_key_or_revoke_disables_it() {
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let home = dir
+            .path()
+            .canonicalize()
+            .expect("canonical temp root")
+            .join("codewhale-home");
+        let _home = ScopedEnvVar::set("CODEWHALE_HOME", &home.to_string_lossy());
+        let config_path = dir.path().join("config.toml");
+        let external_path = dir.path().join("grok-auth.json");
+        let external_raw = r#"{"secret":"must-never-be-read-or-written"}"#;
+        std::fs::write(&external_path, external_raw).expect("external auth trap");
+        let mut store = ConfigStore::load(Some(config_path.clone())).expect("store should load");
+        let secrets = no_keyring_secrets();
+
+        let preview = external_consent_preview_lines(
+            ProviderKind::Xai,
+            codewhale_config::ExternalCredentialSource::GrokCli,
+            &external_path,
+        )
+        .join("\n");
+        assert!(preview.contains("owning CLI: Grok CLI"), "{preview}");
+        assert!(
+            preview.contains(&format!(
+                "exact resolved path: {}",
+                codewhale_config::quote_os_path(&external_path)
+            )),
+            "{preview}"
+        );
+        assert!(preview.contains("no refresh, identity-provider or discovery requests"));
+        assert!(preview.contains("normal requests to the explicitly selected provider"));
+        assert!(preview.contains("managed: unavailable"));
+
+        let mut prompt = Vec::new();
+        confirm_external_consent_answer(&mut "yes\n".as_bytes(), &mut prompt)
+            .expect("exact yes confirms");
+        assert!(
+            String::from_utf8(prompt)
+                .unwrap()
+                .contains("exact read-only")
+        );
+        let cancelled = confirm_external_consent_answer(&mut "YES\n".as_bytes(), &mut Vec::new())
+            .expect_err("confirmation is deliberate and case-sensitive");
+        assert!(cancelled.to_string().contains("cancelled"));
+
+        let unconfirmed = run_auth_command_with_secrets(
+            &mut store,
+            AuthCommand::ExternalConsent {
+                provider: ProviderArg::Xai,
+                mode: ExternalCredentialModeArg::ReadOnly,
+                path: Some(external_path.clone()),
+                yes: false,
+            },
+            &secrets,
+        )
+        .expect_err("non-interactive consent requires --yes");
+        assert!(unconfirmed.to_string().contains("requires explicit --yes"));
+        assert!(store.config.providers.xai.external_credentials.is_none());
+        assert!(
+            !config_path.exists(),
+            "unconfirmed consent must not persist"
+        );
+
+        run_auth_command_with_secrets(
+            &mut store,
+            AuthCommand::ExternalConsent {
+                provider: ProviderArg::Xai,
+                mode: ExternalCredentialModeArg::ReadOnly,
+                path: Some(external_path.clone()),
+                yes: true,
+            },
+            &secrets,
+        )
+        .expect("read-only consent should persist");
+
+        let consent = store
+            .config
+            .providers
+            .xai
+            .external_credentials
+            .as_ref()
+            .expect("persisted consent");
+        assert_eq!(
+            consent.access,
+            codewhale_config::ExternalCredentialAccess::ReadOnly
+        );
+        assert_eq!(consent.provider, ProviderKind::Xai.as_str());
+        assert_eq!(
+            consent.source,
+            codewhale_config::ExternalCredentialSource::GrokCli
+        );
+        assert_eq!(consent.path, external_path);
+        assert_eq!(
+            consent.consent_version,
+            codewhale_config::EXTERNAL_CREDENTIAL_CONSENT_VERSION
+        );
+        assert_eq!(
+            store.config.providers.xai.auth_mode.as_deref(),
+            Some("oauth")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&consent.path).expect("external file unchanged"),
+            external_raw
+        );
+
+        let reloaded = ConfigStore::load(Some(config_path.clone())).expect("reload consent");
+        let reloaded_consent = reloaded
+            .config
+            .providers
+            .xai
+            .external_credentials
+            .as_ref()
+            .expect("reloaded exact consent");
+        assert_eq!(reloaded_consent.provider, ProviderKind::Xai.as_str());
+        assert_eq!(
+            reloaded_consent.source,
+            codewhale_config::ExternalCredentialSource::GrokCli
+        );
+        assert_eq!(reloaded_consent.path, external_path);
+        assert_eq!(
+            reloaded_consent.consent_version,
+            codewhale_config::EXTERNAL_CREDENTIAL_CONSENT_VERSION
+        );
+
+        run_auth_command_with_secrets(
+            &mut store,
+            AuthCommand::Set {
+                provider: ProviderArg::Xai,
+                api_key: Some("xai-codewhale-owned-key".to_string()),
+                api_key_stdin: false,
+            },
+            &secrets,
+        )
+        .expect("Codewhale-owned API key should supersede external consent");
+        assert!(store.config.providers.xai.external_credentials.is_none());
+        assert_eq!(
+            std::fs::read_to_string(&external_path).expect("external file still unchanged"),
+            external_raw
+        );
+
+        run_auth_command_with_secrets(
+            &mut store,
+            AuthCommand::ExternalConsent {
+                provider: ProviderArg::Xai,
+                mode: ExternalCredentialModeArg::ReadOnly,
+                path: Some(external_path.clone()),
+                yes: true,
+            },
+            &secrets,
+        )
+        .expect("consent can be granted again");
+        run_auth_command_with_secrets(
+            &mut store,
+            AuthCommand::ExternalRevoke {
+                provider: ProviderArg::Xai,
+            },
+            &secrets,
+        )
+        .expect("revoke should persist");
+        assert!(store.config.providers.xai.external_credentials.is_none());
+        assert_eq!(
+            std::fs::read_to_string(&external_path).expect("revoke never touches external file"),
+            external_raw
+        );
+    }
+
+    #[test]
+    fn unsupported_managed_and_kimi_external_consent_fail_closed() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let external_path = dir.path().join("external-auth.json");
+        std::fs::write(&external_path, "must remain unchanged").expect("external fixture");
+        let mut store = ConfigStore::load(Some(config_path.clone())).expect("store should load");
+        let secrets = no_keyring_secrets();
+
+        let managed = run_auth_command_with_secrets(
+            &mut store,
+            AuthCommand::ExternalConsent {
+                provider: ProviderArg::OpenaiCodex,
+                mode: ExternalCredentialModeArg::Managed,
+                path: Some(external_path.clone()),
+                yes: true,
+            },
+            &secrets,
+        )
+        .expect_err("managed access must fail without a preservation adapter");
+        assert!(
+            managed
+                .to_string()
+                .contains("schema-safe preservation adapter")
+        );
+
+        let kimi = run_auth_command_with_secrets(
+            &mut store,
+            AuthCommand::ExternalConsent {
+                provider: ProviderArg::Moonshot,
+                mode: ExternalCredentialModeArg::ReadOnly,
+                path: Some(external_path.clone()),
+                yes: true,
+            },
+            &secrets,
+        )
+        .expect_err("Kimi must remain API-key-only");
+        assert!(kimi.to_string().contains("API-key-only"));
+        assert!(
+            kimi.to_string()
+                .contains("https://platform.kimi.ai/console/api-keys")
+        );
+        assert!(
+            store
+                .config
+                .providers
+                .openai_codex
+                .external_credentials
+                .is_none()
+        );
+        assert!(
+            store
+                .config
+                .providers
+                .moonshot
+                .external_credentials
+                .is_none()
+        );
+        assert_eq!(
+            std::fs::read_to_string(external_path).expect("external fixture unchanged"),
+            "must remain unchanged"
+        );
+        assert!(
+            !config_path.exists(),
+            "rejected consent must not write config"
+        );
+    }
+
+    #[test]
+    fn api_key_config_failure_restores_absent_and_existing_secret_state() {
+        let _lock = env_lock();
+        for prior in [None, Some("prior-xai-key")] {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let home = dir
+                .path()
+                .canonicalize()
+                .expect("canonical temp root")
+                .join("codewhale-home");
+            let _home = ScopedEnvVar::set("CODEWHALE_HOME", &home.to_string_lossy());
+            let config_path = dir.path().join("config.toml");
+            let mut store = ConfigStore::load(Some(config_path.clone())).expect("load store");
+            store.config.providers.xai.auth_mode = Some("oauth".to_string());
+            store.config.providers.xai.external_credentials =
+                Some(codewhale_config::ExternalCredentialConsentToml::read_only(
+                    ProviderKind::Xai,
+                    codewhale_config::ExternalCredentialSource::GrokCli,
+                    dir.path().join("external.json"),
+                ));
+            std::fs::create_dir(&config_path).expect("turn config target into a directory");
+            let secrets = no_keyring_secrets();
+            if let Some(prior) = prior {
+                secrets.set("xai", prior).expect("seed prior secret");
+            }
+
+            let error = run_auth_command_with_secrets(
+                &mut store,
+                AuthCommand::Set {
+                    provider: ProviderArg::Xai,
+                    api_key: Some("new-xai-key".to_string()),
+                    api_key_stdin: false,
+                },
+                &secrets,
+            )
+            .expect_err("config write must fail");
+            assert!(error.to_string().contains("config"), "{error:#}");
+            assert_eq!(
+                secrets.get("xai").expect("restored secret"),
+                prior.map(str::to_string)
+            );
+            assert_eq!(
+                store.config.providers.xai.auth_mode.as_deref(),
+                Some("oauth")
+            );
+            assert!(store.config.providers.xai.external_credentials.is_some());
+            assert!(store.config.providers.xai.api_key.is_none());
+            assert!(config_path.is_dir());
+        }
     }
 
     #[test]
@@ -4772,10 +7150,14 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_keyring_recovery_self_heals_into_config_file() {
+    fn dispatch_uses_secret_store_without_rehydrating_plaintext_config() {
         use codewhale_secrets::{InMemoryKeyringStore, KeyringStore};
         use std::sync::Arc;
 
+        // Runtime resolution reads process-global provider environment overrides.
+        // Serialize with the tests that temporarily set those overrides so this
+        // in-memory DeepSeek credential is not resolved against another provider.
+        let _lock = env_lock();
         let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
         let path = std::env::temp_dir().join(format!(
             "deepseek-cli-dispatch-keyring-heal-test-{}-{nanos}.toml",
@@ -4793,28 +7175,27 @@ mod tests {
         );
 
         assert_eq!(resolved.api_key.as_deref(), Some("ring-key"));
-        assert_eq!(
-            resolved.api_key_source,
-            Some(RuntimeApiKeySource::ConfigFile)
+        assert_eq!(resolved.api_key_source, Some(RuntimeApiKeySource::Keyring));
+        assert!(store.config.api_key.is_none());
+        assert!(store.config.providers.deepseek.api_key.is_none());
+        assert!(
+            !path.exists(),
+            "dispatch must not create config from a stored key"
         );
-        assert_eq!(store.config.api_key.as_deref(), Some("ring-key"));
-        assert_eq!(
-            store.config.providers.deepseek.api_key.as_deref(),
-            Some("ring-key")
-        );
-
-        let saved = std::fs::read_to_string(&path).expect("config should be written");
-        assert!(saved.contains("api_key = \"ring-key\""));
 
         let resolved_again = resolve_runtime_for_dispatch_with_secrets(
             &mut store,
             &CliRuntimeOverrides::default(),
-            &no_keyring_secrets(),
+            &secrets,
         );
         assert_eq!(resolved_again.api_key.as_deref(), Some("ring-key"));
         assert_eq!(
             resolved_again.api_key_source,
-            Some(RuntimeApiKeySource::ConfigFile)
+            Some(RuntimeApiKeySource::Keyring)
+        );
+        assert!(
+            !path.exists(),
+            "repeat dispatch must remain credential-file free"
         );
 
         let _ = std::fs::remove_file(path);
@@ -4822,16 +7203,35 @@ mod tests {
 
     #[test]
     fn logout_removes_plaintext_provider_keys() {
-        let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
-        let path = std::env::temp_dir().join(format!(
-            "deepseek-cli-logout-test-{}-{nanos}.toml",
-            std::process::id()
-        ));
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let home = dir
+            .path()
+            .canonicalize()
+            .expect("canonical temp root")
+            .join("codewhale-home");
+        let _home = ScopedEnvVar::set("CODEWHALE_HOME", &home.to_string_lossy());
+        let path = home.join("config.toml");
         let mut store = ConfigStore::load(Some(path.clone())).expect("store should load");
         store.config.api_key = Some("sk-stale".to_string());
         store.config.providers.deepseek.api_key = Some("sk-stale".to_string());
         store.config.providers.fireworks.api_key = Some("fw-stale".to_string());
+        store.config.providers.xai.auth_mode = Some("oauth".to_string());
+        let generation = "xai-auth-0123456789abcdef0123456789abcdef.json";
+        store.config.providers.xai.oauth_credential_generation = Some(generation.to_string());
         store.save().unwrap();
+        let credentials = home.join("credentials");
+        codewhale_config::with_xai_oauth_lifecycle_lock(|owned| {
+            owned.write(generation, b"xai-generation", false)?;
+            owned.write(
+                codewhale_config::LEGACY_XAI_OAUTH_FILE_NAME,
+                b"legacy-xai",
+                false,
+            )?;
+            Ok(())
+        })
+        .expect("seed Codewhale-owned xAI credentials");
+        std::fs::write(credentials.join("other-provider.json"), "preserve").unwrap();
 
         let secrets = no_keyring_secrets();
 
@@ -4840,6 +7240,18 @@ mod tests {
         assert!(store.config.api_key.is_none());
         assert!(store.config.providers.deepseek.api_key.is_none());
         assert!(store.config.providers.fireworks.api_key.is_none());
+        assert!(store.config.providers.xai.auth_mode.is_none());
+        assert!(
+            store
+                .config
+                .providers
+                .xai
+                .oauth_credential_generation
+                .is_none()
+        );
+        assert!(!credentials.join(generation).exists());
+        assert!(!credentials.join("xai-auth.json").exists());
+        assert!(credentials.join("other-provider.json").exists());
 
         let _ = std::fs::remove_file(path);
     }
@@ -4885,6 +7297,38 @@ mod tests {
         assert!(!saved.contains("sk-deep"), "plaintext leaked: {saved}");
         assert!(!saved.contains("or-key"), "plaintext leaked: {saved}");
         assert!(!saved.contains("nv-key"), "plaintext leaked: {saved}");
+
+        let backup_path = path.with_file_name(format!(
+            "{}.bak",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        let backup = std::fs::read_to_string(&backup_path).expect("credential-free backup");
+        assert!(
+            !backup.contains("sk-deep"),
+            "plaintext leaked in backup: {backup}"
+        );
+        assert!(
+            !backup.contains("or-key"),
+            "plaintext leaked in backup: {backup}"
+        );
+        assert!(
+            !backup.contains("nv-key"),
+            "plaintext leaked in backup: {backup}"
+        );
+
+        let resolved = resolve_runtime_for_dispatch_with_secrets(
+            &mut store,
+            &CliRuntimeOverrides::default(),
+            &secrets,
+        );
+        assert_eq!(resolved.api_key_source, Some(RuntimeApiKeySource::Keyring));
+        let after_dispatch = std::fs::read_to_string(&path).expect("config after dispatch");
+        assert!(!after_dispatch.contains("sk-deep"), "{after_dispatch}");
+        assert!(
+            !after_dispatch
+                .lines()
+                .any(|line| line.trim_start().starts_with("api_key ="))
+        );
 
         let _ = std::fs::remove_file(path);
     }
@@ -4956,7 +7400,7 @@ mod tests {
             "deepseek-v4-pro",
         ]);
 
-        assert!(matches!(cli.provider, Some(ProviderArg::Openai)));
+        assert_eq!(cli.provider.as_deref(), Some("openai"));
         assert_eq!(cli.config, Some(PathBuf::from("/tmp/deepseek.toml")));
         assert_eq!(cli.profile.as_deref(), Some("work"));
         assert_eq!(cli.model.as_deref(), Some("deepseek-v4-pro"));
@@ -5000,6 +7444,60 @@ mod tests {
     }
 
     #[test]
+    fn build_tui_command_forwards_raw_exec_and_fleet_provider_without_secret_bridge() {
+        let _lock = env_lock();
+        let (_dir, _bin) = install_fake_tui_binary();
+        let _ambient_provider = ScopedEnvVar::set("CODEWHALE_PROVIDER", "openrouter");
+
+        let cases = [
+            (
+                parse_ok(&["codewhale", "--provider", "lm-studio", "exec", "Reply OK"]),
+                vec!["exec".to_string(), "Reply OK".to_string()],
+            ),
+            (
+                parse_ok(&["codewhale", "--provider", "lm-studio", "fleet", "status"]),
+                vec!["fleet".to_string(), "status".to_string()],
+            ),
+        ];
+
+        for (cli, passthrough) in cases {
+            let mut resolved =
+                resolved_runtime_for_test(ProviderKind::Openrouter, ProviderSource::Config);
+            resolved.api_key = Some("unrelated-keyring-secret".to_string());
+            resolved.api_key_source = Some(RuntimeApiKeySource::Keyring);
+
+            let cmd = build_tui_command(&cli, &resolved, passthrough.clone())
+                .expect("raw provider should dispatch to the TUI");
+            assert_eq!(
+                command_env(&cmd, "CODEWHALE_PROVIDER").as_deref(),
+                Some("lm-studio")
+            );
+            assert_eq!(
+                command_env(&cmd, "DEEPSEEK_PROVIDER").as_deref(),
+                Some("lm-studio")
+            );
+            for secret_var in [
+                "CODEWHALE_CLI_API_KEY",
+                "DEEPSEEK_API_KEY",
+                "OPENROUTER_API_KEY",
+                "DEEPSEEK_API_KEY_SOURCE",
+            ] {
+                assert_eq!(
+                    command_env(&cmd, secret_var),
+                    None,
+                    "raw provider dispatch must not bridge {secret_var}"
+                );
+            }
+            assert_eq!(
+                cmd.get_args()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+                passthrough
+            );
+        }
+    }
+
+    #[test]
     fn build_tui_command_allows_openai_and_forwards_provider_key() {
         let _lock = env_lock();
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -5037,6 +7535,10 @@ mod tests {
         };
 
         let cmd = build_tui_command(&cli, &resolved, Vec::new()).expect("command");
+        assert_eq!(
+            command_env(&cmd, "CODEWHALE_PROVIDER").as_deref(),
+            Some("openai")
+        );
         assert_eq!(
             command_env(&cmd, "DEEPSEEK_PROVIDER").as_deref(),
             Some("openai")
@@ -5818,5 +8320,26 @@ mod tests {
 
         let resolved = locate_sibling_tui_binary().expect("override must resolve");
         assert_eq!(resolved, custom);
+    }
+
+    /// `CODEWHALE_TUI_BIN` is the canonical override name and outranks the
+    /// legacy `DEEPSEEK_TUI_BIN` alias when both are set.
+    #[test]
+    fn locate_sibling_tui_binary_prefers_codewhale_env_override() {
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let canonical = dir
+            .path()
+            .join(format!("canonical-tui{}", std::env::consts::EXE_SUFFIX));
+        let legacy = dir
+            .path()
+            .join(format!("legacy-tui{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&canonical, b"").unwrap();
+        std::fs::write(&legacy, b"").unwrap();
+        let _canonical_bin = ScopedEnvVar::set("CODEWHALE_TUI_BIN", &canonical.to_string_lossy());
+        let _legacy_bin = ScopedEnvVar::set("DEEPSEEK_TUI_BIN", &legacy.to_string_lossy());
+
+        let resolved = locate_sibling_tui_binary().expect("override must resolve");
+        assert_eq!(resolved, canonical);
     }
 }

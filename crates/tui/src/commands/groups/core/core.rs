@@ -4,11 +4,11 @@ use std::fmt::Write;
 use std::path::PathBuf;
 
 use crate::config::{
-    ApiProvider, COMMON_DEEPSEEK_MODELS, normalize_custom_model_id,
+    ApiProvider, COMMON_DEEPSEEK_MODELS, DEFAULT_KIMI_CODE_BASE_URL,
+    KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL, normalize_custom_model_id,
     normalize_model_name_for_provider,
 };
-use crate::localization::{MessageId, tr};
-use crate::route_runtime::resolve_route_candidate;
+use crate::localization::{Locale, MessageId, tr};
 use crate::tui::app::{App, AppAction, AppMode, ReasoningEffort};
 use crate::tui::views::{HelpView, ModalKind, SubAgentsView, subagent_view_agents};
 
@@ -156,10 +156,11 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
                 app.session.last_completion_tokens = None;
                 app.session.last_output_throughput = None;
             }
-            app.provider_models
-                .insert(app.api_provider.as_str().to_string(), "auto".to_string());
-            let persist_warning =
-                provider_model_selection_persist_warning(app.api_provider, "auto");
+            app.provider_models.insert(
+                app.provider_identity_for_persistence().to_string(),
+                "auto".to_string(),
+            );
+            let persist_warning = provider_model_selection_persist_warning(app, "auto");
             let mut message = tr(app.ui_locale, MessageId::ModelChanged)
                 .replace("{old}", &old_model)
                 .replace("{new}", "auto");
@@ -192,27 +193,51 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
                 app.api_provider,
                 ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::Zai
             );
-        let route_limits = if strict_direct_custom_endpoint {
+        let route_resolution = if strict_direct_custom_endpoint {
             None
         } else {
-            match resolve_route_candidate(
+            // `/model` normally resolves against the active provider's
+            // catalog-default endpoint so it retains the existing local
+            // provider/model validation. The one endpoint-sensitive model
+            // selection is Kimi Code's bare `k3`: resolve it against the
+            // committed Kimi Code route rather than silently falling back to
+            // Moonshot's direct API route. Do not pass an unrelated stale
+            // endpoint through here; doing so would turn a foreign provider
+            // model into an apparent custom-route selection.
+            let route_base_url = crate::config::is_exact_kimi_code_k3_route(
+                app.api_provider,
+                &app.active_route_base_url,
+                &model_id,
+            )
+            .then(|| app.active_route_base_url.clone());
+            match crate::route_runtime::resolve_route_candidate_with_context_metadata(
                 app.api_provider,
                 Some(&model_id),
                 None,
-                None,
+                route_base_url,
                 app.active_context_window_override,
+                None,
             ) {
-                Ok(candidate) => Some(candidate.limits),
+                Ok(resolution) => Some(resolution),
                 Err(reason) => return CommandResult::error(reason),
             }
         };
         let old_model = app.model_display_label();
         let model_changed = app.auto_model || app.model != model_id;
         app.set_model_selection(model_id.clone());
-        if let Some(limits) = route_limits {
-            app.set_active_route_limits(limits);
+        if let Some(resolution) = route_resolution {
+            app.set_active_route_resolution(
+                resolution.candidate.endpoint().base_url.clone(),
+                resolution.candidate.limits(),
+                resolution.context_window.source,
+            );
         } else {
             app.active_route_limits = app.context_window_override_limits();
+            app.active_context_window_source = if app.active_context_window_override.is_some() {
+                crate::route_runtime::ContextWindowSource::Configured
+            } else {
+                crate::route_runtime::ContextWindowSource::Fallback
+            };
         }
         app.update_model_compaction_budget();
         if model_changed {
@@ -222,9 +247,11 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
             app.session.last_completion_tokens = None;
             app.session.last_output_throughput = None;
         }
-        app.provider_models
-            .insert(app.api_provider.as_str().to_string(), model_id.clone());
-        let persist_warning = provider_model_selection_persist_warning(app.api_provider, &model_id);
+        app.provider_models.insert(
+            app.provider_identity_for_persistence().to_string(),
+            model_id.clone(),
+        );
+        let persist_warning = provider_model_selection_persist_warning(app, &model_id);
         let mut message = tr(app.ui_locale, MessageId::ModelChanged)
             .replace("{old}", &old_model)
             .replace("{new}", &model_id);
@@ -240,10 +267,17 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
     }
 }
 
-fn provider_model_selection_persist_warning(provider: ApiProvider, model: &str) -> Option<String> {
-    crate::settings::Settings::persist_provider_model_selection(provider, model)
-        .err()
-        .map(|err| format!(" (not persisted: {err})"))
+fn provider_model_selection_persist_warning(app: &App, model: &str) -> Option<String> {
+    let result = if app.api_provider == ApiProvider::Custom {
+        (|| -> anyhow::Result<()> {
+            let mut settings = crate::settings::Settings::load()?;
+            settings.set_model_for_provider(app.provider_identity_for_persistence(), model);
+            settings.save()
+        })()
+    } else {
+        crate::settings::Settings::persist_provider_model_selection(app.api_provider, model)
+    };
+    result.err().map(|err| format!(" (not persisted: {err})"))
 }
 
 /// Fetch and list available models from the configured API endpoint.
@@ -323,165 +357,53 @@ fn expand_workspace_path(path: &str) -> Result<PathBuf, String> {
     Ok(PathBuf::from(path))
 }
 
-struct ProviderLinkInfo {
-    key_url: Option<&'static str>,
-    docs_url: &'static str,
-    note: &'static str,
-}
-
-fn provider_link_info(provider_id: &str) -> ProviderLinkInfo {
-    match provider_id {
-        "deepseek" => ProviderLinkInfo {
-            key_url: Some("https://platform.deepseek.com/api_keys"),
-            docs_url: "https://api-docs.deepseek.com/",
-            note: "Create an API key in the DeepSeek platform console.",
-        },
-        "nvidia-nim" => ProviderLinkInfo {
-            key_url: Some("https://build.nvidia.com/settings/api-keys"),
-            docs_url: "https://build.nvidia.com/explore/discover",
-            note: "NVIDIA NIM keys are managed from the NVIDIA build console.",
-        },
-        "openai" => ProviderLinkInfo {
-            key_url: Some("https://platform.openai.com/api-keys"),
-            docs_url: "https://platform.openai.com/docs/api-reference",
-            note: "Use this for OpenAI or compatible endpoints that share OpenAI-style auth.",
-        },
-        "atlascloud" => ProviderLinkInfo {
-            key_url: None,
-            docs_url: "https://atlascloud.ai/docs/en/api-keys",
-            note: "Atlas Cloud documents API key creation in its API Keys guide.",
-        },
-        "wanjie-ark" => ProviderLinkInfo {
-            key_url: None,
-            docs_url: "https://platform.lingyiwanwu.com/docs",
-            note: "Use the Wanjie/01.AI platform console for provider credentials.",
-        },
-        "volcengine" => ProviderLinkInfo {
-            key_url: Some("https://console.volcengine.com/ark/apiKey"),
-            docs_url: "https://www.volcengine.com/docs/82379/1541594",
-            note: "Volcengine Ark API keys are managed in the Ark console.",
-        },
-        "openrouter" => ProviderLinkInfo {
-            key_url: Some("https://openrouter.ai/settings/keys"),
-            docs_url: "https://openrouter.ai/docs/api/reference/authentication",
-            note: "OpenRouter keys can include app credit limits and model routing controls.",
-        },
-        "xiaomi-mimo" => ProviderLinkInfo {
-            key_url: Some("https://platform.xiaomimimo.com/token-plan"),
-            docs_url: "https://mimo.mi.com/docs/en-US/tokenplan/Token%20Plan/subscription",
-            note: "Token Plan keys use the base URL shown on the Xiaomi MiMo Token Plan page.",
-        },
-        "novita" => ProviderLinkInfo {
-            key_url: Some("https://novita.ai/en/settings/key-management"),
-            docs_url: "https://novita.ai/docs/guides/quickstart",
-            note: "Novita keys are managed from Key Management in account settings.",
-        },
-        "fireworks" => ProviderLinkInfo {
-            key_url: Some("https://fireworks.ai/api-keys"),
-            docs_url: "https://docs.fireworks.ai/getting-started/quickstart",
-            note: "Create a Fireworks API key before exporting FIREWORKS_API_KEY.",
-        },
-        "siliconflow" => ProviderLinkInfo {
-            key_url: Some("https://cloud.siliconflow.com/account/ak"),
-            docs_url: "https://docs.siliconflow.com/en/userguide/quickstart",
-            note: "Use the global SiliconFlow console unless your route is the China endpoint.",
-        },
-        "siliconflow-CN" => ProviderLinkInfo {
-            key_url: Some("https://cloud.siliconflow.cn/account/ak"),
-            docs_url: "https://docs.siliconflow.cn/en/userguide/quickstart",
-            note: "Use the China SiliconFlow console for the China endpoint.",
-        },
-        "arcee" => ProviderLinkInfo {
-            key_url: None,
-            docs_url: "https://docs.arcee.ai/other/create-your-first-api-key",
-            note: "Arcee documents key creation from the platform API Keys page.",
-        },
-        "moonshot" => ProviderLinkInfo {
-            key_url: Some("https://platform.kimi.ai/console/api-keys"),
-            docs_url: "https://platform.kimi.ai/docs/api/overview",
-            note: "Moonshot/Kimi keys are managed in the Kimi Open Platform console.",
-        },
-        "sglang" => ProviderLinkInfo {
-            key_url: None,
-            docs_url: "https://docs.sglang.ai/",
-            note: "Self-hosted SGLang usually needs a local base URL, not a hosted token.",
-        },
-        "vllm" => ProviderLinkInfo {
-            key_url: None,
-            docs_url: "https://docs.vllm.ai/en/stable/serving/openai_compatible_server/",
-            note: "Self-hosted vLLM usually needs a local base URL, not a hosted token.",
-        },
-        "ollama" => ProviderLinkInfo {
-            key_url: None,
-            docs_url: "https://docs.ollama.com/api",
-            note: "Local Ollama does not require an API key by default.",
-        },
-        "huggingface" => ProviderLinkInfo {
-            key_url: Some("https://huggingface.co/settings/tokens"),
-            docs_url: "https://huggingface.co/docs/hub/en/security-tokens",
-            note: "Use a scoped Hugging Face access token.",
-        },
-        "together" => ProviderLinkInfo {
-            key_url: Some("https://api.together.ai/settings/api-keys"),
-            docs_url: "https://docs.together.ai/docs/api-keys-authentication",
-            note: "Together API keys are project-scoped.",
-        },
-        "openai-codex" => ProviderLinkInfo {
-            key_url: None,
-            docs_url: "https://developers.openai.com/codex/",
-            note: "This route uses Codex/ChatGPT auth instead of a normal provider API key.",
-        },
-        "anthropic" => ProviderLinkInfo {
-            key_url: Some("https://console.anthropic.com/settings/keys"),
-            docs_url: "https://docs.anthropic.com/en/api/overview",
-            note: "Create Claude API keys from the Anthropic Console.",
-        },
-        "zai" => ProviderLinkInfo {
-            key_url: None,
-            docs_url: "https://docs.z.ai/api-reference/introduction",
-            note: "Create or manage Z.ai API keys from the API Keys page linked in the docs.",
-        },
-        "stepfun" => ProviderLinkInfo {
-            key_url: Some("https://platform.stepfun.ai/"),
-            docs_url: "https://platform.stepfun.ai/docs/en/quickstart/overview",
-            note: "Open Account Management > Interface Keys in the StepFun console.",
-        },
-        "minimax" => ProviderLinkInfo {
-            key_url: Some(
-                "https://platform.minimax.io/user-center/basic-information/interface-key",
-            ),
-            docs_url: "https://platform.minimax.io/docs/api-reference/api-overview",
-            note: "MiniMax has separate pay-as-you-go API keys and Token Plan subscription keys.",
-        },
-        "deepinfra" => ProviderLinkInfo {
-            key_url: Some("https://deepinfra.com/dash/api_keys"),
-            docs_url: "https://docs.deepinfra.com/quickstart",
-            note: "Create DeepInfra API keys from the dashboard.",
-        },
-        "qianfan" => ProviderLinkInfo {
-            key_url: None,
-            docs_url: "https://cloud.baidu.com/doc/qianfan/index.html",
-            note: "Create Baidu Qianfan API keys from the Qianfan console.",
-        },
-        _ => ProviderLinkInfo {
-            key_url: None,
-            docs_url: "https://codewhale.net/en/docs",
-            note: "Use the provider console for credentials, then configure the matching env var.",
-        },
+fn public_site_locale_segment(locale: Locale) -> &'static str {
+    match locale {
+        Locale::ZhHans | Locale::ZhHant => "zh",
+        Locale::En | Locale::Ja | Locale::PtBr | Locale::Es419 | Locale::Vi | Locale::Ko => "en",
     }
 }
 
-/// Show provider dashboard, token, and docs links.
-pub fn deepseek_links(app: &mut App) -> CommandResult {
+/// Show Codewhale documentation, community, managed-app, and provider links.
+pub fn codewhale_links(app: &mut App) -> CommandResult {
     let locale = app.ui_locale;
     let active_provider = app.api_provider.as_str();
+    let site_locale = public_site_locale_segment(locale);
     let mut message = format!(
         "{}\n─────────────────────────────\n",
+        tr(locale, MessageId::LinksProjectTitle)
+    );
+
+    let _ = writeln!(
+        message,
+        "{} `https://codewhale.net/{site_locale}/docs`",
+        tr(locale, MessageId::LinksDocumentation)
+    );
+    let _ = writeln!(
+        message,
+        "{} `https://codewhale.net/{site_locale}/community`",
+        tr(locale, MessageId::LinksCommunity)
+    );
+    let _ = writeln!(
+        message,
+        "{} `https://github.com/Hmbown/CodeWhale`",
+        tr(locale, MessageId::LinksGitHub)
+    );
+    let _ = writeln!(
+        message,
+        "{} `https://app.codewhale.net`",
+        tr(locale, MessageId::LinksManagedApp)
+    );
+    let _ = writeln!(message, "{}", tr(locale, MessageId::LinksManagedAppNote));
+
+    let _ = write!(
+        message,
+        "\n{}\n─────────────────────────────\n",
         tr(locale, MessageId::LinksTitle)
     );
 
     for provider in codewhale_config::provider::providers_sorted_for_display() {
-        let links = provider_link_info(provider.id());
+        let links = provider.credential_help();
         let active_marker = if provider.id() == active_provider {
             " <- current"
         } else {
@@ -494,7 +416,7 @@ pub fn deepseek_links(app: &mut App) -> CommandResult {
             provider.id(),
             active_marker
         );
-        if let Some(key_url) = links.key_url {
+        if let Some(key_url) = links.credential_url {
             let _ = writeln!(
                 message,
                 "{} `{}`",
@@ -506,15 +428,26 @@ pub fn deepseek_links(app: &mut App) -> CommandResult {
                 message,
                 "{} {}",
                 tr(locale, MessageId::LinksDashboard),
-                links.note
+                links.guidance
             );
         }
-        let _ = writeln!(
-            message,
-            "{}      `{}`",
-            tr(locale, MessageId::LinksDocs),
-            links.docs_url
-        );
+        if let Some(docs_url) = links.docs_url {
+            let _ = writeln!(
+                message,
+                "{}      `{}`",
+                tr(locale, MessageId::LinksDocs),
+                docs_url
+            );
+        }
+        if provider.kind() == codewhale_config::ProviderKind::Moonshot {
+            let _ = writeln!(
+                message,
+                "{}",
+                tr(locale, MessageId::LinksKimiCodeRouteNote)
+                    .replace("{route}", DEFAULT_KIMI_CODE_BASE_URL)
+                    .replace("{console}", KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL)
+            );
+        }
         let env_vars = provider.env_vars();
         if env_vars.is_empty() {
             let _ = writeln!(message, "Env: none");
@@ -672,7 +605,7 @@ mod tests {
     struct SettingsPathGuard {
         _tmp: TempDir,
         previous: Option<OsString>,
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: crate::test_support::TestEnvLock,
     }
 
     impl SettingsPathGuard {
@@ -775,7 +708,7 @@ mod tests {
         let result = help(&mut app, Some("links"));
         let msg = result.message.expect("help topic should return message");
         assert!(msg.contains("links"));
-        assert!(msg.contains("Show provider token, dashboard, and docs links"));
+        assert!(msg.contains("Show Codewhale, community, and provider links"));
         assert!(msg.contains("Usage: /links"));
         assert!(msg.contains("Aliases: dashboard, api"));
     }
@@ -924,6 +857,7 @@ mod tests {
         });
         app.push_turn_cache_record(TurnCacheRecord {
             provider: None,
+            provider_identity: None,
             model: None,
             auto_model: false,
             input_tokens: 100,
@@ -1035,6 +969,43 @@ mod tests {
         assert_eq!(app.model, "deepseek-v4-flash");
         assert_eq!(app.session.last_prompt_tokens, None);
         assert_eq!(app.session.last_completion_tokens, None);
+    }
+
+    #[test]
+    fn model_command_preserves_active_kimi_code_endpoint_for_bare_k3() {
+        let _settings = SettingsPathGuard::new();
+        let mut app = create_test_app();
+        app.set_provider_identity(crate::config::ApiProvider::Moonshot, "moonshot");
+        app.model_ids_passthrough = true;
+        app.active_route_base_url = crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string();
+        app.active_context_window_override = None;
+
+        let result = model(&mut app, Some(crate::config::KIMI_CODE_K3_MODEL));
+
+        assert!(
+            !result.is_error,
+            "Kimi Code K3 route should resolve: {result:?}"
+        );
+        assert_eq!(app.model, crate::config::KIMI_CODE_K3_MODEL);
+        assert_eq!(
+            app.active_route_limits
+                .and_then(|limits| limits.context_tokens),
+            Some(u64::from(crate::config::KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS))
+        );
+
+        // The same bare model ID on Moonshot's direct API must retain the
+        // generic route limits rather than inheriting Kimi Code entitlement.
+        app.active_route_base_url = crate::config::DEFAULT_MOONSHOT_BASE_URL.to_string();
+        let direct = model(&mut app, Some(crate::config::KIMI_CODE_K3_MODEL));
+        assert!(
+            !direct.is_error,
+            "direct Moonshot route remains valid: {direct:?}"
+        );
+        assert_ne!(
+            app.active_route_limits
+                .and_then(|limits| limits.context_tokens),
+            Some(u64::from(crate::config::KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS))
+        );
     }
 
     #[test]
@@ -1188,6 +1159,7 @@ mod tests {
         app.model = "deepseek-v4-pro".to_string();
         app.push_turn_cache_record(TurnCacheRecord {
             provider: None,
+            provider_identity: None,
             model: None,
             auto_model: false,
             input_tokens: 100,
@@ -1212,6 +1184,7 @@ mod tests {
         app.model = "deepseek-v4-pro".to_string();
         app.push_turn_cache_record(TurnCacheRecord {
             provider: None,
+            provider_identity: None,
             model: None,
             auto_model: false,
             input_tokens: 100,
@@ -1364,18 +1337,38 @@ mod tests {
     }
 
     #[test]
-    fn test_deepseek_links() {
+    fn test_codewhale_links() {
         let mut app = create_test_app();
-        let result = deepseek_links(&mut app);
+        let result = codewhale_links(&mut app);
         assert!(result.message.is_some());
         let msg = result.message.unwrap();
+        assert!(msg.contains("Codewhale & community"));
+        assert!(msg.contains("https://codewhale.net/en/docs"));
+        assert!(msg.contains("https://codewhale.net/en/community"));
+        assert!(msg.contains("https://github.com/Hmbown/CodeWhale"));
+        assert!(msg.contains("https://app.codewhale.net"));
+        assert!(msg.contains("separate sign-in"));
+        assert!(msg.contains("not connected to the current local session"));
         assert!(msg.contains("Provider Links"));
         assert!(msg.contains("DeepSeek (deepseek) <- current"));
         assert!(msg.contains("https://platform.deepseek.com/api_keys"));
         assert!(msg.contains("Xiaomi MiMo (xiaomi-mimo)"));
         assert!(msg.contains("https://platform.xiaomimimo.com/token-plan"));
+        assert!(msg.contains("Moonshot/Kimi (moonshot)"));
+        assert!(msg.contains("https://platform.kimi.ai/console/api-keys"));
+        assert!(msg.contains("https://platform.kimi.ai/docs/overview"));
+        assert!(msg.contains("https://api.kimi.com/coding/v1"));
+        assert!(msg.contains("https://www.kimi.com/code/console"));
+        assert!(msg.contains("never imports Kimi CLI credentials"));
+        assert!(msg.contains("https://console.openmodel.ai/"));
+        assert!(msg.contains("https://docs.openmodel.ai/en/docs/getting-started/authentication"));
+        assert!(msg.contains("https://console.sakana.ai/api-keys"));
+        assert!(msg.contains("https://console.sakana.ai/get-started"));
         assert!(msg.contains("Baidu Qianfan (qianfan)"));
         assert!(msg.contains("https://cloud.baidu.com/doc/qianfan/index.html"));
+        assert!(msg.contains("Local Ollama is keyless by default"));
+        assert!(msg.contains("Run `codex login`"));
+        assert!(msg.contains("no canonical vendor credential page exists"));
         assert!(msg.contains("OPENAI_API_KEY"));
         assert!(msg.contains("XIAOMI_MIMO_TOKEN_PLAN_API_KEY"));
         assert!(!msg.contains("https://codewhale.dev/docs/providers"));
@@ -1385,7 +1378,7 @@ mod tests {
     #[test]
     fn provider_links_emit_urls_as_inline_code_for_narrow_transcripts() {
         let mut app = create_test_app();
-        let result = deepseek_links(&mut app);
+        let result = codewhale_links(&mut app);
         let msg = result.message.expect("links should return a message");
 
         assert!(msg.contains("`https://platform.openai.com/api-keys`"));
@@ -1407,11 +1400,31 @@ mod tests {
     }
 
     #[test]
-    fn provider_link_fallback_uses_current_codewhale_docs() {
-        let links = provider_link_info("unknown-provider");
+    fn provider_link_metadata_marks_custom_routes_as_configuration_owned() {
+        let links =
+            codewhale_config::provider::provider_for_kind(codewhale_config::ProviderKind::Custom)
+                .credential_help();
 
-        assert_eq!(links.docs_url, "https://codewhale.net/en/docs");
-        assert_eq!(links.key_url, None);
+        assert_eq!(
+            links.acquisition,
+            codewhale_config::provider::CredentialAcquisition::Configuration
+        );
+        assert_eq!(links.docs_url, None);
+        assert_eq!(links.credential_url, None);
+    }
+
+    #[test]
+    fn project_links_follow_the_available_public_site_locale() {
+        let mut app = create_test_app();
+        app.ui_locale = Locale::ZhHans;
+
+        let msg = codewhale_links(&mut app)
+            .message
+            .expect("links should return a message");
+
+        assert!(msg.contains("`https://codewhale.net/zh/docs`"));
+        assert!(msg.contains("`https://codewhale.net/zh/community`"));
+        assert!(msg.contains("`https://app.codewhale.net`"));
     }
 
     #[test]
@@ -1421,7 +1434,8 @@ mod tests {
         let result = home_dashboard(&mut app);
         assert!(result.message.is_some());
         let msg = result.message.unwrap();
-        assert!(msg.contains("codewhale Home Dashboard"));
+        assert!(msg.contains("Codewhale"));
+        assert!(!msg.contains("codewhale Home Dashboard"));
         assert!(msg.contains("Model:"));
         assert!(msg.contains("Mode:"));
         assert!(msg.contains("Workspace:"));
@@ -1470,7 +1484,7 @@ mod tests {
         let msg = result
             .message
             .expect("home dashboard should return message");
-        assert!(msg.contains("/links      - Dashboard & API links"));
+        assert!(msg.contains("/links      - Codewhale, community & provider links"));
         assert!(msg.contains("/config      - Inspect and change settings"));
         assert!(
             !msg.lines()
@@ -1488,7 +1502,10 @@ mod tests {
         let msg = result
             .message
             .expect("home dashboard should return message");
-        assert!(msg.contains("主面板"), "missing zh-Hans title:\n{msg}");
+        assert!(
+            msg.contains("Codewhale"),
+            "missing canonical product title:\n{msg}"
+        );
         assert!(msg.contains("模型"), "missing zh-Hans model label:\n{msg}");
         assert!(
             msg.contains("快捷操作"),

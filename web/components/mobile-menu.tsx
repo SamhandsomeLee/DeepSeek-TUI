@@ -56,12 +56,12 @@ export function MobileMenu({
       {open && (
         <div
           id="mobile-menu"
-          className="md:hidden fixed inset-x-0 top-[5.7rem] bottom-0 z-40 bg-paper hairline-t overflow-y-auto"
+          className="md:hidden fixed inset-x-0 top-[4.25rem] bottom-0 z-40 bg-paper hairline-t overflow-y-auto"
           role="dialog"
           aria-modal="true"
         >
           <nav className="px-6 py-4">
-            <ul className="divide-y divide-[rgba(14,14,16,0.18)]">
+            <ul className="divide-y divide-[rgba(27,34,48,0.18)]">
               {links.map((l) => {
                 const isActive = pathname === l.href || pathname.startsWith(`${l.href}/`);
                 return (

@@ -1,5 +1,5 @@
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║                         CodeWhale Configuration                               ║
+# ║                         Codewhale Configuration                               ║
 # ║                                                                              ║
 # ║  Terminal coding agent for any model — open models first.                ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
@@ -17,11 +17,11 @@
 # `--provider fireworks`, `--provider siliconflow`, `--provider siliconflow-CN`,
 # `/provider arcee`, `/provider moonshot`, `/provider qianfan`, `/provider sglang`, `/provider vllm`,
 # `/provider ollama`, `/provider huggingface`, `/provider stepfun`, `/provider openmodel`,
-# `/provider meta`, `/provider xai`) toggle without having to re-enter keys. Top-level
+# `/provider opencode-go`, `/provider meta`, `/provider xai`) toggle without having to re-enter keys. Top-level
 # `api_key` / `base_url` are
 # still read as DeepSeek defaults when `[providers.deepseek]` is absent
 # (backward compatibility).
-provider = "deepseek" # deepseek | deepseek-cn | deepseek-anthropic | nvidia-nim | openai | atlascloud | wanjie-ark | volcengine | openrouter | xiaomi-mimo | novita | fireworks | siliconflow | siliconflow-CN | arcee | moonshot | zai | stepfun | minimax | sglang | vllm | ollama | huggingface | together | qianfan | openai-codex | anthropic | openmodel | deepinfra | sakana | longcat | meta | xai
+provider = "deepseek" # deepseek | deepseek-cn | deepseek-anthropic | nvidia-nim | openai | atlascloud | wanjie-ark | volcengine | openrouter | xiaomi-mimo | novita | fireworks | siliconflow | siliconflow-CN | arcee | moonshot | zai | stepfun | minimax | sglang | vllm | ollama | huggingface | together | qianfan | openai-codex | anthropic | openmodel | deepinfra | sakana | longcat | opencode-go | meta | xai
 api_key = "YOUR_DEEPSEEK_API_KEY" # must be non-empty
 base_url = "https://api.deepseek.com/beta"
 # provider = "deepseek-cn"                       # legacy alias (official host is still https://api.deepseek.com)
@@ -49,7 +49,10 @@ base_url = "https://api.deepseek.com/beta"
 #   GLM-5.1                       — direct Z.AI smaller model
 #   GLM-5-Turbo                   — direct Z.AI fast model (faster/explore sub-agent sibling)
 #   step-3.7-flash                — default direct StepFun / StepFlash model ID
-#   kimi-k2.6                       — default Moonshot/Kimi model ID
+#   kimi-k3                         — direct Moonshot K3 model ID (1M context)
+#   kimi-k2.7-code                  — default direct Moonshot/Kimi K2.7 model ID
+#   k3                              — Kimi Code membership K3 API model ID
+#   kimi-for-coding                 — Kimi Code membership K2.7 compatibility ID
 #   gpt-4.1                         — default generic OpenAI-compatible model ID
 #   deepseek-ai/deepseek-v4-flash   — default AtlasCloud model ID
 #   deepseek-reasoner               — default Wanjie Ark model ID
@@ -90,7 +93,7 @@ cost_currency = "usd" # usd | cny
 # ─────────────────────────────────────────────────────────────────────────────────
 # Startup update check
 # ─────────────────────────────────────────────────────────────────────────────────
-# The TUI checks for newer CodeWhale releases in the background at startup.
+# The TUI checks for newer Codewhale releases in the background at startup.
 # Set check_for_updates = false in managed or air-gapped environments.
 # update_uri may point at a GitHub-compatible latest-release JSON endpoint.
 [update]
@@ -481,15 +484,26 @@ max_subagents = 10 # optional (1-20)
 # base_url = "https://api.arcee.ai/api/v1"
 # model = "trinity-large-thinking"          # or trinity-large-preview
 
-# Moonshot/Kimi OpenAI-compatible endpoint (https://platform.moonshot.ai)
+# Moonshot/Kimi OpenAI-compatible endpoint (https://platform.kimi.ai)
 [providers.moonshot]
 # api_key = "YOUR_MOONSHOT_API_KEY"           # or KIMI_API_KEY
 # base_url = "https://api.moonshot.ai/v1"      # or KIMI_BASE_URL
-# model = "kimi-k2.6"
-# # Kimi Code path:
-# # base_url = "https://api.kimi.com/coding/v1"
-# # model = "kimi-for-coding"
-# # auth_mode = "kimi_oauth"                   # reads Kimi Code OAuth credentials
+# model = "kimi-k3"                         # direct Moonshot K3 wire ID
+# Direct K3 is always-thinking: off -> low, medium -> high, and max remains max.
+# The exact route sends top-level reasoning_effort, max_completion_tokens, and
+# omits temperature/top_p per https://platform.kimi.ai/docs/guide/kimi-k3-quickstart.
+# Kimi Code membership path (key: https://www.kimi.com/code/console):
+# api_key = "YOUR_KIMI_CODE_API_KEY"
+# base_url = "https://api.kimi.com/coding/v1"
+# model = "k3"                              # Kimi Code K3 wire ID
+# K3 membership off -> enabled/low; dispatched auto selects a concrete tier.
+# Only an omitted reasoning setting leaves the provider default in control.
+# context_window = 1048576                   # only for Allegretto+ plans with 1M access
+# Omit context_window for Codewhale's safe 262144-token K3 baseline.
+# `k3[1m]` is a Claude Code-only convention, not an API model ID; Codewhale rejects it.
+# Kimi Code K2.7 remains available to all members as model = "kimi-for-coding".
+# Kimi OAuth is not supported. Legacy auth_mode = "kimi_oauth" fails closed
+# to the API-key guidance above without probing Kimi CLI credential files.
 
 # Z.AI GLM Coding Plan endpoint (https://docs.z.ai)
 [providers.zai]
@@ -499,12 +513,12 @@ max_subagents = 10 # optional (1-20)
 # # base_url = "https://api.z.ai/api/paas/v4"
 # model = "GLM-5.2"                             # default; GLM-5.1 is the smaller model, GLM-5-Turbo the fast sub-agent sibling
 
-# StepFun / StepFlash direct OpenAI-compatible endpoint (https://platform.stepfun.com)
+# StepFun / StepFlash direct OpenAI-compatible endpoint (https://platform.stepfun.ai)
 [providers.stepfun]
 # api_key = "YOUR_STEPFUN_API_KEY"               # or STEP_API_KEY
 # base_url = "https://api.stepfun.ai/v1"          # or STEP_BASE_URL
 # # Coding Plan endpoint:
-# # base_url = "https://api.stepfun.com/step_plan/v1"
+# # base_url = "https://api.stepfun.ai/step_plan/v1"
 # model = "step-3.7-flash"                       # or STEPFUN_MODEL / STEP_MODEL
 
 # MiniMax direct OpenAI-compatible endpoint (https://platform.minimax.io)
@@ -566,6 +580,19 @@ max_subagents = 10 # optional (1-20)
 # base_url = "https://api.longcat.chat/openai/v1"
 # model = "LongCat-2.0"
 
+# OpenCode Go (https://opencode.ai/docs/go/)
+# Subscription-backed OpenAI-compatible Chat Completions route.
+# Env vars: OPENCODE_GO_API_KEY, OPENCODE_GO_BASE_URL, OPENCODE_GO_MODEL
+# Chat Completions models: deepseek-v4-pro, grok-4.5, glm-5.2, glm-5.1,
+# kimi-k3, kimi-k2.7-code, kimi-k2.6, deepseek-v4-flash, mimo-v2.5,
+# mimo-v2.5-pro.
+# Models documented only on OpenCode Go's Anthropic `/messages` endpoint are
+# intentionally not advertised by this provider yet.
+[providers.opencode_go]
+# api_key = "YOUR_OPENCODE_GO_API_KEY"
+# base_url = "https://opencode.ai/zen/go/v1"
+# model = "deepseek-v4-pro"
+
 # Meta Model API / Muse Spark (https://developer.meta.com/ai/)
 # OpenAI-compatible Chat Completions route.
 # Provider aliases: meta, meta-ai, meta-model-api, muse, muse-spark
@@ -584,8 +611,9 @@ max_subagents = 10 # optional (1-20)
 #
 # Auth modes:
 #   api_key (default) — console.x.ai pay-per-use key via api_key / XAI_API_KEY / keyring
-#   oauth             — reuse Grok CLI ~/.grok/auth.json (or device-code login).
-#                       SuperGrok / X Premium+ subscription path; may 403 on some tiers.
+#   oauth             — `codewhale auth xai-device` uses Codewhale-owned storage.
+#                       Reading an existing Grok CLI file requires explicit
+#                       `codewhale auth external-consent --provider xai --mode read-only`.
 [providers.xai]
 # api_key = "YOUR_XAI_API_KEY"
 # auth_mode = "oauth"                      # or "device_code" / "grok_cli"
@@ -613,15 +641,24 @@ max_subagents = 10 # optional (1-20)
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # OpenAI Codex (ChatGPT) Provider — EXPERIMENTAL
-# Reuses your existing ChatGPT/Codex CLI OAuth login. Run `codex login` first;
-# CodeWhale reads and refreshes the access token from ~/.codex/auth.json. No API
-# key is stored here. Talks to the OpenAI Responses API at /codex/responses.
+# Run `codex login`, then explicitly grant read-only access to that exact file:
+#   codewhale auth external-consent --provider openai-codex --mode read-only
+# Codewhale never refreshes or rewrites the Codex CLI file. No API key is
+# stored here. Talks to the OpenAI Responses API at /codex/responses.
 # Env var aliases: OPENAI_CODEX_ACCESS_TOKEN / CODEX_ACCESS_TOKEN (token override),
 #   OPENAI_CODEX_BASE_URL / CODEX_BASE_URL, OPENAI_CODEX_MODEL / CODEX_MODEL,
 #   OPENAI_CODEX_ACCOUNT_ID / CODEX_ACCOUNT_ID, OPENAI_CODEX_AUTH_FILE, CODEX_HOME
 [providers.openai_codex]
 # base_url = "https://chatgpt.com/backend-api"
 # model = "gpt-5.5"
+# The CLI writes this table after informed consent; do not copy it between
+# providers or machines. Absence means disabled.
+# [providers.openai_codex.external_credentials]
+# access = "read_only"
+# provider = "openai-codex"
+# source = "codex_cli"
+# path = "/absolute/path/to/.codex/auth.json"
+# consent_version = 1
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # Anthropic Provider (native Messages API)
@@ -650,6 +687,8 @@ max_subagents = 10 # optional (1-20)
 # with Bing fallback — no API key needed. Bing remains selectable for users who
 # explicitly prefer it. Switch to Tavily, Bocha, Metaso, Baidu, Volcengine,
 # Sofya, or a trusted SearXNG instance for API-backed search.
+# API runtime failures and empty responses visibly degrade through DuckDuckGo
+# then Bing. Missing configuration and network-policy denials fail closed.
 #
 # [search]
 # provider = "duckduckgo"  # duckduckgo | bing | tavily | bocha | metaso | searxng | baidu | volcengine | sofya
@@ -657,8 +696,8 @@ max_subagents = 10 # optional (1-20)
 #                            # bing:       HTML scrape, no API key
 #                            # tavily:     https://tavily.com — AI search, needs api_key
 #                            # bocha:      https://bochaai.com — 博查AI搜索，国内友好，需api_key
-#                            # metaso:     https://metaso.cn — 秘塔AI搜索，每天 100 次免费
-#                            #             设置 METASO_API_KEY 或 [search] api_key 可提升额度
+#                            # metaso:     https://metaso.cn — 秘塔AI搜索，需 api_key
+#                            #             设置 METASO_API_KEY 或 [search] api_key
 #                            # searxng:    https://docs.searxng.org — trusted/self-hosted JSON API,
 #                            #             set base_url; no public instance is used by default
 #                            # baidu:      百度 AI Search via qianfan.baidubce.com，需 api_key
@@ -669,7 +708,7 @@ max_subagents = 10 # optional (1-20)
 #                            #             also falls back to the SOFYA_API_KEY env var
 # base_url = "https://search.example/" # optional DuckDuckGo-compatible HTML endpoint;
 #                                      # required SearXNG root or /search endpoint
-# api_key = "YOUR_SEARCH_KEY" # required for tavily, bocha, baidu, volcengine, and sofya; optional for metaso; unused by searxng
+# api_key = "YOUR_SEARCH_KEY" # required for tavily, bocha, metaso, baidu, volcengine, and sofya; unused by searxng
 #                             # WARNING: treat config.toml like a secret file when
 #                             # storing API keys. Prefer env vars for local smoke tests.
 #
@@ -680,6 +719,7 @@ max_subagents = 10 # optional (1-20)
 #   DEEPSEEK_SEARCH_BASE_URL  → search.base_url (legacy alias)
 #   METASO_API_KEY           → metaso key fallback
 #   BAIDU_SEARCH_API_KEY     → baidu key fallback
+#   VOLCENGINE_API_KEY / VOLCENGINE_ARK_API_KEY / ARK_API_KEY → volcengine key fallback
 #   SOFYA_API_KEY            → sofya key fallback
 
 # ─────────────────────────────────────────────────────────────────────────────────
@@ -704,6 +744,8 @@ max_subagents = 10 # optional (1-20)
 # default = "prompt"     # allow | deny | prompt
 # allow = ["api.deepseek.com", "github.com", ".githubusercontent.com"]
 # deny = []
+# proxy = ["github.com", ".githubusercontent.com"]
+# proxy_fake_ip_cidrs = ["198.18.0.0/15"] # requires both matching host and address
 # audit = true            # one line per call to ~/.codewhale/audit.log
 
 # ─────────────────────────────────────────────────────────────────────────────────
@@ -867,7 +909,7 @@ fallback_default_prior = 3.8
 # ─────────────────────────────────────────────────────────────────────────────────
 # Harness Profiles (preview schema; runtime consumption follows later)
 # ─────────────────────────────────────────────────────────────────────────────────
-# Harness profiles let future CodeWhale runtime slices select model-specific
+# Harness profiles let future Codewhale runtime slices select model-specific
 # prompt, context, tool, and subagent posture. v0.9 parses, validates, and can
 # resolve profiles for tests/status plumbing, but normal Agent and Workflow
 # runs do not silently promote or mutate behavior from these profiles yet.
@@ -1043,7 +1085,7 @@ default_text_model = "deepseek-ai/deepseek-v4-pro"
 #
 # [[hooks.hooks]]
 # event = "session_start"
-# command = "echo 'CodeWhale session started'"
+# command = "echo 'Codewhale session started'"
 #
 # # Inject ephemeral creds into every shell call. Output one
 # # KEY=VALUE per line on stdout (export prefix optional).

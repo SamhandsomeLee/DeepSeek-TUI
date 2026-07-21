@@ -1,21 +1,115 @@
 //! Shared test-only helpers.
 
 use std::ffi::{OsStr, OsString};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock, TryLockError};
+use std::thread::ThreadId;
+
+/// Build a syntactically valid, non-secret JWT fixture without embedding a
+/// high-entropy token-shaped literal in Git history.
+pub(crate) fn future_test_jwt(label: &str) -> String {
+    use base64::Engine as _;
+
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"exp":9999999999}"#);
+    format!("test.{payload}.{label}")
+}
 
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn env_lock_owner() -> &'static Mutex<Option<ThreadId>> {
+    static OWNER: OnceLock<Mutex<Option<ThreadId>>> = OnceLock::new();
+    OWNER.get_or_init(|| Mutex::new(None))
+}
+
+fn record_env_lock_owner() {
+    let mut owner = match env_lock_owner().lock() {
+        Ok(owner) => owner,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *owner = Some(std::thread::current().id());
+}
+
+fn current_thread_owns_contended_env_lock() -> bool {
+    let owner = match env_lock_owner().lock() {
+        Ok(owner) => owner,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    owner.as_ref() == Some(&std::thread::current().id())
+}
+
+/// Owned process-wide test-environment lock.
+///
+/// Clearing the owner before the underlying mutex unlocks keeps re-entrant
+/// reader detection exact; a stale thread id could otherwise let the previous
+/// owner bypass a newly acquired lock during its tiny owner-registration
+/// window.
+pub(crate) struct TestEnvLock {
+    _guard: MutexGuard<'static, ()>,
+}
+
+impl Drop for TestEnvLock {
+    fn drop(&mut self) {
+        let mut owner = match env_lock_owner().lock() {
+            Ok(owner) => owner,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if owner.as_ref() == Some(&std::thread::current().id()) {
+            *owner = None;
+        }
+    }
+}
+
 /// Acquire the process-wide env-var mutex.
 ///
 /// If a prior test panicked while holding the lock, recover the guard instead
 /// of cascading failures across unrelated tests.
-pub(crate) fn lock_test_env() -> MutexGuard<'static, ()> {
-    match env_lock().lock() {
+pub(crate) fn lock_test_env() -> TestEnvLock {
+    let guard = match env_lock().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
+    };
+    record_env_lock_owner();
+    TestEnvLock { _guard: guard }
+}
+
+/// Read process-global test environment while respecting [`lock_test_env`].
+///
+/// Config-path writers hold the mutex for their whole test. Production path
+/// resolution normally only reads the environment, but those reads still have
+/// to wait or they can resolve another test's temporary config and later write
+/// into it. The owner check makes the barrier re-entrant for a test that reads
+/// its own guarded override.
+pub(crate) fn with_test_env_lock<T>(read: impl FnOnce() -> T) -> T {
+    match env_lock().try_lock() {
+        Ok(_guard) => read(),
+        Err(TryLockError::Poisoned(poisoned)) => {
+            let _guard = poisoned.into_inner();
+            read()
+        }
+        Err(TryLockError::WouldBlock) if current_thread_owns_contended_env_lock() => read(),
+        Err(TryLockError::WouldBlock) => {
+            let _guard = match env_lock().lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            read()
+        }
+    }
+}
+
+fn current_thread_holds_test_env_lock() -> bool {
+    match env_lock().try_lock() {
+        Ok(guard) => {
+            drop(guard);
+            false
+        }
+        Err(TryLockError::Poisoned(poisoned)) => {
+            drop(poisoned.into_inner());
+            false
+        }
+        Err(TryLockError::WouldBlock) => current_thread_owns_contended_env_lock(),
     }
 }
 
@@ -30,6 +124,10 @@ pub(crate) struct EnvVarGuard {
 
 impl EnvVarGuard {
     pub(crate) fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+        debug_assert!(
+            current_thread_holds_test_env_lock(),
+            "EnvVarGuard::set({key}) requires lock_test_env()"
+        );
         let previous = std::env::var_os(key);
         // SAFETY: callers hold the process-wide test env mutex.
         unsafe { std::env::set_var(key, value) };
@@ -37,6 +135,10 @@ impl EnvVarGuard {
     }
 
     pub(crate) fn remove(key: &'static str) -> Self {
+        debug_assert!(
+            current_thread_holds_test_env_lock(),
+            "EnvVarGuard::remove({key}) requires lock_test_env()"
+        );
         let previous = std::env::var_os(key);
         // SAFETY: callers hold the process-wide test env mutex.
         unsafe { std::env::remove_var(key) };
@@ -101,5 +203,45 @@ pub(crate) fn assert_byte_identical(label: &str, a: &str, b: &str) {
             "{label}: prompt construction is non-deterministic — first diff at byte {pos}\n\
              ── side A (±32B) ──\n{a_ctx:?}\n── side B (±32B) ──\n{b_ctx:?}",
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn config_path_read_waits_for_foreign_env_redirect_to_restore() {
+        let (tx, rx) = mpsc::channel();
+        let redirected = std::env::temp_dir().join(format!(
+            "codewhale-config-path-read-barrier-{}",
+            std::process::id()
+        ));
+
+        let reader = {
+            let lock = lock_test_env();
+            let redirect = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &redirected);
+            let reader = std::thread::spawn(move || {
+                tx.send(crate::config_persistence::config_toml_path(None))
+                    .expect("send resolved config path");
+            });
+
+            assert!(
+                rx.recv_timeout(Duration::from_millis(50)).is_err(),
+                "a foreign reader observed the temporary config redirect"
+            );
+            drop(redirect);
+            drop(lock);
+            reader
+        };
+
+        let resolved = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("reader resumed after the redirect was restored")
+            .expect("resolve config path");
+        reader.join().expect("reader thread");
+        assert_ne!(resolved, redirected);
     }
 }

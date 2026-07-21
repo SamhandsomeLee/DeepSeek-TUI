@@ -269,13 +269,7 @@ pub fn clear_taskbar_progress() {
     set_taskbar_progress(0, None);
 }
 
-/// Animation frame characters for the terminal title.
-/// Uses the DeepSeek whale emoji (🐳 spouting, 🐋 resting) to match the
-/// existing header status indicator in the TUI.
-const TITLE_FRAMES: &[&str] = &["🐳", "🐋", "🐳", "🐋"];
-const TITLE_ANIMATION_INTERVAL: Duration = Duration::from_millis(800);
-
-/// Shared flag controlling the title animation loop. Set to `true` by
+/// Shared flag controlling the title activity marker. Set to `true` by
 /// `start_title_animation()`, cleared by `stop_title_animation()`.
 static TITLE_ANIMATION_RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -287,58 +281,30 @@ fn set_terminal_title(title: &str) {
     let _ = stdout.flush();
 }
 
-/// Tracks whether the ✅ completion marker was set, so
+/// Tracks whether the completion marker was set, so
 /// `reset_title_on_interaction()` can skip redundant writes.
 static COMPLETION_MARKER_SHOWN: AtomicBool = AtomicBool::new(false);
 
-/// Start an animated terminal title spinner.
-///
-/// Cycles the terminal title between 🐳→🐋 every 800ms while processing,
-/// matching the whale status indicator in the TUI header, so alt-tabbed
-/// users can see activity.
-///
-/// The animation runs in a background tokio task that checks
-/// `TITLE_ANIMATION_RUNNING`. Each call restarts the animation with the
-/// given `original` base title — safe to call on every turn start.
+/// Mark the terminal title as active. Window chrome stays static so an
+/// alt-tabbed session communicates state without another competing spinner.
 pub fn start_title_animation(original: &str) {
-    // Signal any existing animation loop to exit, then start fresh.
     TITLE_ANIMATION_RUNNING.store(true, Ordering::SeqCst);
-    let base = original.to_string();
-    tokio::spawn(async move {
-        let mut frame = 0usize;
-        while TITLE_ANIMATION_RUNNING.load(Ordering::SeqCst) {
-            // Yield once per frame so a racing stop_title_animation()
-            // can observe the cleared flag and apply the completion
-            // marker before the next frame write. Without this yield
-            // the background task could overwrite the ✅ marker with
-            // the next whale frame.
-            tokio::task::yield_now().await;
-            if !TITLE_ANIMATION_RUNNING.load(Ordering::SeqCst) {
-                break;
-            }
-            let spinner = TITLE_FRAMES[frame % TITLE_FRAMES.len()];
-            set_terminal_title(&format!("{spinner} {base}"));
-            frame += 1;
-            tokio::time::sleep(TITLE_ANIMATION_INTERVAL).await;
-        }
-        // Don't restore title here — stop_title_animation() handles
-        // what to show on completion (e.g. ✅ marker).
-    });
+    set_terminal_title(&format!("› {original}"));
 }
 
 /// Stop the title animation and show a completion marker.
 ///
-/// Sets the title to `✅ <base>` so alt-tabbed users see at a glance
+/// Sets the title to `✓ <base>` so alt-tabbed users see at a glance
 /// that processing finished. The marker is overwritten on the next turn
 /// by [`start_title_animation`].
 pub fn stop_title_animation() {
     TITLE_ANIMATION_RUNNING.store(false, Ordering::SeqCst);
     COMPLETION_MARKER_SHOWN.store(false, Ordering::SeqCst);
-    // Show ✅ marker only for beep mode. Bell mode already has its own
+    // Show a completion marker only for beep mode. Bell mode already has its own
     // terminal-level visual indicator (flash/icon).
     let mode = COMPLETION_SOUND_MODE.load(Ordering::SeqCst);
     if mode == 1 {
-        set_terminal_title("✅ CodeWhale");
+        set_terminal_title("✓ Codewhale");
     }
     play_completion_sound();
 }
@@ -350,16 +316,16 @@ pub fn stop_title_animation() {
 pub fn stop_title_animation_quietly() {
     TITLE_ANIMATION_RUNNING.store(false, Ordering::SeqCst);
     COMPLETION_MARKER_SHOWN.store(false, Ordering::SeqCst);
-    set_terminal_title("CodeWhale");
+    set_terminal_title("Codewhale");
 }
 
-/// Clear the ✅ completion marker from the title when the user interacts.
+/// Clear the completion marker from the title when the user interacts.
 ///
 /// Call this on every user input event (key press, mouse click) so the
 /// marker doesn't persist once the user is back at the terminal.
 pub fn reset_title_on_interaction() {
     if COMPLETION_MARKER_SHOWN.swap(false, Ordering::SeqCst) {
-        set_terminal_title("CodeWhale");
+        set_terminal_title("Codewhale");
     }
 }
 
@@ -480,7 +446,7 @@ fn completion_sound_state_for_tests() -> (crate::config::CompletionSound, Option
 /// Runs on a dedicated background thread so the caller is not blocked.
 ///
 /// The notification includes:
-/// - **Title**: "CodeWhale"
+/// - **Title**: "Codewhale"
 /// - **Subtitle**: First line of `msg` (when the message contains a newline,
 ///   e.g. the localized completion status from a completed turn)
 /// - **Body**: Remaining lines of `msg`, if any
@@ -526,7 +492,7 @@ fn macos_display_notification(msg: &str) {
                 "-e".to_string(),
                 "set theSubtitle to item 2 of argv".to_string(),
                 "-e".to_string(),
-                "display notification theBody with title \"CodeWhale\" subtitle theSubtitle sound name \"default\"".to_string(),
+                "display notification theBody with title \"Codewhale\" subtitle theSubtitle sound name \"default\"".to_string(),
                 "-e".to_string(),
                 "end run".to_string(),
                 "--".to_string(),
@@ -563,7 +529,7 @@ fn macos_notification_parts(msg: &str) -> (String, String) {
         .collect();
 
     if lines.is_empty() {
-        return ("CodeWhale".to_string(), String::new());
+        return ("Codewhale".to_string(), String::new());
     }
 
     let subtitle = truncate_notification_text(lines[0], SUBTITLE_MAX_CHARS);
@@ -653,6 +619,7 @@ pub fn humanize_duration(d: Duration) -> String {
 
 use crate::localization::{Locale, MessageId, tr};
 use crate::models::{ContentBlock, Message};
+use crate::tools::subagent::SubAgentStatus;
 use crate::tui::app::App;
 
 /// Resolve the effective notification method/threshold/include-summary tuple
@@ -725,13 +692,15 @@ pub fn completed_turn_message(
     msg
 }
 
-/// Compose a notification body for a sub-agent completion. Falls back
-/// to a generic "sub-agent X complete" if no human-readable line can
-/// be teased out of the child's transcript.
-pub fn subagent_completion_message(
+/// Compose a notification body for a terminal sub-agent outcome. Falls back
+/// to the agent id if no human-readable line can be teased out of the child's
+/// transcript. The heading reflects the actual status so a Stop/failed worker
+/// is never announced as successfully complete (#4408).
+pub fn subagent_terminal_message(
     locale: Locale,
     id: &str,
     result: &str,
+    status: &SubAgentStatus,
     include_summary: bool,
     elapsed: Duration,
 ) -> String {
@@ -739,12 +708,15 @@ pub fn subagent_completion_message(
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty() && !line.starts_with("<codewhale:subagent.done>"));
-    let mut msg = completion_status(
-        &tr(locale, MessageId::NotificationSubagentComplete),
-        include_summary,
-        elapsed,
-        None,
-    );
+    let label = match status {
+        SubAgentStatus::Completed => MessageId::NotificationSubagentComplete,
+        SubAgentStatus::Failed(_) => MessageId::NotificationSubagentFailed,
+        SubAgentStatus::Interrupted(_) => MessageId::NotificationSubagentInterrupted,
+        SubAgentStatus::Cancelled => MessageId::NotificationSubagentCancelled,
+        SubAgentStatus::BudgetExhausted => MessageId::NotificationSubagentBudgetExhausted,
+        SubAgentStatus::Running => MessageId::NotificationSubagentComplete,
+    };
+    let mut msg = completion_status(&tr(locale, label), include_summary, elapsed, None);
     let detail = result_line
         .and_then(text_summary)
         .map(|summary| format!("{id}: {summary}"))

@@ -11,10 +11,11 @@
 //!   CodeWhale's `reasoning_effort` tiers, sampling-parameter rules for
 //!   models that reject them, and `cache_control` breakpoint placement
 //!   aligned with the prefix-zone model in `prefix_cache.rs`;
-//! - usage normalization (#2961): `prompt_cache_hit_tokens` comes from
-//!   `cache_read_input_tokens`, `prompt_cache_miss_tokens` is `input_tokens`
-//!   plus `cache_creation_input_tokens`, and the normalized `input_tokens`
-//!   is the sum of all three (total prompt, the DeepSeek convention);
+//! - usage normalization (#2961 / #4318): `prompt_cache_hit_tokens` comes from
+//!   `cache_read_input_tokens`, `prompt_cache_write_tokens` from
+//!   `cache_creation_input_tokens`, `prompt_cache_miss_tokens` is the raw
+//!   non-cached `input_tokens`, and the normalized `input_tokens` is the sum
+//!   of all three (total prompt, the DeepSeek convention);
 //! - signed-thinking handling: `signature_delta` is captured into
 //!   [`crate::models::Delta::SignatureDelta`] and assistant thinking blocks
 //!   replay verbatim (signature included); unsigned thinking blocks are
@@ -26,9 +27,11 @@
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
+use crate::config::{ApiProvider, wire_model_for_provider_route};
 use crate::llm_client::StreamEventBox;
 use crate::logging;
 use crate::models::{ContentBlock, MessageRequest, MessageResponse, StreamEvent, Usage};
+use crate::tools::schema_sanitize;
 
 use super::{DeepSeekClient, ERROR_BODY_MAX_BYTES, bounded_error_text};
 
@@ -38,8 +41,10 @@ const MAX_CACHE_BREAKPOINTS: usize = 4;
 impl DeepSeekClient {
     /// Build the native Messages API request body from a [`MessageRequest`].
     pub(super) fn build_anthropic_body(&self, request: &MessageRequest, stream: bool) -> Value {
+        let model =
+            wire_model_for_provider_route(self.api_provider, &self.base_url, &request.model);
         let mut body = json!({
-            "model": request.model,
+            "model": model,
             "max_tokens": request.max_tokens,
             "stream": stream,
         });
@@ -80,10 +85,23 @@ impl DeepSeekClient {
                 tools
                     .iter()
                     .map(|tool| {
+                        // Sanitize the tool's input_schema the same way the
+                        // OpenAI Responses adapter does: strip top-level
+                        // oneOf/anyOf/allOf (which Anthropic rejects), merge
+                        // alternative properties into the root, and surface
+                        // the dropped constraint as a description note so the
+                        // model still knows which parameters are expected.
+                        let mut schema = tool.input_schema.clone();
+                        let constraint_note = schema_sanitize::sanitize_for_responses(&mut schema);
+                        let description = match constraint_note {
+                            Some(note) if tool.description.trim().is_empty() => note,
+                            Some(note) => format!("{}\n\n{}", tool.description.trim(), note),
+                            None => tool.description.clone(),
+                        };
                         let mut value = json!({
                             "name": tool.name,
-                            "description": tool.description,
-                            "input_schema": tool.input_schema,
+                            "description": description,
+                            "input_schema": schema,
                         });
                         if let Some(strict) = tool.strict {
                             value["strict"] = json!(strict);
@@ -101,25 +119,34 @@ impl DeepSeekClient {
             body["tool_choice"] = anthropic_tool_choice(tool_choice);
         }
 
-        // Thinking + effort shaping. "off" omits thinking entirely; any other
-        // tier enables adaptive thinking, with `output_config.effort` only on
-        // models the capability matrix marks as thinking-capable.
-        let thinking_capable = crate::models::model_supports_reasoning(&request.model);
+        // Thinking + effort shaping. MiniMax supports adaptive/disabled but
+        // not Anthropic's output_config effort field; native Anthropic routes
+        // keep the existing effort mapping.
+        let thinking_capable = crate::models::model_supports_reasoning(&model);
+        let is_minimax = self.api_provider == ApiProvider::MinimaxAnthropic;
+        let is_deepseek = self.api_provider == ApiProvider::DeepseekAnthropic;
         let effort = request
             .reasoning_effort
             .as_deref()
             .map(|raw| raw.trim().to_ascii_lowercase());
         match effort.as_deref() {
+            Some("off" | "disabled" | "none" | "false")
+                if (is_minimax || is_deepseek) && thinking_capable =>
+            {
+                body["thinking"] = json!({ "type": "disabled" });
+            }
             Some("off" | "disabled" | "none" | "false") => {}
             Some(level) if thinking_capable => {
                 body["thinking"] = json!({ "type": "adaptive" });
-                let mapped = match level {
-                    "low" | "minimal" => "low",
-                    "medium" | "mid" => "medium",
-                    "max" | "xhigh" | "highest" => "max",
-                    _ => "high",
-                };
-                body["output_config"] = json!({ "effort": mapped });
+                if !is_minimax {
+                    let mapped = match level {
+                        "low" | "minimal" => "low",
+                        "medium" | "mid" => "medium",
+                        "max" | "xhigh" | "highest" => "max",
+                        _ => "high",
+                    };
+                    body["output_config"] = json!({ "effort": mapped });
+                }
             }
             None if thinking_capable => {
                 body["thinking"] = json!({ "type": "adaptive" });
@@ -496,8 +523,8 @@ fn convert_anthropic_sse_data(data: &str) -> Option<Result<StreamEvent>> {
 }
 
 /// Map Anthropic's usage payload onto the normalized [`Usage`] convention
-/// (#2961): hit = cache reads, miss = uncached input + cache writes,
-/// `input_tokens` = the total prompt across all three.
+/// (#2961 / #4318): hit = cache reads, write = cache creation, miss = raw
+/// uncached input, `input_tokens` = the total prompt across all three.
 fn parse_anthropic_usage(usage: &Value) -> Usage {
     let field = |name: &str| {
         usage
@@ -517,7 +544,8 @@ fn parse_anthropic_usage(usage: &Value) -> Usage {
             .saturating_add(cache_read),
         output_tokens: output,
         prompt_cache_hit_tokens: Some(cache_read),
-        prompt_cache_miss_tokens: Some(input_raw.saturating_add(cache_creation)),
+        prompt_cache_miss_tokens: Some(input_raw),
+        prompt_cache_write_tokens: Some(cache_creation),
         reasoning_tokens: None,
         reasoning_replay_tokens: None,
         server_tool_use: None,
@@ -604,6 +632,39 @@ mod tests {
         DeepSeekClient::new(&config).expect("anthropic client constructs")
     }
 
+    fn minimax_test_client() -> DeepSeekClient {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let config = crate::config::Config {
+            provider: Some("minimax-anthropic".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                minimax_anthropic: crate::config::ProviderConfig {
+                    api_key: Some("test-key".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        DeepSeekClient::new(&config).expect("MiniMax Messages client constructs")
+    }
+
+    fn deepseek_test_client(base_url: &str) -> DeepSeekClient {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let config = crate::config::Config {
+            provider: Some("deepseek-anthropic".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                deepseek_anthropic: crate::config::ProviderConfig {
+                    api_key: Some("test-key".to_string()),
+                    base_url: Some(base_url.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        DeepSeekClient::new(&config).expect("DeepSeek Messages client constructs")
+    }
+
     #[test]
     fn body_keeps_native_cache_control_on_system_and_tools() {
         let client = test_client();
@@ -687,6 +748,128 @@ mod tests {
             true,
         );
         assert!(body.get("thinking").is_none(), "{body}");
+        assert!(body.get("output_config").is_none(), "{body}");
+    }
+
+    #[test]
+    fn deepseek_messages_body_retires_aliases_and_keeps_thinking_control() {
+        let client = deepseek_test_client(crate::config::DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL);
+
+        let chat = client.build_anthropic_body(
+            &request_with("deepseek-chat", Some("off"), None, None),
+            true,
+        );
+        assert_eq!(
+            chat.get("model").and_then(Value::as_str),
+            Some(crate::config::DEEPSEEK_ALIAS_REPLACEMENT)
+        );
+        assert_eq!(
+            chat.pointer("/thinking/type").and_then(Value::as_str),
+            Some("disabled")
+        );
+
+        let reasoner = client.build_anthropic_body(
+            &request_with("deepseek-reasoner", Some("high"), None, None),
+            true,
+        );
+        assert_eq!(
+            reasoner.get("model").and_then(Value::as_str),
+            Some(crate::config::DEEPSEEK_ALIAS_REPLACEMENT)
+        );
+        assert_eq!(
+            reasoner.pointer("/thinking/type").and_then(Value::as_str),
+            Some("adaptive")
+        );
+        assert_eq!(
+            reasoner
+                .pointer("/output_config/effort")
+                .and_then(Value::as_str),
+            Some("high")
+        );
+
+        let custom = deepseek_test_client("https://messages.example/v1");
+        let custom_body = custom.build_anthropic_body(
+            &request_with("deepseek-reasoner", Some("high"), None, None),
+            true,
+        );
+        assert_eq!(
+            custom_body.get("model").and_then(Value::as_str),
+            Some("deepseek-reasoner")
+        );
+    }
+
+    #[test]
+    fn omitted_alias_effort_is_migrated_into_deepseek_messages_body() {
+        for (alias, expected_effort, expected_thinking) in [
+            ("deepseek-chat", "off", "disabled"),
+            ("deepseek-reasoner", "high", "adaptive"),
+        ] {
+            let mut config = crate::config::Config {
+                provider: Some("deepseek-anthropic".to_string()),
+                providers: Some(crate::config::ProvidersConfig {
+                    deepseek_anthropic: crate::config::ProviderConfig {
+                        api_key: Some("test-key".to_string()),
+                        model: Some(alias.to_string()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert!(
+                config.reasoning_effort().is_none(),
+                "fixture must omit effort"
+            );
+
+            crate::config::normalize_model_config_for_test(&mut config);
+            let client = DeepSeekClient::new(&config).expect("DeepSeek Messages client");
+            let model = config.default_model();
+            let body = client.build_anthropic_body(
+                &request_with(&model, config.reasoning_effort(), None, None),
+                true,
+            );
+
+            assert_eq!(
+                body.get("model").and_then(Value::as_str),
+                Some(crate::config::DEEPSEEK_ALIAS_REPLACEMENT),
+                "{alias}: {body}"
+            );
+            assert_eq!(config.reasoning_effort(), Some(expected_effort));
+            assert_eq!(
+                body.pointer("/thinking/type").and_then(Value::as_str),
+                Some(expected_thinking),
+                "{alias}: {body}"
+            );
+            if alias == "deepseek-reasoner" {
+                assert_eq!(
+                    body.pointer("/output_config/effort")
+                        .and_then(Value::as_str),
+                    Some("high"),
+                    "{body}"
+                );
+            } else {
+                assert!(body.get("output_config").is_none(), "{body}");
+            }
+        }
+    }
+
+    #[test]
+    fn minimax_body_uses_supported_thinking_controls() {
+        let client = minimax_test_client();
+        let body =
+            client.build_anthropic_body(&request_with("MiniMax-M3", Some("off"), None, None), true);
+        assert_eq!(
+            body.pointer("/thinking/type").and_then(Value::as_str),
+            Some("disabled")
+        );
+        assert!(body.get("output_config").is_none(), "{body}");
+
+        let body = client
+            .build_anthropic_body(&request_with("MiniMax-M3", Some("high"), None, None), true);
+        assert_eq!(
+            body.pointer("/thinking/type").and_then(Value::as_str),
+            Some("adaptive")
+        );
         assert!(body.get("output_config").is_none(), "{body}");
     }
 
@@ -852,7 +1035,8 @@ mod tests {
         };
         assert_eq!(message.usage.input_tokens, 3 + 2045 + 18000);
         assert_eq!(message.usage.prompt_cache_hit_tokens, Some(18000));
-        assert_eq!(message.usage.prompt_cache_miss_tokens, Some(3 + 2045));
+        assert_eq!(message.usage.prompt_cache_miss_tokens, Some(3));
+        assert_eq!(message.usage.prompt_cache_write_tokens, Some(2045));
 
         assert!(matches!(
             &decoded[1],
@@ -927,6 +1111,21 @@ mod tests {
         assert_eq!(usage.output_tokens, 5);
         assert_eq!(usage.prompt_cache_hit_tokens, Some(0));
         assert_eq!(usage.prompt_cache_miss_tokens, Some(10));
+        assert_eq!(usage.prompt_cache_write_tokens, Some(0));
+    }
+
+    #[test]
+    fn usage_mapping_keeps_cache_write_separate_from_miss() {
+        let usage = parse_anthropic_usage(&json!({
+            "input_tokens": 3,
+            "cache_creation_input_tokens": 2045,
+            "cache_read_input_tokens": 18000,
+            "output_tokens": 1,
+        }));
+        assert_eq!(usage.input_tokens, 3 + 2045 + 18000);
+        assert_eq!(usage.prompt_cache_hit_tokens, Some(18000));
+        assert_eq!(usage.prompt_cache_miss_tokens, Some(3));
+        assert_eq!(usage.prompt_cache_write_tokens, Some(2045));
     }
 
     #[test]
@@ -959,6 +1158,14 @@ mod tests {
         assert_eq!(
             anthropic_messages_url("https://api.deepseek.com/anthropic"),
             "https://api.deepseek.com/anthropic/v1/messages"
+        );
+        assert_eq!(
+            anthropic_messages_url("https://api.minimax.io/anthropic"),
+            "https://api.minimax.io/anthropic/v1/messages"
+        );
+        assert_eq!(
+            anthropic_messages_url("https://api.minimaxi.com/anthropic"),
+            "https://api.minimaxi.com/anthropic/v1/messages"
         );
     }
 }

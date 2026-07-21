@@ -1,4 +1,4 @@
-//! DeepSeek color palette and semantic roles.
+//! Codewhale color palette and semantic roles.
 //!
 //! This module defines the color system for the TUI in three layers:
 //!

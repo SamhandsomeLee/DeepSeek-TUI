@@ -28,14 +28,16 @@
 //! which structurally bars prompt-content routing.
 
 use super::candidate::{
-    PricingSku, ReadyRouteCandidate, ResolvedAuthSource, ResolvedEndpoint, ValidationReport,
+    LimitField, PricingSku, ReadyRouteCandidate, ResolvedAuthSource, ResolvedEndpoint,
+    SourcedLimitOverride, ValidationReport,
 };
+use super::capabilities::RouteCapabilities;
 use super::descriptor::ProviderDescriptor;
 use super::errors::RouteError;
 use super::ids::{LogicalModelRef, ModelId, ProviderId, WireModelId};
 use super::offering::{ProviderModelOffering, RouteLimits, bundled_offerings};
-use crate::ProviderKind;
 use crate::catalog::{CatalogOffering, bundled_catalog_offerings};
+use crate::{ProviderKind, opencode_go_chat_model_id, provider_preserves_custom_base_url_model};
 
 /// A request to resolve into an executable route.
 ///
@@ -51,12 +53,52 @@ pub struct RouteRequest {
     pub saved_provider_model: Option<WireModelId>,
     /// An explicit base URL override for the endpoint.
     pub base_url_override: Option<String>,
+    /// Sourced limit overrides, applied in order BEFORE the candidate is
+    /// constructed and recorded on it as provenance. This is the ONLY channel
+    /// for adjusting a route's effective limits: the candidate itself is
+    /// immutable once minted.
+    pub limit_overrides: Vec<SourcedLimitOverride>,
 }
 
 /// Resolves [`RouteRequest`]s into [`ReadyRouteCandidate`]s.
 #[derive(Debug, Clone)]
 pub struct RouteResolver {
     offerings: Vec<ProviderModelOffering>,
+}
+
+/// Offering-owned facts selected within one provider scope before the final
+/// executable route candidate is minted.
+struct ResolvedOffering {
+    wire_model_id: WireModelId,
+    canonical_model: Option<ModelId>,
+    endpoint_key: String,
+    limits: RouteLimits,
+    capabilities: RouteCapabilities,
+    pricing: PricingSku,
+}
+
+impl ResolvedOffering {
+    fn unknown(wire_model_id: WireModelId) -> Self {
+        Self {
+            wire_model_id,
+            canonical_model: None,
+            endpoint_key: "chat".to_string(),
+            limits: RouteLimits::default(),
+            capabilities: RouteCapabilities::default(),
+            pricing: PricingSku::UnknownOrStale,
+        }
+    }
+
+    fn from_offering(offering: &ProviderModelOffering) -> Self {
+        Self {
+            wire_model_id: offering.wire_model_id.clone(),
+            canonical_model: offering.canonical_model.clone(),
+            endpoint_key: offering.endpoint_key.clone(),
+            limits: offering.limits,
+            capabilities: offering.capabilities,
+            pricing: offering.pricing.clone(),
+        }
+    }
 }
 
 impl Default for RouteResolver {
@@ -139,45 +181,39 @@ impl RouteResolver {
 
         // 4. Map the selector to a wire id within provider scope.
         //    Prefixed selectors are preserved VERBATIM as the wire id.
-        let class = if request_uses_custom_endpoint(&descriptor, req.base_url_override.as_deref()) {
+        let custom_endpoint =
+            request_uses_custom_endpoint(&descriptor, req.base_url_override.as_deref());
+        let class = if custom_endpoint {
             ProviderClass::LocalOrCustom
         } else {
             classify(provider_kind)
         };
-        let (wire_model_id, canonical_model, endpoint_key, limits, pricing) = if is_auto {
+        let mut selected = if is_auto {
             default_offering.map_or_else(
                 || {
-                    (
-                        descriptor.default_wire_model(),
-                        None,
-                        "chat".to_string(),
-                        RouteLimits::default(),
-                        // No offering in hand on the default branch: pricing is
-                        // honestly unknown (#3085), never a fabricated zero.
-                        PricingSku::UnknownOrStale,
-                    )
+                    // No offering in hand on the default branch: capability
+                    // and pricing facts are honestly unknown.
+                    ResolvedOffering::unknown(descriptor.default_wire_model())
                 },
-                |offering| {
-                    (
-                        offering.wire_model_id.clone(),
-                        offering.canonical_model.clone(),
-                        offering.endpoint_key.clone(),
-                        offering.limits,
-                        // Matched offering: carry its sourced pricing meter.
-                        offering.pricing.clone(),
-                    )
-                },
+                ResolvedOffering::from_offering,
             )
         } else {
             self.scope_selector(provider_kind, &provider_id, &logical_model, class)?
         };
+        if custom_endpoint {
+            // A documented first-party server tool is an endpoint-owned fact.
+            // Reusing a provider enum/model id against a custom compatible
+            // endpoint cannot carry that fact across the authority boundary.
+            selected.capabilities.server_side_web_search =
+                super::capabilities::CapabilityState::Unknown;
+        }
 
         let endpoint = ResolvedEndpoint {
             base_url: req
                 .base_url_override
                 .clone()
                 .unwrap_or_else(|| descriptor.default_base_url().to_string()),
-            endpoint_key,
+            endpoint_key: selected.endpoint_key,
             protocol: descriptor.protocol(),
         };
 
@@ -192,21 +228,37 @@ impl RouteResolver {
         }
         let validation = ValidationReport { ok: true, messages };
 
+        // Apply caller-requested limit overrides in order, BEFORE the candidate
+        // is minted. The candidate is immutable afterwards; the applied
+        // overrides are recorded on it as provenance.
+        let mut limits = selected.limits;
+        for limit_override in &req.limit_overrides {
+            match limit_override.field {
+                LimitField::ContextTokens => limits.context_tokens = limit_override.value,
+                LimitField::InputTokens => limits.input_tokens = limit_override.value,
+                LimitField::OutputTokens => limits.output_tokens = limit_override.value,
+            }
+        }
+
         Ok(ReadyRouteCandidate::new(
             provider_id,
             provider_kind,
             logical_model,
-            canonical_model,
-            wire_model_id,
+            selected.canonical_model,
+            selected.wire_model_id,
             endpoint,
-            ResolvedAuthSource::Missing,
+            // The resolver never inspects credentials: auth is honestly
+            // `Unresolved` at resolution time, not a claimed `Missing`.
+            ResolvedAuthSource::Unresolved,
             descriptor.protocol(),
             limits,
+            selected.capabilities,
             // #3085: honest pricing projected from the matched offering (the
             // catalog layer maps sourced cost → SKU); `UnknownOrStale` whenever
             // no offering was matched or the offering carried no price.
-            Some(pricing),
+            Some(selected.pricing),
             validation,
+            req.limit_overrides.clone(),
         ))
     }
 
@@ -217,17 +269,22 @@ impl RouteResolver {
         provider_id: &ProviderId,
         logical_model: &LogicalModelRef,
         class: ProviderClass,
-    ) -> Result<
-        (
-            WireModelId,
-            Option<ModelId>,
-            String,
-            RouteLimits,
-            PricingSku,
-        ),
-        RouteError,
-    > {
-        let raw = logical_model.raw();
+    ) -> Result<ResolvedOffering, RouteError> {
+        // OpenCode Go publishes one combined model roster across two wire
+        // protocols. Codewhale's provider is deliberately Chat Completions
+        // only, so this allowlist must sit at the sole route-candidate seam.
+        // In particular, a custom base URL must not reopen generic
+        // LocalOrCustom pass-through for Messages-only model ids.
+        let raw = if provider_kind == ProviderKind::OpencodeGo {
+            opencode_go_chat_model_id(logical_model.raw()).ok_or_else(|| {
+                RouteError::ForeignModelForDirectProvider {
+                    provider: provider_id.clone(),
+                    model: logical_model.raw().to_string(),
+                }
+            })?
+        } else {
+            provider_scoped_wire_alias(provider_kind, logical_model.raw(), class)
+        };
 
         // Try to match a catalog offering owned by THIS provider, either by
         // canonical model id or by exact wire id. This keeps interpretation
@@ -242,14 +299,7 @@ impl RouteResolver {
                 .is_some_and(|m| m.as_str() == raw);
             let matches_wire = offering.wire_model_id.as_str() == raw;
             if matches_canonical || matches_wire {
-                return Ok((
-                    offering.wire_model_id.clone(),
-                    offering.canonical_model.clone(),
-                    offering.endpoint_key.clone(),
-                    offering.limits,
-                    // Matched offering: carry its sourced pricing meter (#3085).
-                    offering.pricing.clone(),
-                ));
+                return Ok(ResolvedOffering::from_offering(offering));
             }
         }
 
@@ -274,26 +324,14 @@ impl RouteResolver {
                 // A bare, unknown model on a strict direct provider is passed
                 // through verbatim (the provider validates it server-side). No
                 // offering matched, so pricing is honestly unknown (#3085).
-                Ok((
-                    WireModelId::from(raw),
-                    None,
-                    "chat".to_string(),
-                    RouteLimits::default(),
-                    PricingSku::UnknownOrStale,
-                ))
+                Ok(ResolvedOffering::unknown(WireModelId::from(raw)))
             }
             // Aggregators, local runtimes, and custom OpenAI-compatible
             // endpoints legitimately accept arbitrary / prefixed ids verbatim.
             ProviderClass::Aggregator | ProviderClass::LocalOrCustom => {
                 let _ = provider_kind;
                 // No offering matched: pricing is honestly unknown (#3085).
-                Ok((
-                    WireModelId::from(raw),
-                    None,
-                    "chat".to_string(),
-                    RouteLimits::default(),
-                    PricingSku::UnknownOrStale,
-                ))
+                Ok(ResolvedOffering::unknown(WireModelId::from(raw)))
             }
         }
     }
@@ -328,6 +366,31 @@ impl RouteResolver {
                         .is_some_and(|model| model.as_str() == raw))
         })
     }
+}
+
+/// Normalize aliases whose provider wire identity is publicly documented but
+/// intentionally absent from the offline offering catalog. Keeping this seam
+/// provider-scoped avoids claiming unverified limits or pricing while ensuring
+/// receipts and HTTP requests carry the exact upstream model id.
+fn provider_scoped_wire_alias(
+    provider_kind: ProviderKind,
+    raw: &str,
+    class: ProviderClass,
+) -> &str {
+    if class != ProviderClass::LocalOrCustom {
+        if provider_kind == ProviderKind::Together
+            && (raw.eq_ignore_ascii_case("inkling") || raw.eq_ignore_ascii_case("together-inkling"))
+        {
+            return "thinkingmachines/inkling";
+        }
+        if provider_kind == ProviderKind::Openrouter
+            && (raw.eq_ignore_ascii_case("qwen3.7-plus")
+                || raw.eq_ignore_ascii_case("qwen-3.7-plus"))
+        {
+            return "qwen/qwen3.7-plus";
+        }
+    }
+    raw
 }
 
 /// Build the default resolver offerings from the bundled Models.dev asset.
@@ -389,32 +452,8 @@ fn request_uses_custom_endpoint(
     descriptor: &ProviderDescriptor,
     base_url_override: Option<&str>,
 ) -> bool {
-    base_url_override.is_some_and(|base_url| {
-        normalize_route_base_url(base_url)
-            != normalize_route_base_url(descriptor.default_base_url())
-    })
-}
-
-fn normalize_route_base_url(base_url: &str) -> String {
-    let trimmed = base_url.trim().trim_end_matches('/');
-    let deepseek_domains = ["api.deepseek.com", "api.deepseeki.com"];
-    if deepseek_domains
-        .iter()
-        .any(|domain| trimmed.to_ascii_lowercase().contains(domain))
-    {
-        return trimmed.trim_end_matches("/v1").to_string();
-    }
-    if let Some(idx) = trimmed.find("://") {
-        let (scheme, rest) = trimmed.split_at(idx);
-        let scheme = scheme.to_ascii_lowercase();
-        let rest = &rest[3..];
-        let (authority, path) = match rest.find('/') {
-            Some(p) => (&rest[..p], &rest[p..]),
-            None => (rest, ""),
-        };
-        return format!("{scheme}://{}{path}", authority.to_ascii_lowercase());
-    }
-    trimmed.to_ascii_lowercase()
+    base_url_override
+        .is_some_and(|base_url| provider_preserves_custom_base_url_model(descriptor.kind, base_url))
 }
 
 /// True when `base_url` is an `http://` endpoint whose host is NOT loopback

@@ -1,6 +1,6 @@
 # HarmonyOS and OpenHarmony
 
-This page covers CodeWhale on HarmonyOS PC and OpenHarmony cross-build setups.
+This page covers Codewhale on HarmonyOS PC and OpenHarmony cross-build setups.
 
 ## Running On HarmonyOS PC
 
@@ -42,7 +42,15 @@ cargo build --target aarch64-unknown-linux-ohos -p codewhale-cli
 
 The setup scripts export Cargo's target-specific `linker`, `AR`, `CC`, `CXX`,
 `CFLAGS`, `CXXFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CC_SHELL_ESCAPED_FLAGS`, and
-CMake toolchain variables for `aarch64-unknown-linux-ohos`.
+CMake toolchain variables for `aarch64-unknown-linux-ohos`. They also point
+`bindgen` at the SDK's `libclang` and sysroot so `rquickjs-sys` can generate
+the OpenHarmony bindings that it does not ship pre-generated.
+
+On Windows, `ohos-env.ps1` points Cargo at the repository's
+`ohos-clang.cmd` launcher. The launcher delegates to `ohos-clang.ps1`, so the
+final Rust link—not only C/C++ compilation and bindgen—always carries
+`-target aarch64-linux-ohos`, the SDK sysroot, and `-D__MUSL__` while preserving
+Cargo's linker arguments and exit status.
 
 ## Compiler Wrappers
 
@@ -85,8 +93,15 @@ Release prep runs a no-SDK dependency check:
 ./scripts/release/check-ohos-deps.sh
 ```
 
-The guard resolves the `codewhale-tui` dependency graph for
-`aarch64-unknown-linux-ohos` and fails if unsupported host/UI crates re-enter
-the target graph: `nix` 0.28/0.29, `portable-pty`, `starlark`, `arboard`, or
-`keyring`. This does not replace a real SDK/sysroot build, but it catches the
-known `starlark -> rustyline -> nix` and PTY/keyring regressions before release.
+The guard asserts the Windows final-link wrapper contract, proves that OHOS
+activates the `rquickjs-sys` bindgen feature, resolves the `codewhale-tui`
+dependency graph for `aarch64-unknown-linux-ohos`, and fails if unsupported
+host/UI crates re-enter that graph: `nix` 0.28/0.29, `portable-pty`, `starlark`,
+`arboard`, or `keyring`. This no-SDK check does not replace a real SDK/sysroot
+build, but it catches the known linker, bindgen, `starlark -> rustyline -> nix`,
+and PTY/keyring regressions before release.
+
+Because `portable-pty` is intentionally absent from the OpenHarmony graph, the
+persistent `terminal/*` PTY tools are not registered on that target. The
+ordinary `exec_shell` tools remain available through their non-PTY process
+implementation.

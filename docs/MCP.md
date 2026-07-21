@@ -36,6 +36,34 @@ Summaries redact commands, args, env, headers, and tokens.
 optional-surface intent (paths, counts, static checks) so wizard and doctor
 stay consistent.
 
+## Plugin-contributed MCP
+
+A reviewed local plugin bundle may contribute MCP servers without creating a
+second transport or approval system. The servers use the same MCP manager,
+tool approval, resource, prompt, timeout, and network-policy paths documented
+here, and appear under namespaced `<plugin>-<server>` identities.
+
+The bundle boundary is intentionally stricter than user-authored `mcp.json`:
+unknown fields and ambiguous transports fail closed; stdio environment values
+must be exact environment-source references; remote literal headers and
+secret-bearing URLs are rejected; declared network hosts must exactly match
+the normalized endpoint host set; and redirects remain on the reviewed origin.
+Reviewed plugin remotes also bypass ambient HTTP proxy configuration entirely;
+proxy credentials and proxy-observed traffic are not part of the v1 review.
+The plugin review discloses local host-user authority, structural argv,
+environment provenance, endpoint, auth source names, scopes, and tool filters
+without reading or printing secret values.
+
+Trust stages reviewed content but does not enable it. Enablement attaches that
+staged snapshot to the current workspace's MCP pool. Disable, revoke, and other
+cross-process generation changes remove catalog entries, cancel in-flight
+operations, and terminate plugin stdio children. Source or staged-tree drift is
+fully revalidated before each dispatch/catalogue boundary and fails the next
+boundary closed; v0.9.1 does not continuously hash mutable trees during an
+already-running call and therefore does not promise drift-triggered mid-call
+cancellation. MCP subscriptions are not exposed through plugin bundles. See
+[Plugin bundles](PLUGIN_BUNDLES.md) for the complete lifecycle contract.
+
 ## Bootstrap MCP Config
 
 Create a starter MCP config at your resolved MCP path:
@@ -120,9 +148,9 @@ codewhale-tui mcp add remote --url "https://example.com/mcp"
 codewhale-tui mcp login remote
 ```
 
-CodeWhale discovers the server OAuth metadata, opens the authorization URL in
+Codewhale discovers the server OAuth metadata, opens the authorization URL in
 your browser, listens on a local callback, exchanges the code, and stores the
-token response through the CodeWhale secrets backend. Stored OAuth tokens are
+token response through the Codewhale secrets backend. Stored OAuth tokens are
 looked up by server name plus URL and refreshed when possible before requests.
 During login, the CLI prints the authorization URL and a waiting status while
 the local callback listener is active. If a URL-based server returns 401 or
@@ -162,20 +190,20 @@ These callback fields are ignored from project-scope config overlays.
 ## Hugging Face MCP
 
 Hugging Face provides a hosted MCP server for Hub resources, documentation,
-datasets, Spaces, and community tools. CodeWhale does not call Hugging Face's
+datasets, Spaces, and community tools. Codewhale does not call Hugging Face's
 Hub HTTP APIs from `/hf`; it only helps you inspect and set up the MCP config
 that the regular MCP manager will load.
 
 The recommended setup path is Hugging Face's settings-generated configuration:
 
 1. Visit <https://huggingface.co/settings/mcp> while signed in.
-2. Choose the MCP client closest to your CodeWhale config shape and copy the
+2. Choose the MCP client closest to your Codewhale config shape and copy the
    generated server snippet.
 3. Paste the Hugging Face server entry into your resolved MCP config file.
-4. Restart CodeWhale, or run `/mcp reload` for the manager snapshot and restart
+4. Restart Codewhale, or run `/mcp reload` for the manager snapshot and restart
    if the model-visible tool pool still needs to rebuild.
 
-CodeWhale reads both `servers` and `mcpServers`, so settings-generated snippets
+Codewhale reads both `servers` and `mcpServers`, so settings-generated snippets
 can be adapted without changing the rest of the MCP file. A placeholder-only
 shape looks like this:
 
@@ -213,7 +241,7 @@ Official docs: <https://huggingface.co/docs/hub/hf-mcp-server>
 
 Default path:
 
-- `~/.codewhale/mcp.json` (`~/.deepseek/mcp.json` is still read when the CodeWhale file is absent)
+- `~/.codewhale/mcp.json` (`~/.deepseek/mcp.json` is still read when the Codewhale file is absent)
 
 Overrides:
 

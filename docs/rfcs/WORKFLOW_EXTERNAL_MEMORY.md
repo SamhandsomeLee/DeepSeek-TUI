@@ -1,15 +1,20 @@
 # Workflow External Memory Cutline
 
-This note resolves the v0.9.0 cutline for Aleph-style external memory in
+**Status (2026-07-15): Principle-only cutline — current.** The boundary below
+still holds at v0.9.0. Note the layer table names machinery (TraceStore, the
+ARMH/RLM memo store, the cached-main overlay) that is proposed, not in the
+tree; only user memory (`/memory`, `remember`) and RLM sessions exist today.
+
+This note resolves the next-major cutline for Aleph-style external memory in
 Workflow. It is a design boundary, not a runtime implementation.
 
 ## Decision
 
-External memory should be optional and explicit for v0.9.0. Normal CodeWhale
+External memory should remain optional and explicit after v0.9.0. Normal Codewhale
 operation must not depend on it, and Workflow must not silently enable it for
 long-running runs.
 
-For v0.9.0, external memory can appear only as:
+In a later release, external memory can appear only as:
 
 - an explicit workflow node whose inputs, outputs, scope, and permissions are
   visible in the typed Workflow IR;
@@ -23,7 +28,7 @@ default backing store for every workflow run.
 
 External memory is separate from the existing memory and replay layers:
 
-| Layer | Scope | v0.9.0 rule |
+| Layer | Scope | Post-v0.9.0 rule |
 | --- | --- | --- |
 | User memory | Small durable user preferences and facts surfaced by `/memory` | Opt-in, user-owned, not workflow evidence |
 | Repo search / codemap | Derived repo structure and search results | Rebuildable from the workspace; not a memory log |

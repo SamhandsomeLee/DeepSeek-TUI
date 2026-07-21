@@ -1,4 +1,4 @@
-//! Runtime HTTP/SSE API for local CodeWhale automation.
+//! Runtime HTTP/SSE API for local Codewhale automation.
 
 use std::convert::Infallible;
 use std::fs;
@@ -10,9 +10,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use async_stream::stream;
 use axum::extract::{Path, Query, Request, State};
-#[cfg(test)]
 use axum::http::header;
-use axum::http::{HeaderValue, Method, StatusCode};
+use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware;
 use axum::response::Html;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -29,7 +28,7 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 
 #[cfg(test)]
 use crate::dependencies::ExternalTool;
@@ -38,7 +37,10 @@ use crate::automation_manager::{
     AutomationManager, AutomationRecord, AutomationRunRecord, AutomationSchedulerConfig,
     CreateAutomationRequest, SharedAutomationManager, UpdateAutomationRequest, spawn_scheduler,
 };
-use crate::config::{Config, DEFAULT_TEXT_MODEL};
+use crate::config::{
+    ApiProvider, Config, DEFAULT_TEXT_MODEL, normalize_model_name_for_provider, validate_route,
+};
+use crate::fleet::executor::{FleetExecutor, configured_codewhale_binary};
 use crate::fleet::ledger::{FleetLedgerState, FleetTaskLedgerStatus};
 use crate::fleet::manager::{
     FleetManager, FleetStatusSnapshot, FleetWorkerInspection, FleetWorkerRuntimeProjection,
@@ -47,10 +49,10 @@ use crate::mcp::McpPool;
 #[cfg(test)]
 pub(super) use crate::models::{ContentBlock, Message};
 use crate::runtime_threads::{
-    CompactThreadRequest, CreateThreadRequest, ExternalApprovalDecision, RuntimeThreadManager,
-    RuntimeThreadManagerConfig, SharedRuntimeThreadManager, StartTurnRequest, SteerTurnRequest,
-    ThreadDetail, ThreadListFilter, ThreadRecord, TurnItemKind, TurnRecord, UpdateThreadRequest,
-    UsageGroupBy,
+    CompactThreadRequest, CreateThreadRequest, ExternalApprovalDecision,
+    MAX_RUNTIME_EVENT_REPLAY_TAIL, RuntimeThreadManager, RuntimeThreadManagerConfig,
+    SharedRuntimeThreadManager, StartTurnRequest, SteerTurnRequest, ThreadDetail, ThreadListFilter,
+    ThreadRecord, TurnItemKind, TurnRecord, UpdateThreadRequest, UsageGroupBy,
 };
 #[cfg(test)]
 pub(super) use crate::runtime_threads::{RuntimeTurnStatus, TurnItemLifecycleStatus};
@@ -71,6 +73,7 @@ use codewhale_protocol::fleet::{
 
 mod auth;
 mod sessions;
+mod web;
 mod workspace;
 #[cfg(test)]
 use self::auth::{ResolvedRuntimeAuth, token_from_cookie_header};
@@ -89,6 +92,7 @@ use self::workspace::{collect_workspace_git_metadata, workspace_status};
 pub struct RuntimeApiState {
     config: Arc<parking_lot::RwLock<Config>>,
     workspace: PathBuf,
+    plugin_discovery: Arc<crate::plugins::PluginDiscoveryContext>,
     task_manager: SharedTaskManager,
     runtime_threads: SharedRuntimeThreadManager,
     cors_origins: Vec<String>,
@@ -98,6 +102,9 @@ pub struct RuntimeApiState {
     /// GUI-driven config changes target the same file the server was
     /// started with, instead of falling back to the default discovery.
     config_path: Option<PathBuf>,
+    /// Effective initial profile (`--profile` or `DEEPSEEK_PROFILE`).
+    /// Reload must retain this overlay so profile-scoped routes do not vanish.
+    config_profile: Option<String>,
     automations: SharedAutomationManager,
     sub_agent_manager: SharedSubAgentManager,
     runtime_token: Option<String>,
@@ -106,12 +113,36 @@ pub struct RuntimeApiState {
     bind_host: String,
     bind_port: u16,
     mobile_enabled: bool,
+    web: Option<web::RuntimeWebState>,
+    /// Executable used by Runtime API-owned Fleet manager loops. Stored on
+    /// state so tests and embedded callers can provide a hermetic worker.
+    fleet_codewhale_binary: String,
     /// Shared McpPool reused for explicit live MCP discovery. Passive API
     /// calls do not initialize this pool so dashboards cannot accidentally
     /// become a second stdio-process owner. The outer mutex guards only the
     /// lazily-initialized slot; slow per-pool work (connect_all) runs under
     /// the inner handle so it cannot block slot reads.
     mcp_pool: Arc<Mutex<Option<Arc<Mutex<McpPool>>>>>,
+    #[cfg(test)]
+    compat_stream_test_hook: Option<tokio::sync::mpsc::UnboundedSender<CompatStreamTestPoint>>,
+}
+
+#[cfg(test)]
+enum CompatStreamTestPoint {
+    ThreadCreated {
+        thread_id: String,
+        resume: tokio::sync::oneshot::Sender<()>,
+    },
+    SubscribedBeforeReplay {
+        thread_id: String,
+        turn_id: String,
+        resume: tokio::sync::oneshot::Sender<()>,
+    },
+    ReplayLoaded {
+        thread_id: String,
+        turn_id: String,
+        resume: tokio::sync::oneshot::Sender<()>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -134,12 +165,18 @@ pub struct RuntimeApiOptions {
     pub insecure_no_auth: bool,
     /// Enables the built-in mobile control page at `/mobile`.
     pub mobile: bool,
+    /// Enables the embedded local browser client and opens it after binding.
+    /// Web mode is always loopback-only and uses a one-time bootstrap cookie
+    /// exchange rather than exposing the Runtime token to the browser URL.
+    pub web: bool,
     /// Show a QR code for the mobile URL in the terminal.
     pub show_qr: bool,
     /// Original `--config` path used to load the initial config. When
     /// `Some`, GUI-driven config reloads and persistence target this file
     /// instead of the default discovery path.
     pub config_path: Option<PathBuf>,
+    /// Effective profile used to load the server's initial Config.
+    pub config_profile: Option<String>,
 }
 
 impl Default for RuntimeApiOptions {
@@ -152,8 +189,10 @@ impl Default for RuntimeApiOptions {
             auth_token: None,
             insecure_no_auth: false,
             mobile: false,
+            web: false,
             show_qr: false,
             config_path: None,
+            config_profile: None,
         }
     }
 }
@@ -240,7 +279,13 @@ struct ThreadSummary {
 struct SkillEntry {
     name: String,
     description: String,
-    path: PathBuf,
+    /// Native Skill locator. Reviewed plugin paths are deliberately omitted;
+    /// their bodies are available only through the authority-bound snapshot.
+    path: Option<PathBuf>,
+    source: String,
+    plugin_id: Option<String>,
+    plugin_generation: Option<u64>,
+    plugin_content_hash: Option<String>,
     enabled: bool,
     is_bundled: bool,
 }
@@ -402,10 +447,17 @@ struct StartTurnResponse {
 pub async fn run_http_server(
     config: Config,
     workspace: PathBuf,
+    plugin_discovery: Arc<crate::plugins::PluginDiscoveryContext>,
     options: RuntimeApiOptions,
 ) -> Result<()> {
     if options.port == 0 {
         bail!("Port must be > 0");
+    }
+    if options.web && options.host != "127.0.0.1" {
+        bail!("Codewhale web is loopback-only and must bind to 127.0.0.1");
+    }
+    if options.web && options.insecure_no_auth {
+        bail!("Codewhale web requires Runtime authentication; remove --insecure");
     }
 
     let task_cfg = TaskManagerConfig::from_runtime(
@@ -414,10 +466,11 @@ pub async fn run_http_server(
         config.default_text_model.clone(),
         Some(options.workers),
     );
-    let runtime_threads = Arc::new(RuntimeThreadManager::open(
+    let runtime_threads = Arc::new(RuntimeThreadManager::open_with_plugin_registry(
         config.clone(),
         workspace.clone(),
         RuntimeThreadManagerConfig::from_task_data_dir(task_cfg.data_dir.clone()),
+        plugin_discovery.registry_for_workspace(&workspace),
     )?);
     let task_manager =
         TaskManager::start_with_runtime_manager(task_cfg, config.clone(), runtime_threads.clone())
@@ -447,22 +500,28 @@ pub async fn run_http_server(
     );
     let runtime_token = resolved_auth.token.clone();
     let auth_enabled = runtime_token.is_some();
-    let skill_state = SkillStateStore::load_default().unwrap_or_else(|err| {
-        tracing::warn!(
-            "Failed to load skills_state.toml ({}); treating all skills as enabled",
-            err
-        );
-        SkillStateStore::default()
-    });
+    let (web, web_bootstrap) = if options.web {
+        runtime_token
+            .as_ref()
+            .context("Codewhale web requires a Runtime authentication token")?;
+        let (web, bootstrap) = web::RuntimeWebState::new();
+        (Some(web), Some(bootstrap))
+    } else {
+        (None, None)
+    };
+    let skill_state = SkillStateStore::load_default()
+        .context("load persistent Skill activation state for Runtime API")?;
     let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, options.workers);
     let state = RuntimeApiState {
         config: Arc::new(parking_lot::RwLock::new(config.clone())),
         workspace,
+        plugin_discovery,
         task_manager,
         runtime_threads,
         cors_origins: options.cors_origins.clone(),
         sessions_dir,
         config_path: options.config_path.clone(),
+        config_profile: options.config_profile.clone(),
         automations,
         sub_agent_manager,
         runtime_token: runtime_token.clone(),
@@ -471,7 +530,11 @@ pub async fn run_http_server(
         bind_host: options.host.clone(),
         bind_port: options.port,
         mobile_enabled: options.mobile,
+        web,
+        fleet_codewhale_binary: configured_codewhale_binary(),
         mcp_pool: Arc::new(Mutex::new(None)),
+        #[cfg(test)]
+        compat_stream_test_hook: None,
     };
     let app = build_router(state);
 
@@ -482,12 +545,30 @@ pub async fn run_http_server(
         .await
         .with_context(|| format!("Failed to bind {addr}"))?;
 
-    println!("Runtime API listening on http://{addr}");
+    let bound_addr = listener
+        .local_addr()
+        .context("Failed to read Runtime API listener address")?;
+    println!("Runtime API listening on http://{bound_addr}");
     for line in runtime_auth_status_lines(&resolved_auth) {
         println!("{line}");
     }
     if options.mobile {
-        print_mobile_urls(addr, auth_enabled, resolved_auth.generated, options.show_qr);
+        print_mobile_urls(
+            bound_addr,
+            auth_enabled,
+            resolved_auth.generated,
+            options.show_qr,
+        );
+    }
+    if let Some(bootstrap) = web_bootstrap {
+        println!("Codewhale web enabled at http://{bound_addr}/");
+        let bootstrap_url = web::bootstrap_url(bound_addr, &bootstrap);
+        if let Err(error) = crate::utils::open_url(&bootstrap_url) {
+            scheduler_cancel.cancel();
+            scheduler_handle.abort();
+            return Err(error)
+                .context("Failed to open the Codewhale web client in the default browser");
+        }
     }
     let is_loopback = options.host == "127.0.0.1" || options.host == "::1";
     if is_loopback {
@@ -509,9 +590,12 @@ pub async fn run_http_server(
             auth = auth_enabled,
         );
     }
-    let serve_result = axum::serve(listener, app)
-        .await
-        .map_err(|e| anyhow!("Runtime API server error: {e}"));
+    let serve_result = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .map_err(|e| anyhow!("Runtime API server error: {e}"));
     scheduler_cancel.cancel();
     scheduler_handle.abort();
     serve_result
@@ -610,6 +694,13 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         ));
 
     Router::new()
+        .route("/", get(web::web_page))
+        .route("/assets/codewhale-web.css", get(web::web_styles))
+        .route("/assets/codewhale-web.js", get(web::web_script))
+        .route(
+            "/__codewhale/bootstrap/{nonce}",
+            get(web::exchange_bootstrap),
+        )
         .route("/health", get(health))
         .route("/mobile", get(mobile_page))
         .route("/mobile/", get(mobile_page))
@@ -739,16 +830,6 @@ async fn create_thread(
     State(state): State<RuntimeApiState>,
     Json(mut req): Json<CreateThreadRequest>,
 ) -> Result<(StatusCode, Json<ThreadRecord>), ApiError> {
-    if req.model.as_ref().is_none_or(|m| m.trim().is_empty()) {
-        req.model = Some(
-            state
-                .config
-                .read()
-                .default_text_model
-                .clone()
-                .unwrap_or_else(|| DEFAULT_TEXT_MODEL.to_string()),
-        );
-    }
     if req.workspace.is_none() {
         req.workspace = Some(state.workspace.clone());
     }
@@ -1003,14 +1084,41 @@ async fn restart_fleet_worker(
     Path(worker_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let manager = open_fleet_manager(&state)?;
-    let inspection = manager.restart_worker(&worker_id).map_err(|err| {
+    let report = manager.restart_worker(&worker_id).map_err(|err| {
         ApiError::bad_request(format!(
             "Failed to restart fleet worker '{worker_id}': {err}"
         ))
     })?;
+    let worker = fleet_worker_json(&report.inspection);
+    let run_id = report.run_id.clone();
+    let max_workers = report.max_workers;
+    let workspace = state.workspace.clone();
+    let codewhale_binary = state.fleet_codewhale_binary.clone();
+    tokio::spawn(async move {
+        let mut executor = FleetExecutor::new(&workspace);
+        if let Err(err) = manager
+            .run_to_completion(
+                &run_id,
+                max_workers,
+                &mut executor,
+                &codewhale_binary,
+                None,
+                Duration::from_millis(250),
+            )
+            .await
+        {
+            tracing::error!(
+                run_id = %run_id.0,
+                error = %err,
+                "Runtime API Fleet restart manager exited with an error"
+            );
+        }
+    });
     Ok(Json(json!({
         "action": "restart",
-        "worker": fleet_worker_json(&inspection),
+        "execution": "scheduled",
+        "run_id": report.run_id.0,
+        "worker": worker,
     })))
 }
 
@@ -1035,7 +1143,7 @@ async fn stop_fleet_run(
 }
 
 fn open_fleet_manager(state: &RuntimeApiState) -> Result<FleetManager, ApiError> {
-    let (exec_config, session_model) = {
+    let (exec_config, session_model, route_config) = {
         let config = state.config.read();
         let exec_config = config
             .fleet
@@ -1044,7 +1152,7 @@ fn open_fleet_manager(state: &RuntimeApiState) -> Result<FleetManager, ApiError>
             .unwrap_or_default();
         // The active session route is the operator: workers without a
         // task/profile model pin inherit the model the user picked in /model.
-        (exec_config, config.default_model())
+        (exec_config, config.default_model(), config.clone())
     };
     FleetManager::open(&state.workspace)
         .map(|manager| {
@@ -1052,6 +1160,7 @@ fn open_fleet_manager(state: &RuntimeApiState) -> Result<FleetManager, ApiError>
                 .with_exec_config(exec_config)
                 .with_sub_agent_manager(state.sub_agent_manager.clone())
                 .with_session_model(session_model)
+                .with_route_config(route_config)
         })
         .map_err(|err| ApiError::internal(format!("Failed to open fleet manager: {err}")))
 }
@@ -1288,18 +1397,55 @@ async fn list_skills(
         );
         (skills_dir, mode)
     };
-    let (registry, directories) =
-        discover_skills_for_runtime_api(&state.workspace, &skills_dir, mode);
-    let skill_state = state.skill_state.lock().await;
+    let plugin_registry = state
+        .plugin_discovery
+        .registry_for_workspace(&state.workspace);
+    let (registry, directories) = discover_skills_for_runtime_api(
+        &state.workspace,
+        &skills_dir,
+        mode,
+        Some(plugin_registry.as_ref()),
+    );
+    let mut skill_state = state.skill_state.lock().await;
+    skill_state
+        .refresh()
+        .map_err(|error| ApiError::internal(format!("refresh skill state: {error}")))?;
     let skills = registry
         .list()
         .iter()
-        .map(|skill| SkillEntry {
-            name: skill.name.clone(),
-            description: skill.description.clone(),
-            path: skill.path.clone(),
-            enabled: skill_state.is_enabled(&skill.name),
-            is_bundled: skill_entry_is_bundled(skill, &skills_dir),
+        .map(|skill| {
+            let (path, source, plugin_id, plugin_generation, plugin_content_hash) =
+                match &skill.source {
+                    crate::skills::SkillSource::Native => (
+                        Some(skill.path.clone()),
+                        "native".to_string(),
+                        None,
+                        None,
+                        None,
+                    ),
+                    crate::skills::SkillSource::Plugin {
+                        plugin_id,
+                        plugin_name,
+                        authority,
+                    } => (
+                        None,
+                        format!("reviewed-plugin-snapshot:{plugin_name}"),
+                        Some(plugin_id.clone()),
+                        Some(authority.state_generation),
+                        Some(authority.content_hash.clone()),
+                    ),
+                };
+            SkillEntry {
+                name: skill.name.clone(),
+                description: skill.description.clone(),
+                path,
+                source,
+                plugin_id,
+                plugin_generation,
+                plugin_content_hash,
+                enabled: skill_state.is_enabled(&skill.name),
+                is_bundled: skill_entry_is_bundled(skill, &skills_dir),
+            }
         })
         .collect();
     Ok(Json(SkillsResponse {
@@ -1323,8 +1469,15 @@ async fn set_skill_enabled(
         );
         (skills_dir, mode)
     };
-    let (registry, directories) =
-        discover_skills_for_runtime_api(&state.workspace, &skills_dir, mode);
+    let plugin_registry = state
+        .plugin_discovery
+        .registry_for_workspace(&state.workspace);
+    let (registry, directories) = discover_skills_for_runtime_api(
+        &state.workspace,
+        &skills_dir,
+        mode,
+        Some(plugin_registry.as_ref()),
+    );
     let exists = registry.list().iter().any(|skill| skill.name == name);
     if !exists {
         return Err(ApiError::not_found(format!(
@@ -1398,6 +1551,11 @@ async fn submit_user_input(
         .submit_user_input(&thread_id, &input_id, response)
         .await
         .map_err(map_thread_err)?;
+    if !delivered {
+        return Err(ApiError::not_found(format!(
+            "no pending user-input request with id '{input_id}'"
+        )));
+    }
     Ok(Json(SubmitUserInputResponse {
         ok: true,
         input_id,
@@ -1425,8 +1583,15 @@ async fn list_mcp_servers(
     State(state): State<RuntimeApiState>,
 ) -> Result<Json<McpServersResponse>, ApiError> {
     let mcp_config_path = state.config.read().mcp_config_path();
-    let config = crate::mcp::load_config_with_workspace(&mcp_config_path, &state.workspace)
-        .map_err(|e| ApiError::internal(format!("Failed to load MCP config: {e}")))?;
+    let plugin_registry = state
+        .plugin_discovery
+        .registry_for_workspace(&state.workspace);
+    let config = crate::mcp::load_config_with_workspace_and_plugins(
+        &mcp_config_path,
+        &state.workspace,
+        plugin_registry.as_ref(),
+    )
+    .map_err(|e| ApiError::internal(format!("Failed to load MCP config: {e}")))?;
 
     let mut servers = Vec::new();
     for (name, server_cfg) in config.servers {
@@ -1459,11 +1624,15 @@ async fn list_mcp_tools(
             Some(pool) => Some(Arc::clone(pool)),
             None if query.connect => {
                 let mcp_config_path = state.config.read().mcp_config_path();
-                let new_pool =
-                    McpPool::from_config_path_with_workspace(&mcp_config_path, &state.workspace)
-                        .map_err(|e| {
-                            ApiError::internal(format!("Failed to load MCP config: {e}"))
-                        })?;
+                let plugin_registry = state
+                    .plugin_discovery
+                    .registry_for_workspace(&state.workspace);
+                let new_pool = McpPool::from_config_path_with_workspace_and_plugins(
+                    &mcp_config_path,
+                    &state.workspace,
+                    plugin_registry,
+                )
+                .map_err(|e| ApiError::internal(format!("Failed to load MCP config: {e}")))?;
                 let handle = Arc::new(Mutex::new(new_pool));
                 pool_slot.replace(Arc::clone(&handle));
                 Some(handle)
@@ -1930,7 +2099,7 @@ async fn interrupt_thread_turn(
 
 async fn deliver_dynamic_tool_result(
     State(state): State<RuntimeApiState>,
-    Path((id, _turn_id, call_id)): Path<(String, String, String)>,
+    Path((id, turn_id, call_id)): Path<(String, String, String)>,
     Json(result): Json<DynamicToolCallResult>,
 ) -> Result<StatusCode, ApiError> {
     state
@@ -1940,7 +2109,9 @@ async fn deliver_dynamic_tool_result(
         .map_err(map_thread_err)?;
     if state
         .runtime_threads
-        .deliver_dynamic_tool_result(&call_id, result)
+        .deliver_dynamic_tool_result(&id, &turn_id, &call_id, result)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?
     {
         Ok(StatusCode::ACCEPTED)
     } else {
@@ -1996,12 +2167,12 @@ async fn cancel_task(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<TaskRecord>, ApiError> {
-    let task = state
+    let cancellation = state
         .task_manager
         .cancel_task(&id)
         .await
         .map_err(map_task_err)?;
-    Ok(Json(task))
+    Ok(Json(cancellation.task))
 }
 
 async fn stream_thread_events(
@@ -2015,49 +2186,142 @@ async fn stream_thread_events(
         .await
         .map_err(map_thread_err)?;
 
-    let mut backlog = state
-        .runtime_threads
-        .events_since(&id, query.since_seq)
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    if let Some(limit) = query.replay_limit
-        && backlog.len() > limit
+    // Subscribe before reading durable history. An event emitted while replay
+    // is loaded is then present in both places (and deduped below) or queued
+    // live, never in an uncovered handoff window.
+    let live = state.runtime_threads.subscribe_events();
+    if query
+        .replay_limit
+        .is_some_and(|limit| limit > MAX_RUNTIME_EVENT_REPLAY_TAIL)
     {
-        backlog = backlog.split_off(backlog.len() - limit);
+        return Err(ApiError::bad_request(format!(
+            "replay_limit cannot exceed {MAX_RUNTIME_EVENT_REPLAY_TAIL}"
+        )));
     }
-    let mut last_seq = query.since_seq.unwrap_or(0);
-    if let Some(last) = backlog.last() {
-        last_seq = last.seq;
-    }
+    let replay = state
+        .runtime_threads
+        .replay_events(&id, query.since_seq, query.replay_limit)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    let mut live = state.runtime_threads.subscribe_events();
-    let thread_id = id.clone();
-    let stream = stream! {
-        for event in backlog {
-            let event_name = event.event.clone();
-            yield Ok(sse_json(&event_name, runtime_event_payload(event)));
-        }
-        loop {
-            let incoming = live.recv().await;
-            let Ok(event) = incoming else {
-                break;
-            };
-            if event.thread_id != thread_id {
-                continue;
-            }
-            if event.seq <= last_seq {
-                continue;
-            }
-            last_seq = event.seq;
-            let event_name = event.event.clone();
-            yield Ok(sse_json(&event_name, runtime_event_payload(event)));
-        }
-    };
+    let stream = replay_live_thread_events(
+        state.runtime_threads.clone(),
+        id,
+        replay.base_seq,
+        replay.batches,
+        live,
+    );
 
     Ok(Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
             .text("keepalive"),
     ))
+}
+
+fn replay_live_thread_events(
+    runtime_threads: SharedRuntimeThreadManager,
+    thread_id: String,
+    mut last_seq: u64,
+    mut backlog: tokio::sync::mpsc::Receiver<
+        std::result::Result<Vec<crate::runtime_threads::RuntimeEventRecord>, String>,
+    >,
+    mut live: tokio::sync::broadcast::Receiver<crate::runtime_threads::RuntimeEventRecord>,
+) -> impl futures_util::Stream<Item = Result<SseEvent, Infallible>> {
+    stream! {
+        while let Some(batch) = backlog.recv().await {
+            let events = match batch {
+                Ok(events) => events,
+                Err(error) => {
+                    tracing::warn!(
+                        thread_id = %thread_id,
+                        last_seq,
+                        %error,
+                        "Failed to replay Runtime web event stream from durable history"
+                    );
+                    return;
+                }
+            };
+            for event in events {
+                if event.thread_id != thread_id || event.seq <= last_seq {
+                    continue;
+                }
+                let previous_seq = last_seq;
+                last_seq = event.seq;
+                let event_name = event.event.clone();
+                yield Ok(sse_json(
+                    &event_name,
+                    runtime_event_payload_with_previous(event, previous_seq),
+                ));
+            }
+        }
+
+        'live: loop {
+            match live.recv().await {
+                Ok(event) => {
+                    if event.thread_id != thread_id || event.seq <= last_seq {
+                        continue;
+                    }
+                    let previous_seq = last_seq;
+                    last_seq = event.seq;
+                    let event_name = event.event.clone();
+                    yield Ok(sse_json(
+                        &event_name,
+                        runtime_event_payload_with_previous(event, previous_seq),
+                    ));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    // Broadcast is only a wake-up path; durable history remains
+                    // authoritative. Catch up from the last delivered cursor so
+                    // receiver pressure cannot turn into a silent prompt loss.
+                    let mut recovered = match runtime_threads
+                        .replay_events(&thread_id, Some(last_seq), None)
+                        .await
+                    {
+                        Ok(replay) => replay.batches,
+                        Err(error) => {
+                            tracing::warn!(
+                                thread_id = %thread_id,
+                                last_seq,
+                                skipped,
+                                %error,
+                                "Failed to recover lagged Runtime web event stream from durable history"
+                            );
+                            break 'live;
+                        }
+                    };
+                    while let Some(batch) = recovered.recv().await {
+                        let events = match batch {
+                            Ok(events) => events,
+                            Err(error) => {
+                                tracing::warn!(
+                                    thread_id = %thread_id,
+                                    last_seq,
+                                    skipped,
+                                    %error,
+                                    "Failed to recover lagged Runtime web event stream from durable history"
+                                );
+                                break 'live;
+                            }
+                        };
+                        for event in events {
+                            if event.thread_id != thread_id || event.seq <= last_seq {
+                                continue;
+                            }
+                            let previous_seq = last_seq;
+                            last_seq = event.seq;
+                            let event_name = event.event.clone();
+                            yield Ok(sse_json(
+                                &event_name,
+                                runtime_event_payload_with_previous(event, previous_seq),
+                            ));
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    }
 }
 
 async fn stream_turn(
@@ -2103,6 +2367,19 @@ async fn stream_turn(
         .await
         .map_err(|e| ApiError::internal(format!("Failed to create stream thread: {e}")))?;
 
+    #[cfg(test)]
+    if let Some(hook) = &state.compat_stream_test_hook {
+        let (resume, wait_for_resume) = tokio::sync::oneshot::channel();
+        hook.send(CompatStreamTestPoint::ThreadCreated {
+            thread_id: thread.id.clone(),
+            resume,
+        })
+        .map_err(|_| ApiError::internal("Compatibility stream test hook closed"))?;
+        wait_for_resume
+            .await
+            .map_err(|_| ApiError::internal("Compatibility stream test hook dropped resume"))?;
+    }
+
     let turn = state
         .runtime_threads
         .start_turn(
@@ -2121,15 +2398,49 @@ async fn stream_turn(
         .await
         .map_err(|e| ApiError::internal(format!("Failed to start stream turn: {e}")))?;
 
-    let backlog = state
-        .runtime_threads
-        .events_since(&thread.id, None)
-        .map_err(|e| ApiError::internal(format!("Failed to load stream backlog: {e}")))?;
+    // Subscribe before reading the durable replay. Events produced while the
+    // replay is loaded then exist in at least one source, and the sequence
+    // cursor below removes overlap without dropping the handoff edge.
     let mut live = state.runtime_threads.subscribe_events();
     let thread_id = thread.id.clone();
     let turn_id = turn.id.clone();
 
+    #[cfg(test)]
+    if let Some(hook) = &state.compat_stream_test_hook {
+        let (resume, wait_for_resume) = tokio::sync::oneshot::channel();
+        hook.send(CompatStreamTestPoint::SubscribedBeforeReplay {
+            thread_id: thread_id.clone(),
+            turn_id: turn_id.clone(),
+            resume,
+        })
+        .map_err(|_| ApiError::internal("Compatibility stream test hook closed"))?;
+        wait_for_resume
+            .await
+            .map_err(|_| ApiError::internal("Compatibility stream test hook dropped resume"))?;
+    }
+
+    let mut backlog = state
+        .runtime_threads
+        .replay_events(&thread.id, None, None)
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to load stream backlog: {e}")))?;
+
+    #[cfg(test)]
+    if let Some(hook) = &state.compat_stream_test_hook {
+        let (resume, wait_for_resume) = tokio::sync::oneshot::channel();
+        hook.send(CompatStreamTestPoint::ReplayLoaded {
+            thread_id: thread_id.clone(),
+            turn_id: turn_id.clone(),
+            resume,
+        })
+        .map_err(|_| ApiError::internal("Compatibility stream test hook closed"))?;
+        wait_for_resume
+            .await
+            .map_err(|_| ApiError::internal("Compatibility stream test hook dropped resume"))?;
+    }
+
     let stream = stream! {
+        let mut last_seq = 0;
         yield Ok(sse_json("turn.started", json!({
             "thread_id": thread.id,
             "turn_id": turn.id,
@@ -2138,43 +2449,149 @@ async fn stream_turn(
             "workspace": workspace,
         })));
 
-        for event in backlog {
-            if event.thread_id != thread_id || event.turn_id.as_deref() != Some(&turn_id) {
-                continue;
-            }
-            if let Some(mapped) = map_compat_stream_event(&event) {
-                yield Ok(mapped);
-            }
-            if event.event == "turn.completed" {
-                yield Ok(sse_json("done", json!({})));
-                return;
+        while let Some(batch) = backlog.batches.recv().await {
+            let events = match batch {
+                Ok(events) => events,
+                Err(error) => {
+                    tracing::warn!(
+                        thread_id = %thread_id,
+                        turn_id = %turn_id,
+                        %error,
+                        "Failed to replay compatibility stream from durable history"
+                    );
+                    yield Ok(sse_json("error", json!({
+                        "message": "failed to replay durable event stream",
+                    })));
+                    return;
+                }
+            };
+            for event in events {
+                let Some((mapped, terminal)) = take_compat_turn_event(
+                    &event,
+                    &thread_id,
+                    &turn_id,
+                    &mut last_seq,
+                ) else {
+                    continue;
+                };
+                if let Some(mapped) = mapped {
+                    yield Ok(mapped);
+                }
+                if terminal {
+                    yield Ok(sse_json("done", json!({})));
+                    return;
+                }
             }
         }
 
         loop {
-            let incoming = live.recv().await;
-            let Ok(event) = incoming else {
-                yield Ok(sse_json("error", json!({ "message": "event channel closed" })));
-                break;
-            };
-            if event.thread_id != thread_id || event.turn_id.as_deref() != Some(&turn_id) {
-                continue;
-            }
-            if let Some(mapped) = map_compat_stream_event(&event) {
-                yield Ok(mapped);
-            }
-            if event.event == "turn.completed" {
-                break;
+            match live.recv().await {
+                Ok(event) => {
+                    let Some((mapped, terminal)) = take_compat_turn_event(
+                        &event,
+                        &thread_id,
+                        &turn_id,
+                        &mut last_seq,
+                    ) else {
+                        continue;
+                    };
+                    if let Some(mapped) = mapped {
+                        yield Ok(mapped);
+                    }
+                    if terminal {
+                        yield Ok(sse_json("done", json!({})));
+                        return;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    let mut recovered = match state.runtime_threads
+                        .replay_events(&thread_id, Some(last_seq), None)
+                        .await
+                    {
+                        Ok(replay) => replay.batches,
+                        Err(error) => {
+                            tracing::warn!(
+                                thread_id = %thread_id,
+                                turn_id = %turn_id,
+                                last_seq,
+                                skipped,
+                                %error,
+                                "Failed to recover lagged compatibility stream from durable history"
+                            );
+                            yield Ok(sse_json("error", json!({
+                                "message": "failed to recover lagged event stream",
+                            })));
+                            return;
+                        }
+                    };
+                    while let Some(batch) = recovered.recv().await {
+                        let events = match batch {
+                            Ok(events) => events,
+                            Err(error) => {
+                                tracing::warn!(
+                                    thread_id = %thread_id,
+                                    turn_id = %turn_id,
+                                    last_seq,
+                                    skipped,
+                                    %error,
+                                    "Failed to recover lagged compatibility stream from durable history"
+                                );
+                                yield Ok(sse_json("error", json!({
+                                    "message": "failed to recover lagged event stream",
+                                })));
+                                return;
+                            }
+                        };
+                        for event in events {
+                            let Some((mapped, terminal)) = take_compat_turn_event(
+                                &event,
+                                &thread_id,
+                                &turn_id,
+                                &mut last_seq,
+                            ) else {
+                                continue;
+                            };
+                            if let Some(mapped) = mapped {
+                                yield Ok(mapped);
+                            }
+                            if terminal {
+                                yield Ok(sse_json("done", json!({})));
+                                return;
+                            }
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    yield Ok(sse_json("error", json!({ "message": "event channel closed" })));
+                    return;
+                }
             }
         }
-
-        yield Ok(sse_json("done", json!({})));
     };
 
     Ok(Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
             .text("keepalive"),
+    ))
+}
+
+fn take_compat_turn_event(
+    event: &crate::runtime_threads::RuntimeEventRecord,
+    thread_id: &str,
+    turn_id: &str,
+    last_seq: &mut u64,
+) -> Option<(Option<SseEvent>, bool)> {
+    if event.thread_id != thread_id
+        || event.turn_id.as_deref() != Some(turn_id)
+        || event.seq <= *last_seq
+    {
+        return None;
+    }
+    *last_seq = event.seq;
+    Some((
+        map_compat_stream_event(event),
+        event.event == "turn.completed",
     ))
 }
 
@@ -2196,6 +2613,17 @@ fn runtime_event_payload(event: crate::runtime_threads::RuntimeEventRecord) -> s
         extra: Default::default(),
     };
     serde_json::to_value(envelope).expect("serialize runtime event envelope")
+}
+
+fn runtime_event_payload_with_previous(
+    event: crate::runtime_threads::RuntimeEventRecord,
+    previous_seq: u64,
+) -> serde_json::Value {
+    let mut payload = runtime_event_payload(event);
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("previous_seq".to_string(), json!(previous_seq));
+    }
+    payload
 }
 
 fn map_compat_stream_event(event: &crate::runtime_threads::RuntimeEventRecord) -> Option<SseEvent> {
@@ -2279,9 +2707,99 @@ fn map_compat_stream_event(event: &crate::runtime_threads::RuntimeEventRecord) -
                 None
             }
         }
-        "approval.required" => Some(sse_json("approval.required", payload.clone())),
-        "approval.decided" => Some(sse_json("approval.decided", payload.clone())),
-        "approval.timeout" => Some(sse_json("approval.timeout", payload.clone())),
+        "approval.required" => {
+            let approval_id = payload
+                .get("approval_id")
+                .or_else(|| payload.get("id"))?
+                .clone();
+            Some(sse_json(
+                "approval.required",
+                json!({
+                    "id": approval_id,
+                    "approval_id": approval_id,
+                    "thread_id": event.thread_id,
+                    "turn_id": event.turn_id,
+                    "tool_name": payload.get("tool_name"),
+                    "description": payload.get("description"),
+                    "intent_summary": payload.get("intent_summary"),
+                }),
+            ))
+        }
+        "approval.decided" => {
+            let approval_id = payload
+                .get("approval_id")
+                .or_else(|| payload.get("id"))?
+                .clone();
+            Some(sse_json(
+                "approval.decided",
+                json!({
+                    "id": approval_id,
+                    "approval_id": approval_id,
+                    "thread_id": event.thread_id,
+                    "turn_id": event.turn_id,
+                    "decision": payload.get("decision"),
+                    "remember": payload.get("remember"),
+                    "auto": payload.get("auto"),
+                    "timeout": payload.get("timeout"),
+                }),
+            ))
+        }
+        "approval.timeout" => {
+            let approval_id = payload
+                .get("approval_id")
+                .or_else(|| payload.get("id"))?
+                .clone();
+            Some(sse_json(
+                "approval.timeout",
+                json!({
+                    "id": approval_id,
+                    "approval_id": approval_id,
+                    "thread_id": event.thread_id,
+                    "turn_id": event.turn_id,
+                    "timeout_secs": payload.get("timeout_secs"),
+                }),
+            ))
+        }
+        "user_input.required" => {
+            let input_id = payload
+                .get("input_id")
+                .or_else(|| payload.get("id"))?
+                .clone();
+            let request = payload.get("request")?.clone();
+            Some(sse_json(
+                "user_input.required",
+                json!({
+                    "id": input_id,
+                    "input_id": input_id,
+                    "thread_id": event.thread_id,
+                    "turn_id": event.turn_id,
+                    "status": "required",
+                    "request": request,
+                }),
+            ))
+        }
+        "user_input.answered" | "user_input.canceled" => {
+            let input_id = payload
+                .get("input_id")
+                .or_else(|| payload.get("id"))?
+                .clone();
+            let status = if event.event == "user_input.answered" {
+                "submitted"
+            } else {
+                "canceled"
+            };
+            Some(sse_json(
+                &event.event,
+                json!({
+                    "id": input_id,
+                    "input_id": input_id,
+                    "thread_id": event.thread_id,
+                    "turn_id": event.turn_id,
+                    "status": status,
+                    "terminal": payload.get("terminal").and_then(Value::as_bool).unwrap_or(false),
+                }),
+            ))
+        }
         "sandbox.denied" => Some(sse_json("sandbox.denied", payload.clone())),
         "turn.completed" => {
             let usage = payload
@@ -2360,9 +2878,11 @@ fn discover_skills_for_runtime_api(
     workspace: &FsPath,
     skills_dir: &FsPath,
     mode: crate::skills::SkillDiscoveryMode,
+    plugins: Option<&crate::plugins::PluginRegistry>,
 ) -> (crate::skills::SkillRegistry, Vec<PathBuf>) {
     let directories = skills_search_directories(workspace, skills_dir, mode);
-    let registry = crate::skills::discover_from_directories(directories.clone());
+    let registry =
+        crate::skills::discover_from_directories_with_plugins(directories.clone(), plugins);
     (registry, directories)
 }
 
@@ -2568,6 +3088,17 @@ struct SetConfigResponse {
     requires_reload: bool,
 }
 
+fn persist_runtime_tui_setting(key: &str, value: &str) -> Result<(), ApiError> {
+    let mut settings = crate::settings::Settings::load_persisted()
+        .map_err(|e| ApiError::internal(format!("Failed to load settings: {e}")))?;
+    settings
+        .set(key, value)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    settings
+        .save()
+        .map_err(|e| ApiError::internal(format!("Failed to save settings: {e}")))
+}
+
 /// Response for `POST /v1/config/reload`.
 #[derive(Debug, Serialize)]
 struct ReloadConfigResponse {
@@ -2578,16 +3109,12 @@ async fn get_config(
     State(state): State<RuntimeApiState>,
 ) -> Result<Json<GuiConfigResponse>, ApiError> {
     let config = state.config.read();
-    let settings = crate::settings::Settings::load().unwrap_or_default();
+    let settings = crate::settings::Settings::load_persisted().unwrap_or_default();
     let mcp_config_path = config.mcp_config_path().display().to_string();
 
-    // Determine effective model: prefer config default, then constant.
-    let model = config
-        .default_text_model
-        .clone()
-        .unwrap_or_else(|| DEFAULT_TEXT_MODEL.to_string());
+    let model = config.default_model();
 
-    let provider = config.api_provider().as_str().to_string();
+    let provider = config.provider_identity_for(config.api_provider());
     let approval_mode = config
         .approval_policy
         .as_deref()
@@ -2596,8 +3123,12 @@ async fn get_config(
     let reasoning_effort = config.reasoning_effort().unwrap_or("auto").to_string();
     let cost_currency = settings.cost_currency.clone();
     let default_mode = settings.default_mode.as_str().to_string();
-    let default_model = settings
-        .default_model
+    // This field is the legacy root DeepSeek fallback, not the active
+    // provider model above. Keeping the two explicit prevents a Z.ai model
+    // update from silently rewriting a future DeepSeek route.
+    let default_model = config
+        .default_text_model
+        .clone()
         .unwrap_or_else(|| DEFAULT_TEXT_MODEL.to_string());
     let base_url = config.deepseek_base_url().to_string();
 
@@ -2640,8 +3171,26 @@ async fn set_config(
     use crate::config_persistence;
 
     let key = req.key.to_lowercase();
-    let value = req.value;
+    let mut value = req.value;
     let persist = req.persist;
+
+    // Validate model keys even for dry-run requests. Model ids are provider
+    // owned; accepting a DeepSeek id while Z.ai is active creates a saved
+    // route that cannot execute after reload.
+    let active_route = {
+        let config = state.config.read();
+        let provider = config.api_provider();
+        (provider, config.provider_identity_for(provider))
+    };
+    match key.as_str() {
+        "model" => {
+            value = normalize_runtime_config_model(active_route.0, &value)?;
+        }
+        "default_model" => {
+            value = normalize_runtime_config_model(ApiProvider::Deepseek, &value)?;
+        }
+        _ => {}
+    }
 
     // All persisted config keys require a reload to take effect in the
     // runtime (including syncing to active engines). The caller should
@@ -2654,7 +3203,13 @@ async fn set_config(
     if persist {
         let config_path = state.config_path.as_deref();
         let result: anyhow::Result<PathBuf> = match key.as_str() {
-            "model" | "default_model" => config_persistence::persist_root_string_key(
+            "model" => config_persistence::persist_provider_model_key(
+                config_path,
+                active_route.0,
+                &active_route.1,
+                &value,
+            ),
+            "default_model" => config_persistence::persist_root_string_key(
                 config_path,
                 "default_text_model",
                 &value,
@@ -2674,48 +3229,17 @@ async fn set_config(
                 let provider = state.config.read().api_provider();
                 config_persistence::persist_provider_base_url_key(config_path, provider, &value)
             }
-            "cost_currency" => {
-                let mut settings = crate::settings::Settings::load()
-                    .map_err(|e| ApiError::internal(format!("Failed to load settings: {e}")))?;
-                settings.cost_currency = match value.as_str() {
-                    "cny" | "yuan" | "rmb" => "cny".to_string(),
-                    _ => "usd".to_string(),
-                };
-                settings
-                    .save()
-                    .map_err(|e| ApiError::internal(format!("Failed to save settings: {e}")))?;
-                return Ok(Json(SetConfigResponse {
-                    key,
-                    value,
-                    message: "Config persisted. Call /v1/config/reload to apply.".to_string(),
-                    persisted: true,
-                    requires_reload,
-                }));
-            }
-            "default_mode" => {
-                let mut settings = crate::settings::Settings::load()
-                    .map_err(|e| ApiError::internal(format!("Failed to load settings: {e}")))?;
-                settings.default_mode = crate::tui::app::AppMode::from_setting(&value)
-                    .as_setting()
-                    .into();
-                settings
-                    .save()
-                    .map_err(|e| ApiError::internal(format!("Failed to save settings: {e}")))?;
-                return Ok(Json(SetConfigResponse {
-                    key,
-                    value,
-                    message: "Config persisted. Call /v1/config/reload to apply.".to_string(),
-                    persisted: true,
-                    requires_reload,
-                }));
-            }
-            "auto_compact" => {
-                let mut settings = crate::settings::Settings::load()
-                    .map_err(|e| ApiError::internal(format!("Failed to load settings: {e}")))?;
-                settings.auto_compact = value.parse::<bool>().unwrap_or(true);
-                settings
-                    .save()
-                    .map_err(|e| ApiError::internal(format!("Failed to save settings: {e}")))?;
+            "cost_currency"
+            | "default_mode"
+            | "auto_compact"
+            | "show_thinking"
+            | "show_tool_details"
+            | "calm_mode"
+            | "prefer_external_pdftotext"
+            | "workspace_follow_symlinks"
+            | "locale"
+            | "max_history" => {
+                persist_runtime_tui_setting(&key, &value)?;
                 return Ok(Json(SetConfigResponse {
                     key,
                     value,
@@ -2734,67 +3258,6 @@ async fn set_config(
             }
             "mcp_config_path" => {
                 config_persistence::persist_root_string_key(config_path, "mcp_config_path", &value)
-            }
-            "show_thinking"
-            | "show_tool_details"
-            | "calm_mode"
-            | "prefer_external_pdftotext"
-            | "workspace_follow_symlinks" => {
-                let mut settings = crate::settings::Settings::load()
-                    .map_err(|e| ApiError::internal(format!("Failed to load settings: {e}")))?;
-                let bool_val = value.parse::<bool>().unwrap_or(false);
-                match key.as_str() {
-                    "show_thinking" => settings.show_thinking = bool_val,
-                    "show_tool_details" => settings.show_tool_details = bool_val,
-                    "calm_mode" => settings.calm_mode = bool_val,
-                    "prefer_external_pdftotext" => settings.prefer_external_pdftotext = bool_val,
-                    "workspace_follow_symlinks" => settings.workspace_follow_symlinks = bool_val,
-                    _ => {}
-                }
-                settings
-                    .save()
-                    .map_err(|e| ApiError::internal(format!("Failed to save settings: {e}")))?;
-                return Ok(Json(SetConfigResponse {
-                    key,
-                    value,
-                    message: "Config persisted. Call /v1/config/reload to apply.".to_string(),
-                    persisted: true,
-                    requires_reload,
-                }));
-            }
-            "locale" => {
-                let mut settings = crate::settings::Settings::load()
-                    .map_err(|e| ApiError::internal(format!("Failed to load settings: {e}")))?;
-                settings.locale = value.clone();
-                settings
-                    .save()
-                    .map_err(|e| ApiError::internal(format!("Failed to save settings: {e}")))?;
-                return Ok(Json(SetConfigResponse {
-                    key,
-                    value,
-                    message: "Config persisted. Call /v1/config/reload to apply.".to_string(),
-                    persisted: true,
-                    requires_reload,
-                }));
-            }
-            "max_history" => {
-                let mut settings = crate::settings::Settings::load()
-                    .map_err(|e| ApiError::internal(format!("Failed to load settings: {e}")))?;
-                settings.max_input_history = value.parse::<usize>().map_err(|_| {
-                    ApiError::bad_request(format!(
-                        "Invalid value '{value}' for max_history: expected a non-negative integer"
-                    ))
-                })?;
-                settings
-                    .save()
-                    .map_err(|e| ApiError::internal(format!("Failed to save settings: {e}")))?;
-                return Ok(Json(SetConfigResponse {
-                    key,
-                    value,
-                    message: "Config persisted. Call /v1/config/reload to apply.".to_string(),
-                    persisted: true,
-                    requires_reload,
-                }));
             }
             "subagents_enabled" => {
                 let enabled = value.parse::<bool>().map_err(|_| {
@@ -2902,23 +3365,36 @@ async fn set_config(
     }))
 }
 
+fn normalize_runtime_config_model(provider: ApiProvider, value: &str) -> Result<String, ApiError> {
+    let value = value.trim();
+    validate_route(provider, value).map_err(ApiError::bad_request)?;
+    if value.eq_ignore_ascii_case("auto") {
+        return Ok("auto".to_string());
+    }
+    normalize_model_name_for_provider(provider, value).ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "Invalid model '{value}' for provider '{}'.",
+            provider.as_str()
+        ))
+    })
+}
+
 async fn reload_config(
     State(state): State<RuntimeApiState>,
 ) -> Result<Json<ReloadConfigResponse>, ApiError> {
-    let reloaded = Config::load(state.config_path.clone(), None)
+    let reloaded = Config::load(state.config_path.clone(), state.config_profile.as_deref())
         .map_err(|e| ApiError::internal(format!("Failed to reload config: {e}")))?;
+    state
+        .runtime_threads
+        .reload_config(reloaded.clone())
+        .await
+        .map_err(|err| ApiError::bad_request(format!("Config reload rejected: {err}")))?;
     {
         let mut config = state.config.write();
         *config = reloaded;
     }
-    // Propagate config to RuntimeThreadManager so model routing uses the new values.
-    state
-        .runtime_threads
-        .reload_config(state.config.read().clone());
-    // Sync running engines with the new config (model, compaction, timeouts, subagent settings).
-    state.runtime_threads.sync_engines_with_config().await;
     Ok(Json(ReloadConfigResponse {
-        message: "Config reloaded from disk, propagated to runtime and synced to active engines"
+        message: "Config reloaded from disk; new turns will resolve the updated provider routes"
             .to_string(),
     }))
 }
@@ -2961,7 +3437,13 @@ fn cors_layer(extra_origins: &[String]) -> CorsLayer {
             Method::DELETE,
             Method::OPTIONS,
         ])
-        .allow_headers(Any)
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::ACCEPT,
+            HeaderName::from_static("x-codewhale-runtime-token"),
+            HeaderName::from_static("x-deepseek-runtime-token"),
+        ])
 }
 
 fn map_task_err(err: anyhow::Error) -> ApiError {
@@ -2986,7 +3468,10 @@ fn map_automation_err(err: anyhow::Error) -> ApiError {
 
 fn map_thread_err(err: anyhow::Error) -> ApiError {
     let message = err.to_string();
-    if message.contains("not found") {
+    let lower = message.to_ascii_lowercase();
+    if (lower.starts_with("thread '") && lower.ends_with("' not found"))
+        || lower.starts_with("thread not found:")
+    {
         ApiError::not_found(message)
     } else if message.contains("already has an active turn")
         || message.contains("No active turn")

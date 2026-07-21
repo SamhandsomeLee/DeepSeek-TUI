@@ -2,7 +2,7 @@
 
 This document provides an overview of the codewhale architecture for developers and contributors.
 
-Current boundary note (v0.8.67):
+Current boundary note (v0.9.1):
 - `crates/tui` is still the live end-user runtime for the TUI, runtime API, task manager, and tool execution loop.
 - Other workspace crates are being split out incrementally, but they are not yet the sole runtime source of truth.
 - The LSP subsystem (`crates/tui/src/lsp/`) is fully wired into the engine's post-tool-execution path
@@ -97,6 +97,12 @@ Current boundary note (v0.8.67):
 - **`crates/protocol`** - Request/response framing and protocol types.
 - **`crates/secrets`** - OS keyring integration for API key storage.
 - **`crates/state`** - SQLite thread/session persistence layer.
+- **`crates/workflow`** / **`crates/workflow-js`** - Workflow engine and its
+  QuickJS scripting layer (renamed from the whaleflow crates).
+- **`crates/lane`** - Lane runtime: durable, attachable running instances of
+  Fleet/Workflow work (`codewhale lane list/status/attach/logs/stop`).
+- **`crates/release`** / **`crates/build-support`** - Release checks and build
+  plumbing.
 
 ### LLM Integration
 

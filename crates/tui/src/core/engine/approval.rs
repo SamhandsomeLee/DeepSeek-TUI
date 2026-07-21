@@ -76,7 +76,7 @@ impl Engine {
             tokio::select! {
                 _ = self.cancel_token.cancelled() => {
                     let suffix = self.cancel_reason_suffix();
-                    return Err(ToolError::execution_failed(
+                    return Err(ToolError::cancelled(
                         format!("Request cancelled while awaiting approval{suffix}"),
                     ));
                 }
@@ -123,7 +123,7 @@ impl Engine {
             tokio::select! {
                 _ = self.cancel_token.cancelled() => {
                     let suffix = self.cancel_reason_suffix();
-                    return Err(ToolError::execution_failed(
+                    return Err(ToolError::cancelled(
                         format!("Request cancelled while awaiting user input{suffix}"),
                     ));
                 }
@@ -135,7 +135,7 @@ impl Engine {
                                     return Ok(response);
                                 }
                                 UserInputDecision::Cancelled { id } if id == tool_id => {
-                                    return Err(ToolError::execution_failed(
+                                    return Err(ToolError::cancelled(
                                         "User input cancelled".to_string(),
                                     ));
                                 }
@@ -157,12 +157,9 @@ impl Engine {
                                     ),
                                 })
                                 .await;
-                            return Err(ToolError::execution_failed(
-                                format!(
-                                    "User input timed out after {}s",
-                                    USER_INPUT_TIMEOUT.as_secs()
-                                ),
-                            ));
+                            return Err(ToolError::Timeout {
+                                seconds: USER_INPUT_TIMEOUT.as_secs(),
+                            });
                         }
                     }
                 }

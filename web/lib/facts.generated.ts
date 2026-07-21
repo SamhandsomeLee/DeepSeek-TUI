@@ -18,8 +18,8 @@ export interface RepoFacts {
 }
 
 export const FACTS: RepoFacts = {
-  "generatedAt": "2026-07-10T00:34:57.187Z",
-  "version": "0.8.68",
+  "generatedAt": "2026-07-17T06:07:26.812Z",
+  "version": "0.9.1",
   "crates": [
     "agent",
     "app-server",
@@ -184,6 +184,11 @@ export const FACTS: RepoFacts = {
       "env": "MINIMAX_API_KEY"
     },
     {
+      "id": "minimax-anthropic",
+      "label": "MiniMax (Anthropic-compatible)",
+      "env": "MINIMAX_API_KEY"
+    },
+    {
       "id": "deepinfra",
       "label": "DeepInfra",
       "env": "DEEPINFRA_API_KEY / DEEPINFRA_TOKEN"
@@ -199,6 +204,11 @@ export const FACTS: RepoFacts = {
       "env": "LONGCAT_API_KEY"
     },
     {
+      "id": "opencode-go",
+      "label": "OpenCode Go",
+      "env": "OPENCODE_GO_API_KEY"
+    },
+    {
       "id": "meta",
       "label": "Meta Model API",
       "env": "META_MODEL_API_KEY / MODEL_API_KEY"
@@ -211,7 +221,7 @@ export const FACTS: RepoFacts = {
   ],
   "defaultModel": "deepseek-v4-pro",
   "nodeEngines": ">=18",
-  "toolCount": 80,
+  "toolCount": 85,
   "license": "MIT",
   "latestRelease": null
 };

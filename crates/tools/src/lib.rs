@@ -10,6 +10,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
+mod outcome;
+mod prepared;
+mod resources;
+
+pub use outcome::{ToolExecutionOutcome, ToolTerminalStatus};
+pub use prepared::PreparedToolCall;
+pub use resources::{ResourceClaim, schedule_non_conflicting};
+
 tokio::task_local! {
     static TOOL_EXECUTION_LOCK_HELD: ();
 }
@@ -56,6 +64,8 @@ pub enum ToolError {
     ExecutionFailed { message: String },
     #[error("Failed to execute tool: operation timed out after {seconds}s")]
     Timeout { seconds: u64 },
+    #[error("Tool execution cancelled: {message}")]
+    Cancelled { message: String },
     #[error("Failed to locate tool: {message}")]
     NotAvailable { message: String },
     #[error("Failed to authorize tool execution: {message}")]
@@ -80,6 +90,13 @@ impl ToolError {
     #[must_use]
     pub fn execution_failed(msg: impl Into<String>) -> Self {
         Self::ExecutionFailed {
+            message: msg.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn cancelled(msg: impl Into<String>) -> Self {
+        Self::Cancelled {
             message: msg.into(),
         }
     }

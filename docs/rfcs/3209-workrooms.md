@@ -1,11 +1,14 @@
 # RFC: CodeWhale Workrooms — Chat-native Threaded Agent Work
 
 **Issue:** #3209
-**Status:** Draft
-**Date:** 2026-06-17
-**Target:** v0.9.0
+**Status:** Future RFC — Phase 1 shipped (protocol types + link parser in
+`crates/protocol/src/workroom.rs`); Phase 2 (store, app-server endpoints,
+`resolve_workroom_link` tool, TUI inbox) not started
+**Date:** 2026-06-17 (status refreshed 2026-07-15)
+**Target:** post-v0.9.0; the release label is a maintainer decision, not part
+of this design
 
-This document is design scaffolding. The v0.8.62 branch currently carries the
+This document is design scaffolding. As of v0.9.0 the tree carries the
 shared protocol types and link parser only; runtime endpoints, mobile UI
 integration, persistent state, and model-visible tools remain follow-up work.
 

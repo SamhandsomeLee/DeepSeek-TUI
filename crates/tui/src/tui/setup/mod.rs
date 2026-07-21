@@ -14,10 +14,10 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Padding, Paragraph, Widget, Wrap},
+    widgets::{Paragraph, Widget, Wrap},
 };
 
-use crate::config::{Config, has_api_key, has_api_key_for};
+use crate::config::{Config, has_api_key};
 use crate::localization::{Locale, MessageId, tr};
 use crate::palette;
 use crate::prompts::{
@@ -26,8 +26,8 @@ use crate::prompts::{
 use crate::tui::app::App;
 use crate::tui::onboarding;
 use crate::tui::views::{
-    ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, centered_modal_area,
-    render_modal_footer, render_modal_surface,
+    ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, render_modal_footer,
+    render_panel_scroll_rail, render_underwater_surface,
 };
 
 use codewhale_config::{
@@ -294,36 +294,78 @@ impl Default for SetupRuntimeFacts {
 impl SetupRuntimeFacts {
     fn from_app_config(app: &App, config: &Config) -> Self {
         let expert_override = SetupExpertOverrideState::load();
-        let provider_ready = has_api_key_for(config, app.api_provider);
+        let readiness = crate::provider_readiness::resolve_for_model(
+            config,
+            app.api_provider,
+            if app.auto_model { "auto" } else { &app.model },
+            &app.provider_health,
+        );
+        // A failed observed check remains retryable in route pickers, but the
+        // setup receipt must not certify it as healthy. Saved-unchecked and
+        // local-unchecked are honest reviewed configuration states; an actual
+        // session failure is NeedsAction until a later success replaces it.
+        let provider_ready = readiness.can_attempt()
+            && !matches!(
+                &readiness,
+                crate::provider_readiness::ResolvedProviderReadiness::SavedLastCheckFailed { .. }
+            );
         let model = app.model_display_label();
-        let provider = app.api_provider.display_name().to_string();
-        let auth = if provider_ready {
-            "present or local runtime".to_string()
-        } else if app.api_provider == crate::config::ApiProvider::OpenaiCodex {
-            "missing Codex OAuth login".to_string()
+        let provider_name = if app.api_provider == crate::config::ApiProvider::Custom {
+            app.provider_identity_for_persistence().to_string()
         } else {
-            "missing for active provider".to_string()
+            app.api_provider.display_name().to_string()
         };
+        let context_window = crate::route_budget::route_context_window_tokens(
+            app.api_provider,
+            &app.model,
+            app.active_route_limits,
+        );
+        let context_window_source = app.active_context_window_source.label();
+        let provider =
+            format!("{provider_name} · context {context_window} ({context_window_source})");
+        let auth = readiness.label().into_owned();
         let health = if provider_ready {
-            "ready for first turn; live validation remains with /provider".to_string()
+            format!("{}; route can be attempted", readiness.label())
+        } else if matches!(
+            &readiness,
+            crate::provider_readiness::ResolvedProviderReadiness::SavedLastCheckFailed { .. }
+        ) {
+            format!("{}; retry or open /provider", readiness.label())
         } else if app.api_provider == crate::config::ApiProvider::OpenaiCodex {
-            "run codex login or set OPENAI_CODEX_ACCESS_TOKEN before first turn".to_string()
-        } else if let Some(url) = app.api_provider.credential_url() {
-            format!("needs key or local runtime before first turn; credentials: {url}")
+            format!(
+                "{}; run codex login, then grant exact read-only access with `codewhale auth external-consent --provider openai-codex --mode read-only`, or open /provider",
+                readiness.label()
+            )
+        } else if let Some(url) = crate::config::credential_help_for_provider_route(
+            app.api_provider,
+            &config.deepseek_base_url(),
+        )
+        .credential_url
+        {
+            format!(
+                "{}; credentials: {url}; open /provider to repair the route",
+                readiness.label()
+            )
         } else {
-            "needs key or local runtime before first turn".to_string()
+            format!(
+                "{}; {}; open /provider to repair the route",
+                readiness.label(),
+                crate::config::credential_help_for_provider_route(
+                    app.api_provider,
+                    &config.deepseek_base_url(),
+                )
+                .guidance
+            )
         };
         let provider_result = format!(
-            "provider={}, model={}, auth={}, health={}",
-            app.api_provider.as_str(),
+            "provider={}, model={}, context_window={} ({}) auth={}, health={}",
+            app.provider_identity_for_persistence(),
             model,
+            context_window,
+            context_window_source,
+            readiness.label(),
             if provider_ready {
-                "present/local"
-            } else {
-                "missing"
-            },
-            if provider_ready {
-                "not checked"
+                "attemptable"
             } else {
                 "needs action"
             }
@@ -355,7 +397,9 @@ impl SetupRuntimeFacts {
         let runtime_result = format!(
             "intent={}, approval={}, shell={}, trust={}, sandbox={}, network={}",
             app.mode.as_setting(),
-            app.approval_mode.label().to_ascii_lowercase(),
+            app.approval_mode
+                .permission_chip_label()
+                .to_ascii_lowercase(),
             if app.allow_shell { "enabled" } else { "hidden" },
             if app.trust_mode {
                 "trusted"
@@ -420,7 +464,10 @@ impl SetupRuntimeFacts {
             provider_ready,
             provider_result,
             work_intent: app.mode.display_name().to_string(),
-            approval: app.approval_mode.label().to_ascii_lowercase(),
+            approval: app
+                .approval_mode
+                .permission_chip_label()
+                .to_ascii_lowercase(),
             shell,
             allow_shell_enabled: app.allow_shell,
             trust,
@@ -529,18 +576,22 @@ impl SetupRuntimePreset {
     pub fn default_mode(self) -> &'static str {
         match self {
             Self::AskFirst => "plan",
-            Self::NormalAgent => "agent",
-            Self::HighTrustLocal => "yolo",
+            Self::NormalAgent | Self::HighTrustLocal => "agent",
+        }
+    }
+
+    pub fn permission_posture(self) -> &'static str {
+        match self {
+            Self::AskFirst | Self::NormalAgent => "ask",
+            Self::HighTrustLocal => "full-access",
         }
     }
 
     pub fn approval_policy(self) -> Option<&'static str> {
         match self {
             Self::AskFirst | Self::NormalAgent => Some("on-request"),
-            // YOLO derives bypass approval from `default_mode = "yolo"`.
-            // `approval_policy = "bypass"` is intentionally not a persisted
-            // config value. Interactive Shift+Tab posture is stored separately
-            // in TUI settings and cannot override managed approval policy.
+            // Full Access lives in TUI settings; it is intentionally not a
+            // top-level approval_policy value.
             Self::HighTrustLocal => None,
         }
     }
@@ -560,15 +611,26 @@ impl SetupRuntimePreset {
     }
 
     pub fn result_summary(self) -> String {
-        let approval = self.approval_policy().unwrap_or("mode-derived-yolo-bypass");
+        let approval = self
+            .approval_policy()
+            .unwrap_or("unset (Full Access saved in TUI settings)");
         format!(
-            "preset={}, default_mode={}, approval_policy={}, allow_shell={}, sandbox_mode={}, network=unchanged, trust=unchanged",
+            "preset={}, default_mode={}, permission_posture={}, approval_policy={}, allow_shell={}, sandbox_mode={}, network=unchanged, trust=unchanged",
             self.id(),
-            self.default_mode(),
+            self.display_mode(),
+            self.permission_posture(),
             approval,
             self.allow_shell(),
             self.sandbox_mode()
         )
+    }
+
+    fn display_mode(self) -> &'static str {
+        match self {
+            Self::AskFirst => "plan",
+            Self::NormalAgent => "act",
+            Self::HighTrustLocal => "act + full-access",
+        }
     }
 }
 
@@ -718,7 +780,7 @@ impl GuidedConstitutionDraft {
                     bounded_freeform_note(note, MAX_NOTES_LEN)
                 ),
                 Locale::ZhHans => format!(
-                    "\n用户自由原则：{}",
+                    "\n用户自定义准则：{}",
                     bounded_freeform_note(note, MAX_NOTES_LEN)
                 ),
                 Locale::ZhHant => format!(
@@ -735,6 +797,10 @@ impl GuidedConstitutionDraft {
                 ),
                 Locale::Vi => format!(
                     "\nNguyên tắc tự do của người dùng: {}",
+                    bounded_freeform_note(note, MAX_NOTES_LEN)
+                ),
+                Locale::Ko => format!(
+                    "\n사용자 자유 원칙: {}",
                     bounded_freeform_note(note, MAX_NOTES_LEN)
                 ),
                 _ => format!(
@@ -900,6 +966,15 @@ impl GuidedEvidence {
             (Locale::Vi, Self::ReleaseReceipts) => {
                 "Trích dẫn tệp, lệnh, ảnh chụp, CI hoặc nguồn cho tuyên bố quan trọng và bằng chứng phát hành."
             }
+            (Locale::Ko, Self::Assumptions) => {
+                "완료를 주장하기 전에 가정, 불확실한 점, 남은 위험을 요약한다."
+            }
+            (Locale::Ko, Self::TestsAndReceipts) => {
+                "불확실성을 실질적으로 줄일 수 있을 때는 명령어, 테스트, 스크린샷, 인용으로 구체적으로 검증한다."
+            }
+            (Locale::Ko, Self::ReleaseReceipts) => {
+                "중요한 주장과 릴리스 근거에는 파일 경로, 명령어, 스크린샷, CI, 출처를 제시한다."
+            }
             (_, Self::Assumptions) => {
                 "Summarize assumptions, unknowns, and remaining risk before claiming completion."
             }
@@ -949,6 +1024,9 @@ impl GuidedCommunication {
             (Locale::Vi, Self::Concise) => "ngắn gọn",
             (Locale::Vi, Self::Teaching) => "giảng giải",
             (Locale::Vi, Self::Direct) => "trực tiếp",
+            (Locale::Ko, Self::Concise) => "간결함",
+            (Locale::Ko, Self::Teaching) => "설명 중심",
+            (Locale::Ko, Self::Direct) => "직설적",
             (_, Self::Concise) => "concise",
             (_, Self::Teaching) => "teaching",
             (_, Self::Direct) => "direct",
@@ -997,6 +1075,15 @@ impl GuidedCommunication {
             (Locale::Vi, Self::Direct) => {
                 "Nói thẳng về điểm chặn, rủi ro và bất định; tránh câu chữ trang trí."
             }
+            (Locale::Ko, Self::Concise) => {
+                "업데이트는 간결하게 유지하고, 중요한 트레이드오프만 짧게 설명한다."
+            }
+            (Locale::Ko, Self::Teaching) => {
+                "사용자가 시스템을 이해할 수 있을 만큼 핵심 추론과 트레이드오프를 설명한다."
+            }
+            (Locale::Ko, Self::Direct) => {
+                "차단 요인, 위험, 불확실성을 직설적으로 말하고 장식적인 표현은 피한다."
+            }
             (_, Self::Concise) => "Keep updates concise and explain important tradeoffs briefly.",
             (_, Self::Teaching) => {
                 "Explain key reasoning and tradeoffs enough that the user can learn the system."
@@ -1044,6 +1131,9 @@ impl GuidedPrivacy {
             (Locale::Vi, Self::StandardCare) => "bảo vệ tiêu chuẩn",
             (Locale::Vi, Self::StrictBoundaries) => "ranh giới nghiêm ngặt",
             (Locale::Vi, Self::ProjectLocal) => "bộ nhớ trong dự án",
+            (Locale::Ko, Self::StandardCare) => "표준 보호",
+            (Locale::Ko, Self::StrictBoundaries) => "엄격한 경계",
+            (Locale::Ko, Self::ProjectLocal) => "프로젝트 내 메모리",
             (_, Self::StandardCare) => "standard care",
             (_, Self::StrictBoundaries) => "strict boundaries",
             (_, Self::ProjectLocal) => "project-local memory",
@@ -1105,6 +1195,15 @@ impl GuidedPrivacy {
             }
             (Locale::Vi, Self::ProjectLocal) => {
                 "Giữ ngữ cảnh riêng của dự án trong dự án; tránh ghi vào bộ nhớ nếu không được yêu cầu rõ."
+            }
+            (Locale::Ko, Self::StandardCare) => {
+                "비밀 정보, 사용자 파일, Git 이력, 프로덕션 시스템, 비용, 프라이버시, 시간을 보호한다."
+            }
+            (Locale::Ko, Self::StrictBoundaries) => {
+                "비밀 정보, 개인 데이터, 자격 증명, 프로덕션 상태, 자금, 게시 작업은 먼저 확인하는 경계로 취급한다."
+            }
+            (Locale::Ko, Self::ProjectLocal) => {
+                "프로젝트 고유 맥락은 프로젝트 안에 두고, 명시적으로 요청받지 않는 한 메모리에 쓰지 않는다."
             }
             (_, Self::StandardCare) => {
                 "Protect secrets, user files, git history, production systems, cost, privacy, and time."
@@ -1174,6 +1273,15 @@ impl GuidedPrivacy {
             (Locale::Vi, Self::ProjectLocal) => {
                 "Xác nhận trước khi mang chi tiết dự án sang bộ nhớ, workspace khác hoặc handoff cũ."
             }
+            (Locale::Ko, Self::StandardCare) => {
+                "파괴적이거나, 비용이 크거나, 자격 증명, 게시, 법적, 보안 위험이 있는 작업 전에 먼저 물어본다."
+            }
+            (Locale::Ko, Self::StrictBoundaries) => {
+                "민감 정보를 읽거나 퍼뜨리기 전, 프로덕션 시스템을 건드리기 전, 자금을 쓰거나 게시하기 전에 멈추고 물어본다."
+            }
+            (Locale::Ko, Self::ProjectLocal) => {
+                "프로젝트 세부 정보를 메모리, 다른 워크스페이스, 오래된 인계 자료로 옮기기 전에 확인한다."
+            }
             (_, Self::StandardCare) => {
                 "Ask before destructive, high-cost, credential, publishing, legal, or security-risk actions."
             }
@@ -1223,6 +1331,9 @@ impl GuidedPrinciples {
             (Locale::Vi, Self::ScopedChanges) => "thay đổi có phạm vi",
             (Locale::Vi, Self::UserVoice) => "giữ giọng người dùng",
             (Locale::Vi, Self::ReversibleOps) => "bước có thể đảo ngược",
+            (Locale::Ko, Self::ScopedChanges) => "범위가 명확한 변경",
+            (Locale::Ko, Self::UserVoice) => "사용자의 어조 유지",
+            (Locale::Ko, Self::ReversibleOps) => "되돌릴 수 있는 단계",
             (_, Self::ScopedChanges) => "scoped changes",
             (_, Self::UserVoice) => "user voice",
             (_, Self::ReversibleOps) => "reversible steps",
@@ -1241,13 +1352,13 @@ impl GuidedPrinciples {
                 "自由原則：影響の大きい操作の前に、可逆手順、チェックポイント、ロールバック説明を選ぶ。"
             }
             (Locale::ZhHans, Self::ScopedChanges) => {
-                "自由原则：优先采用小范围、可审查的改动；除非明确要求，不做无关重构。"
+                "自定义准则：优先采用小范围、可审查的改动；除非明确要求，不做无关重构。"
             }
             (Locale::ZhHans, Self::UserVoice) => {
-                "自由原则：保留用户的语气、品牌和约束；不把偏好推断成权限扩大。"
+                "自定义准则：保留用户的语气、品牌和约束；不把偏好推断成权限扩大。"
             }
             (Locale::ZhHans, Self::ReversibleOps) => {
-                "自由原则：先选择可逆步骤、检查点和回滚说明，再进行高影响操作。"
+                "自定义准则：先选择可逆步骤、检查点和回滚说明，再进行高影响操作。"
             }
             (Locale::ZhHant, Self::ScopedChanges) => {
                 "自由原則：優先採用小範圍、可審查的改動；除非明確要求，不做無關重構。"
@@ -1284,6 +1395,15 @@ impl GuidedPrinciples {
             }
             (Locale::Vi, Self::ReversibleOps) => {
                 "Nguyên tắc tự do: ưu tiên bước có thể đảo ngược, checkpoint và ghi chú rollback trước thao tác tác động cao."
+            }
+            (Locale::Ko, Self::ScopedChanges) => {
+                "자유 원칙: 작고 리뷰하기 쉬운 변경을 우선하고, 명시적으로 요청받지 않는 한 관련 없는 리팩터링은 하지 않는다."
+            }
+            (Locale::Ko, Self::UserVoice) => {
+                "자유 원칙: 사용자의 어조, 브랜드, 제약을 유지하고 선호를 권한 확대로 취급하지 않는다."
+            }
+            (Locale::Ko, Self::ReversibleOps) => {
+                "자유 원칙: 영향이 큰 작업 전에 되돌릴 수 있는 단계, 체크포인트, 롤백 메모를 우선한다."
             }
             (_, Self::ScopedChanges) => {
                 "Freeform principle: prefer small, reviewable changes and avoid unrelated refactors unless explicitly requested."
@@ -1328,6 +1448,9 @@ fn autonomy_label(preference: AutonomyPreference, locale: Locale) -> &'static st
         (Locale::Vi, AutonomyPreference::Cautious) => "thận trọng",
         (Locale::Vi, AutonomyPreference::Balanced) => "cân bằng",
         (Locale::Vi, AutonomyPreference::Autonomous) => "chủ động",
+        (Locale::Ko, AutonomyPreference::Cautious) => "신중함",
+        (Locale::Ko, AutonomyPreference::Balanced) => "균형",
+        (Locale::Ko, AutonomyPreference::Autonomous) => "적극적",
         (_, AutonomyPreference::Cautious) => "cautious",
         (_, AutonomyPreference::Balanced) => "balanced",
         (_, AutonomyPreference::Autonomous) => "ambitious",
@@ -1391,6 +1514,15 @@ fn autonomy_priority(preference: AutonomyPreference, locale: Locale) -> &'static
         (Locale::Vi, AutonomyPreference::Autonomous) => {
             "Gộp việc thường lệ an toàn, nhưng dừng với thao tác phá hủy, thông tin xác thực, xuất bản, chi phí cao, pháp lý hoặc bảo mật."
         }
+        (Locale::Ko, AutonomyPreference::Cautious) => {
+            "파일 수정, 명령어 실행, 애매한 제품 선택 전에 멈추고 물어본다."
+        }
+        (Locale::Ko, AutonomyPreference::Balanced) => {
+            "명확하고 위험이 낮은 작업은 바로 진행하고, 위험하거나 파괴적이거나 애매한 작업은 먼저 확인한다."
+        }
+        (Locale::Ko, AutonomyPreference::Autonomous) => {
+            "안전한 정형 작업은 모아서 진행하되, 파괴적이거나 자격 증명, 게시, 고비용, 법적, 보안 위험이 있는 작업에서는 멈추고 물어본다."
+        }
         (_, AutonomyPreference::Cautious) => {
             "Stop and ask before editing files, running commands, or choosing between ambiguous product paths."
         }
@@ -1419,6 +1551,9 @@ fn authority_priority(locale: Locale) -> &'static str {
         }
         Locale::Vi => {
             "Yêu cầu hiện tại của người dùng và bằng chứng trực tiếp từ công cụ ưu tiên hơn bộ nhớ, handoff cũ và phỏng đoán."
+        }
+        Locale::Ko => {
+            "현재 사용자 요청과 실시간 도구 근거는 메모리, 오래된 인계 자료, 추측보다 우선한다."
         }
         _ => {
             "Current user requests and live tool evidence outrank memory, stale handoffs, and guesses."
@@ -1463,11 +1598,13 @@ fn freeform_note_line(locale: Locale, note: &str, editing: bool) -> Line<'static
         (Locale::Ja, false, true) => "F 自由原則：F で有界の原則を入力または貼り付け".to_string(),
         (Locale::Ja, false, false) => format!("F 自由原則：{preview}"),
         (Locale::ZhHans, true, true) => {
-            "F 自由原则：正在编辑 - 输入或粘贴有界原则，Enter 完成".to_string()
+            "F 自定义准则：正在编辑 - 输入或粘贴明确的准则，Enter 完成".to_string()
         }
-        (Locale::ZhHans, true, false) => format!("F 自由原则：正在编辑 - {preview}"),
-        (Locale::ZhHans, false, true) => "F 自由原则：按 F 输入或粘贴自己的有界原则".to_string(),
-        (Locale::ZhHans, false, false) => format!("F 自由原则：{preview}"),
+        (Locale::ZhHans, true, false) => format!("F 自定义准则：正在编辑 - {preview}"),
+        (Locale::ZhHans, false, true) => {
+            "F 自定义准则：按 F 输入或粘贴自己的明确准则".to_string()
+        }
+        (Locale::ZhHans, false, false) => format!("F 自定义准则：{preview}"),
         (Locale::ZhHant, true, true) => {
             "F 自由原則：正在編輯 - 輸入或貼上有界原則，Enter 完成".to_string()
         }
@@ -1498,6 +1635,12 @@ fn freeform_note_line(locale: Locale, note: &str, editing: bool) -> Line<'static
             "F Nguyên tắc tự do: nhấn F để nhập hoặc dán nguyên tắc có giới hạn".to_string()
         }
         (Locale::Vi, false, false) => format!("F Nguyên tắc tự do: {preview}"),
+        (Locale::Ko, true, true) => {
+            "F 자유 원칙: 편집 중 - 제한된 원칙을 입력하거나 붙여넣고 Enter로 완료".to_string()
+        }
+        (Locale::Ko, true, false) => format!("F 자유 원칙: 편집 중 - {preview}"),
+        (Locale::Ko, false, true) => "F 자유 원칙: F를 눌러 제한된 원칙을 입력하거나 붙여넣기".to_string(),
+        (Locale::Ko, false, false) => format!("F 자유 원칙: {preview}"),
         (_, true, true) => {
             "F Own words: editing - type or paste a bounded principle, Enter to finish".to_string()
         }
@@ -1506,7 +1649,7 @@ fn freeform_note_line(locale: Locale, note: &str, editing: bool) -> Line<'static
         (_, false, false) => format!("F Own words: {preview}"),
     };
     let style = if editing || !preview.is_empty() {
-        Style::default().fg(palette::WHALE_ACCENT_PRIMARY)
+        Style::default().fg(palette::WHALE_HUMAN)
     } else {
         Style::default().fg(palette::TEXT_MUTED)
     };
@@ -1642,6 +1785,19 @@ impl SetupWizardView {
         }
         let mut state = self.state.clone();
         state.set_step(spec.id(), entry);
+        if spec.id() == SetupStep::Constitution && status == StepStatus::Skipped {
+            // `S` is a durable response to the versioned checkpoint, just like
+            // choosing the explicit defer action. It only skips this setup
+            // checkpoint, though; it must not replace an already active
+            // bundled or custom Constitution choice. A fresh state has no
+            // active choice, so keep the bundled floor by recording Deferred.
+            let choice = if state.constitution_choice.is_explicit() {
+                state.constitution_choice
+            } else {
+                ConstitutionChoice::Deferred
+            };
+            state.complete_constitution_checkpoint(CONSTITUTION_CHECKPOINT_VERSION, choice);
+        }
         self.state = state.clone();
         if advance {
             self.move_next();
@@ -2294,33 +2450,20 @@ impl ModalView for SetupWizardView {
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let popup_area = centered_modal_area(area, 92, 30, 56, 16);
-        render_modal_surface(area, popup_area, buf);
         let progress = format!(
             "{} {}/{}",
             tr(self.locale, MessageId::SetupWizardProgress),
             self.selected + 1,
             STEP_SPECS.len()
         );
-        let block = Block::default()
-            .title(Line::from(Span::styled(
-                format!(" {} ", tr(self.locale, MessageId::SetupWizardTitle)),
-                Style::default()
-                    .fg(palette::WHALE_ACCENT_PRIMARY)
-                    .add_modifier(Modifier::BOLD),
-            )))
-            .title_bottom(Line::from(Span::styled(
-                format!(" {progress} "),
-                Style::default()
-                    .fg(palette::TEXT_MUTED)
-                    .add_modifier(Modifier::BOLD),
-            )))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(palette::BORDER_COLOR))
-            .style(Style::default().bg(palette::WHALE_PANEL))
-            .padding(Padding::new(2, 2, 1, 1));
-        let inner = block.inner(popup_area);
-        block.render(popup_area, buf);
+        let inner = render_underwater_surface(
+            area,
+            buf,
+            format!(
+                "{} · {progress}",
+                tr(self.locale, MessageId::SetupWizardTitle)
+            ),
+        );
         let mut hints = vec![
             ActionHint::new("B", tr(self.locale, MessageId::SetupActionBack).to_string()),
             ActionHint::new(
@@ -2444,6 +2587,18 @@ impl ModalView for SetupWizardView {
         lines.push(Line::from(""));
         for (idx, step) in STEP_SPECS.iter().enumerate() {
             let selected = idx == self.selected;
+            let status = self.state.status(step.id());
+            let status_color = match status {
+                StepStatus::InProgress => palette::WHALE_LIVE,
+                StepStatus::NeedsAction => palette::WHALE_HUMAN,
+                StepStatus::Verified => palette::STATUS_SUCCESS,
+                StepStatus::Failed => palette::STATUS_ERROR,
+                StepStatus::NotStarted
+                | StepStatus::Recommended
+                | StepStatus::Optional
+                | StepStatus::Deferred
+                | StepStatus::Skipped => palette::TEXT_MUTED,
+            };
             let marker = if selected { ">" } else { " " };
             let style = if selected {
                 Style::default()
@@ -2457,8 +2612,8 @@ impl ModalView for SetupWizardView {
                 Span::styled(tr(self.locale, step.title_id()).to_string(), style),
                 Span::raw("  "),
                 Span::styled(
-                    self.status_label(self.state.status(step.id())).to_string(),
-                    Style::default().fg(palette::WHALE_ACCENT_PRIMARY),
+                    self.status_label(status).to_string(),
+                    Style::default().fg(status_color),
                 ),
             ]));
         }
@@ -2474,6 +2629,8 @@ impl ModalView for SetupWizardView {
         let visible_rows = usize::from(content_area.height).max(1);
         let max_scroll = visual_rows.saturating_sub(visible_rows);
         let scroll = self.body_scroll.min(max_scroll);
+        let content_area =
+            render_panel_scroll_rail(content_area, buf, visual_rows, scroll, visible_rows, true);
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .scroll((scroll as u16, 0))
@@ -2590,7 +2747,7 @@ impl SetupWizardView {
         if self.facts.constitution_file == SetupConstitutionFileState::Loaded {
             lines.push(Line::from(Span::styled(
                 keep_existing_invitation_line(self.locale),
-                Style::default().fg(palette::WHALE_ACCENT_PRIMARY),
+                Style::default().fg(palette::WHALE_HUMAN),
             )));
         }
         if let Some(label) = self
@@ -2600,12 +2757,12 @@ impl SetupWizardView {
         {
             lines.push(Line::from(Span::styled(
                 model_draft_ready_line(self.locale, label),
-                Style::default().fg(palette::WHALE_ACCENT_PRIMARY),
+                Style::default().fg(palette::STATUS_SUCCESS),
             )));
         } else if self.facts.provider_ready {
             lines.push(Line::from(Span::styled(
                 model_draft_invitation_line(self.locale, &self.facts.model),
-                Style::default().fg(palette::WHALE_ACCENT_PRIMARY),
+                Style::default().fg(palette::WHALE_HUMAN),
             )));
         }
         lines.push(Line::from(Span::styled(
@@ -3016,14 +3173,18 @@ fn runtime_preset_preview_text(
 
 fn runtime_preset_diff_rows(preset: SetupRuntimePreset, facts: &SetupRuntimeFacts) -> Vec<String> {
     let approval_target = preset.approval_policy().map_or_else(
-        || "unchanged; YOLO derives bypass from default_mode".to_string(),
+        || "removed; Full Access comes from settings.permission_posture".to_string(),
         ToString::to_string,
     );
     let mut rows = vec![
         format!(
             "settings.default_mode: {} -> {}",
             facts.default_mode,
-            preset.default_mode()
+            preset.display_mode()
+        ),
+        format!(
+            "settings.permission_posture: -> {}",
+            preset.permission_posture()
         ),
         format!(
             "config.approval_policy: {} -> {}",
@@ -3146,7 +3307,7 @@ fn guided_constitution_template(locale: Locale) -> UserConstitution {
 enum DraftProvenance {
     /// Rendered deterministically from the guided answers.
     Guided,
-    /// Drafted by the named model, then sanitized and bounded by CodeWhale.
+    /// Drafted by the named model, then sanitized and bounded by Codewhale.
     Model(String),
     /// The user's existing `constitution.json`, shown unchanged for the
     /// keep-existing checkpoint completion (#3794).
@@ -3156,11 +3317,12 @@ enum DraftProvenance {
 fn ratification_preview_title(locale: Locale) -> &'static str {
     match locale {
         Locale::Ja => "ユーザー憲法 - 批准前の草案",
-        Locale::ZhHans => "用户宪法 — 批准前草案",
+        Locale::ZhHans => "用户协作准则 — 确认前草案",
         Locale::ZhHant => "使用者憲法 - 批准前草案",
         Locale::PtBr => "Constituição do Usuário - Rascunho para Ratificação",
         Locale::Es419 => "Constitución del Usuario - Borrador para Ratificación",
         Locale::Vi => "Hiến pháp Người dùng - Bản nháp để phê chuẩn",
+        Locale::Ko => "사용자 헌법 - 승인 전 초안",
         _ => "User Constitution — Draft for Ratification",
     }
 }
@@ -3180,11 +3342,12 @@ fn constitution_ratification_text(
         .render_block(None)
         .unwrap_or_else(|| match locale {
             Locale::Ja => "構造化された憲法は空です。".to_string(),
-            Locale::ZhHans => "结构化宪法为空。".to_string(),
+            Locale::ZhHans => "结构化协作准则为空。".to_string(),
             Locale::ZhHant => "結構化憲法為空。".to_string(),
             Locale::PtBr => "A constituição estruturada está vazia.".to_string(),
             Locale::Es419 => "La constitución estructurada está vacía.".to_string(),
             Locale::Vi => "Hiến pháp có cấu trúc đang trống.".to_string(),
+            Locale::Ko => "구조화된 헌법이 비어 있습니다.".to_string(),
             _ => "The structured constitution is empty.".to_string(),
         });
     let layer_order = tr(locale, MessageId::SetupCheckpointLayerOrder);
@@ -3193,7 +3356,7 @@ fn constitution_ratification_text(
         Locale::Ja => {
             let drafted_by = match provenance {
                 DraftProvenance::Model(label) => format!(
-                    "{label} があなたのガイド回答から起草し、CodeWhale が構造検証と境界制限を適用しました。"
+                    "{label} があなたのガイド回答から起草し、Codewhale が構造検証と境界制限を適用しました。"
                 ),
                 DraftProvenance::Guided => {
                     "あなたのガイド回答から決定的に生成されました。".to_string()
@@ -3215,7 +3378,7 @@ fn constitution_ratification_text(
             };
             format!(
                 "CODEWHALE · ユーザー憲法\n{RULE}\n\n{drafted_by}\n\n\
-                 これは CodeWhale があなたと協働するための常設の基準です。優れた憲法のように、使えるほど短く、\
+                 これは Codewhale があなたと協働するための常設の基準です。優れた憲法のように、使えるほど短く、\
                  網羅的な規則ではなく持続する原則で構成され、あなたの変化に合わせて修正できます。\
                  すべての個別判断を裁くのではなく権限と境界を定め、セッションを越えて協働を継続させます。\
                  ただしこれは記憶ではありません。履歴ではなく原則を保持します。\n\n\
@@ -3225,7 +3388,7 @@ fn constitution_ratification_text(
                  これは行動を導くものです。承認ポリシー、サンドボックス、Shell、ネットワーク、信頼、MCP 権限、\
                  既定モード、公開、支出の権限を付与または変更することはできません。これらは実行時にあなたが管理します。\n\n\
                  縮小コアと任意モジュール\n\
-                 組み込みの 55 行コアは引き続き有効です。この草案はユーザーグローバルの長期設定だけを保存します。\
+                 組み込みのコアは引き続き有効です。この草案はユーザーグローバルの長期設定だけを保存します。\
                  重い実行/オーケストレーション教義はモードプロンプトまたは将来の任意モジュールに属します。このプレビューはモジュールを有効化せず、設定も変更しません。\n\n\
                  批准\n{ratify_how}"
             )
@@ -3233,40 +3396,41 @@ fn constitution_ratification_text(
         Locale::ZhHans => {
             let drafted_by = match provenance {
                 DraftProvenance::Model(label) => format!(
-                    "由 {label} 根据你的引导式答案起草，并已由 CodeWhale 完成结构校验与边界限制。"
+                    "由 {label} 根据你的引导式答案起草，并已由 Codewhale 完成结构校验与边界限制。"
                 ),
                 DraftProvenance::Guided => "由你的引导式答案确定性生成。".to_string(),
                 DraftProvenance::Existing => {
-                    "你现有的宪法，读取自 constitution.json——原样展示，未做任何修改。".to_string()
+                    "你现有的协作准则，读取自 constitution.json——原样展示，未做任何修改。"
+                        .to_string()
                 }
             };
             let ratify_how = match provenance {
                 DraftProvenance::Existing => {
-                    "这已是你现行的准则。关闭此预览后按 K 保留并完成检查点——文件不会被修改。\
-                     之后可随时用 /constitution 或 /setup 修订。"
+                    "这已是你当前使用的协作准则。关闭此预览后按 K 保留并完成检查点——文件不会被修改。\
+                     之后可随时用 /constitution 或 /setup 修改。"
                 }
                 _ => {
-                    "未经你确认，任何内容都不会成为准则。关闭此预览后按 G 批准并保存；\
-                     之后可随时用 /constitution 或 /setup 修订。"
+                    "未经你确认，任何内容都不会成为协作准则。关闭此预览后按 G 确认并保存；\
+                     之后可随时用 /constitution 或 /setup 修改。"
                 }
             };
             format!(
-                "CODEWHALE · 用户宪法\n{RULE}\n\n{drafted_by}\n\n\
-                 这是 CodeWhale 与你协作的长期准则。像优秀的宪法一样：足够简短因而可用，由持久原则而非详尽规则构成，并且可以随你修订。\
-                 它界定权力与边界，而非裁决每个具体决定；它让协作跨会话延续——但它不是记忆，它承载的是原则，而非历史。\n\n\
+                "CODEWHALE · 用户协作准则\n{RULE}\n\n{drafted_by}\n\n\
+                 这是 Codewhale 与你协作时长期遵循的偏好和规则。内容应保持简短、便于执行，以持久原则为主，并可随时调整。\
+                 它界定协作方式与行为边界，而不是替你决定每一种情况；它让协作跨会话延续——但它不是记忆，只保留原则，不保留历史。\n\n\
                  {rendered}\n\n\
                  权限层级\n{layer_order}\n你的直接指令始终高于本文件。\n\n\
                  它不能做什么\n\
                  它只提供行为指导，不能授予或更改审批策略、沙箱、Shell、网络、信任、MCP 权限、默认模式、发布或支出权限——这些始终由你在运行时掌控。\n\n\
-                 精简核心与可选模块\n\
-                 内置 55 行核心始终生效。本草案只保存你的用户全局长期偏好。执行/编排等重型教义位于模式提示词或未来的可选模块中；此预览不会启用模块或更改其配置。\n\n\
-                 批准\n{ratify_how}"
+                 精简核心与可选策略\n\
+                 内置核心始终生效。本草案只保存你的用户全局长期偏好。执行与编排等高级策略仍由模式提示词或未来的可选规则包管理；此预览不会启用任何策略或更改配置。\n\n\
+                 确认\n{ratify_how}"
             )
         }
         Locale::ZhHant => {
             let drafted_by = match provenance {
                 DraftProvenance::Model(label) => format!(
-                    "由 {label} 根據你的引導式答案起草，並已由 CodeWhale 完成結構驗證與邊界限制。"
+                    "由 {label} 根據你的引導式答案起草，並已由 Codewhale 完成結構驗證與邊界限制。"
                 ),
                 DraftProvenance::Guided => "由你的引導式答案確定性生成。".to_string(),
                 DraftProvenance::Existing => {
@@ -3285,21 +3449,21 @@ fn constitution_ratification_text(
             };
             format!(
                 "CODEWHALE · 使用者憲法\n{RULE}\n\n{drafted_by}\n\n\
-                 這是 CodeWhale 與你協作的長期準則。像優秀的憲法一樣：足夠簡短因而可用，由持久原則而非詳盡規則構成，並且可以隨你修訂。\
+                 這是 Codewhale 與你協作的長期準則。像優秀的憲法一樣：足夠簡短因而可用，由持久原則而非詳盡規則構成，並且可以隨你修訂。\
                  它界定權力與邊界，而非裁決每個具體決定；它讓協作跨會話延續，但它不是記憶，它承載的是原則，而非歷史。\n\n\
                  {rendered}\n\n\
                  權限層級\n{layer_order}\n你的直接指令始終高於本文件。\n\n\
                  它不能做什麼\n\
                  它只提供行為指導，不能授予或更改審批策略、沙箱、Shell、網路、信任、MCP 權限、預設模式、發布或支出權限；這些始終由你在執行時掌控。\n\n\
                  精簡核心與可選模組\n\
-                 內建 55 行核心始終生效。本草案只保存你的使用者全域長期偏好。執行/編排等重型教義位於模式提示詞或未來的可選模組中；此預覽不會啟用模組或更改其配置。\n\n\
+                 內建核心始終生效。本草案只保存你的使用者全域長期偏好。執行/編排等重型教義位於模式提示詞或未來的可選模組中；此預覽不會啟用模組或更改其配置。\n\n\
                  批准\n{ratify_how}"
             )
         }
         Locale::PtBr => {
             let drafted_by = match provenance {
                 DraftProvenance::Model(label) => format!(
-                    "Rascunhado por {label} a partir das suas respostas guiadas, depois validado por schema e limitado pelo CodeWhale."
+                    "Rascunhado por {label} a partir das suas respostas guiadas, depois validado por schema e limitado pelo Codewhale."
                 ),
                 DraftProvenance::Guided => {
                     "Renderizado deterministicamente a partir das suas respostas guiadas.".to_string()
@@ -3321,7 +3485,7 @@ fn constitution_ratification_text(
             };
             format!(
                 "CODEWHALE · CONSTITUIÇÃO DO USUÁRIO\n{RULE}\n\n{drafted_by}\n\n\
-                 Esta é a regra permanente de como o CodeWhale trabalha com você. Como boas constituições, \
+                 Esta é a regra permanente de como o Codewhale trabalha com você. Como boas constituições, \
                  ela é curta o bastante para ser usada, formada por princípios duráveis em vez de regras exaustivas, \
                  e pode ser emendada conforme você muda. Ela define poderes e limites em vez de decidir cada caso, \
                  e dá continuidade à colaboração entre sessões. Mas ela não é memória: carrega princípios, não histórico.\n\n\
@@ -3331,7 +3495,7 @@ fn constitution_ratification_text(
                  Isto orienta comportamento. Não pode conceder nem alterar política de aprovação, sandbox, shell, rede, \
                  confiança, permissões MCP, modo padrão, publicação ou autoridade para gastos; isso continua sob seu controle em tempo de execução.\n\n\
                  NÚCLEO REDUZIDO E MÓDULOS OPT-IN\n\
-                 O núcleo embutido de 55 linhas continua ativo. Este rascunho só salva suas preferências permanentes globais de usuário. \
+                 O núcleo embutido continua ativo. Este rascunho só salva suas preferências permanentes globais de usuário. \
                  Doutrina pesada de execução ou orquestração pertence a prompts de modo ou módulos opt-in futuros; esta prévia não ativa módulos nem muda sua configuração.\n\n\
                  RATIFICAÇÃO\n{ratify_how}"
             )
@@ -3339,7 +3503,7 @@ fn constitution_ratification_text(
         Locale::Es419 => {
             let drafted_by = match provenance {
                 DraftProvenance::Model(label) => format!(
-                    "Redactado por {label} desde tus respuestas guiadas, luego validado por schema y acotado por CodeWhale."
+                    "Redactado por {label} desde tus respuestas guiadas, luego validado por schema y acotado por Codewhale."
                 ),
                 DraftProvenance::Guided => {
                     "Renderizado de forma determinística desde tus respuestas guiadas.".to_string()
@@ -3361,7 +3525,7 @@ fn constitution_ratification_text(
             };
             format!(
                 "CODEWHALE · CONSTITUCIÓN DEL USUARIO\n{RULE}\n\n{drafted_by}\n\n\
-                 Esta es la regla permanente de cómo CodeWhale trabaja contigo. Como las buenas constituciones, \
+                 Esta es la regla permanente de cómo Codewhale trabaja contigo. Como las buenas constituciones, \
                  es lo bastante breve para usarse, hecha de principios duraderos en vez de reglas exhaustivas, \
                  y enmendable a medida que cambias. Define poderes y límites en vez de decidir cada caso, \
                  y da continuidad a la colaboración entre sesiones. Pero no es memoria: lleva principios, no historial.\n\n\
@@ -3371,7 +3535,7 @@ fn constitution_ratification_text(
                  Orienta comportamiento. No puede conceder ni cambiar política de aprobación, sandbox, shell, red, \
                  confianza, permisos MCP, modo predeterminado, publicación o autoridad de gasto; eso sigue bajo tu control en tiempo de ejecución.\n\n\
                  NÚCLEO REDUCIDO Y MÓDULOS OPT-IN\n\
-                 El núcleo integrado de 55 líneas sigue activo. Este borrador solo guarda tus preferencias permanentes globales de usuario. \
+                 El núcleo integrado sigue activo. Este borrador solo guarda tus preferencias permanentes globales de usuario. \
                  La doctrina pesada de ejecución u orquestación pertenece a prompts de modo o módulos opt-in futuros; esta vista previa no activa módulos ni cambia su configuración.\n\n\
                  RATIFICACIÓN\n{ratify_how}"
             )
@@ -3379,7 +3543,7 @@ fn constitution_ratification_text(
         Locale::Vi => {
             let drafted_by = match provenance {
                 DraftProvenance::Model(label) => format!(
-                    "Được {label} soạn từ câu trả lời hướng dẫn của bạn, rồi được CodeWhale kiểm tra schema và giới hạn biên."
+                    "Được {label} soạn từ câu trả lời hướng dẫn của bạn, rồi được Codewhale kiểm tra schema và giới hạn biên."
                 ),
                 DraftProvenance::Guided => {
                     "Được kết xuất xác định từ câu trả lời hướng dẫn của bạn.".to_string()
@@ -3401,7 +3565,7 @@ fn constitution_ratification_text(
             };
             format!(
                 "CODEWHALE · HIẾN PHÁP NGƯỜI DÙNG\n{RULE}\n\n{drafted_by}\n\n\
-                 Đây là luật thường trực cho cách CodeWhale làm việc với bạn. Giống các hiến pháp tốt, \
+                 Đây là luật thường trực cho cách Codewhale làm việc với bạn. Giống các hiến pháp tốt, \
                  nó đủ ngắn để dùng, gồm các nguyên tắc bền vững thay vì luật lệ cạn kiệt, \
                  và có thể sửa khi bạn thay đổi. Nó định khung quyền hạn và giới hạn thay vì quyết định từng trường hợp, \
                  đồng thời giữ sự liên tục giữa các phiên. Nhưng nó không phải bộ nhớ: nó mang nguyên tắc, không mang lịch sử.\n\n\
@@ -3411,15 +3575,55 @@ fn constitution_ratification_text(
                  Nó hướng dẫn hành vi. Nó không thể cấp hoặc đổi chính sách phê duyệt, sandbox, shell, mạng, \
                  độ tin cậy, quyền MCP, chế độ mặc định, xuất bản hoặc quyền chi tiêu; những thứ đó vẫn do bạn kiểm soát lúc chạy.\n\n\
                  LÕI RÚT GỌN VÀ MÔ-ĐUN OPT-IN\n\
-                 Lõi tích hợp 55 dòng vẫn hoạt động. Bản nháp này chỉ lưu tùy chọn thường trực toàn cục của người dùng. \
+                 Lõi tích hợp vẫn hoạt động. Bản nháp này chỉ lưu tùy chọn thường trực toàn cục của người dùng. \
                  Giáo điều thực thi hoặc điều phối nặng thuộc về prompt chế độ hoặc mô-đun opt-in trong tương lai; bản xem trước này không bật mô-đun hoặc đổi cấu hình của chúng.\n\n\
                  PHÊ CHUẨN\n{ratify_how}"
+            )
+        }
+        Locale::Ko => {
+            let drafted_by = match provenance {
+                DraftProvenance::Model(label) => format!(
+                    "{label}이(가) 당신의 가이드 답변을 바탕으로 초안을 작성했고, Codewhale이 구조를 검증하고 범위를 제한했습니다."
+                ),
+                DraftProvenance::Guided => {
+                    "당신의 가이드 답변으로부터 결정적으로 생성되었습니다.".to_string()
+                }
+                DraftProvenance::Existing => {
+                    "constitution.json에서 불러온 기존 헌법이며, 변경 없이 그대로 표시됩니다."
+                        .to_string()
+                }
+            };
+            let ratify_how = match provenance {
+                DraftProvenance::Existing => {
+                    "이것은 이미 당신의 상시 규칙입니다. 미리보기를 닫고 K를 눌러 그대로 유지하며 체크포인트를 완료하세요; \
+                     파일은 수정되지 않습니다. /constitution 또는 /setup으로 언제든지 수정할 수 있습니다."
+                }
+                _ => {
+                    "확인하기 전까지는 아무것도 규칙이 되지 않습니다. 미리보기를 닫고 G를 눌러 승인하고 저장하세요. \
+                     /constitution 또는 /setup으로 언제든지 수정할 수 있습니다."
+                }
+            };
+            format!(
+                "CODEWHALE · 사용자 헌법\n{RULE}\n\n{drafted_by}\n\n\
+                 이것은 Codewhale이 당신과 함께 일하는 방식에 대한 상시 규칙입니다. 훌륭한 헌법이 그렇듯, \
+                 사용할 수 있을 만큼 짧고, 소모적인 규칙이 아닌 지속적인 원칙으로 이루어져 있으며, 당신이 변화함에 따라 수정할 수 있습니다. \
+                 이는 모든 개별 사례를 판단하는 대신 권한과 한계를 규정하며, 세션을 넘어 협업의 연속성을 부여합니다. \
+                 다만 이것은 기억이 아닙니다: 이력이 아니라 원칙을 담습니다.\n\n\
+                 {rendered}\n\n\
+                 권한 계층\n{layer_order}\n당신의 직접적인 요청은 언제나 이 문서보다 우선합니다.\n\n\
+                 이것이 할 수 없는 일\n\
+                 이것은 행동을 안내할 뿐입니다. 승인 정책, 샌드박스, 셸, 네트워크, 신뢰, MCP 권한, 기본 모드, 게시, 지출 권한을 \
+                 부여하거나 바꿀 수 없습니다; 이는 여전히 런타임에서 당신이 직접 관리합니다.\n\n\
+                 축소된 코어와 옵트인 모듈\n\
+                 내장된 코어는 계속 활성 상태입니다. 이 초안은 사용자 전역의 상시 선호만 저장합니다. \
+                 무거운 실행/오케스트레이션 지침은 모드 프롬프트나 향후 옵트인 모듈에 속합니다. 이 미리보기는 모듈을 활성화하지 않으며 그 설정도 바꾸지 않습니다.\n\n\
+                 승인\n{ratify_how}"
             )
         }
         _ => {
             let drafted_by = match provenance {
                 DraftProvenance::Model(label) => format!(
-                    "Drafted by {label} from your guided answers, then schema-checked and bounded by CodeWhale."
+                    "Drafted by {label} from your guided answers, then schema-checked and bounded by Codewhale."
                 ),
                 DraftProvenance::Guided => {
                     "Rendered deterministically from your guided answers.".to_string()
@@ -3442,7 +3646,7 @@ fn constitution_ratification_text(
             };
             format!(
                 "CODEWHALE · USER CONSTITUTION\n{RULE}\n\n{drafted_by}\n\n\
-                 This is the standing law for how CodeWhale works with you. Like the best \
+                 This is the standing law for how Codewhale works with you. Like the best \
                  constitutions, it is short enough to use, made of durable principles rather \
                  than exhaustive rules, and amendable as you change. It frames powers and \
                  limits rather than deciding every case, and it gives your collaboration \
@@ -3455,7 +3659,7 @@ fn constitution_ratification_text(
                  network, trust, MCP permissions, default mode, publishing, or spending \
                  authority — those stay under your hand at runtime.\n\n\
                  REDUCED CORE AND OPT-IN MODULES\n\
-                 The bundled 55-line core stays active. This draft only saves your user-global \
+                 The bundled core stays active. This draft only saves your user-global \
                  standing preferences. Heavy execution or orchestration doctrine belongs in mode \
                  prompts or future opt-in modules; this preview does not enable modules or change \
                  their configuration.\n\n\
@@ -3472,7 +3676,7 @@ fn model_draft_invitation_line(locale: Locale, model_label: &str) -> String {
             format!("A {model_label} が起草し、あなたが批准します。確認するまで保存しません。")
         }
         Locale::ZhHans => {
-            format!("A {model_label} 起草，你批准。未经确认不会保存。")
+            format!("A {model_label} 生成草案，由你确认。未经确认不会保存。")
         }
         Locale::ZhHant => {
             format!("A {model_label} 起草，你批准。未經確認不會保存。")
@@ -3486,6 +3690,11 @@ fn model_draft_invitation_line(locale: Locale, model_label: &str) -> String {
         Locale::Vi => {
             format!("A {model_label} có thể soạn. Bạn phê chuẩn. Không lưu gì nếu chưa có bạn.")
         }
+        Locale::Ko => {
+            format!(
+                "A {model_label}이(가) 초안을 작성할 수 있습니다. 승인은 당신이 합니다. 당신 없이는 아무것도 저장되지 않습니다."
+            )
+        }
         _ => format!("A {model_label} can draft it. You ratify it. Nothing saves without you."),
     }
 }
@@ -3494,13 +3703,14 @@ fn model_draft_invitation_line(locale: Locale, model_label: &str) -> String {
 fn keep_existing_invitation_line(locale: Locale) -> &'static str {
     match locale {
         Locale::Ja => "K 既存の憲法を保持 - 確認して保持、ファイルは変更しません。",
-        Locale::ZhHans => "K 保留现有宪法——先查看，再保留，文件不变。",
+        Locale::ZhHans => "K 保留现有协作准则——先查看，再保留，文件不变。",
         Locale::ZhHant => "K 保留現有憲法 - 先查看，再保留，檔案不變。",
         Locale::PtBr => "K Manter constituição existente - revise, mantenha, arquivo inalterado.",
         Locale::Es419 => {
             "K Conservar constitución existente - revisa, conserva, archivo sin cambios."
         }
         Locale::Vi => "K Giữ hiến pháp hiện có - xem lại, giữ nguyên, tệp không đổi.",
+        Locale::Ko => "K 기존 헌법 유지 - 검토 후 유지, 파일은 변경되지 않음.",
         _ => "K Keep your existing constitution — review it, keep it, file unchanged.",
     }
 }
@@ -3514,7 +3724,7 @@ fn model_draft_ready_line(locale: Locale, model_label: &str) -> String {
             )
         }
         Locale::ZhHans => {
-            format!("{model_label} 的草案待批准——按 G 查看并批准；按 1-6 会丢弃草案。")
+            format!("{model_label} 的草案待确认——按 G 查看并确认；按 1-6 会丢弃草案。")
         }
         Locale::ZhHant => {
             format!("{model_label} 的草案待批准 - 按 G 查看並批准；按 1-6 會丟棄草案。")
@@ -3534,6 +3744,11 @@ fn model_draft_ready_line(locale: Locale, model_label: &str) -> String {
                 "Bản nháp của {model_label} chờ phê chuẩn - G để xem và phê chuẩn; 1-6 sẽ bỏ bản nháp."
             )
         }
+        Locale::Ko => {
+            format!(
+                "{model_label}의 초안이 승인을 기다리고 있습니다 - G로 확인하고 승인, 1-6은 초안을 버립니다."
+            )
+        }
         _ => format!(
             "Draft by {model_label} awaits ratification — G to review and ratify; 1-6 discards it."
         ),
@@ -3546,7 +3761,9 @@ pub(crate) fn model_draft_ready_message(locale: Locale, model_label: &str) -> St
         Locale::Ja => format!(
             "{model_label} があなたの憲法を起草しました。プレビューを確認してから G で批准してください。"
         ),
-        Locale::ZhHans => format!("{model_label} 已起草你的宪法。请查看预览，然后按 G 批准。"),
+        Locale::ZhHans => {
+            format!("{model_label} 已生成你的协作准则草案。请查看预览，然后按 G 确认。")
+        }
         Locale::ZhHant => format!("{model_label} 已起草你的憲法。請查看預覽，然後按 G 批准。"),
         Locale::PtBr => format!(
             "{model_label} rascunhou sua constituição. Revise a prévia e pressione G para ratificar."
@@ -3556,6 +3773,9 @@ pub(crate) fn model_draft_ready_message(locale: Locale, model_label: &str) -> St
         ),
         Locale::Vi => format!(
             "{model_label} đã soạn hiến pháp của bạn. Xem bản xem trước rồi nhấn G để phê chuẩn."
+        ),
+        Locale::Ko => format!(
+            "{model_label}이(가) 당신의 헌법 초안을 작성했습니다. 미리보기를 확인한 뒤 G를 눌러 승인하세요."
         ),
         _ => format!(
             "{model_label} drafted your constitution. Review the preview, then press G to ratify."
@@ -3577,7 +3797,7 @@ pub(crate) fn model_draft_failed_message(
             )
         }
         Locale::ZhHans => {
-            format!("{model_label} 未能完成起草（{reason}）。引导式草案仍然有效——按 G 预览并批准。")
+            format!("{model_label} 未能生成草案（{reason}）。引导式草案仍可使用——按 G 预览并确认。")
         }
         Locale::ZhHant => {
             format!("{model_label} 未能完成起草（{reason}）。引導式草案仍然有效；按 G 預覽並批准。")
@@ -3595,6 +3815,11 @@ pub(crate) fn model_draft_failed_message(
         Locale::Vi => {
             format!(
                 "{model_label} không thể soạn hiến pháp của bạn ({reason}). Bản nháp hướng dẫn vẫn hợp lệ; nhấn G để xem trước và phê chuẩn."
+            )
+        }
+        Locale::Ko => {
+            format!(
+                "{model_label}이(가) 당신의 헌법 초안을 작성하지 못했습니다 ({reason}). 가이드 초안은 여전히 유효합니다. G를 눌러 미리보고 승인하세요."
             )
         }
         _ => format!(
@@ -3894,8 +4119,15 @@ mod tests {
             panic!("expected skipped setup-state commit event");
         };
         assert_eq!(state.status(SetupStep::Constitution), StepStatus::Skipped);
+        assert_eq!(
+            state.constitution_checkpoint_completed_for.as_deref(),
+            Some(CONSTITUTION_CHECKPOINT_VERSION)
+        );
+        assert_eq!(state.constitution_choice, ConstitutionChoice::Deferred);
         assert!(message.contains("skipped"));
         assert_eq!(view.selected_step(), SetupStep::OperateFleet);
+        let restarted = SetupWizardView::new(state, Locale::En);
+        assert_eq!(restarted.selected_step(), SetupStep::Language);
 
         let action = view.handle_key(key(KeyCode::Char('r')));
 
@@ -3908,6 +4140,54 @@ mod tests {
             StepStatus::NeedsAction
         );
         assert!(message.contains("retry"));
+    }
+
+    #[test]
+    fn skipping_checkpoint_preserves_active_custom_constitution() {
+        let mut state = SetupState {
+            constitution_choice: ConstitutionChoice::GuidedCustom,
+            constitution_source: ConstitutionSource::UserGlobal,
+            constitution_validity: ConstitutionValidity::Valid,
+            constitution_authoring: Some(ConstitutionAuthoring::Guided),
+            constitution_preview_hash: Some("sha256:existing-custom-preview".to_string()),
+            constitution_preview_version: 7,
+            ..SetupState::default()
+        };
+        state.constitution_checkpoint_completed_for = Some("0.8.66".to_string());
+        let mut view = SetupWizardView::new_at_with_facts(
+            state,
+            Locale::En,
+            SetupStep::Constitution,
+            SetupRuntimeFacts::default(),
+        );
+
+        let action = view.handle_key(key(KeyCode::Char('s')));
+
+        let ViewAction::Emit(ViewEvent::SetupStateCommitRequested { state, message }) = action
+        else {
+            panic!("expected skipped setup-state commit event");
+        };
+        assert_eq!(state.status(SetupStep::Constitution), StepStatus::Skipped);
+        assert_eq!(
+            state.constitution_checkpoint_completed_for.as_deref(),
+            Some(CONSTITUTION_CHECKPOINT_VERSION)
+        );
+        assert_eq!(state.constitution_choice, ConstitutionChoice::GuidedCustom);
+        assert_eq!(state.constitution_source, ConstitutionSource::UserGlobal);
+        assert_eq!(state.constitution_validity, ConstitutionValidity::Valid);
+        assert_eq!(
+            state.constitution_authoring,
+            Some(ConstitutionAuthoring::Guided)
+        );
+        assert_eq!(
+            state.constitution_preview_hash.as_deref(),
+            Some("sha256:existing-custom-preview")
+        );
+        assert_eq!(state.constitution_preview_version, 7);
+        assert!(message.contains("skipped"));
+
+        let restarted = SetupWizardView::new(state, Locale::En);
+        assert_eq!(restarted.selected_step(), SetupStep::Language);
     }
 
     #[test]
@@ -3968,6 +4248,39 @@ mod tests {
     }
 
     #[test]
+    fn zh_hans_constitution_surfaces_use_functional_terminology() {
+        let constitution = GuidedConstitutionDraft::default().to_constitution(Locale::ZhHans);
+        let samples = [
+            ratification_preview_title(Locale::ZhHans).to_string(),
+            constitution_ratification_text(
+                Locale::ZhHans,
+                &constitution,
+                &DraftProvenance::Existing,
+            ),
+            lines_to_text(vec![freeform_note_line(Locale::ZhHans, "", false)]),
+            keep_existing_invitation_line(Locale::ZhHans).to_string(),
+            model_draft_invitation_line(Locale::ZhHans, "GLM-5.2"),
+            model_draft_ready_line(Locale::ZhHans, "GLM-5.2"),
+            model_draft_ready_message(Locale::ZhHans, "GLM-5.2"),
+            model_draft_failed_message(Locale::ZhHans, "GLM-5.2", "超时"),
+        ];
+        let visible_copy = samples.join("\n");
+
+        for literal_metaphor in ["宪法", "教义", "自由原则", "起草"] {
+            assert!(
+                !visible_copy.contains(literal_metaphor),
+                "Simplified Chinese setup copy should avoid {literal_metaphor}: {visible_copy}"
+            );
+        }
+        assert!(visible_copy.contains("协作准则"));
+        assert!(visible_copy.contains("自定义准则"));
+        assert!(visible_copy.contains("可选策略"));
+        assert!(visible_copy.contains("Codewhale"));
+        assert!(visible_copy.contains("/constitution"));
+        assert!(visible_copy.contains("constitution.json"));
+    }
+
+    #[test]
     fn guided_constitution_requires_preview_before_save() {
         let mut view = SetupWizardView::new(SetupState::default(), Locale::En);
 
@@ -3980,7 +4293,7 @@ mod tests {
         assert!(content.contains("<codewhale_user_constitution"));
         assert!(content.contains("press G to ratify and save"));
         assert!(content.contains("REDUCED CORE AND OPT-IN MODULES"));
-        assert!(content.contains("The bundled 55-line core stays active"));
+        assert!(content.contains("The bundled core stays active"));
         assert!(content.contains("does not enable modules"));
         assert_eq!(view.state().constitution_choice, ConstitutionChoice::Unset);
 
@@ -4028,8 +4341,8 @@ mod tests {
                     ),
                     Locale::ZhHans => (
                         "精简核心",
-                        "模块",
-                        "不会启用",
+                        "可选策略",
+                        "不会启用任何策略",
                         "不能授予或更改审批策略、沙箱、Shell、网络、信任、MCP 权限",
                         "发布或支出权限",
                     ),
@@ -4061,6 +4374,13 @@ mod tests {
                         "không thể cấp hoặc đổi chính sách phê duyệt, sandbox, shell, mạng",
                         "quyền MCP",
                     ),
+                    Locale::Ko => (
+                        "축소된 코어",
+                        "모듈",
+                        "활성화하지 않으며",
+                        "승인 정책, 샌드박스, 셸, 네트워크, 신뢰, MCP 권한, 기본 모드, 게시, 지출 권한을 부여하거나 바꿀 수 없습니다",
+                        "MCP 권한",
+                    ),
                     Locale::En => (
                         "REDUCED CORE",
                         "modules",
@@ -4070,7 +4390,6 @@ mod tests {
                     ),
                 };
 
-            assert!(content.contains("55"), "{}", locale.tag());
             assert!(content.contains(heading), "{}", locale.tag());
             assert!(content.contains(module_marker), "{}", locale.tag());
             assert!(content.contains(no_enable_marker), "{}", locale.tag());
@@ -4151,6 +4470,66 @@ mod tests {
     }
 
     #[test]
+    fn provider_model_detail_lines_use_kimi_code_membership_console_for_exact_route() {
+        let _guard = crate::test_support::lock_test_env();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        let codewhale_home = tmp.path().join(".codewhale");
+        let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
+        let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path());
+        let _codewhale_home =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home);
+        let _moonshot_key = crate::test_support::EnvVarGuard::remove("MOONSHOT_API_KEY");
+        let _kimi_key = crate::test_support::EnvVarGuard::remove("KIMI_API_KEY");
+        let config = Config {
+            provider: Some("moonshot".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                moonshot: crate::config::ProviderConfig {
+                    base_url: Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string()),
+                    model: Some(crate::config::KIMI_CODE_K3_MODEL.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        let mut app = App::new(setup_test_options(workspace), &config);
+        app.model = crate::config::KIMI_CODE_K3_MODEL.to_string();
+        let resolution = crate::route_runtime::resolve_route_candidate_with_context_metadata(
+            app.api_provider,
+            Some(crate::config::KIMI_CODE_K3_MODEL),
+            Some(crate::config::KIMI_CODE_K3_MODEL),
+            Some(config.deepseek_base_url()),
+            None,
+            None,
+        )
+        .expect("bare k3 on the Kimi Code route must resolve");
+        app.set_active_route_resolution(
+            resolution.candidate.endpoint().base_url.clone(),
+            resolution.candidate.limits(),
+            resolution.context_window.source,
+        );
+        let facts = SetupRuntimeFacts::from_app_config(&app, &config);
+        let view = SetupWizardView::new_at_with_facts(
+            SetupState::default(),
+            Locale::En,
+            SetupStep::ProviderModel,
+            facts,
+        );
+
+        let text = lines_to_text(view.provider_model_detail_lines());
+
+        assert!(text.contains("Moonshot/Kimi"), "{text}");
+        assert!(text.contains("static Kimi Code safe floor"), "{text}");
+        assert!(
+            text.contains(crate::config::KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL),
+            "{text}"
+        );
+        assert!(!text.contains("https://platform.kimi.ai/console/api-keys"));
+    }
+
+    #[test]
     fn provider_model_detail_lines_keep_codex_oauth_url_free() {
         let _guard = crate::test_support::lock_test_env();
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -4180,6 +4559,7 @@ mod tests {
         let text = lines_to_text(view.provider_model_detail_lines());
 
         assert!(text.contains("codex login"), "{text}");
+        assert!(text.contains("external-consent"), "{text}");
         assert!(!text.contains("credentials:"), "{text}");
     }
 
@@ -4214,7 +4594,7 @@ mod tests {
             cn_text.contains("credentials: https://platform.deepseek.com/api_keys"),
             "{cn_text}"
         );
-        assert!(cn_text.contains("missing for active provider"), "{cn_text}");
+        assert!(cn_text.contains("missing key"), "{cn_text}");
 
         let local_config = Config {
             provider: Some("ollama".to_string()),
@@ -4229,10 +4609,7 @@ mod tests {
         );
         let local_text = lines_to_text(local_view.provider_model_detail_lines());
         assert!(local_text.contains("Ollama"), "{local_text}");
-        assert!(
-            local_text.contains("present or local runtime"),
-            "{local_text}"
-        );
+        assert!(local_text.contains("local · not checked"), "{local_text}");
         assert!(!local_text.contains("credentials:"), "{local_text}");
     }
 
@@ -4361,6 +4738,45 @@ mod tests {
     }
 
     #[test]
+    fn remote_runtime_on_ramp_never_substitutes_deepseek_for_named_custom_route() {
+        let _guard = crate::test_support::lock_test_env();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        let codewhale_home = tmp.path().join(".codewhale");
+        let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
+        let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path());
+        let _codewhale_home =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home);
+        let mut custom = std::collections::HashMap::new();
+        custom.insert(
+            "lm-studio".to_string(),
+            crate::config::ProviderConfig {
+                kind: Some("openai-compatible".to_string()),
+                base_url: Some("http://127.0.0.1:1234/v1".to_string()),
+                model: Some("local-code-model".to_string()),
+                ..Default::default()
+            },
+        );
+        let config = Config {
+            provider: Some("lm-studio".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                custom,
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        let app = App::new(setup_test_options(workspace), &config);
+        let facts = SetupRuntimeFacts::from_app_config(&app, &config);
+
+        let content = remote_runtime_on_ramp_text(Locale::En, &facts);
+
+        assert!(content.contains("active route lm-studio"), "{content}");
+        assert!(content.contains("--provider lm-studio"), "{content}");
+        assert!(!content.contains("--provider deepseek"), "{content}");
+    }
+
+    #[test]
     fn remote_runtime_on_ramp_is_localized_for_shipped_locales() {
         let facts = SetupRuntimeFacts {
             remote_clouds_result: "3 cloud targets: lighthouse, azure, digitalocean".to_string(),
@@ -4450,7 +4866,9 @@ mod tests {
         let text = lines_to_text(view.constitution_detail_lines());
 
         assert!(text.contains("user-global preferences only"));
-        assert!(text.contains("55-line core"));
+        // The en copy no longer claims a line count for the core (#4057 wave 2
+        // reword: the shipped core outgrew "55-line").
+        assert!(text.contains("bundled core"));
         assert!(text.contains("mode prompts"));
         assert!(text.contains("future opt-ins"));
     }
@@ -4823,6 +5241,7 @@ mod tests {
             (Locale::PtBr, "guiada por evidências"),
             (Locale::Es419, "basada en evidencia"),
             (Locale::Vi, "ưu tiên bằng chứng"),
+            (Locale::Ko, "근거 중심"),
         ];
         for (locale, marker) in markers {
             let body = guided_constitution_template(locale).render_body();
@@ -4838,7 +5257,7 @@ mod tests {
                 locale.tag()
             );
             assert!(
-                !body.contains("A CodeWhale user who wants"),
+                !body.contains("A Codewhale user who wants"),
                 "locale {} reused English purpose copy",
                 locale.tag()
             );
@@ -4876,18 +5295,19 @@ mod tests {
         assert!(english.contains("powers and limits rather than deciding every case"));
         assert!(english.contains("but it is not memory"));
         assert!(zh_hans.contains("<codewhale_user_constitution"));
-        assert!(zh_hans.contains("按 G 批准并保存"));
-        assert!(zh_hans.contains("它界定权力与边界"));
+        assert!(zh_hans.contains("按 G 确认并保存"));
+        assert!(zh_hans.contains("它界定协作方式与行为边界"));
         assert!(zh_hans.contains("但它不是记忆"));
         assert_ne!(english, zh_hans);
 
         let localized_markers = [
             (Locale::Ja, "権限の階層"),
-            (Locale::ZhHans, "精简核心与可选模块"),
+            (Locale::ZhHans, "精简核心与可选策略"),
             (Locale::ZhHant, "精簡核心與可選模組"),
             (Locale::PtBr, "NÚCLEO REDUZIDO E MÓDULOS OPT-IN"),
             (Locale::Es419, "NÚCLEO REDUCIDO Y MÓDULOS OPT-IN"),
             (Locale::Vi, "LÕI RÚT GỌN VÀ MÔ-ĐUN OPT-IN"),
+            (Locale::Ko, "축소된 코어와 옵트인 모듈"),
         ];
         for (locale, marker) in localized_markers {
             let content = constitution_ratification_text(
@@ -4942,7 +5362,7 @@ mod tests {
             &DraftProvenance::Model("GLM-5.2".to_string()),
         );
         assert!(drafted.contains("Drafted by GLM-5.2"));
-        assert!(drafted.contains("schema-checked and bounded by CodeWhale"));
+        assert!(drafted.contains("schema-checked and bounded by Codewhale"));
 
         let zh = constitution_ratification_text(
             Locale::ZhHans,
@@ -5388,6 +5808,55 @@ mod tests {
     }
 
     #[test]
+    fn observed_provider_failure_records_needs_action_not_verified() {
+        let _guard = crate::test_support::lock_test_env();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let codewhale_home = tmp.path().join(".codewhale");
+        let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
+        let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path());
+        let _codewhale_home =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home);
+        let _deepseek_env = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
+        let config = Config {
+            api_key: Some("saved-deepseek-key".to_string()),
+            ..Default::default()
+        };
+        let mut app = App::new(setup_test_options(workspace), &config);
+        app.api_provider = crate::config::ApiProvider::Deepseek;
+        app.model = "deepseek-v4-pro".to_string();
+        app.provider_health.record_failure_message(
+            &config,
+            crate::config::ApiProvider::Deepseek,
+            "deepseek-v4-pro",
+            crate::error_taxonomy::ErrorCategory::Authentication,
+            "credential rejected",
+        );
+
+        let facts = SetupRuntimeFacts::from_app_config(&app, &config);
+        assert!(!facts.provider_ready);
+        assert!(facts.auth.contains("last check failed"), "{}", facts.auth);
+        assert!(facts.provider_result.contains("health=needs action"));
+
+        let mut view = SetupWizardView::new_at_with_facts(
+            SetupState::default(),
+            Locale::En,
+            SetupStep::ProviderModel,
+            facts,
+        );
+        let ViewAction::Emit(ViewEvent::SetupStateCommitRequested { state, .. }) =
+            view.handle_key(key(KeyCode::Enter))
+        else {
+            panic!("expected setup-state commit event");
+        };
+        assert_eq!(
+            state.status(SetupStep::ProviderModel),
+            StepStatus::NeedsAction
+        );
+    }
+
+    #[test]
     fn runtime_posture_review_confirms_without_config_mutation() {
         let facts = SetupRuntimeFacts {
             runtime_result: "intent=agent, approval=suggest, shell=enabled, trust=workspace, sandbox=default, network=prompt by default".to_string(),
@@ -5519,7 +5988,7 @@ mod tests {
 
         assert!(text.contains("Selected preset:"));
         assert!(text.contains("Normal agent"));
-        assert!(text.contains("settings.default_mode: agent -> agent"));
+        assert!(text.contains("settings.default_mode: agent -> act"));
         assert!(text.contains("config.allow_shell: true -> true"));
         assert!(text.contains("Safety floor:"));
         assert!(text.contains("Press A to preview"));
@@ -5693,7 +6162,7 @@ mod tests {
     #[test]
     fn tools_mcp_detail_lines_show_read_only_inventory_facts() {
         let facts = SetupRuntimeFacts {
-            tools_mcp_servers_result: "healthy — 2 configured (2 healthy, 0 needs_config, 0 off; global present at /tmp/mcp.json; project missing at /tmp/project/.codewhale/mcp.json); healthy: docs, search".to_string(),
+            tools_mcp_servers_result: "configured — 2 configured (2 configuration valid, 0 needs_config, 0 off; global present at /tmp/mcp.json; project missing at /tmp/project/.codewhale/mcp.json); live health not checked — servers not started; configuration valid: docs, search".to_string(),
             tools_mcp_skills_result: "healthy — 3 discovered (hotbar skill sources), 3 on disk at /tmp/skills".to_string(),
             tools_mcp_tools_result: "healthy — 1 entries, 0 script-plugin tools at /tmp/tools".to_string(),
             tools_mcp_plugins_result: "off — nothing configured yet (missing at /tmp/plugins); optional".to_string(),
@@ -5710,7 +6179,8 @@ mod tests {
         let text = lines_to_text(view.tools_mcp_detail_lines());
 
         assert!(text.contains("MCP servers:"));
-        assert!(text.contains("healthy"));
+        assert!(text.contains("configured"));
+        assert!(text.contains("live health not checked"));
         assert!(text.contains("/tmp/mcp.json"));
         assert!(text.contains("/tmp/project/.codewhale/mcp.json"));
         assert!(text.contains("Skills:"));
@@ -6022,10 +6492,11 @@ mod tests {
             panic!("first apply should preview the exact diff");
         };
         assert!(content.contains("Runtime Posture Preset Preview"));
-        assert!(content.contains("settings.default_mode: agent -> yolo"));
+        assert!(content.contains("settings.default_mode: agent -> act + full-access"));
         assert!(content.contains(
-            "config.approval_policy: never -> unchanged; YOLO derives bypass from default_mode"
+            "config.approval_policy: never -> removed; Full Access comes from settings.permission_posture"
         ));
+        assert!(content.contains("settings.permission_posture: -> full-access"));
         assert!(content.contains("config.network.default: deny -> unchanged"));
 
         let action = view.handle_key(key(KeyCode::Char('a')));
@@ -6050,7 +6521,7 @@ mod tests {
                 .and_then(|entry| entry.result.as_deref())
                 .is_some_and(|result| {
                     result.contains("preset=high-trust-local")
-                        && result.contains("default_mode=yolo")
+                        && result.contains("default_mode=act + full-access")
                         && result.contains("network=unchanged")
                 })
         );

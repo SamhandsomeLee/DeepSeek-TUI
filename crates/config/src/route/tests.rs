@@ -1,10 +1,12 @@
 //! Behavior tests for the route foundation (#2608 / #3084 / #3384).
 
-use super::RequestProtocol;
 use super::descriptor::ProviderDescriptor;
 use super::errors::RouteError;
 use super::ids::{LogicalModelRef, ModelId, NamespaceHint, ProviderId, WireModelId};
 use super::resolver::{RouteRequest, RouteResolver};
+use super::{
+    LimitField, OverrideSource, RequestProtocol, ResolvedAuthSource, SourcedLimitOverride,
+};
 use crate::ProviderKind;
 use crate::models_dev::ModelsDevCatalog;
 
@@ -15,6 +17,7 @@ fn req(provider: Option<ProviderKind>, model: Option<&str>) -> RouteRequest {
         model_selector: model.map(LogicalModelRef::from),
         saved_provider_model: None,
         base_url_override: None,
+        limit_overrides: Vec::new(),
     }
 }
 
@@ -133,6 +136,122 @@ fn newtypes_serialize_transparently() {
 }
 
 #[test]
+fn resolver_reports_auth_as_unresolved_until_preflight() {
+    let candidate = RouteResolver::new()
+        .resolve(&req(Some(ProviderKind::Deepseek), Some("deepseek-v4-pro")))
+        .expect("route resolves");
+
+    assert_eq!(candidate.auth(), &ResolvedAuthSource::Unresolved);
+    assert_eq!(
+        serde_json::to_value(&candidate).expect("candidate serializes")["auth"],
+        "unresolved"
+    );
+}
+
+#[test]
+fn resolver_applies_every_limit_override_field_before_construction() {
+    let mut request = req(Some(ProviderKind::Deepseek), Some("deepseek-v4-pro"));
+    request.limit_overrides = vec![
+        SourcedLimitOverride {
+            field: LimitField::ContextTokens,
+            value: Some(111),
+            source: OverrideSource::UserContextWindow,
+        },
+        SourcedLimitOverride {
+            field: LimitField::InputTokens,
+            value: Some(222),
+            source: OverrideSource::CodexPublicApiLimitStrip,
+        },
+        SourcedLimitOverride {
+            field: LimitField::OutputTokens,
+            value: Some(333),
+            source: OverrideSource::CodexRosterCorrection,
+        },
+    ];
+
+    let candidate = RouteResolver::new()
+        .resolve(&request)
+        .expect("route with overrides resolves");
+
+    assert_eq!(candidate.limits().context_tokens, Some(111));
+    assert_eq!(candidate.limits().input_tokens, Some(222));
+    assert_eq!(candidate.limits().output_tokens, Some(333));
+}
+
+#[test]
+fn resolver_applies_repeated_limit_overrides_in_request_order() {
+    let mut request = req(Some(ProviderKind::Deepseek), Some("deepseek-v4-pro"));
+    request.limit_overrides = vec![
+        SourcedLimitOverride {
+            field: LimitField::ContextTokens,
+            value: Some(111),
+            source: OverrideSource::CodexRosterCorrection,
+        },
+        SourcedLimitOverride {
+            field: LimitField::ContextTokens,
+            value: None,
+            source: OverrideSource::CodexPublicApiLimitStrip,
+        },
+        SourcedLimitOverride {
+            field: LimitField::ContextTokens,
+            value: Some(333),
+            source: OverrideSource::UserContextWindow,
+        },
+    ];
+
+    let candidate = RouteResolver::new()
+        .resolve(&request)
+        .expect("route with ordered overrides resolves");
+
+    assert_eq!(candidate.limits().context_tokens, Some(333));
+}
+
+#[test]
+fn resolver_records_exact_limit_override_provenance() {
+    let overrides = vec![
+        SourcedLimitOverride {
+            field: LimitField::InputTokens,
+            value: None,
+            source: OverrideSource::CodexPublicApiLimitStrip,
+        },
+        SourcedLimitOverride {
+            field: LimitField::ContextTokens,
+            value: Some(128_000),
+            source: OverrideSource::CodexRosterCorrection,
+        },
+    ];
+    let mut request = req(Some(ProviderKind::OpenaiCodex), None);
+    request.limit_overrides = overrides.clone();
+
+    let candidate = RouteResolver::new()
+        .resolve(&request)
+        .expect("Codex route with sourced overrides resolves");
+
+    assert_eq!(candidate.applied_limit_overrides(), overrides.as_slice());
+}
+
+#[test]
+fn resolved_auth_source_existing_variants_keep_wire_compatibility() {
+    let cases = [
+        (ResolvedAuthSource::Cli, "cli"),
+        (ResolvedAuthSource::ConfigFile, "config_file"),
+        (ResolvedAuthSource::Keyring, "keyring"),
+        (ResolvedAuthSource::Env, "env"),
+        (ResolvedAuthSource::Command, "command"),
+        (ResolvedAuthSource::Secret, "secret"),
+        (ResolvedAuthSource::Missing, "missing"),
+    ];
+
+    for (source, wire) in cases {
+        let encoded = serde_json::to_string(&source).expect("auth source serializes");
+        assert_eq!(encoded, format!("\"{wire}\""));
+        let decoded: ResolvedAuthSource =
+            serde_json::from_str(&encoded).expect("auth source deserializes");
+        assert_eq!(decoded, source);
+    }
+}
+
+#[test]
 fn descriptor_for_every_kind_has_nonempty_transport_facts() {
     for kind in ProviderKind::ALL {
         let d = ProviderDescriptor::for_kind(kind);
@@ -161,9 +280,10 @@ fn descriptor_protocol_matches_provider_wire() {
         );
         let expected = match kind {
             ProviderKind::OpenaiCodex => RequestProtocol::Responses,
-            ProviderKind::DeepseekAnthropic | ProviderKind::Anthropic | ProviderKind::Openmodel => {
-                RequestProtocol::AnthropicMessages
-            }
+            ProviderKind::DeepseekAnthropic
+            | ProviderKind::Anthropic
+            | ProviderKind::MinimaxAnthropic
+            | ProviderKind::Openmodel => RequestProtocol::AnthropicMessages,
             _ => RequestProtocol::ChatCompletions,
         };
         assert_eq!(d.protocol(), expected, "{kind:?} protocol mismatch");
@@ -176,10 +296,10 @@ fn resolver_explicit_provider_scoped_model_maps_to_wire_id() {
     let out = r
         .resolve(&req(Some(ProviderKind::Deepseek), Some("deepseek-v4-pro")))
         .expect("should resolve");
-    assert_eq!(out.provider_kind, ProviderKind::Deepseek);
-    assert_eq!(out.wire_model_id.as_str(), "deepseek-v4-pro");
+    assert_eq!(out.provider_kind(), ProviderKind::Deepseek);
+    assert_eq!(out.wire_model_id().as_str(), "deepseek-v4-pro");
     assert_eq!(
-        out.canonical_model.as_ref().map(ModelId::as_str),
+        out.canonical_model().map(ModelId::as_str),
         Some("deepseek-v4-pro")
     );
 }
@@ -194,10 +314,10 @@ fn resolver_aggregator_preserves_prefixed_wire_id_without_inferring_deepseek() {
         ))
         .expect("aggregator should resolve");
     // Provider stays Together, NOT Deepseek, despite the deepseek-ai/ prefix.
-    assert_eq!(out.provider_kind, ProviderKind::Together);
-    assert_ne!(out.provider_kind, ProviderKind::Deepseek);
+    assert_eq!(out.provider_kind(), ProviderKind::Together);
+    assert_ne!(out.provider_kind(), ProviderKind::Deepseek);
     // Wire id preserved verbatim.
-    assert_eq!(out.wire_model_id.as_str(), "deepseek-ai/DeepSeek-V4-Pro");
+    assert_eq!(out.wire_model_id().as_str(), "deepseek-ai/DeepSeek-V4-Pro");
 }
 
 #[test]
@@ -222,11 +342,11 @@ fn resolver_openrouter_keeps_provider_for_every_namespace_prefix() {
             .unwrap_or_else(|e| panic!("{raw} should resolve on openrouter: {e}"));
         // ...but the provider stays Openrouter regardless.
         assert_eq!(
-            out.provider_kind,
+            out.provider_kind(),
             ProviderKind::Openrouter,
             "{raw} must not change provider"
         );
-        assert_eq!(out.wire_model_id.as_str(), raw, "{raw} wire id verbatim");
+        assert_eq!(out.wire_model_id().as_str(), raw, "{raw} wire id verbatim");
     }
 }
 
@@ -253,10 +373,10 @@ fn resolver_auto_is_sentinel_not_literal_model() {
         .resolve(&req(Some(ProviderKind::Deepseek), Some("auto")))
         .expect("auto should resolve");
     // The logical selector is the auto sentinel...
-    assert!(out.logical_model.is_auto());
+    assert!(out.logical_model().is_auto());
     // ...and "auto" is NOT put on the wire as a literal model.
-    assert_ne!(out.wire_model_id.as_str(), "auto");
-    assert_eq!(out.wire_model_id.as_str(), "deepseek-v4-pro");
+    assert_ne!(out.wire_model_id().as_str(), "auto");
+    assert_eq!(out.wire_model_id().as_str(), "deepseek-v4-pro");
 }
 
 #[test]
@@ -266,11 +386,11 @@ fn resolver_can_use_models_dev_offering_for_provider_scoped_route() {
         .resolve(&req(Some(ProviderKind::Zai), Some("glm-5.2")))
         .expect("Models.dev-backed Z.ai route should resolve");
 
-    assert_eq!(out.provider_kind, ProviderKind::Zai);
-    assert_eq!(out.provider_id.as_str(), "zai");
-    assert_eq!(out.wire_model_id.as_str(), "glm-5.2");
+    assert_eq!(out.provider_kind(), ProviderKind::Zai);
+    assert_eq!(out.provider_id().as_str(), "zai");
+    assert_eq!(out.wire_model_id().as_str(), "glm-5.2");
     assert_eq!(
-        out.canonical_model.as_ref().map(ModelId::as_str),
+        out.canonical_model().map(ModelId::as_str),
         Some("zhipuai/glm-5.2")
     );
 }
@@ -282,14 +402,14 @@ fn resolver_auto_uses_models_dev_default_offering_when_available() {
         .resolve(&req(Some(ProviderKind::Zai), Some("auto")))
         .expect("auto should resolve through catalog default");
 
-    assert!(out.logical_model.is_auto());
+    assert!(out.logical_model().is_auto());
     assert_eq!(
-        out.wire_model_id.as_str(),
+        out.wire_model_id().as_str(),
         "glm-5.2",
         "catalog default should win over the built-in Z.ai spelling"
     );
     assert_eq!(
-        out.canonical_model.as_ref().map(ModelId::as_str),
+        out.canonical_model().map(ModelId::as_str),
         Some("zhipuai/glm-5.2")
     );
 }
@@ -321,14 +441,15 @@ fn resolver_auto_falls_back_to_descriptor_default_without_catalog_default() {
         .resolve(&req(Some(ProviderKind::Zai), Some("auto")))
         .expect("auto should resolve to the descriptor default");
 
-    assert!(out.logical_model.is_auto());
+    assert!(out.logical_model().is_auto());
     assert_eq!(
-        out.wire_model_id.as_str(),
+        out.wire_model_id().as_str(),
         "GLM-5.2",
         "no catalog default → descriptor built-in default wins"
     );
     assert_eq!(
-        out.canonical_model, None,
+        out.canonical_model(),
+        None,
         "descriptor fallback carries no catalog canonical link"
     );
 }
@@ -340,11 +461,11 @@ fn resolver_models_dev_prefixed_wire_id_stays_inside_provider_scope() {
         .resolve(&req(Some(ProviderKind::Openrouter), Some("z-ai/glm-5.2")))
         .expect("OpenRouter Models.dev row should resolve");
 
-    assert_eq!(out.provider_kind, ProviderKind::Openrouter);
-    assert_ne!(out.provider_kind, ProviderKind::Zai);
-    assert_eq!(out.wire_model_id.as_str(), "z-ai/glm-5.2");
+    assert_eq!(out.provider_kind(), ProviderKind::Openrouter);
+    assert_ne!(out.provider_kind(), ProviderKind::Zai);
+    assert_eq!(out.wire_model_id().as_str(), "z-ai/glm-5.2");
     assert_eq!(
-        out.canonical_model.as_ref().map(ModelId::as_str),
+        out.canonical_model().map(ModelId::as_str),
         Some("zhipuai/glm-5.2")
     );
 }
@@ -356,10 +477,34 @@ fn resolver_carries_models_dev_limits_into_ready_candidate() {
         .resolve(&req(Some(ProviderKind::Zai), Some("glm-5.2")))
         .expect("Z.AI Models.dev row should resolve");
 
-    assert_eq!(out.limits.context_tokens, Some(1_000_000));
-    assert_eq!(out.limits.input_tokens, Some(900_000));
-    assert_eq!(out.limits.output_tokens, Some(131_072));
-    assert!(out.limits.has_known_limit());
+    assert_eq!(out.limits().context_tokens, Some(1_000_000));
+    assert_eq!(out.limits().input_tokens, Some(900_000));
+    assert_eq!(out.limits().output_tokens, Some(131_072));
+    assert!(out.limits().has_known_limit());
+}
+
+#[test]
+fn minimax_anthropic_routes_use_catalog_limits_and_messages_protocol() {
+    let resolver = RouteResolver::new();
+
+    for (model, context) in [("MiniMax-M3", 1_000_000), ("MiniMax-M2.7", 204_800)] {
+        let route = resolver
+            .resolve(&req(Some(ProviderKind::MinimaxAnthropic), Some(model)))
+            .expect("MiniMax Messages route should resolve");
+
+        assert_eq!(route.provider_kind(), ProviderKind::MinimaxAnthropic);
+        assert_eq!(route.wire_model_id().as_str(), model);
+        assert_eq!(route.protocol(), RequestProtocol::AnthropicMessages);
+        assert_eq!(
+            route.endpoint().protocol,
+            RequestProtocol::AnthropicMessages
+        );
+        assert_eq!(
+            route.endpoint().base_url,
+            "https://api.minimax.io/anthropic"
+        );
+        assert_eq!(route.limits().context_tokens, Some(context));
+    }
 }
 
 #[test]
@@ -373,12 +518,12 @@ fn resolver_keeps_limits_provider_scoped_for_same_canonical_model() {
         .expect("hosted OpenRouter route should resolve");
 
     assert_eq!(
-        direct.canonical_model.as_ref().map(ModelId::as_str),
-        hosted.canonical_model.as_ref().map(ModelId::as_str)
+        direct.canonical_model().map(ModelId::as_str),
+        hosted.canonical_model().map(ModelId::as_str)
     );
-    assert_eq!(direct.limits.context_tokens, Some(1_000_000));
-    assert_eq!(hosted.limits.context_tokens, Some(128_000));
-    assert_eq!(hosted.limits.output_tokens, Some(32_768));
+    assert_eq!(direct.limits().context_tokens, Some(1_000_000));
+    assert_eq!(hosted.limits().context_tokens, Some(128_000));
+    assert_eq!(hosted.limits().output_tokens, Some(32_768));
 }
 
 #[test]
@@ -415,13 +560,55 @@ fn resolver_custom_endpoint_allows_namespaced_selector_for_strict_provider() {
         model_selector: Some(LogicalModelRef::from("vendor/custom-coder")),
         saved_provider_model: None,
         base_url_override: Some("https://example.local/v1".to_string()),
+        limit_overrides: Vec::new(),
     };
     let out = r
         .resolve(&request)
         .expect("custom endpoint should defer model validation upstream");
-    assert_eq!(out.provider_kind, ProviderKind::Deepseek);
-    assert_eq!(out.wire_model_id.as_str(), "vendor/custom-coder");
-    assert_eq!(out.endpoint.base_url, "https://example.local/v1");
+    assert_eq!(out.provider_kind(), ProviderKind::Deepseek);
+    assert_eq!(out.wire_model_id().as_str(), "vendor/custom-coder");
+    assert_eq!(out.endpoint().base_url, "https://example.local/v1");
+}
+
+#[test]
+fn resolver_treats_every_official_deepseek_endpoint_as_strict_direct() {
+    let resolver = RouteResolver::new();
+    for base_url in [
+        "https://api.deepseek.com",
+        "https://api.deepseek.com/v1/",
+        "https://api.deepseek.com/beta",
+    ] {
+        let request = RouteRequest {
+            explicit_provider: Some(ProviderKind::Deepseek),
+            model_selector: Some(LogicalModelRef::from("anthropic/claude-foo")),
+            saved_provider_model: None,
+            base_url_override: Some(base_url.to_string()),
+            limit_overrides: Vec::new(),
+        };
+        assert!(
+            matches!(
+                resolver.resolve(&request),
+                Err(RouteError::ForeignModelForDirectProvider { .. })
+            ),
+            "official endpoint {base_url} must retain DeepSeek's strict namespace"
+        );
+    }
+}
+
+#[test]
+fn resolver_does_not_trust_deepseek_hostname_substrings() {
+    let resolver = RouteResolver::new();
+    let request = RouteRequest {
+        explicit_provider: Some(ProviderKind::Deepseek),
+        model_selector: Some(LogicalModelRef::from("vendor/custom-coder")),
+        saved_provider_model: None,
+        base_url_override: Some("https://api.deepseek.com.evil.example/v1".to_string()),
+        limit_overrides: Vec::new(),
+    };
+    let route = resolver
+        .resolve(&request)
+        .expect("lookalike host must be treated as a custom endpoint");
+    assert_eq!(route.wire_model_id().as_str(), "vendor/custom-coder");
 }
 
 #[test]
@@ -435,17 +622,21 @@ fn resolver_explicit_custom_with_base_url_override_passes_model_through_verbatim
         model_selector: Some(LogicalModelRef::from("vendor/custom-model-v1")),
         saved_provider_model: None,
         base_url_override: Some("https://api.example.com/v1".to_string()),
+        limit_overrides: Vec::new(),
     };
     let out = r
         .resolve(&request)
         .expect("custom provider should resolve via pass-through");
-    assert_eq!(out.provider_kind, ProviderKind::Custom);
-    assert_eq!(out.provider_id.as_str(), "custom");
-    assert_eq!(out.wire_model_id.as_str(), "vendor/custom-model-v1");
-    assert_eq!(out.endpoint.base_url, "https://api.example.com/v1");
-    assert_eq!(out.protocol, crate::route::RequestProtocol::ChatCompletions);
-    assert!(out.validation.ok);
-    assert!(out.validation.messages.is_empty());
+    assert_eq!(out.provider_kind(), ProviderKind::Custom);
+    assert_eq!(out.provider_id().as_str(), "custom");
+    assert_eq!(out.wire_model_id().as_str(), "vendor/custom-model-v1");
+    assert_eq!(out.endpoint().base_url, "https://api.example.com/v1");
+    assert_eq!(
+        out.protocol(),
+        crate::route::RequestProtocol::ChatCompletions
+    );
+    assert!(out.validation().ok);
+    assert!(out.validation().messages.is_empty());
 }
 
 #[test]
@@ -477,23 +668,29 @@ fn default_resolver_yields_real_facts_from_bundled_catalog() {
     let glm = r
         .resolve(&req(Some(ProviderKind::Zai), Some("GLM-5.2")))
         .expect("Z.ai GLM-5.2 should resolve from the bundled catalog");
-    assert_eq!(glm.provider_kind, ProviderKind::Zai);
-    assert_eq!(glm.wire_model_id.as_str(), "GLM-5.2");
+    assert_eq!(glm.provider_kind(), ProviderKind::Zai);
+    assert_eq!(glm.wire_model_id().as_str(), "GLM-5.2");
     assert_eq!(
-        glm.limits.context_tokens,
+        glm.limits().context_tokens,
         Some(1_000_000),
         "GLM-5.2 must carry its real context window, not the unknown default"
     );
-    assert_eq!(glm.limits.output_tokens, Some(131_072));
-    assert!(glm.limits.has_known_limit());
+    assert_eq!(glm.limits().output_tokens, Some(131_072));
+    assert!(glm.limits().has_known_limit());
 
     // A Kimi row (Moonshot) likewise resolves with its real window — a model
     // the 4-row seam never knew about at all.
-    let kimi = r
+    let kimi_k27 = r
         .resolve(&req(Some(ProviderKind::Moonshot), Some("kimi-k2.7-code")))
         .expect("Moonshot kimi-k2.7-code should resolve from the bundled catalog");
-    assert_eq!(kimi.limits.context_tokens, Some(262_144));
-    assert_eq!(kimi.limits.output_tokens, Some(262_144));
+    assert_eq!(kimi_k27.limits().context_tokens, Some(262_144));
+    assert_eq!(kimi_k27.limits().output_tokens, Some(262_144));
+
+    let kimi_k3 = r
+        .resolve(&req(Some(ProviderKind::Moonshot), Some("kimi-k3")))
+        .expect("Moonshot kimi-k3 should resolve from the bundled catalog");
+    assert_eq!(kimi_k3.limits().context_tokens, Some(1_048_576));
+    assert_eq!(kimi_k3.limits().output_tokens, Some(131_072));
 
     // With the #3085 pricing keystone present on the release branch, the asset's
     // provider-scoped `cost` now projects onto the candidate via
@@ -503,9 +700,9 @@ fn default_resolver_yields_real_facts_from_bundled_catalog() {
     let glm51 = r
         .resolve(&req(Some(ProviderKind::Zai), Some("glm-5.1")))
         .expect("Z.ai glm-5.1 should resolve from the bundled catalog");
-    assert_eq!(glm51.limits.context_tokens, Some(202_752));
+    assert_eq!(glm51.limits().context_tokens, Some(202_752));
     assert!(matches!(
-        glm51.pricing,
+        glm51.pricing(),
         Some(super::candidate::PricingSku::Token { .. })
     ));
 }
@@ -523,7 +720,7 @@ fn default_resolver_preserves_seam_canonical_joins() {
         .resolve(&req(Some(ProviderKind::Deepseek), Some("deepseek-v4-pro")))
         .expect("deepseek-v4-pro resolves");
     assert_eq!(
-        direct.canonical_model.as_ref().map(ModelId::as_str),
+        direct.canonical_model().map(ModelId::as_str),
         Some("deepseek-v4-pro")
     );
 
@@ -534,11 +731,150 @@ fn default_resolver_preserves_seam_canonical_joins() {
         ))
         .expect("together hosted deepseek resolves");
     assert_eq!(
-        hosted.canonical_model.as_ref().map(ModelId::as_str),
+        hosted.canonical_model().map(ModelId::as_str),
         Some("deepseek-v4-pro"),
         "seam canonical join must survive the asset merge"
     );
-    assert_eq!(hosted.wire_model_id.as_str(), "deepseek-ai/DeepSeek-V4-Pro");
+    assert_eq!(
+        hosted.wire_model_id().as_str(),
+        "deepseek-ai/DeepSeek-V4-Pro"
+    );
+}
+
+#[test]
+fn together_inkling_aliases_use_the_exact_wire_identity_without_invented_metadata() {
+    let resolver = RouteResolver::new();
+
+    for requested in ["inkling", "together-inkling", "thinkingmachines/inkling"] {
+        let route = resolver
+            .resolve(&req(Some(ProviderKind::Together), Some(requested)))
+            .expect("Together Inkling route should resolve");
+        assert_eq!(route.provider_kind(), ProviderKind::Together, "{requested}");
+        assert_eq!(
+            route.wire_model_id().as_str(),
+            "thinkingmachines/inkling",
+            "{requested}"
+        );
+        assert!(route.canonical_model().is_none(), "{requested}");
+        assert!(!route.limits().has_known_limit(), "{requested}");
+        assert!(matches!(
+            route.pricing(),
+            Some(super::candidate::PricingSku::UnknownOrStale)
+        ));
+    }
+}
+
+#[test]
+fn together_custom_endpoint_preserves_its_explicit_model_id() {
+    let resolver = RouteResolver::new();
+    let route = resolver
+        .resolve(&RouteRequest {
+            explicit_provider: Some(ProviderKind::Together),
+            model_selector: Some(LogicalModelRef::from("inkling")),
+            saved_provider_model: None,
+            base_url_override: Some("http://127.0.0.1:8000/v1".to_string()),
+            limit_overrides: Vec::new(),
+        })
+        .expect("custom Together-compatible endpoint should resolve");
+
+    assert_eq!(route.wire_model_id().as_str(), "inkling");
+}
+
+#[test]
+fn openrouter_qwen37_plus_aliases_use_exact_catalog_wire_identity() {
+    let resolver = RouteResolver::new();
+
+    for requested in ["qwen3.7-plus", "qwen-3.7-plus", "qwen/qwen3.7-plus"] {
+        let route = resolver
+            .resolve(&req(Some(ProviderKind::Openrouter), Some(requested)))
+            .expect("OpenRouter Qwen 3.7 Plus route should resolve");
+        assert_eq!(route.wire_model_id().as_str(), "qwen/qwen3.7-plus");
+        assert!(!route.limits().has_known_limit());
+        assert!(matches!(
+            route.pricing(),
+            Some(super::candidate::PricingSku::Token {
+                input_per_mtok: Some(_),
+                output_per_mtok: Some(_)
+            })
+        ));
+    }
+}
+
+#[test]
+fn openrouter_custom_endpoint_preserves_qwen37_alias() {
+    let route = RouteResolver::new()
+        .resolve(&RouteRequest {
+            explicit_provider: Some(ProviderKind::Openrouter),
+            model_selector: Some(LogicalModelRef::from("qwen3.7-plus")),
+            saved_provider_model: None,
+            base_url_override: Some("https://gateway.example.test/v1".to_string()),
+            limit_overrides: Vec::new(),
+        })
+        .expect("custom OpenRouter-compatible endpoint should resolve");
+
+    assert_eq!(route.wire_model_id().as_str(), "qwen3.7-plus");
+}
+
+#[test]
+fn opencode_go_resolver_accepts_only_chat_completions_models() {
+    let resolver = RouteResolver::new();
+    let chat_models = crate::OPENCODE_GO_CHAT_MODELS;
+    assert!(chat_models.contains(&"grok-4.5"));
+    assert!(chat_models.contains(&"kimi-k3"));
+
+    for &model in chat_models {
+        for requested in [model.to_string(), format!("opencode-go/{model}")] {
+            let route = resolver
+                .resolve(&req(Some(ProviderKind::OpencodeGo), Some(&requested)))
+                .unwrap_or_else(|error| panic!("{requested} should resolve: {error}"));
+            assert_eq!(
+                route.provider_kind(),
+                ProviderKind::OpencodeGo,
+                "{requested}"
+            );
+            assert_eq!(route.wire_model_id().as_str(), model, "{requested}");
+        }
+    }
+
+    let automatic = resolver
+        .resolve(&req(Some(ProviderKind::OpencodeGo), Some("auto")))
+        .expect("OpenCode Go auto should resolve to its Chat default");
+    assert_eq!(automatic.wire_model_id().as_str(), "deepseek-v4-pro");
+}
+
+#[test]
+fn opencode_go_resolver_rejects_messages_models_even_on_custom_base_urls() {
+    let resolver = RouteResolver::new();
+    let messages_models = [
+        "minimax-m3",
+        "minimax-m2.7",
+        "minimax-m2.5",
+        "qwen3.7-max",
+        "qwen3.7-plus",
+        "qwen3.6-plus",
+    ];
+
+    for model in messages_models {
+        for requested in [model.to_string(), format!("opencode-go/{model}")] {
+            for base_url_override in [None, Some("https://go-gateway.example.test/v1".to_string())]
+            {
+                let request = RouteRequest {
+                    explicit_provider: Some(ProviderKind::OpencodeGo),
+                    model_selector: Some(LogicalModelRef::from(requested.as_str())),
+                    saved_provider_model: None,
+                    base_url_override,
+                    limit_overrides: Vec::new(),
+                };
+                assert!(
+                    matches!(
+                        resolver.resolve(&request),
+                        Err(RouteError::ForeignModelForDirectProvider { .. })
+                    ),
+                    "{requested} must not reach OpenCode Go Chat Completions"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -547,8 +883,8 @@ fn resolver_deepseek_none_selector_uses_default_wire_id() {
     let out = r
         .resolve(&req(Some(ProviderKind::Deepseek), None))
         .expect("none selector should use provider default");
-    assert_eq!(out.provider_kind, ProviderKind::Deepseek);
-    assert_eq!(out.wire_model_id.as_str(), "deepseek-v4-pro");
+    assert_eq!(out.provider_kind(), ProviderKind::Deepseek);
+    assert_eq!(out.wire_model_id().as_str(), "deepseek-v4-pro");
 }
 
 #[test]
@@ -568,6 +904,7 @@ fn resolver_empty_saved_provider_model_is_empty_model_error() {
         model_selector: None,
         saved_provider_model: Some(WireModelId::from("")),
         base_url_override: None,
+        limit_overrides: Vec::new(),
     };
     assert!(matches!(r.resolve(&request), Err(RouteError::EmptyModel)));
 }
@@ -578,10 +915,10 @@ fn resolver_passthrough_provider_preserves_custom_id_verbatim() {
     let out = r
         .resolve(&req(Some(ProviderKind::Ollama), Some("my-local:7b")))
         .expect("local passthrough should resolve");
-    assert_eq!(out.provider_kind, ProviderKind::Ollama);
-    assert_eq!(out.wire_model_id.as_str(), "my-local:7b");
-    assert_eq!(out.limits, Default::default());
-    assert!(out.validation.ok);
+    assert_eq!(out.provider_kind(), ProviderKind::Ollama);
+    assert_eq!(out.wire_model_id().as_str(), "my-local:7b");
+    assert_eq!(out.limits(), Default::default());
+    assert!(out.validation().ok);
 }
 
 #[test]
@@ -634,12 +971,13 @@ fn resolver_protocol_matches_descriptor_for_every_provider() {
             .resolve(&request)
             .unwrap_or_else(|e| panic!("{kind:?} should resolve its own default: {e}"));
         assert_eq!(
-            out.protocol,
+            out.protocol(),
             ProviderDescriptor::for_kind(kind).protocol(),
             "{kind:?} candidate protocol must match descriptor"
         );
         assert_eq!(
-            out.endpoint.protocol, out.protocol,
+            out.endpoint().protocol,
+            out.protocol(),
             "{kind:?} endpoint protocol"
         );
     }
@@ -674,6 +1012,78 @@ fn priced_deepseek_resolver() -> RouteResolver {
 }
 
 #[test]
+fn resolver_carries_exact_offering_capabilities_without_protocol_inference() {
+    use crate::catalog::{CatalogOffering, CatalogSource};
+    use crate::route::CapabilityState;
+
+    let offering = CatalogOffering {
+        provider: "deepseek".into(),
+        wire_model_id: "deepseek-v4-pro".into(),
+        canonical_model: Some("deepseek-v4-pro".into()),
+        endpoint_key: "chat".into(),
+        default_for_provider: true,
+        attachment: Some(false),
+        reasoning: Some(true),
+        tool_call: Some(false),
+        structured_output: Some(true),
+        source: CatalogSource::Bundled,
+        ..Default::default()
+    };
+    let resolver = RouteResolver::from_offerings(vec![offering.to_offering()]);
+
+    let candidate = resolver
+        .resolve(&req(Some(ProviderKind::Deepseek), Some("deepseek-v4-pro")))
+        .expect("matching offering resolves");
+    let capabilities = candidate.capabilities();
+
+    assert_eq!(capabilities.attachments, CapabilityState::Unsupported);
+    assert_eq!(capabilities.reasoning, CapabilityState::Supported);
+    assert_eq!(capabilities.native_tool_calls, CapabilityState::Unsupported);
+    assert_eq!(capabilities.structured_output, CapabilityState::Supported);
+    assert_eq!(capabilities.streaming, CapabilityState::Unknown);
+    assert_eq!(
+        capabilities.server_side_web_search,
+        CapabilityState::Unknown
+    );
+}
+
+#[test]
+fn provider_native_web_search_requires_exact_direct_endpoint_offering() {
+    use crate::route::CapabilityState;
+
+    let resolver = RouteResolver::new();
+    let direct = resolver
+        .resolve(&req(Some(ProviderKind::Xai), Some("grok-4.5")))
+        .expect("bundled direct xAI offering resolves");
+    assert_eq!(
+        direct.capabilities().server_side_web_search,
+        CapabilityState::Supported
+    );
+
+    let aggregator = resolver
+        .resolve(&req(Some(ProviderKind::OpencodeGo), Some("grok-4.5")))
+        .expect("aggregator offering resolves independently");
+    assert_eq!(
+        aggregator.capabilities().server_side_web_search,
+        CapabilityState::Unknown
+    );
+
+    let custom_endpoint = resolver
+        .resolve(&RouteRequest {
+            explicit_provider: Some(ProviderKind::Xai),
+            model_selector: Some(LogicalModelRef::from("grok-4.5")),
+            saved_provider_model: None,
+            base_url_override: Some("https://gateway.example.test/v1".to_string()),
+            limit_overrides: Vec::new(),
+        })
+        .expect("custom compatible endpoint resolves");
+    assert_eq!(
+        custom_endpoint.capabilities().server_side_web_search,
+        CapabilityState::Unknown
+    );
+}
+
+#[test]
 fn priced_offering_yields_token_pricing_sku() {
     use super::candidate::PricingSku;
 
@@ -682,13 +1092,13 @@ fn priced_offering_yields_token_pricing_sku() {
         .resolve(&req(Some(ProviderKind::Deepseek), Some("deepseek-v4-pro")))
         .expect("priced DeepSeek route should resolve");
 
-    match out.pricing {
+    match out.pricing() {
         Some(PricingSku::Token {
             input_per_mtok,
             output_per_mtok,
         }) => {
-            assert_eq!(input_per_mtok, Some(0.28));
-            assert_eq!(output_per_mtok, Some(0.42));
+            assert_eq!(*input_per_mtok, Some(0.28));
+            assert_eq!(*output_per_mtok, Some(0.42));
         }
         other => panic!("expected Some(Token), got {other:?}"),
     }
@@ -706,9 +1116,9 @@ fn unpriced_offering_stays_unknown() {
         .resolve(&req(Some(ProviderKind::Deepseek), Some("deepseek-v4-pro")))
         .expect("bundled DeepSeek route should resolve");
     assert!(
-        matches!(out.pricing, Some(PricingSku::UnknownOrStale)),
+        matches!(out.pricing(), Some(PricingSku::UnknownOrStale)),
         "bundled offering carries no price → UnknownOrStale, got {:?}",
-        out.pricing
+        out.pricing()
     );
 
     // A pass-through route with no matched offering is likewise unknown.
@@ -716,7 +1126,7 @@ fn unpriced_offering_stays_unknown() {
         .resolve(&req(Some(ProviderKind::Ollama), Some("my-local:7b")))
         .expect("local passthrough should resolve");
     assert!(matches!(
-        passthrough.pricing,
+        passthrough.pricing(),
         Some(PricingSku::UnknownOrStale)
     ));
 }
@@ -732,6 +1142,7 @@ fn req_with_base(provider: ProviderKind, model: &str, base_url: &str) -> RouteRe
         model_selector: Some(LogicalModelRef::from(model)),
         saved_provider_model: None,
         base_url_override: Some(base_url.to_string()),
+        limit_overrides: Vec::new(),
     }
 }
 
@@ -748,16 +1159,16 @@ fn http_custom_endpoint_emits_insecure_warning() {
 
     // Advisory only: the route stays usable.
     assert!(
-        out.validation.ok,
+        out.validation().ok,
         "insecure http is advisory, not a hard fail"
     );
     assert!(
-        out.validation
+        out.validation()
             .messages
             .iter()
             .any(|m| m.contains("insecure http")),
         "expected an insecure-http advisory, got {:?}",
-        out.validation.messages
+        out.validation().messages
     );
 }
 
@@ -773,11 +1184,11 @@ fn loopback_http_endpoint_does_not_warn() {
         let out = r
             .resolve(&req_with_base(ProviderKind::Ollama, "my-local:7b", base))
             .unwrap_or_else(|e| panic!("loopback route {base} should resolve: {e}"));
-        assert!(out.validation.ok);
+        assert!(out.validation().ok);
         assert!(
-            out.validation.messages.is_empty(),
+            out.validation().messages.is_empty(),
             "loopback {base} must not warn, got {:?}",
-            out.validation.messages
+            out.validation().messages
         );
     }
 }
@@ -792,10 +1203,10 @@ fn https_endpoint_has_no_warning() {
             "https://example.com/v1",
         ))
         .expect("https endpoint should resolve");
-    assert!(out.validation.ok);
+    assert!(out.validation().ok);
     assert!(
-        out.validation.messages.is_empty(),
+        out.validation().messages.is_empty(),
         "https must not warn, got {:?}",
-        out.validation.messages
+        out.validation().messages
     );
 }

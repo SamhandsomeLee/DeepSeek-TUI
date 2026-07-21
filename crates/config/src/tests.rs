@@ -17,12 +17,14 @@ fn network_policy_toml_deserializes_proxy_hosts() {
         r#"
         default = "allow"
         proxy = ["github.com", ".githubusercontent.com"]
+        proxy_fake_ip_cidrs = ["198.18.0.0/15"]
         "#,
     )
     .expect("network policy toml");
 
     assert_eq!(policy.default, "allow");
     assert_eq!(policy.proxy, ["github.com", ".githubusercontent.com"]);
+    assert_eq!(policy.proxy_fake_ip_cidrs, ["198.18.0.0/15"]);
     assert!(policy.audit);
 }
 
@@ -845,6 +847,7 @@ struct EnvGuard {
     stepfun_model: Option<OsString>,
     minimax_api_key: Option<OsString>,
     minimax_base_url: Option<OsString>,
+    minimax_anthropic_base_url: Option<OsString>,
     minimax_model: Option<OsString>,
     sakana_api_key: Option<OsString>,
     fugu_api_key: Option<OsString>,
@@ -868,6 +871,9 @@ struct EnvGuard {
     xai_api_key: Option<OsString>,
     xai_base_url: Option<OsString>,
     xai_model: Option<OsString>,
+    opencode_go_api_key: Option<OsString>,
+    opencode_go_base_url: Option<OsString>,
+    opencode_go_model: Option<OsString>,
     meta_model_api_key: Option<OsString>,
     model_api_key: Option<OsString>,
     meta_model_api_base_url: Option<OsString>,
@@ -894,6 +900,9 @@ impl EnvGuard {
             xai_api_key: env::var_os("XAI_API_KEY"),
             xai_base_url: env::var_os("XAI_BASE_URL"),
             xai_model: env::var_os("XAI_MODEL"),
+            opencode_go_api_key: env::var_os("OPENCODE_GO_API_KEY"),
+            opencode_go_base_url: env::var_os("OPENCODE_GO_BASE_URL"),
+            opencode_go_model: env::var_os("OPENCODE_GO_MODEL"),
             meta_model_api_key: env::var_os("META_MODEL_API_KEY"),
             model_api_key: env::var_os("MODEL_API_KEY"),
             meta_model_api_base_url: env::var_os("META_MODEL_API_BASE_URL"),
@@ -977,6 +986,7 @@ impl EnvGuard {
             stepfun_model: env::var_os("STEPFUN_MODEL"),
             minimax_api_key: env::var_os("MINIMAX_API_KEY"),
             minimax_base_url: env::var_os("MINIMAX_BASE_URL"),
+            minimax_anthropic_base_url: env::var_os("MINIMAX_ANTHROPIC_BASE_URL"),
             minimax_model: env::var_os("MINIMAX_MODEL"),
             sakana_api_key: env::var_os("SAKANA_API_KEY"),
             fugu_api_key: env::var_os("FUGU_API_KEY"),
@@ -1012,6 +1022,9 @@ impl EnvGuard {
             env::remove_var("XAI_API_KEY");
             env::remove_var("XAI_BASE_URL");
             env::remove_var("XAI_MODEL");
+            env::remove_var("OPENCODE_GO_API_KEY");
+            env::remove_var("OPENCODE_GO_BASE_URL");
+            env::remove_var("OPENCODE_GO_MODEL");
             env::remove_var("META_MODEL_API_KEY");
             env::remove_var("MODEL_API_KEY");
             env::remove_var("META_MODEL_API_BASE_URL");
@@ -1095,6 +1108,7 @@ impl EnvGuard {
             env::remove_var("STEPFUN_MODEL");
             env::remove_var("MINIMAX_API_KEY");
             env::remove_var("MINIMAX_BASE_URL");
+            env::remove_var("MINIMAX_ANTHROPIC_BASE_URL");
             env::remove_var("MINIMAX_MODEL");
             env::remove_var("SAKANA_API_KEY");
             env::remove_var("FUGU_API_KEY");
@@ -1153,6 +1167,9 @@ impl Drop for EnvGuard {
             Self::restore_var("XAI_API_KEY", self.xai_api_key.take());
             Self::restore_var("XAI_BASE_URL", self.xai_base_url.take());
             Self::restore_var("XAI_MODEL", self.xai_model.take());
+            Self::restore_var("OPENCODE_GO_API_KEY", self.opencode_go_api_key.take());
+            Self::restore_var("OPENCODE_GO_BASE_URL", self.opencode_go_base_url.take());
+            Self::restore_var("OPENCODE_GO_MODEL", self.opencode_go_model.take());
             Self::restore_var("META_MODEL_API_KEY", self.meta_model_api_key.take());
             Self::restore_var("MODEL_API_KEY", self.model_api_key.take());
             Self::restore_var(
@@ -1248,6 +1265,10 @@ impl Drop for EnvGuard {
             Self::restore_var("STEPFUN_MODEL", self.stepfun_model.take());
             Self::restore_var("MINIMAX_API_KEY", self.minimax_api_key.take());
             Self::restore_var("MINIMAX_BASE_URL", self.minimax_base_url.take());
+            Self::restore_var(
+                "MINIMAX_ANTHROPIC_BASE_URL",
+                self.minimax_anthropic_base_url.take(),
+            );
             Self::restore_var("MINIMAX_MODEL", self.minimax_model.take());
             Self::restore_var("SAKANA_API_KEY", self.sakana_api_key.take());
             Self::restore_var("FUGU_API_KEY", self.fugu_api_key.take());
@@ -1523,7 +1544,7 @@ fn nvidia_nim_provider_normalizes_flash_aliases() {
 }
 
 #[test]
-fn nvidia_nim_provider_uses_nvidia_env_credentials() {
+fn nvidia_nim_custom_env_url_does_not_inherit_ambient_credentials() {
     let _lock = env_lock();
     let _env = EnvGuard::without_deepseek_runtime_overrides();
     // Safety: test-only environment mutation guarded by a module mutex.
@@ -1537,7 +1558,8 @@ fn nvidia_nim_provider_uses_nvidia_env_credentials() {
     let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
 
     assert_eq!(resolved.provider, ProviderKind::NvidiaNim);
-    assert_eq!(resolved.api_key.as_deref(), Some("nim-env-key"));
+    assert_eq!(resolved.api_key, None);
+    assert_eq!(resolved.api_key_source, None);
     assert_eq!(resolved.base_url, "https://nim-env.example/v1");
     assert_eq!(resolved.model, DEFAULT_NVIDIA_NIM_MODEL);
 }
@@ -2615,7 +2637,7 @@ fn state_migration_notice_explains_preserved_data_and_canonical_root() {
 
     let notice = migration.user_notice();
 
-    assert!(notice.contains("CodeWhale migrated legacy state"));
+    assert!(notice.contains("Codewhale migrated legacy state"));
     assert!(notice.contains("/home/alice/.deepseek/sessions"));
     assert!(notice.contains("/home/alice/.codewhale/sessions"));
     assert!(notice.contains("Your data was preserved"));
@@ -2820,7 +2842,7 @@ fn config_store_save_revalidates_path_before_parent_creation() {
         .join("..")
         .join("outside")
         .join(CONFIG_FILE_NAME);
-    let store = ConfigStore {
+    let mut store = ConfigStore {
         path: traversal_path,
         config: ConfigToml::default(),
         permissions: PermissionsToml::default(),
@@ -2986,14 +3008,14 @@ fn save_clamps_existing_config_permissions() {
     fs::write(&path, "api_key = \"old\"\n").expect("seed config");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod seed");
 
-    let store = ConfigStore {
+    let mut store = ConfigStore {
         path: path.clone(),
         config: ConfigToml {
             api_key: Some("new-secret".to_string()),
             ..ConfigToml::default()
         },
         permissions: PermissionsToml::default(),
-        original_raw: None,
+        original_raw: Some("api_key = \"old\"\n".to_string()),
     };
     store.save().expect("save");
 
@@ -3026,11 +3048,11 @@ fn config_store_save_skips_identical_serialized_body() {
     #[cfg(unix)]
     fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).expect("chmod seed");
 
-    let store = ConfigStore {
+    let mut store = ConfigStore {
         path: path.clone(),
         config,
         permissions: PermissionsToml::default(),
-        original_raw: None,
+        original_raw: Some(body.clone()),
     };
     store.save().expect("identical save should not rewrite");
 
@@ -3062,14 +3084,14 @@ fn config_store_save_creates_one_time_backup_before_changed_write() {
     let original = "model = \"deepseek-v4-flash\"\n";
     fs::write(&path, original).expect("seed config");
 
-    let store = ConfigStore {
+    let mut store = ConfigStore {
         path: path.clone(),
         config: ConfigToml {
             model: Some("deepseek-v4-pro".to_string()),
             ..ConfigToml::default()
         },
         permissions: PermissionsToml::default(),
-        original_raw: None,
+        original_raw: Some(original.to_string()),
     };
     store.save().expect("changed save");
 
@@ -3082,6 +3104,57 @@ fn config_store_save_creates_one_time_backup_before_changed_write() {
     assert!(updated.contains("model = \"deepseek-v4-pro\""));
 
     let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn config_backup_strips_plaintext_api_keys_but_preserves_non_secret_auth_metadata() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(CONFIG_FILE_NAME);
+    let original = r#"api_key = "root-test-credential"
+default_text_model = "deepseek-v4-pro"
+
+[providers.openrouter]
+api_key = "provider-test-credential"
+api_key_env = "OPENROUTER_API_KEY"
+auth_mode = "api_key"
+"#;
+    fs::write(&path, original).expect("seed config");
+
+    let mut store = ConfigStore::load(Some(path.clone())).expect("load config");
+    store.config.default_text_model = Some("deepseek-v4-flash".to_string());
+    store.save().expect("changed save");
+
+    let backup = fs::read_to_string(config_backup_path(&path)).expect("read backup");
+    assert!(!backup.contains("root-test-credential"), "{backup}");
+    assert!(!backup.contains("provider-test-credential"), "{backup}");
+    assert!(
+        !backup
+            .lines()
+            .any(|line| line.trim_start().starts_with("api_key ="))
+    );
+    assert!(backup.contains("api_key_env = \"OPENROUTER_API_KEY\""));
+    assert!(backup.contains("auth_mode = \"api_key\""));
+    assert!(backup.contains("default_text_model = \"deepseek-v4-pro\""));
+}
+
+#[test]
+fn config_backup_scrub_repairs_an_existing_plaintext_backup() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(CONFIG_FILE_NAME);
+    fs::write(&path, "model = \"new-model\"\n").expect("seed config");
+    let backup_path = config_backup_path(&path);
+    fs::write(
+        &backup_path,
+        "api_key = \"old-test-credential\"\nmodel = \"old-model\"\n",
+    )
+    .expect("seed backup");
+
+    scrub_plaintext_api_keys_from_config_backup(&path).expect("scrub backup");
+
+    let backup = fs::read_to_string(backup_path).expect("read backup");
+    assert!(!backup.contains("old-test-credential"), "{backup}");
+    assert!(!backup.contains("api_key"), "{backup}");
+    assert!(backup.contains("model = \"old-model\""));
 }
 
 #[test]
@@ -3220,15 +3293,21 @@ fn config_store_load_fails_on_malformed_config_without_touching_file() {
     // leaves the file bytes untouched for the user (or doctor) to repair.
     let dir = tempfile::tempdir().expect("tempdir");
     let config_path = dir.path().join(CONFIG_FILE_NAME);
-    let malformed = "# half-edited config\nmodel = \"deepseek-v4-flash\n";
-    fs::write(&config_path, malformed).expect("write config");
+    let secret = "cw-secret-store-load-4507";
+    let malformed =
+        format!("# half-edited config\n[providers.xai]\napi_key = \"{secret}\" trailing-junk\n");
+    fs::write(&config_path, &malformed).expect("write config");
 
     let err = ConfigStore::load(Some(config_path.clone())).expect_err("malformed must not parse");
+    let diagnostic = format!("{err:#}");
 
     assert!(
-        format!("{err:#}").contains("failed to parse config"),
+        diagnostic.contains("failed to parse config"),
         "error should name the parse failure: {err:#}"
     );
+    assert!(!diagnostic.contains(secret), "{diagnostic}");
+    assert!(!diagnostic.contains("api_key"), "{diagnostic}");
+    assert!(diagnostic.contains("file contents were omitted"));
     let body = fs::read_to_string(&config_path).expect("read config");
     assert_eq!(body, malformed, "malformed config left untouched");
 }
@@ -3264,35 +3343,48 @@ fn config_store_rendered_body_preserves_comments_at_legacy_deepseek_path() {
 
 #[test]
 fn merge_and_preserve_comments_returns_err_on_invalid_serialized() {
-    let err = merge_and_preserve_comments("{{{ not toml", "model = 1\n")
-        .expect_err("invalid serialized should fail");
+    let secret = "sentinel";
+    let err = merge_and_preserve_comments(
+        &format!("api_key = \"{secret}\" trailing-junk\n"),
+        "model = 1\n",
+    )
+    .expect_err("invalid serialized should fail");
+    let diagnostic = format!("{err:#}");
     assert!(
-        format!("{err:#}").contains("failed to parse serialized"),
+        diagnostic.contains("failed to parse serialized"),
         "unexpected error: {err:#}"
     );
+    assert!(!diagnostic.contains(secret), "{diagnostic}");
+    assert!(!diagnostic.contains("api_key"), "{diagnostic}");
 }
 
 #[test]
 fn merge_and_preserve_comments_returns_err_on_invalid_original() {
-    let err = merge_and_preserve_comments("model = 1\n", "{{{ not toml")
-        .expect_err("invalid original should fail");
+    let secret = "cw-secret-original-4507";
+    let err = merge_and_preserve_comments(
+        "model = 1\n",
+        &format!("api_key = \"{secret}\" trailing-junk\n"),
+    )
+    .expect_err("invalid original should fail");
+    let diagnostic = format!("{err:#}");
     assert!(
-        format!("{err:#}").contains("failed to parse original"),
+        diagnostic.contains("failed to parse original"),
         "unexpected error: {err:#}"
     );
+    assert!(!diagnostic.contains(secret), "{diagnostic}");
+    assert!(!diagnostic.contains("api_key"), "{diagnostic}");
 }
 
 #[test]
-fn config_store_save_falls_back_when_comment_merge_fails() {
+fn config_store_save_rejects_a_stale_or_corrupt_original_snapshot() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config_path = dir.path().join(CONFIG_FILE_NAME);
-    // Valid TOML so load succeeds, but the raw is corrupt so the merge
-    // will fail inside save() — save must still succeed and write the
-    // plain serialized config.
+    // A full typed writer must never overwrite bytes that differ from its
+    // original snapshot, even when that snapshot is corrupt.
     fs::write(&config_path, "model = \"deepseek-v4-flash\"\n").expect("write config");
 
     // Bypass ConfigStore::load to inject a deliberately broken original_raw.
-    let store = ConfigStore {
+    let mut store = ConfigStore {
         path: config_path.clone(),
         config: ConfigToml {
             model: Some("deepseek-v4-pro".to_string()),
@@ -3301,15 +3393,44 @@ fn config_store_save_falls_back_when_comment_merge_fails() {
         permissions: PermissionsToml::default(),
         original_raw: Some("{ broken".to_string()),
     };
-    store
+    let error = store
         .save()
-        .expect("save should succeed even when merge fails");
+        .expect_err("stale original bytes must fail instead of overwriting");
+    assert!(
+        error.to_string().contains("reload") && error.to_string().contains("retry"),
+        "{error:#}"
+    );
 
     let body = fs::read_to_string(&config_path).expect("read config");
-    assert!(
-        body.contains("deepseek-v4-pro"),
-        "config should be written: {body}"
-    );
+    assert_eq!(body, "model = \"deepseek-v4-flash\"\n");
+}
+
+#[test]
+fn sequential_config_stores_cannot_resurrect_a_concurrent_change() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path = dir.path().join(CONFIG_FILE_NAME);
+    fs::write(
+        &config_path,
+        "model = \"before\"\n[providers.xai.external_credentials]\naccess = \"read_only\"\nprovider = \"xai\"\nsource = \"grok_cli\"\npath = \"/external/auth.json\"\nconsent_version = 1\n",
+    )
+    .expect("seed config");
+    let mut stale = ConfigStore::load(Some(config_path.clone())).expect("load stale store");
+
+    mutate_config_document(&config_path, |document| {
+        unset_config_document_value(document, &["providers", "xai", "external_credentials"])?;
+        set_config_document_value(document, &["tui", "low_motion"], true)
+    })
+    .expect("concurrent targeted update");
+    stale.config.model = Some("stale-writer".to_string());
+    let error = stale
+        .save()
+        .expect_err("stale typed snapshot must not overwrite revocation");
+    assert!(error.to_string().contains("config changed"), "{error:#}");
+
+    let saved = fs::read_to_string(config_path).expect("read final config");
+    assert!(!saved.contains("external_credentials"), "{saved}");
+    assert!(saved.contains("low_motion = true"), "{saved}");
+    assert!(!saved.contains("stale-writer"), "{saved}");
 }
 
 #[test]
@@ -3646,7 +3767,7 @@ fn openmodel_route_defaults_to_messages_endpoint() {
 }
 
 #[test]
-fn xai_api_key_provider_resolves_defaults_and_env_overrides() {
+fn xai_api_key_provider_resolves_defaults_and_scopes_env_credentials() {
     let _lock = env_lock();
     let _env = EnvGuard::without_deepseek_runtime_overrides();
 
@@ -3668,13 +3789,93 @@ fn xai_api_key_provider_resolves_defaults_and_env_overrides() {
     }
 
     let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
-    assert_eq!(resolved.api_key.as_deref(), Some("xai-env-key"));
+    assert_eq!(resolved.api_key, None);
+    assert_eq!(resolved.api_key_source, None);
     assert_eq!(resolved.base_url, "https://xai-gateway.example/v1");
     assert_eq!(resolved.model, "grok-4.3");
 }
 
 #[test]
-fn meta_model_api_resolves_defaults_and_both_documented_key_names() {
+fn opencode_go_resolves_current_chat_completions_route() {
+    let _lock = env_lock();
+    let _env = EnvGuard::without_deepseek_runtime_overrides();
+
+    for alias in ["opencode-go", "opencode_go", "opencodego"] {
+        assert_eq!(ProviderKind::parse(alias), Some(ProviderKind::OpencodeGo));
+
+        let parsed: ConfigToml =
+            toml::from_str(&format!("provider = \"{alias}\"")).expect("OpenCode Go alias");
+        assert_eq!(parsed.provider, ProviderKind::OpencodeGo);
+    }
+
+    let metadata = provider::resolve_provider("opencode_go").expect("provider metadata");
+    assert_eq!(metadata.id(), "opencode-go");
+    assert_eq!(metadata.display_name(), "OpenCode Go");
+    assert_eq!(metadata.provider_config_key(), "opencode_go");
+    assert_eq!(metadata.default_base_url(), DEFAULT_OPENCODE_GO_BASE_URL);
+    assert_eq!(metadata.default_model(), DEFAULT_OPENCODE_GO_MODEL);
+    assert_eq!(metadata.env_vars(), &["OPENCODE_GO_API_KEY"]);
+    assert_eq!(metadata.wire(), provider::WireFormat::ChatCompletions);
+
+    let config: ConfigToml = toml::from_str(
+        r#"
+provider = "opencode-go"
+
+[providers.opencode_go]
+api_key = "go-config-key"
+model = "opencode-go/glm-5.2"
+"#,
+    )
+    .expect("OpenCode Go provider table");
+    let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+    assert_eq!(resolved.provider, ProviderKind::OpencodeGo);
+    assert_eq!(resolved.base_url, DEFAULT_OPENCODE_GO_BASE_URL);
+    assert_eq!(resolved.model, OPENCODE_GO_GLM_5_2_MODEL);
+    assert_eq!(resolved.api_key.as_deref(), Some("go-config-key"));
+    assert_eq!(
+        resolved.api_key_source,
+        Some(RuntimeApiKeySource::ConfigFile)
+    );
+
+    // Provider-specific environment overrides remain available, but model ids
+    // stay inside the Chat Completions allowlist.
+    unsafe {
+        std::env::set_var("OPENCODE_GO_API_KEY", "go-env-key");
+        std::env::set_var("OPENCODE_GO_MODEL", "opencode-go/mimo-v2.5-pro");
+    }
+    assert_eq!(
+        codewhale_secrets::env_for("opencode-go").as_deref(),
+        Some("go-env-key")
+    );
+    let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+    assert_eq!(resolved.base_url, DEFAULT_OPENCODE_GO_BASE_URL);
+    assert_eq!(resolved.model, OPENCODE_GO_MIMO_V2_5_PRO_MODEL);
+
+    for model in [OPENCODE_GO_GROK_4_5_MODEL, OPENCODE_GO_KIMI_K3_MODEL] {
+        assert_eq!(opencode_go_chat_model_id(model), Some(model));
+        assert_eq!(
+            opencode_go_chat_model_id(&format!("opencode-go/{model}")),
+            Some(model)
+        );
+    }
+
+    // The Go roster also includes Messages-only models. Even a custom base URL
+    // cannot make one safe for this Chat Completions provider; resolution falls
+    // back to the provider default instead of sending an incompatible request.
+    unsafe {
+        std::env::set_var("OPENCODE_GO_BASE_URL", "https://go-gateway.example/v1");
+        std::env::set_var("OPENCODE_GO_MODEL", "minimax-m3");
+    }
+    assert!(opencode_go_chat_model_id("minimax-m3").is_none());
+    assert!(opencode_go_chat_model_id("qwen3.7-max").is_none());
+    let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+    assert_eq!(resolved.base_url, "https://go-gateway.example/v1");
+    assert_eq!(resolved.model, DEFAULT_OPENCODE_GO_MODEL);
+    assert_eq!(resolved.api_key, None);
+}
+
+#[test]
+fn meta_model_api_scopes_both_documented_key_names_to_official_endpoint() {
     let _lock = env_lock();
     let _env = EnvGuard::without_deepseek_runtime_overrides();
 
@@ -3695,7 +3896,8 @@ fn meta_model_api_resolves_defaults_and_both_documented_key_names() {
         std::env::set_var("MODEL_API_MODEL", "muse-spark-canary");
     }
     let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
-    assert_eq!(resolved.api_key.as_deref(), Some("meta-official-key"));
+    assert_eq!(resolved.api_key, None);
+    assert_eq!(resolved.api_key_source, None);
     assert_eq!(resolved.base_url, "https://meta-gateway.example/v1");
     assert_eq!(resolved.model, "muse-spark-canary");
 
@@ -3705,7 +3907,8 @@ fn meta_model_api_resolves_defaults_and_both_documented_key_names() {
         std::env::set_var("META_MODEL_API_MODEL", "muse-spark-1.1");
     }
     let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
-    assert_eq!(resolved.api_key.as_deref(), Some("meta-models-dev-key"));
+    assert_eq!(resolved.api_key, None);
+    assert_eq!(resolved.api_key_source, None);
     assert_eq!(resolved.base_url, "https://meta-primary.example/v1");
     assert_eq!(resolved.model, "muse-spark-1.1");
 }
@@ -3810,14 +4013,15 @@ fn provider_metadata_defaults_match_runtime_helpers() {
         if kind != ProviderKind::Custom {
             assert!(!provider.env_vars().is_empty());
         }
-        // OpenAI Codex (ChatGPT) speaks the Responses API and Anthropic
-        // speaks the native Messages API; every other built-in provider
-        // is OpenAI-compatible Chat Completions.
+        // OpenAI Codex (ChatGPT) speaks the Responses API; Anthropic and the
+        // Anthropic-compatible routes speak the native Messages API; every
+        // other built-in provider is OpenAI-compatible Chat Completions.
         let expected_wire = match kind {
             ProviderKind::OpenaiCodex => provider::WireFormat::Responses,
-            ProviderKind::Anthropic | ProviderKind::DeepseekAnthropic | ProviderKind::Openmodel => {
-                provider::WireFormat::AnthropicMessages
-            }
+            ProviderKind::Anthropic
+            | ProviderKind::DeepseekAnthropic
+            | ProviderKind::MinimaxAnthropic
+            | ProviderKind::Openmodel => provider::WireFormat::AnthropicMessages,
             _ => provider::WireFormat::ChatCompletions,
         };
         assert_eq!(provider.wire(), expected_wire);
@@ -4157,6 +4361,11 @@ fn zai_stepfun_minimax_and_sakana_default_to_first_party_routes() {
             DEFAULT_MINIMAX_MODEL,
         ),
         (
+            ProviderKind::MinimaxAnthropic,
+            DEFAULT_MINIMAX_ANTHROPIC_BASE_URL,
+            DEFAULT_MINIMAX_MODEL,
+        ),
+        (
             ProviderKind::Sakana,
             DEFAULT_SAKANA_BASE_URL,
             DEFAULT_SAKANA_MODEL,
@@ -4243,6 +4452,29 @@ fn minimax_env_model_override_canonicalizes_known_aliases() {
 }
 
 #[test]
+fn minimax_anthropic_env_overrides_use_messages_base_url() {
+    let _lock = env_lock();
+    let _env = EnvGuard::without_deepseek_runtime_overrides();
+    unsafe {
+        env::set_var("CODEWHALE_PROVIDER", "minimax-anthropic");
+        env::set_var(
+            "MINIMAX_ANTHROPIC_BASE_URL",
+            "https://messages.minimax.example/anthropic",
+        );
+        env::set_var("MINIMAX_MODEL", "MiniMax-M2.7");
+    }
+
+    let resolved = ConfigToml::default().resolve_runtime_options(&CliRuntimeOverrides::default());
+
+    assert_eq!(resolved.provider, ProviderKind::MinimaxAnthropic);
+    assert_eq!(
+        resolved.base_url,
+        "https://messages.minimax.example/anthropic"
+    );
+    assert_eq!(resolved.model, "MiniMax-M2.7");
+}
+
+#[test]
 fn sakana_env_overrides_resolve_fugu_route() {
     let _lock = env_lock();
     let _env = EnvGuard::without_deepseek_runtime_overrides();
@@ -4276,7 +4508,7 @@ fn moonshot_provider_preserves_explicit_kimi_k26() {
 }
 
 #[test]
-fn moonshot_kimi_oauth_uses_kimi_code_endpoint_and_model() {
+fn moonshot_legacy_kimi_import_uses_kimi_code_endpoint_and_model() {
     let _lock = env_lock();
     let _env = EnvGuard::without_deepseek_runtime_overrides();
     let mut config = ConfigToml {
@@ -4647,6 +4879,205 @@ fn loopback_custom_deepseek_base_url_does_not_probe_secret_store_by_default() {
 }
 
 #[test]
+fn remote_custom_provider_endpoint_does_not_reuse_ambient_official_credentials() {
+    let _lock = env_lock();
+    let _env = EnvGuard::without_deepseek_runtime_overrides();
+    // Safety: test-only env mutation guarded by env_lock().
+    unsafe { env::set_var("OPENROUTER_API_KEY", "ambient-official-key") };
+    let store = Arc::new(RecordingSecretsStore::with_value("saved-official-key"));
+    let secrets = Secrets::new(store.clone());
+    let mut config = ConfigToml {
+        provider: ProviderKind::Openrouter,
+        ..ConfigToml::default()
+    };
+    config.providers.openrouter.base_url = Some("https://gateway.example/v1".to_string());
+
+    let resolved =
+        config.resolve_runtime_options_with_secrets(&CliRuntimeOverrides::default(), &secrets);
+
+    assert_eq!(resolved.base_url, "https://gateway.example/v1");
+    assert_eq!(resolved.api_key, None);
+    assert_eq!(resolved.api_key_source, None);
+    assert!(
+        store.gets.lock().unwrap().is_empty(),
+        "a custom endpoint must not read the provider's global secret slot"
+    );
+}
+
+#[test]
+fn env_custom_provider_endpoint_does_not_reuse_ambient_official_credentials() {
+    let _lock = env_lock();
+    let _env = EnvGuard::without_deepseek_runtime_overrides();
+    // A provider-specific base URL and API key are independent ambient
+    // exports; the resolver cannot safely assume the key belongs to a remote
+    // custom gateway. Custom routes must bind their credential explicitly.
+    // Safety: test-only env mutation guarded by env_lock().
+    unsafe {
+        env::set_var("OPENROUTER_BASE_URL", "https://gateway.example/v1");
+        env::set_var("OPENROUTER_API_KEY", "ambient-official-key");
+    }
+    let store = Arc::new(RecordingSecretsStore::with_value("saved-official-key"));
+    let secrets = Secrets::new(store.clone());
+    let config = ConfigToml {
+        provider: ProviderKind::Openrouter,
+        ..ConfigToml::default()
+    };
+
+    let resolved =
+        config.resolve_runtime_options_with_secrets(&CliRuntimeOverrides::default(), &secrets);
+
+    assert_eq!(resolved.base_url, "https://gateway.example/v1");
+    assert_eq!(resolved.api_key, None);
+    assert_eq!(resolved.api_key_source, None);
+    assert!(
+        store.gets.lock().unwrap().is_empty(),
+        "an env-supplied custom endpoint must not read the provider's global secret slot"
+    );
+}
+
+#[test]
+fn remote_custom_provider_endpoint_accepts_only_explicitly_bound_credentials() {
+    let _lock = env_lock();
+    let _env = EnvGuard::without_deepseek_runtime_overrides();
+    // Safety: test-only env mutation guarded by env_lock().
+    unsafe { env::set_var("OPENROUTER_API_KEY", "ambient-official-key") };
+    let store = Arc::new(RecordingSecretsStore::with_value("saved-official-key"));
+    let secrets = Secrets::new(store.clone());
+    let mut config = ConfigToml {
+        provider: ProviderKind::Openrouter,
+        ..ConfigToml::default()
+    };
+    config.providers.openrouter.base_url = Some("https://gateway.example/v1".to_string());
+    config.providers.openrouter.api_key = Some("route-bound-key".to_string());
+
+    let resolved =
+        config.resolve_runtime_options_with_secrets(&CliRuntimeOverrides::default(), &secrets);
+
+    assert_eq!(resolved.api_key.as_deref(), Some("route-bound-key"));
+    assert_eq!(
+        resolved.api_key_source,
+        Some(RuntimeApiKeySource::ConfigFile)
+    );
+    assert!(store.gets.lock().unwrap().is_empty());
+}
+
+#[test]
+fn auth_mode_none_suppresses_every_runtime_credential_source() {
+    let _lock = env_lock();
+    let _env = EnvGuard::without_deepseek_runtime_overrides();
+    // Safety: test-only env mutation guarded by env_lock().
+    unsafe { env::set_var("OPENROUTER_API_KEY", "ambient-key") };
+    let store = Arc::new(RecordingSecretsStore::with_value("saved-key"));
+    let secrets = Secrets::new(store.clone());
+    let mut config = ConfigToml {
+        provider: ProviderKind::Openrouter,
+        auth_mode: Some("none".to_string()),
+        ..ConfigToml::default()
+    };
+    config.providers.openrouter.api_key = Some("configured-key".to_string());
+    config.http_headers.insert(
+        "aUtHoRiZaTiOn".to_string(),
+        "Bearer configured-header-secret".to_string(),
+    );
+    config.providers.openrouter.http_headers.insert(
+        "X-API-Key".to_string(),
+        "configured-x-api-key-secret".to_string(),
+    );
+    config.providers.openrouter.http_headers.insert(
+        "Api-Key".to_string(),
+        "configured-api-key-secret".to_string(),
+    );
+    config.providers.openrouter.http_headers.extend([
+        (
+            "Proxy-Authorization".to_string(),
+            "Basic configured-proxy-secret".to_string(),
+        ),
+        (
+            "X-Auth-Token".to_string(),
+            "configured-auth-token".to_string(),
+        ),
+        (
+            "X-Access-Token".to_string(),
+            "configured-access-token".to_string(),
+        ),
+        (
+            "X-Goog-Api-Key".to_string(),
+            "configured-google-key".to_string(),
+        ),
+        ("Cookie".to_string(), "session=secret".to_string()),
+    ]);
+    config
+        .providers
+        .openrouter
+        .http_headers
+        .insert("X-Route-Metadata".to_string(), "safe".to_string());
+    let cli = CliRuntimeOverrides {
+        api_key: Some("explicit-cli-key".to_string()),
+        ..CliRuntimeOverrides::default()
+    };
+
+    let resolved = config.resolve_runtime_options_with_secrets(&cli, &secrets);
+
+    assert_eq!(resolved.api_key, None);
+    assert_eq!(resolved.api_key_source, None);
+    for name in [
+        "authorization",
+        "x-api-key",
+        "api-key",
+        "proxy-authorization",
+        "x-auth-token",
+        "x-access-token",
+        "x-goog-api-key",
+        "cookie",
+    ] {
+        assert!(
+            !resolved
+                .http_headers
+                .keys()
+                .any(|candidate| candidate.eq_ignore_ascii_case(name)),
+            "disabled auth leaked {name}: {:?}",
+            resolved.http_headers
+        );
+    }
+    assert_eq!(
+        resolved
+            .http_headers
+            .get("X-Route-Metadata")
+            .map(String::as_str),
+        Some("safe")
+    );
+    assert!(
+        store.gets.lock().unwrap().is_empty(),
+        "disabled auth must not probe any durable credential source"
+    );
+}
+
+#[test]
+fn deepseek_official_endpoint_family_shares_canonical_model_namespace() {
+    let _lock = env_lock();
+    let _env = EnvGuard::without_deepseek_runtime_overrides();
+
+    for base_url in [
+        "https://api.deepseek.com",
+        "https://api.deepseek.com/v1/",
+        "https://api.deepseek.com/beta",
+    ] {
+        assert!(provider_base_url_is_official(
+            ProviderKind::Deepseek,
+            base_url
+        ));
+        assert!(!provider_preserves_custom_base_url_model(
+            ProviderKind::Deepseek,
+            base_url
+        ));
+    }
+    assert!(!provider_base_url_is_official(
+        ProviderKind::Deepseek,
+        "https://api.deepseek.com.evil.example/v1"
+    ));
+}
+
+#[test]
 fn ollama_provider_preserves_model_tags() {
     let _lock = env_lock();
     let _env = EnvGuard::without_deepseek_runtime_overrides();
@@ -4663,7 +5094,7 @@ fn ollama_provider_preserves_model_tags() {
 }
 
 #[test]
-fn ollama_env_overrides_provider_base_url_and_optional_key() {
+fn ollama_remote_env_url_does_not_inherit_ambient_optional_key() {
     let _lock = env_lock();
     let _env = EnvGuard::without_deepseek_runtime_overrides();
     // Safety: test-only environment mutation guarded by a module mutex.
@@ -4677,7 +5108,8 @@ fn ollama_env_overrides_provider_base_url_and_optional_key() {
 
     assert_eq!(resolved.provider, ProviderKind::Ollama);
     assert_eq!(resolved.base_url, "http://ollama.example/v1");
-    assert_eq!(resolved.api_key.as_deref(), Some("ollama-env-key"));
+    assert_eq!(resolved.api_key, None);
+    assert_eq!(resolved.api_key_source, None);
 }
 
 #[test]
@@ -4700,7 +5132,7 @@ fn openrouter_env_overrides_key_and_model_when_config_missing() {
 }
 
 #[test]
-fn xiaomi_mimo_env_overrides_provider_key_base_url_and_model() {
+fn xiaomi_mimo_custom_env_url_does_not_inherit_ambient_key() {
     let _lock = env_lock();
     let _env = EnvGuard::without_deepseek_runtime_overrides();
     // Safety: test-only environment mutation guarded by a module mutex.
@@ -4714,7 +5146,8 @@ fn xiaomi_mimo_env_overrides_provider_key_base_url_and_model() {
     let resolved = ConfigToml::default().resolve_runtime_options(&CliRuntimeOverrides::default());
 
     assert_eq!(resolved.provider, ProviderKind::XiaomiMimo);
-    assert_eq!(resolved.api_key.as_deref(), Some("mimo-env-key"));
+    assert_eq!(resolved.api_key, None);
+    assert_eq!(resolved.api_key_source, None);
     assert_eq!(resolved.base_url, "https://mimo-gateway.example/v1");
     assert_eq!(resolved.model, "mimo-v2.5");
 }
@@ -4804,7 +5237,7 @@ fn fireworks_env_overrides_key_and_model_when_config_missing() {
 }
 
 #[test]
-fn siliconflow_env_overrides_key_base_url_and_model() {
+fn siliconflow_custom_env_url_does_not_inherit_ambient_key() {
     let _lock = env_lock();
     let _env = EnvGuard::without_deepseek_runtime_overrides();
     // Safety: test-only environment mutation guarded by a module mutex.
@@ -4818,7 +5251,8 @@ fn siliconflow_env_overrides_key_base_url_and_model() {
     let resolved = ConfigToml::default().resolve_runtime_options(&CliRuntimeOverrides::default());
 
     assert_eq!(resolved.provider, ProviderKind::Siliconflow);
-    assert_eq!(resolved.api_key.as_deref(), Some("sf-env-key"));
+    assert_eq!(resolved.api_key, None);
+    assert_eq!(resolved.api_key_source, None);
     assert_eq!(resolved.base_url, "https://sf-mirror.example/v1");
     assert_eq!(resolved.model, "deepseek-v4-flash");
 }
@@ -4840,7 +5274,7 @@ fn arcee_provider_defaults_to_direct_api_endpoint_and_model() {
 }
 
 #[test]
-fn arcee_env_overrides_key_base_url_and_model() {
+fn arcee_custom_env_url_does_not_inherit_ambient_key() {
     let _lock = env_lock();
     let _env = EnvGuard::without_deepseek_runtime_overrides();
     // Safety: test-only environment mutation guarded by a module mutex.
@@ -4854,7 +5288,8 @@ fn arcee_env_overrides_key_base_url_and_model() {
     let resolved = ConfigToml::default().resolve_runtime_options(&CliRuntimeOverrides::default());
 
     assert_eq!(resolved.provider, ProviderKind::Arcee);
-    assert_eq!(resolved.api_key.as_deref(), Some("arcee-env-key"));
+    assert_eq!(resolved.api_key, None);
+    assert_eq!(resolved.api_key_source, None);
     assert_eq!(resolved.base_url, "https://arcee-mirror.example/api/v1");
     assert_eq!(resolved.model, "trinity-large-preview");
 }
@@ -4880,7 +5315,7 @@ fn arcee_provider_config_overrides_runtime_defaults() {
 }
 
 #[test]
-fn huggingface_env_precedence_prefers_documented_names() {
+fn huggingface_custom_env_url_does_not_inherit_documented_key_names() {
     let _lock = env_lock();
     let _env = EnvGuard::without_deepseek_runtime_overrides();
     // Safety: test-only environment mutation guarded by a module mutex.
@@ -4897,13 +5332,14 @@ fn huggingface_env_precedence_prefers_documented_names() {
     let resolved = ConfigToml::default().resolve_runtime_options(&CliRuntimeOverrides::default());
 
     assert_eq!(resolved.provider, ProviderKind::Huggingface);
-    assert_eq!(resolved.api_key.as_deref(), Some("hf-full-key"));
+    assert_eq!(resolved.api_key, None);
+    assert_eq!(resolved.api_key_source, None);
     assert_eq!(resolved.base_url, "https://hf-full.example/v1");
     assert_eq!(resolved.model, "org/full-model");
 }
 
 #[test]
-fn huggingface_short_env_fallbacks_resolve_when_primary_names_are_absent() {
+fn huggingface_short_custom_env_url_does_not_inherit_ambient_token() {
     let _lock = env_lock();
     let _env = EnvGuard::without_deepseek_runtime_overrides();
     // Safety: test-only environment mutation guarded by a module mutex.
@@ -4917,7 +5353,8 @@ fn huggingface_short_env_fallbacks_resolve_when_primary_names_are_absent() {
     let resolved = ConfigToml::default().resolve_runtime_options(&CliRuntimeOverrides::default());
 
     assert_eq!(resolved.provider, ProviderKind::Huggingface);
-    assert_eq!(resolved.api_key.as_deref(), Some("hf-token-fallback"));
+    assert_eq!(resolved.api_key, None);
+    assert_eq!(resolved.api_key_source, None);
     assert_eq!(resolved.base_url, "https://hf-short.example/v1");
     assert_eq!(resolved.model, "org/short-model");
 }
@@ -4969,7 +5406,7 @@ fn siliconflow_cn_base_url_env_normalizes_model_aliases() {
 }
 
 #[test]
-fn wanjie_ark_env_api_key_and_base_url_fall_back_when_config_missing() {
+fn wanjie_ark_custom_env_url_does_not_inherit_ambient_key() {
     let _lock = env_lock();
     let _env = EnvGuard::without_deepseek_runtime_overrides();
     // Safety: test-only environment mutation guarded by a module mutex.
@@ -4983,13 +5420,14 @@ fn wanjie_ark_env_api_key_and_base_url_fall_back_when_config_missing() {
     let resolved = ConfigToml::default().resolve_runtime_options(&CliRuntimeOverrides::default());
 
     assert_eq!(resolved.provider, ProviderKind::WanjieArk);
-    assert_eq!(resolved.api_key.as_deref(), Some("wanjie-env-key"));
+    assert_eq!(resolved.api_key, None);
+    assert_eq!(resolved.api_key_source, None);
     assert_eq!(resolved.base_url, "https://wanjie.example/api/v1");
     assert_eq!(resolved.model, "account-model-id");
 }
 
 #[test]
-fn volcengine_env_aliases_override_key_base_url_and_model() {
+fn volcengine_custom_env_alias_url_does_not_inherit_ambient_key() {
     let _lock = env_lock();
     let _env = EnvGuard::without_deepseek_runtime_overrides();
     // Safety: test-only environment mutation guarded by a module mutex.
@@ -5003,7 +5441,8 @@ fn volcengine_env_aliases_override_key_base_url_and_model() {
     let resolved = ConfigToml::default().resolve_runtime_options(&CliRuntimeOverrides::default());
 
     assert_eq!(resolved.provider, ProviderKind::Volcengine);
-    assert_eq!(resolved.api_key.as_deref(), Some("volcengine-env-key"));
+    assert_eq!(resolved.api_key, None);
+    assert_eq!(resolved.api_key_source, None);
     assert_eq!(
         resolved.base_url,
         "https://volcengine.example/api/coding/v3"
@@ -5076,6 +5515,8 @@ fn openrouter_provider_normalizes_recent_large_model_aliases() {
         ("qwen3.6-35b-a3b", OPENROUTER_QWEN_3_6_35B_A3B_MODEL),
         ("qwen3.6-max-preview", OPENROUTER_QWEN_3_6_MAX_PREVIEW_MODEL),
         ("qwen3.6-plus", OPENROUTER_QWEN_3_6_PLUS_MODEL),
+        ("qwen3.7-plus", OPENROUTER_QWEN_3_7_PLUS_MODEL),
+        ("qwen-3.7-plus", OPENROUTER_QWEN_3_7_PLUS_MODEL),
         ("mimo-v2.5-pro", OPENROUTER_XIAOMI_MIMO_V2_5_PRO_MODEL),
         ("kimi-k2.7-code", OPENROUTER_KIMI_K2_7_CODE_MODEL),
         ("kimi", OPENROUTER_KIMI_K2_7_CODE_MODEL),

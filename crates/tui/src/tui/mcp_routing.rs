@@ -1,6 +1,6 @@
 //! MCP manager formatting and UI action helpers.
 
-use crate::mcp::{McpManagerSnapshot, McpServerSnapshot};
+use crate::mcp::{McpManagerSnapshot, McpServerSnapshot, format_mcp_tool_description};
 use crate::tui::app::App;
 use crate::tui::history::HistoryCell;
 use crate::tui::pager::PagerView;
@@ -10,13 +10,13 @@ pub(super) fn format_mcp_manager(snapshot: &McpManagerSnapshot) -> String {
         format!("MCP config: {}", snapshot.config_path.display()),
         format!("Config exists: {}", snapshot.config_exists),
     ];
-    if snapshot.restart_required {
+    if snapshot.reload_required {
         lines.push(
-            "Restart required: MCP config changed; the current model-visible MCP tool pool is not hot-reloaded."
+            "Reload required: MCP config changed; run /mcp reload to rebuild the live model-visible tool pool."
                 .to_string(),
         );
     } else {
-        lines.push("Restart required: no pending in-TUI config change.".to_string());
+        lines.push("Reload required: no pending config change.".to_string());
     }
     lines.push(String::new());
 
@@ -72,9 +72,7 @@ fn push_server(lines: &mut Vec<String>, server: &McpServerSnapshot) {
         lines.push(format!(
             "    tool {}{}",
             tool.model_name,
-            tool.description
-                .as_ref()
-                .map_or(String::new(), |desc| format!(" - {desc}"))
+            format_mcp_tool_description(tool.description.as_deref())
         ));
     }
     for resource in &server.resources {
@@ -114,7 +112,7 @@ mod tests {
         let snapshot = McpManagerSnapshot {
             config_path: PathBuf::from("/tmp/mcp.json"),
             config_exists: true,
-            restart_required: true,
+            reload_required: true,
             servers: vec![
                 McpServerSnapshot {
                     name: "fs".to_string(),
@@ -153,7 +151,8 @@ mod tests {
             ],
         };
         let text = format_mcp_manager(&snapshot);
-        assert!(text.contains("Restart required"));
+        assert!(text.contains("Reload required"));
+        assert!(text.contains("/mcp reload"));
         assert!(text.contains("mcp_fs_read"));
         assert!(text.contains("[failed]"));
         assert!(text.contains("boom"));

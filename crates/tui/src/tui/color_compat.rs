@@ -19,6 +19,7 @@ use ratatui::{
 use crate::palette::{self, ColorDepth, PaletteMode, ThemeId, UiTheme};
 
 const RENDER_DEBUG_ENV: &str = "CODEWHALE_TUI_DEBUG";
+const ASCII_SAFE_ENV: &str = "CODEWHALE_ASCII_SAFE";
 const RENDER_DEBUG_SAMPLE_LIMIT: usize = 24;
 
 #[derive(Debug)]
@@ -49,6 +50,7 @@ pub(crate) struct ColorCompatBackend<W: Write> {
     /// the live crossterm query.
     terminal_size: Option<Size>,
     render_debug: Option<RenderDebugLog>,
+    ascii_safe: bool,
 }
 
 impl<W: Write> ColorCompatBackend<W> {
@@ -66,6 +68,7 @@ impl<W: Write> ColorCompatBackend<W> {
             forced_size: None,
             terminal_size: None,
             render_debug: RenderDebugLog::from_env(),
+            ascii_safe: env_flag_enabled(std::env::var(ASCII_SAFE_ENV).ok().as_deref()),
         }
     }
 
@@ -118,6 +121,9 @@ impl<W: Write> Backend for ColorCompatBackend<W> {
                     self.theme_id,
                     &self.active_ui_theme,
                 );
+                if self.ascii_safe {
+                    adapt_cell_symbol_for_ascii(&mut cell);
+                }
                 (x, y, cell)
             })
             .collect::<Vec<_>>();
@@ -269,10 +275,35 @@ impl RenderDebugLog {
 }
 
 fn render_debug_enabled_from_value(value: Option<&str>) -> bool {
+    env_flag_enabled(value)
+}
+
+fn env_flag_enabled(value: Option<&str>) -> bool {
     matches!(
         value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
         Some("1" | "true" | "yes" | "on")
     )
+}
+
+/// Narrow every CodeWhale-authored decorative glyph to a semantic ASCII
+/// alternative. Scope is deliberate: box drawing, block elements (whale
+/// mark, meters, rails), braille state markers, geometric role/state marks,
+/// arrows, and typographic chrome. Language text — CJK labels, accented
+/// letters, user and model content outside those decorative classes —
+/// passes through untouched.
+pub(crate) fn adapt_cell_symbol_for_ascii(cell: &mut Cell) {
+    // Braille: preserve the rising-fill signal instead of collapsing every
+    // working/verifying frame to one glyph.
+    let mut chars = cell.symbol().chars();
+    if let (Some(ch), None) = (chars.next(), chars.next())
+        && let Some(replacement) = crate::tui::glyphs::braille_ascii_fallback(ch)
+    {
+        cell.set_symbol(replacement);
+        return;
+    }
+    if let Some(replacement) = crate::tui::glyphs::ascii_fallback(cell.symbol()) {
+        cell.set_symbol(replacement);
+    }
 }
 
 fn render_debug_line(
@@ -314,6 +345,7 @@ fn adapt_cell_colors(
     theme_id: ThemeId,
     ui_theme: &UiTheme,
 ) {
+    let source_fg = cell.fg;
     // Stage 1: community-theme remap (dark palette → preset slots). No-op
     // for System / Whale / WhaleLight so legacy dark/light flows are
     // untouched. Runs *before* the palette-mode remap so a light terminal
@@ -326,7 +358,7 @@ fn adapt_cell_colors(
     cell.fg = palette::adapt_fg_for_palette_mode(cell.fg, original_bg, palette_mode);
     cell.bg = palette::adapt_bg_for_palette_mode(cell.bg, palette_mode);
     // Stage 3: depth (truecolor / 256 / 16) downsampling.
-    cell.fg = palette::adapt_color(cell.fg, depth);
+    cell.fg = palette::adapt_fg_for_depth(source_fg, cell.fg, depth, ui_theme);
     cell.bg = palette::adapt_bg(cell.bg, depth);
 }
 
@@ -417,6 +449,25 @@ mod tests {
     }
 
     #[test]
+    fn ascii_safe_symbol_adapter_preserves_meaning_with_narrow_glyphs() {
+        for (rich, safe) in [
+            ("─", "-"),
+            ("│", "|"),
+            ("┌", "+"),
+            ("▶", ">"),
+            ("▼", "v"),
+            ("✓", "Y"),
+            ("✕", "X"),
+        ] {
+            let mut cell = Cell::default();
+            cell.set_symbol(rich);
+            adapt_cell_symbol_for_ascii(&mut cell);
+            assert_eq!(cell.symbol(), safe, "{rich} should map to {safe}");
+            assert!(cell.symbol().is_ascii());
+        }
+    }
+
+    #[test]
     fn ansi256_backend_output_does_not_emit_truecolor_sgr() {
         let writer = SharedWriter::default();
         let capture = writer.0.clone();
@@ -487,6 +538,171 @@ mod tests {
         );
 
         assert_eq!(cell.bg, Color::Rgb(0, 0, 0));
+    }
+
+    #[test]
+    fn terminal_and_matrix_cells_keep_effective_mode_colors() {
+        for (theme_id, theme) in [
+            (ThemeId::Terminal, palette::TERMINAL_UI_THEME),
+            (ThemeId::Matrix, palette::MATRIX_UI_THEME),
+        ] {
+            for (source, expected, role) in [
+                (palette::MODE_AGENT, theme.mode_agent, "agent"),
+                (palette::MODE_PLAN, theme.mode_plan, "plan"),
+                (palette::MODE_OPERATE, theme.mode_operate, "operate"),
+                (palette::MODE_YOLO, theme.mode_yolo, "full access"),
+            ] {
+                let mut cell = Cell::default();
+                cell.set_fg(source);
+                adapt_cell_colors(
+                    &mut cell,
+                    ColorDepth::TrueColor,
+                    theme.mode,
+                    theme_id,
+                    &theme,
+                );
+                assert_eq!(
+                    cell.fg,
+                    expected,
+                    "theme '{}' rendered the {role} token through the wrong slot",
+                    theme_id.name(),
+                );
+            }
+        }
+    }
+
+    fn rendered_foreground(
+        source: Color,
+        depth: ColorDepth,
+        theme_id: ThemeId,
+        theme: &UiTheme,
+    ) -> Color {
+        let mut cell = Cell::default();
+        cell.set_fg(source);
+        adapt_cell_colors(&mut cell, depth, theme.mode, theme_id, theme);
+        cell.fg
+    }
+
+    #[test]
+    fn grayscale_modes_are_identity_safe_for_raw_and_direct_cells() {
+        let theme = palette::GRAYSCALE_UI_THEME;
+        let roles = [
+            ("act", palette::MODE_AGENT, theme.mode_agent, Color::Blue),
+            ("plan", palette::MODE_PLAN, theme.mode_plan, Color::Magenta),
+            (
+                "operate",
+                palette::MODE_OPERATE,
+                theme.mode_operate,
+                Color::LightMagenta,
+            ),
+            (
+                "full access",
+                palette::MODE_YOLO,
+                theme.mode_yolo,
+                Color::Red,
+            ),
+        ];
+
+        for depth in [
+            ColorDepth::TrueColor,
+            ColorDepth::Ansi256,
+            ColorDepth::Ansi16,
+        ] {
+            let mut outputs = Vec::new();
+            for (name, raw, direct, ansi16) in roles {
+                let expected = if depth == ColorDepth::Ansi16 {
+                    ansi16
+                } else {
+                    palette::adapt_color(direct, depth)
+                };
+                let raw_output = rendered_foreground(raw, depth, ThemeId::Grayscale, &theme);
+                let direct_output = rendered_foreground(direct, depth, ThemeId::Grayscale, &theme);
+                assert_eq!(raw_output, expected, "raw {name} at {depth:?}");
+                assert_eq!(direct_output, expected, "direct {name} at {depth:?}");
+                outputs.push((name, raw_output));
+            }
+            for (index, (left_name, left)) in outputs.iter().enumerate() {
+                for (right_name, right) in outputs.iter().skip(index + 1) {
+                    assert_ne!(
+                        left, right,
+                        "grayscale {depth:?} merged {left_name} and {right_name}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ansi16_uses_complete_semantic_role_matrix_for_whale_dark_and_light() {
+        let expected = [
+            ("action", Color::LightBlue),
+            ("live", Color::LightCyan),
+            ("human", Color::LightYellow),
+            ("warning", Color::Yellow),
+            ("danger", Color::LightRed),
+            ("success", Color::LightGreen),
+            ("act mode", Color::Blue),
+            ("plan mode", Color::Magenta),
+            ("operate mode", Color::LightMagenta),
+            ("full-access mode", Color::Red),
+        ];
+        let raw = [
+            palette::WHALE_ACTION,
+            palette::WHALE_LIVE,
+            palette::WHALE_HUMAN,
+            palette::STATUS_WARNING,
+            palette::WHALE_ERROR,
+            palette::STATUS_SUCCESS,
+            palette::MODE_AGENT,
+            palette::MODE_PLAN,
+            palette::MODE_OPERATE,
+            palette::MODE_YOLO,
+        ];
+
+        for (theme_id, theme) in [
+            (ThemeId::Whale, palette::UI_THEME),
+            (ThemeId::WhaleLight, palette::LIGHT_UI_THEME),
+        ] {
+            let direct = [
+                theme.accent_primary,
+                theme.status_working,
+                theme.accent_action,
+                theme.warning,
+                theme.error_fg,
+                theme.success,
+                theme.mode_agent,
+                theme.mode_plan,
+                theme.mode_operate,
+                theme.mode_yolo,
+            ];
+            for (source_kind, sources) in [("raw", raw), ("direct", direct)] {
+                let outputs = sources
+                    .into_iter()
+                    .zip(expected)
+                    .map(|(source, (name, expected_color))| {
+                        let output =
+                            rendered_foreground(source, ColorDepth::Ansi16, theme_id, &theme);
+                        assert_eq!(
+                            output,
+                            expected_color,
+                            "{} {source_kind} {name}",
+                            theme_id.name(),
+                        );
+                        (name, output)
+                    })
+                    .collect::<Vec<_>>();
+                for (index, (left_name, left)) in outputs.iter().enumerate() {
+                    for (right_name, right) in outputs.iter().skip(index + 1) {
+                        assert_ne!(
+                            left,
+                            right,
+                            "{} {source_kind} matrix merged {left_name} and {right_name}",
+                            theme_id.name(),
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -709,63 +925,114 @@ mod tests {
         assert!(first_close_at < z_at && z_at < second_at, "{out:?}");
     }
 
-    /// #3029 end-to-end: the in-band `wrap_link` payload rendered into a Buffer
-    /// by `Paragraph` must (a) be cleaned out of the cells by the extractor and
-    /// (b) re-emitted out-of-band by the backend around the label glyph. This
-    /// proves producer (`extract_buffer_link_regions` + `set_frame_links`) and
-    /// consumer (`ColorCompatBackend::draw`) compose.
+    /// #3029 end-to-end: a long bare URL hard-wraps at narrow width while its
+    /// full target travels beside every visible chunk. No escape payload enters
+    /// the buffer, and the backend re-emits one OSC 8 pair per row without
+    /// altering the visible byte stream.
     #[test]
-    fn osc8_extractor_feeds_backend_out_of_band() {
-        use crate::tui::osc8;
+    fn osc8_metadata_feeds_backend_for_every_wrapped_url_chunk() {
+        use crate::tui::{markdown_render, osc8};
         use ratatui::buffer::Buffer;
         use ratatui::layout::Rect;
-        use ratatui::text::{Line, Span};
+        use ratatui::style::Style;
         use ratatui::widgets::{Paragraph, Widget};
+        use unicode_width::UnicodeWidthStr;
 
-        // 1. Render an in-band link payload into a buffer, exactly as the
-        //    transcript render seam would.
-        let target = "https://example.test/e2e";
-        let label = "open";
-        let wrapped = osc8::wrap_link(target, label);
-        let area = Rect::new(0, 0, 40, 1);
+        let target = "https://example.test/a/very/long/path/that/wraps/across/rows";
+        let rendered = markdown_render::render_markdown_tagged(target, 12, Style::default());
+        assert!(rendered.len() > 2, "fixture must wrap at narrow width");
+        let lines = rendered
+            .iter()
+            .map(|rendered| rendered.line.clone())
+            .collect::<Vec<_>>();
+        let line_links = rendered
+            .iter()
+            .map(|rendered| rendered.links.clone())
+            .collect::<Vec<_>>();
+        let visible = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(visible.concat(), target);
+
+        let area = Rect::new(3, 2, 12, u16::try_from(lines.len()).unwrap());
         let mut buf = Buffer::empty(area);
-        Paragraph::new(vec![Line::from(vec![Span::raw(wrapped)])]).render(area, &mut buf);
+        Paragraph::new(lines).render(area, &mut buf);
 
-        // 2. The extractor recovers the region AND blanks the payload cells.
-        //    Capture the region once — re-running would find nothing because
-        //    the payload is now gone (that's the point).
-        let regions = osc8::extract_buffer_link_regions(&mut buf, area);
-        assert_eq!(regions.len(), 1, "one link recovered: {regions:?}");
+        // Visible cells start at the area's real x offset and contain exactly
+        // the URL chunks — never the historical `]8;;` payload bytes.
+        for (row_index, text) in visible.iter().enumerate() {
+            let y = area.y + u16::try_from(row_index).unwrap();
+            let row = (0..u16::try_from(text.width()).unwrap())
+                .map(|offset| buf[(area.x + offset, y)].symbol().to_string())
+                .collect::<String>();
+            assert_eq!(row, *text);
+        }
+        assert!((area.y..area.bottom()).all(|y| {
+            (area.x..area.right()).all(|x| {
+                let symbol = buf[(x, y)].symbol();
+                !symbol.contains('\x1b') && !symbol.contains("]8;;")
+            })
+        }));
+
+        let regions = osc8::link_regions_for_lines(area, &line_links);
+        assert_eq!(regions.len(), rendered.len());
+        for ((region, text), row_index) in regions.iter().zip(&visible).zip(0u16..) {
+            assert_eq!(region.row, area.y + row_index);
+            assert_eq!(region.col_start, area.x);
+            assert_eq!(
+                region.col_end,
+                area.x + u16::try_from(text.width()).unwrap() - 1
+            );
+            assert_eq!(region.target, target);
+        }
+
+        let buf_ref = &buf;
+        let cells = (area.y..area.bottom())
+            .flat_map(|y| (area.x..area.right()).map(move |x| (x, y, buf_ref[(x, y)].clone())))
+            .collect::<Vec<_>>();
+
+        // Capture an unlinked baseline from the exact same cells.
+        let _ = osc8::take_frame_links();
+        let baseline_writer = SharedWriter::default();
+        let baseline_capture = baseline_writer.0.clone();
+        let mut baseline =
+            ColorCompatBackend::new(baseline_writer, ColorDepth::TrueColor, PaletteMode::Dark);
+        baseline
+            .draw(cells.iter().map(|(x, y, cell)| (*x, *y, cell)))
+            .unwrap();
+
         osc8::set_frame_links(regions);
-
-        // 3. Hand the cleaned cells to the backend and capture the byte stream.
         let writer = SharedWriter::default();
         let capture = writer.0.clone();
         let mut backend = ColorCompatBackend::new(writer, ColorDepth::TrueColor, PaletteMode::Dark);
-        let cells: Vec<(u16, u16, ratatui::buffer::Cell)> = (0..area.width)
-            .map(|x| {
-                let cell = buf[(x, 0)].clone();
-                (x, 0u16, cell)
-            })
-            .collect();
         backend
             .draw(cells.iter().map(|(x, y, cell)| (*x, *y, cell)))
             .unwrap();
         let out = String::from_utf8_lossy(&capture.borrow()).to_string();
 
-        // 4. The backend re-emitted the link out-of-band around the label.
         let open = format!("\x1b]8;;{target}\x1b\\");
         let close = "\x1b]8;;\x1b\\";
         assert_eq!(
             out.matches(open.as_str()).count(),
-            1,
-            "open emitted once: {out:?}"
+            rendered.len(),
+            "each row reopens the full target: {out:?}"
         );
-        assert_eq!(out.matches(close).count(), 1, "close emitted once: {out:?}");
-        let open_at = out.find(open.as_str()).expect("open");
-        let close_at = out.find(close).expect("close");
-        let label_at = out.find(label).expect("label glyph");
-        assert!(open_at < label_at, "open precedes label: {out:?}");
-        assert!(label_at < close_at, "close follows label: {out:?}");
+        assert_eq!(out.matches(close).count(), rendered.len());
+
+        let baseline_out = String::from_utf8_lossy(&baseline_capture.borrow()).to_string();
+        let mut baseline_visible = String::new();
+        osc8::strip_ansi_into(&baseline_out, &mut baseline_visible);
+        let mut linked_visible = String::new();
+        osc8::strip_ansi_into(&out, &mut linked_visible);
+        assert_eq!(
+            linked_visible, baseline_visible,
+            "OSC 8 insertion must not move or alter any rendered cell"
+        );
     }
 }

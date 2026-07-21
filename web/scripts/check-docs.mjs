@@ -102,7 +102,22 @@ function checkInstallSnippets() {
       stale.push({ found: v, expected: version, context: ref[0].slice(0, 60) });
     }
   }
-  return { ok: stale.length === 0, stale };
+
+  // A clone without an explicit destination creates a directory whose name
+  // matches the repository slug exactly. Keep the following `cd` command
+  // case-correct so source installation works on case-sensitive filesystems.
+  const sourceCheckout = src.match(
+    /git clone https:\/\/github\.com\/Hmbown\/([^\s`]+)\s*\ncd\s+([^\s`]+)/,
+  );
+  const checkout = sourceCheckout
+    ? {
+        cloned: sourceCheckout[1].replace(/\.git$/, ""),
+        entered: sourceCheckout[2],
+      }
+    : null;
+  const checkoutOk = checkout !== null && checkout.cloned === checkout.entered;
+
+  return { ok: stale.length === 0 && checkoutOk, stale, checkout };
 }
 
 /* ------------------------------------------------------------------ */
@@ -139,12 +154,21 @@ function main() {
   // Check 3: install snippets
   const install = checkInstallSnippets();
   if (!install.ok && !install.note) {
-    console.error("[check-docs] FAIL — stale version in install snippets:");
-    for (const s of install.stale) {
-      console.error(`  found "${s.found}", expected "${s.expected}" in: ${s.context}`);
+    if (install.stale.length > 0) {
+      console.error("[check-docs] FAIL — stale version in install snippets:");
+      for (const s of install.stale) {
+        console.error(`  found "${s.found}", expected "${s.expected}" in: ${s.context}`);
+      }
+    }
+    if (install.checkout === null) {
+      console.error("[check-docs] FAIL — source checkout clone/cd commands not found");
+    } else if (install.checkout.cloned !== install.checkout.entered) {
+      console.error(
+        `[check-docs] FAIL — source checkout clones "${install.checkout.cloned}" but enters "${install.checkout.entered}"`,
+      );
     }
     // #3770: a stale install snippet must fail the gate, not fall through to
-    // the final PASS. Mirror the exit(1) used by checks 1 and 2 above.
+    // the final PASS. The same applies to source checkout copy drift.
     process.exit(1);
   }
   console.log(`[check-docs] OK — install snippets${install.note ? ` (${install.note})` : ""}`);

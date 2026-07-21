@@ -417,6 +417,9 @@ pub fn is_parallel_readonly_command(command: &str) -> bool {
         return true;
     }
     let canonical = classify_command(&command_refs);
+    if has_exec_capable_readonly_flag(&canonical, &command_refs) {
+        return false;
+    }
     if canonical == "tail"
         && command_refs.iter().skip(1).any(|token| {
             *token == "-f"
@@ -431,6 +434,33 @@ pub fn is_parallel_readonly_command(command: &str) -> bool {
     PARALLEL_READONLY_PREFIXES
         .iter()
         .any(|prefix| *prefix == canonical)
+}
+
+fn has_exec_capable_readonly_flag(canonical: &str, tokens: &[&str]) -> bool {
+    match canonical {
+        "fd" => tokens.iter().skip(1).any(|token| {
+            matches!(*token, "--exec" | "--exec-batch")
+                || token.starts_with("--exec=")
+                || token.starts_with("--exec-batch=")
+                || (token.starts_with('-')
+                    && !token.starts_with("--")
+                    && token[1..].chars().any(|flag| matches!(flag, 'x' | 'X')))
+        }),
+        "rg" => tokens
+            .iter()
+            .skip(1)
+            .any(|token| *token == "--pre" || token.starts_with("--pre=")),
+        "git grep" => tokens.iter().skip(2).any(|token| {
+            *token == "-O"
+                || token.starts_with("-O")
+                || *token == "--open-files-in-pager"
+                || token.starts_with("--open-files-in-pager=")
+                || (token.starts_with('-')
+                    && !token.starts_with("--")
+                    && token[1..].chars().any(|flag| flag == 'O'))
+        }),
+        _ => false,
+    }
 }
 
 fn is_codewhale_readonly_invocation(tokens: &[&str]) -> bool {
@@ -1164,10 +1194,15 @@ mod tests {
             "git status -s",
             "git log --oneline -5",
             "rg foo crates/",
+            "fd -e rs .",
+            "fd -H --type f src",
+            "git grep needle crates/",
+            "git grep -n needle crates/",
             "ls -la",
             "cat Cargo.toml",
             "bash -lc 'git status -s'",
             "sh -c 'rg foo crates/'",
+            "bash -lc 'fd -e toml .'",
         ] {
             assert!(
                 is_parallel_readonly_command(command),
@@ -1186,6 +1221,21 @@ mod tests {
             "sleep 5 &",
             "bash -lc 'git status && rm -rf /'",
             "bash -lc 'rg foo | head'",
+            "bash -lc 'fd -x ./pwn.sh'",
+            "fd -x ./pwn.sh",
+            "fd -u -tf -x ./pwn.sh",
+            "fd -uX ./pwn.sh",
+            "fd -uHtx ./pwn.sh",
+            "fd --exec ./pwn.sh",
+            "fd --exec=./pwn.sh",
+            "fd --exec-batch ./pwn.sh",
+            "rg --pre /tmp/evil.sh needle .",
+            "rg --pre=/tmp/evil.sh needle .",
+            "git grep -O needle",
+            "git grep -nO needle",
+            "git grep -O/tmp/evil.sh needle",
+            "git grep --open-files-in-pager /tmp/evil.sh needle",
+            "git grep --open-files-in-pager=/tmp/evil.sh needle",
         ] {
             assert!(
                 !is_parallel_readonly_command(command),

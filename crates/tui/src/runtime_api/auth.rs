@@ -1,6 +1,6 @@
 use axum::Json;
 use axum::extract::{Request, State};
-use axum::http::{StatusCode, header};
+use axum::http::{Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
@@ -74,7 +74,16 @@ pub(super) async fn require_runtime_token(
     let Some(expected) = state.runtime_token.as_deref() else {
         return next.run(req).await;
     };
-    let authorized = request_has_runtime_token(&req, expected);
+    let cookie_authorized = request_has_runtime_cookie(&req, expected)
+        || state.web.as_ref().is_some_and(|web| {
+            web.matches_session_cookie(
+                req.headers()
+                    .get(header::COOKIE)
+                    .and_then(|value| value.to_str().ok()),
+            )
+        });
+    let authorized = request_has_header_runtime_token(&req, expected)
+        || (cookie_authorized && web_cookie_request_is_same_origin(&req, &state));
 
     if authorized {
         next.run(req).await
@@ -83,7 +92,7 @@ pub(super) async fn require_runtime_token(
     }
 }
 
-fn request_has_runtime_token(req: &Request, expected: &str) -> bool {
+fn request_has_header_runtime_token(req: &Request, expected: &str) -> bool {
     req.headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -99,12 +108,51 @@ fn request_has_runtime_token(req: &Request, expected: &str) -> bool {
             .get("x-deepseek-runtime-token")
             .and_then(|value| value.to_str().ok())
             .is_some_and(|token| token == expected)
-        || token_from_cookie_header(
-            req.headers()
-                .get(header::COOKIE)
-                .and_then(|value| value.to_str().ok()),
-        )
-        .is_some_and(|token| token == expected)
+}
+
+fn request_has_runtime_cookie(req: &Request, expected: &str) -> bool {
+    token_from_cookie_header(
+        req.headers()
+            .get(header::COOKIE)
+            .and_then(|value| value.to_str().ok()),
+    )
+    .is_some_and(|token| token == expected)
+}
+
+/// The web bootstrap adds cookie authentication to the existing bearer/header
+/// boundary. SameSite is site-scoped rather than origin-scoped, so a sibling
+/// loopback port can still receive the cookie. Require browser-origin evidence
+/// for unsafe methods and reject Fetch Metadata that identifies any
+/// cross-origin cookie request. Bearer and explicit runtime-token headers keep
+/// their existing behavior.
+fn web_cookie_request_is_same_origin(req: &Request, state: &RuntimeApiState) -> bool {
+    if state.web.is_none() {
+        return true;
+    }
+
+    if req
+        .headers()
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|site| !site.eq_ignore_ascii_case("same-origin"))
+    {
+        return false;
+    }
+
+    let expected_origin = if state.bind_port == 80 {
+        format!("http://{}", state.bind_host)
+    } else {
+        format!("http://{}:{}", state.bind_host, state.bind_port)
+    };
+    if let Some(origin) = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    {
+        return origin == expected_origin;
+    }
+
+    matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS)
 }
 
 fn runtime_token_required_response() -> Response {

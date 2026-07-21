@@ -11,13 +11,15 @@
 //! does not represent (and for unbundled gateways until the live catalog covers
 //! them).
 
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use codewhale_config::catalog::{CatalogOffering, CatalogSnapshot, bundled_catalog_offerings};
 
 use crate::codex_model_cache;
 use crate::config::{
-    ApiProvider, Config, model_completion_names_for_provider, provider_is_configured_for_active,
+    ApiProvider, Config, model_completion_names_for_provider, opencode_go_chat_model_id,
+    provider_is_configured_for_active,
 };
 
 static BUNDLED_SNAPSHOT: std::sync::OnceLock<CatalogSnapshot> = std::sync::OnceLock::new();
@@ -26,10 +28,44 @@ static BUNDLED_SNAPSHOT: std::sync::OnceLock<CatalogSnapshot> = std::sync::OnceL
 /// offline/stale fallback rows are visible.
 static LIVE_SNAPSHOT: RwLock<Option<CatalogSnapshot>> = RwLock::new(None);
 
+/// Generation stamp for the live snapshot. Bumped (under the `LIVE_SNAPSHOT`
+/// write lock) by [`set_live_snapshot`] / [`clear_live_snapshot`] so the
+/// memoized merged snapshot below can detect staleness without re-merging.
+static LIVE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Memoized result of [`merged_snapshot`], tagged with the `LIVE_GENERATION`
+/// it was computed from. Re-merging ~5,700 offerings per call made every
+/// `/model` open pay a multi-second, UI-thread-blocking cost; the merge result
+/// only changes when the live snapshot changes, so cache it.
+static MERGED_CACHE: RwLock<Option<(u64, Arc<CatalogSnapshot>)>> = RwLock::new(None);
+
 fn bundled_snapshot() -> &'static CatalogSnapshot {
     BUNDLED_SNAPSHOT.get_or_init(|| CatalogSnapshot {
         offerings: bundled_catalog_offerings(),
     })
+}
+
+/// Remove catalog rows that cannot use the selected provider's wire protocol.
+///
+/// OpenCode Go publishes one `/models` roster for both Chat Completions and
+/// Anthropic Messages. The `OpencodeGo` route is Chat-only, so sanitize both
+/// saved/live snapshots and the bundled fallback at the lake boundary. This is
+/// deliberately downstream of every publisher so stale cached rows cannot
+/// bypass the client-side live-fetch filter.
+fn apply_provider_model_cutlines(mut snapshot: CatalogSnapshot) -> CatalogSnapshot {
+    snapshot.offerings = snapshot
+        .offerings
+        .into_iter()
+        .filter_map(|mut offering| {
+            if ApiProvider::parse(&offering.provider) == Some(ApiProvider::OpencodeGo) {
+                let canonical = opencode_go_chat_model_id(&offering.wire_model_id)?;
+                offering.provider = ApiProvider::OpencodeGo.as_str().to_string();
+                offering.wire_model_id = canonical.to_string();
+            }
+            Some(offering)
+        })
+        .collect();
+    snapshot
 }
 
 /// Set the live-catalog snapshot. Call this after a background refresh
@@ -37,7 +73,11 @@ fn bundled_snapshot() -> &'static CatalogSnapshot {
 /// Stale or empty snapshots are harmless — a `None` just means "bundled only."
 pub fn set_live_snapshot(snapshot: CatalogSnapshot) {
     if let Ok(mut guard) = LIVE_SNAPSHOT.write() {
-        *guard = Some(snapshot);
+        *guard = Some(apply_provider_model_cutlines(snapshot));
+        // Invalidate the memoized merged snapshot while still holding the
+        // write lock so no reader can cache the old merge against the new
+        // generation.
+        LIVE_GENERATION.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -45,15 +85,39 @@ pub fn set_live_snapshot(snapshot: CatalogSnapshot) {
 pub fn clear_live_snapshot() {
     if let Ok(mut guard) = LIVE_SNAPSHOT.write() {
         *guard = None;
+        LIVE_GENERATION.fetch_add(1, Ordering::SeqCst);
     }
 }
 
 /// The merged catalog snapshot: live rows override bundled rows on
 /// `(provider, wire_model_id)` identity (#4188). When no live snapshot is
 /// present, this is just the offline bundled snapshot.
-fn merged_snapshot() -> CatalogSnapshot {
+///
+/// Memoized: the merge is recomputed only after [`set_live_snapshot`] /
+/// [`clear_live_snapshot`] bump `LIVE_GENERATION`; every other call returns
+/// the cached `Arc` (the picker calls this per row, so it must be cheap).
+fn merged_snapshot() -> Arc<CatalogSnapshot> {
+    let generation = LIVE_GENERATION.load(Ordering::SeqCst);
+    if let Ok(guard) = MERGED_CACHE.read()
+        && let Some((cached_generation, cached)) = guard.as_ref()
+        && *cached_generation == generation
+    {
+        return Arc::clone(cached);
+    }
+    let merged = Arc::new(compute_merged_snapshot());
+    if let Ok(mut guard) = MERGED_CACHE.write() {
+        // `generation` was sampled before the live snapshot was read, so a
+        // concurrent set/clear leaves this entry stale-tagged and the next
+        // reader recomputes; the merge itself is always internally consistent.
+        *guard = Some((generation, Arc::clone(&merged)));
+    }
+    merged
+}
+
+/// Uncached merge (see [`merged_snapshot`] for the caching seam).
+fn compute_merged_snapshot() -> CatalogSnapshot {
     let live = LIVE_SNAPSHOT.read().ok().and_then(|guard| guard.clone());
-    match live {
+    let merged = match live {
         None => bundled_snapshot().clone(),
         Some(live) => {
             use std::collections::BTreeMap;
@@ -74,7 +138,8 @@ fn merged_snapshot() -> CatalogSnapshot {
                 offerings: merged.into_values().collect(),
             }
         }
-    }
+    };
+    apply_provider_model_cutlines(merged)
 }
 
 /// Maps an [`ApiProvider`] to its bundled-catalog provider id.
@@ -412,6 +477,116 @@ mod tests {
         clear_live_snapshot();
         let after_clear = all_catalog_models_for_provider(ApiProvider::Deepseek);
         assert_eq!(after_clear, bundled);
+    }
+
+    /// Memoization: repeated `merged_snapshot()` calls return the cached merge
+    /// (same `Arc` allocation), and publishing or clearing a live snapshot
+    /// invalidates the cache so new content becomes visible.
+    #[test]
+    fn merged_snapshot_cache_invalidates_on_live_snapshot_change() {
+        let _live = lock_live_snapshot();
+        clear_live_snapshot();
+
+        let bundled_only = merged_snapshot();
+        assert!(
+            Arc::ptr_eq(&bundled_only, &merged_snapshot()),
+            "repeated merged_snapshot() calls must return the cached Arc"
+        );
+        let probe = "deepseek-cache-probe-model";
+        assert!(
+            !bundled_only
+                .offerings
+                .iter()
+                .any(|row| row.wire_model_id == probe),
+            "probe model must not pre-exist in the bundled snapshot"
+        );
+
+        set_live_snapshot(CatalogSnapshot {
+            offerings: vec![CatalogOffering {
+                provider: "deepseek".to_string(),
+                wire_model_id: probe.to_string(),
+                endpoint_key: "chat".to_string(),
+                ..Default::default()
+            }],
+        });
+        let with_live = merged_snapshot();
+        assert!(
+            !Arc::ptr_eq(&bundled_only, &with_live),
+            "set_live_snapshot must invalidate the memoized merge"
+        );
+        assert!(
+            with_live
+                .offerings
+                .iter()
+                .any(|row| row.wire_model_id == probe),
+            "new live content must be visible after set_live_snapshot"
+        );
+
+        clear_live_snapshot();
+        let after_clear = merged_snapshot();
+        assert!(
+            !after_clear
+                .offerings
+                .iter()
+                .any(|row| row.wire_model_id == probe),
+            "clear_live_snapshot must invalidate the memoized merge"
+        );
+        assert_eq!(
+            after_clear.offerings, bundled_only.offerings,
+            "clearing live must restore the bundled-only merge content"
+        );
+    }
+
+    #[test]
+    fn opencode_go_lake_drops_messages_only_saved_and_live_rows() {
+        let _live = lock_live_snapshot();
+        clear_live_snapshot();
+
+        let mut offerings: Vec<_> = crate::config::OPENCODE_GO_CHAT_MODELS
+            .iter()
+            .map(|model| CatalogOffering {
+                provider: "opencode_go".to_string(),
+                wire_model_id: if *model == crate::config::DEFAULT_OPENCODE_GO_MODEL {
+                    format!("opencode-go/{model}")
+                } else {
+                    (*model).to_string()
+                },
+                endpoint_key: "chat".to_string(),
+                ..Default::default()
+            })
+            .collect();
+        offerings.extend(["minimax-m3", "qwen3.7-max"].map(|model| CatalogOffering {
+            provider: "opencode-go".to_string(),
+            wire_model_id: model.to_string(),
+            endpoint_key: "messages".to_string(),
+            ..Default::default()
+        }));
+        set_live_snapshot(CatalogSnapshot { offerings });
+
+        let models: std::collections::BTreeSet<_> =
+            all_catalog_models_for_provider(ApiProvider::OpencodeGo)
+                .into_iter()
+                .collect();
+        let expected: std::collections::BTreeSet<_> = crate::config::OPENCODE_GO_CHAT_MODELS
+            .iter()
+            .map(|model| (*model).to_string())
+            .collect();
+        assert_eq!(models, expected);
+        for messages_only in ["minimax-m3", "qwen3.7-max"] {
+            assert!(
+                catalog_offering_for_model(ApiProvider::OpencodeGo, messages_only).is_none(),
+                "saved/live {messages_only} row must not bypass the Chat-only lake cutline"
+            );
+        }
+        assert!(
+            catalog_offering_for_model(
+                ApiProvider::OpencodeGo,
+                crate::config::DEFAULT_OPENCODE_GO_MODEL,
+            )
+            .is_some()
+        );
+
+        clear_live_snapshot();
     }
 
     /// #4188: live > bundled > legacy fallback precedence, including live

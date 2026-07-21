@@ -13,7 +13,7 @@ use serde::Serialize;
 use codewhale_config::route::RouteLimits;
 
 use crate::compaction::{estimate_input_tokens_conservative, estimate_text_tokens_conservative};
-use crate::config::{ApiProvider, Config, provider_capability};
+use crate::config::{ApiProvider, Config};
 use crate::context_budget::PressureLevel;
 use crate::models::{ContentBlock, Message};
 use crate::prompts::{COMPACT_TEMPLATE, Personality};
@@ -26,6 +26,8 @@ pub struct PromptSourceMap {
     pub total_estimated_tokens: usize,
     pub active_context_estimated_tokens: usize,
     pub context_window_tokens: Option<u32>,
+    /// Non-secret receipt for the effective context-window value.
+    pub context_window_source: Option<String>,
     pub budget_used_percent: Option<f64>,
     pub generated_at: String,
     pub note: String,
@@ -130,6 +132,7 @@ impl SourceEntry {
 #[serde(rename_all = "snake_case")]
 pub enum SourceKind {
     Constitution,
+    UserConstitution,
     RepoConstitution,
     ProjectContext,
     ProjectContextWarning,
@@ -187,6 +190,7 @@ impl ReportBuilder {
         provider: ApiProvider,
         model: &str,
         route_limits: Option<RouteLimits>,
+        context_window_source: Option<crate::route_runtime::ContextWindowSource>,
         active_context_estimated_tokens: usize,
         note: impl Into<String>,
     ) -> PromptSourceMap {
@@ -208,6 +212,9 @@ impl ReportBuilder {
             total_estimated_tokens,
             active_context_estimated_tokens,
             context_window_tokens,
+            context_window_source: context_window_source
+                .map(crate::route_runtime::ContextWindowSource::label)
+                .map(str::to_string),
             budget_used_percent,
             generated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
             note: note.into(),
@@ -224,6 +231,7 @@ pub fn build_context_report(app: &App) -> PromptSourceMap {
         app.api_provider,
         &app.model,
         app.active_route_limits,
+        Some(app.active_context_window_source),
         active_context_estimated_tokens,
         "Diagnostic source map. Token counts are conservative estimates and may differ from provider billing.",
     )
@@ -231,6 +239,15 @@ pub fn build_context_report(app: &App) -> PromptSourceMap {
 
 pub fn build_headless_context_report(config: &Config, workspace: &Path) -> PromptSourceMap {
     let model = config.default_model();
+    let provider = config.api_provider();
+    let provider_identity = config.provider_identity_for(provider);
+    let route = crate::route_runtime::resolve_runtime_route(config, provider, Some(&model)).ok();
+    let route_limits = route.as_ref().map(|route| route.candidate.limits());
+    let context_window_source = route
+        .as_ref()
+        .map(|route| route.context_window.source)
+        .unwrap_or(crate::route_runtime::ContextWindowSource::Fallback);
+    let context_window = route_context_window_tokens(provider, &model, route_limits);
     let global_skills_dir = config.skills_dir();
     let selected_skills_dir =
         crate::tui::app::resolve_skills_dir(workspace, &global_skills_dir, config);
@@ -268,16 +285,15 @@ pub fn build_headless_context_report(config: &Config, workspace: &Path) -> Promp
 
     builder.push(SourceEntry::text(
         SourceKind::ModelProviderFact,
-        format!("Provider facts ({})", config.api_provider().as_str()),
+        format!("Provider facts ({provider_identity})"),
         None,
         ActivationReason::RuntimeState,
         &format!(
-            "provider: {}\nmodel: {}\ncontext_window: {}",
-            config.api_provider().as_str(),
+            "provider: {}\nmodel: {}\ncontext_window: {}\ncontext_window_source: {}",
+            provider_identity,
             model,
-            // Route limits aren't resolved in the headless doctor path, so report
-            // the provider+model capability window (route overlay is unavailable).
-            provider_capability(config.api_provider(), &model).context_window
+            context_window,
+            context_window_source.label()
         ),
         CountingConfidence::Approximate,
         None,
@@ -289,10 +305,10 @@ pub fn build_headless_context_report(config: &Config, workspace: &Path) -> Promp
         .map(|entry| entry.estimated_tokens)
         .sum();
     builder.finish(
-        config.api_provider(),
+        provider,
         &model,
-        // Route limits aren't resolved in the headless doctor path.
-        None,
+        route_limits,
+        Some(context_window_source),
         active_context_estimated_tokens,
         "Headless diagnostic source map. Conversation, tool results, and live TUI state are unavailable in doctor mode.",
     )
@@ -301,17 +317,30 @@ pub fn build_headless_context_report(config: &Config, workspace: &Path) -> Promp
 fn base_source_entries(model: &str, workspace: &Path, skills_dir: Option<&Path>) -> ReportBuilder {
     let mut builder = ReportBuilder::new();
 
-    let constitution =
-        crate::prompts::compose_prompt_with_approval_model_and_shell(Personality::Calm, model);
+    let constitution = crate::prompts::compose_default_static_layers(Personality::Calm, model);
     builder.push(SourceEntry::text(
         SourceKind::Constitution,
-        "Constitution and static prompt",
+        "Bundled constitution, language policy, and output policy",
         Some("crates/tui/src/prompts/constitution.md".to_string()),
         ActivationReason::AlwaysOn,
         &constitution,
         CountingConfidence::High,
         Some(1),
     ));
+
+    if let Some(block) = crate::prompts::load_user_constitution_block() {
+        builder.push(SourceEntry::text(
+            SourceKind::UserConstitution,
+            "User-global constitution",
+            codewhale_config::UserConstitution::path()
+                .ok()
+                .map(|path| path.display().to_string()),
+            ActivationReason::FilePresent,
+            &block,
+            CountingConfidence::High,
+            Some(2),
+        ));
+    }
 
     let project_context = crate::project_context::load_project_context_with_parents(workspace);
     if let Some(block) = project_context.constitution_block.as_deref() {
@@ -470,9 +499,9 @@ fn add_app_runtime_entries(builder: &mut ReportBuilder, app: &App) {
             "workspace: {}\nmodel: {}\nprovider: {}\nmode: {}\napproval: {}",
             app.workspace.display(),
             app.model,
-            app.api_provider.as_str(),
+            app.provider_identity_for_persistence(),
             app.mode.label(),
-            app.approval_mode.label()
+            app.approval_mode.permission_chip_label()
         ),
         CountingConfidence::Approximate,
         Some(4),
@@ -697,8 +726,12 @@ pub fn format_context_report(report: &PromptSourceMap) -> String {
         (Some(window), Some(percent)) => {
             let _ = writeln!(
                 out,
-                "Window: {window} tokens ({percent:.1}% used, {})",
-                pressure_label(Some(percent))
+                "Window: {window} tokens ({percent:.1}% used, {}; source: {})",
+                pressure_label(Some(percent)),
+                report
+                    .context_window_source
+                    .as_deref()
+                    .unwrap_or("fallback")
             );
         }
         _ => {
@@ -823,7 +856,14 @@ mod tests {
             Some(1),
         ));
         add_message_entries(&mut builder, &messages);
-        let report = builder.finish(ApiProvider::Deepseek, "deepseek-v4-pro", None, 123, "test");
+        let report = builder.finish(
+            ApiProvider::Deepseek,
+            "deepseek-v4-pro",
+            None,
+            Some(crate::route_runtime::ContextWindowSource::Fallback),
+            123,
+            "test",
+        );
         let json = context_report_json(&report);
 
         assert!(json.contains("\"source_kind\": \"tool_result\""));
@@ -878,6 +918,57 @@ mod tests {
         let json = context_report_json(&report);
         assert!(json.contains("\"repo_constitution\""));
         assert!(json.contains("branch_policy appears stale"));
+    }
+
+    #[test]
+    fn headless_context_report_uses_kimi_code_k3_route_context() {
+        let tmp = tempdir().expect("workspace");
+        let config = Config {
+            provider: Some("moonshot".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                moonshot: crate::config::ProviderConfig {
+                    api_key: Some("test-kimi-key".to_string()),
+                    base_url: Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string()),
+                    model: Some(crate::config::KIMI_CODE_K3_MODEL.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let report = build_headless_context_report(&config, tmp.path());
+
+        assert_eq!(report.context_window_tokens, Some(262_144));
+        assert_eq!(
+            report.context_window_source.as_deref(),
+            Some("static Kimi Code safe floor")
+        );
+        assert!(context_report_json(&report).contains("\"context_window_tokens\": 262144"));
+    }
+
+    #[test]
+    fn headless_context_report_honors_kimi_code_k3_context_override() {
+        let tmp = tempdir().expect("workspace");
+        let config = Config {
+            provider: Some("moonshot".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                moonshot: crate::config::ProviderConfig {
+                    api_key: Some("test-kimi-key".to_string()),
+                    base_url: Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string()),
+                    model: Some(crate::config::KIMI_CODE_K3_MODEL.to_string()),
+                    context_window: Some(1_048_576),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let report = build_headless_context_report(&config, tmp.path());
+
+        assert_eq!(report.context_window_tokens, Some(1_048_576));
+        assert_eq!(report.context_window_source.as_deref(), Some("configured"));
     }
 
     #[test]
@@ -1008,7 +1099,14 @@ mod tests {
             CountingConfidence::High,
             Some(7),
         ));
-        let report = builder.finish(ApiProvider::Deepseek, "deepseek-v4-pro", None, 525, "test");
+        let report = builder.finish(
+            ApiProvider::Deepseek,
+            "deepseek-v4-pro",
+            None,
+            Some(crate::route_runtime::ContextWindowSource::Fallback),
+            525,
+            "test",
+        );
         let summary = format_context_summary(&report);
 
         assert!(summary.contains("Context Summary"));
@@ -1038,6 +1136,7 @@ mod tests {
             ApiProvider::Deepseek,
             "deepseek-v4-pro",
             Some(limits),
+            Some(crate::route_runtime::ContextWindowSource::Catalog),
             10_000,
             "test",
         );

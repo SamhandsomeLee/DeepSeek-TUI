@@ -462,20 +462,38 @@ fn activity_detail_handle_line(app: &App, cell_index: usize, cell: &HistoryCell)
             .iter()
             .find(|artifact| artifact.tool_call_id == detail.tool_id)
         {
+            let details = crate::tui::shell_key_routing::display_chord(
+                crate::tui::shell_key_routing::binding(
+                    crate::tui::shell_key_routing::ShellBindingId::ToolDetails,
+                )
+                .footer_chord,
+            );
             return Some(format!(
-                "Detail handle: {} (retrieve_tool_result ref={}; v raw details)",
+                "Detail handle: {} (retrieve_tool_result ref={}; {details} raw details)",
                 artifact.id, artifact.id
             ));
         }
+        let details = crate::tui::shell_key_routing::display_chord(
+            crate::tui::shell_key_routing::binding(
+                crate::tui::shell_key_routing::ShellBindingId::ToolDetails,
+            )
+            .footer_chord,
+        );
         return Some(format!(
-            "Detail handle: tool:{} (v raw details)",
+            "Detail handle: tool:{} ({details} raw details)",
             detail.tool_id
         ));
     }
 
+    let details = crate::tui::shell_key_routing::display_chord(
+        crate::tui::shell_key_routing::binding(
+            crate::tui::shell_key_routing::ShellBindingId::ToolDetails,
+        )
+        .footer_chord,
+    );
     match cell {
-        HistoryCell::Tool(_) => Some("Detail handle: v details".to_string()),
-        HistoryCell::SubAgent(_) => Some("Detail handle: v details".to_string()),
+        HistoryCell::Tool(_) => Some(format!("Detail handle: {details} details")),
+        HistoryCell::SubAgent(_) => Some(format!("Detail handle: {details} details")),
         _ => None,
     }
 }
@@ -829,6 +847,7 @@ pub(super) fn open_turn_inspector_pager(app: &mut App) -> bool {
     let handoff = turn_handoff_markdown(app);
     app.view_stack.push(
         PagerView::from_text("Turn Inspector", &text, width.saturating_sub(2))
+            .with_copy_text(text)
             .with_export_markdown(handoff),
     );
     true
@@ -890,12 +909,17 @@ pub(super) fn turn_inspector_text(app: &App) -> String {
     } else {
         out.push("Turn: \u{2014} (no turn recorded yet)".to_string());
     }
-    // Restate the Ctrl+O (overview) vs. `v` (raw leaf detail) contract so the
-    // two surfaces never get confused.
-    out.push(
-        "Overview of the current/latest turn · press v for the selected item's raw detail"
-            .to_string(),
+    // Restate the Ctrl+O (overview) vs. Alt+V/⌥V (raw leaf detail) contract so
+    // the two surfaces never get confused. Bare `v` is never a details shortcut.
+    let details = crate::tui::shell_key_routing::display_chord(
+        crate::tui::shell_key_routing::binding(
+            crate::tui::shell_key_routing::ShellBindingId::ToolDetails,
+        )
+        .footer_chord,
     );
+    out.push(format!(
+        "Overview of the current/latest turn · press {details} for the selected item's raw detail"
+    ));
 
     push_section(&mut out, "Intent", vec![turn_intent_line(app, start)]);
 
@@ -925,7 +949,7 @@ pub(super) fn turn_inspector_text(app: &App) -> String {
     push_section(
         &mut out,
         "Final result / status",
-        turn_result_lines(app, start, end),
+        turn_result_lines(app, start, end, ResultDetail::Full),
     );
 
     out.join("\n")
@@ -999,7 +1023,7 @@ pub(crate) fn turn_handoff_markdown(app: &App) -> String {
     push_md_section(
         &mut out,
         "Result / status",
-        md_bullets(turn_result_lines(app, start, end)),
+        md_bullets(turn_result_lines(app, start, end, ResultDetail::Compact)),
     );
 
     // Trailing newline keeps the artifact clean when pasted into a PR body.
@@ -1064,16 +1088,22 @@ fn turn_intent_line(app: &App, start: usize) -> String {
 }
 
 /// Optional selected-item context. The first view is the turn overview, but
-/// when the user has an activity cell selected we surface it plus the `v`
-/// affordance so the Ctrl+O / `v` split stays discoverable.
+/// when the user has an activity cell selected we surface it plus the Alt+V
+/// affordance so the Ctrl+O / Alt+V split stays discoverable.
 fn selected_item_context_line(app: &App) -> Option<String> {
     let idx = selected_transcript_cell_index(app)?;
     let cell = app.cell_at_virtual_index(idx)?;
     let label = truncate_line_to_width(&activity_cell_label(app, idx, cell), 48);
     let hint = if app.cell_has_detail_target(idx) {
-        " · v opens its raw detail"
+        let details = crate::tui::shell_key_routing::display_chord(
+            crate::tui::shell_key_routing::binding(
+                crate::tui::shell_key_routing::ShellBindingId::ToolDetails,
+            )
+            .footer_chord,
+        );
+        format!(" · {details} opens its raw detail")
     } else {
-        ""
+        String::new()
     };
     Some(format!("{label}{hint}"))
 }
@@ -1313,16 +1343,29 @@ fn generic_tool_timeline_kind(generic: &crate::tui::history::GenericToolCell) ->
     }
 }
 
-fn timeline_cell_actions(app: &App, idx: usize, cell: &HistoryCell) -> Vec<&'static str> {
+fn timeline_cell_actions(app: &App, idx: usize, cell: &HistoryCell) -> Vec<String> {
     let mut actions = Vec::new();
     if app.cell_has_detail_target(idx) {
-        actions.push("v raw detail");
-    }
-    match cell {
-        HistoryCell::Tool(ToolCell::DiffPreview(_)) => actions.push("d diff"),
-        HistoryCell::Tool(ToolCell::PatchSummary(_)) => actions.push("d diff"),
-        HistoryCell::Tool(ToolCell::Generic(generic)) if generic.is_diff => actions.push("d diff"),
-        _ => {}
+        let details = crate::tui::shell_key_routing::display_chord(
+            crate::tui::shell_key_routing::binding(
+                crate::tui::shell_key_routing::ShellBindingId::ToolDetails,
+            )
+            .footer_chord,
+        );
+        // Diff-bearing cells open their diff through the same details chord;
+        // bare `v` / `d` always type text (TUI-DOG-002), so no bare-key claim.
+        let is_diff = matches!(
+            cell,
+            HistoryCell::Tool(ToolCell::DiffPreview(_) | ToolCell::PatchSummary(_))
+        ) || matches!(
+            cell,
+            HistoryCell::Tool(ToolCell::Generic(generic)) if generic.is_diff
+        );
+        if is_diff {
+            actions.push(format!("{details} diff"));
+        } else {
+            actions.push(format!("{details} raw detail"));
+        }
     }
     actions
 }
@@ -1332,7 +1375,7 @@ fn timeline_row(
     summary: &str,
     status: Option<&str>,
     duration: Option<&str>,
-    actions: &[&str],
+    actions: &[String],
 ) -> String {
     let mut line = if summary.trim().is_empty() {
         kind.to_string()
@@ -1550,11 +1593,55 @@ fn turn_approvals_lines(app: &App) -> Vec<String> {
 fn turn_route_lines(app: &App) -> Vec<String> {
     let mut lines = Vec::new();
 
-    let (provider, model) = match app.pending_turn_route.as_ref() {
-        Some((provider, model, _passthrough)) => (provider.display_name(), model.clone()),
-        None => (app.api_provider.display_name(), app.model.clone()),
+    let (provider, model) = if let Some(route) = app
+        .active_turn
+        .as_ref()
+        .and_then(|turn| turn.route.as_ref())
+    {
+        let provider = if route.provider == crate::config::ApiProvider::Custom {
+            route.provider_identity.clone()
+        } else {
+            route.provider.display_name().to_string()
+        };
+        (provider, route.model.clone())
+    } else {
+        // Pending and last Auto routes use the same billing-authoritative
+        // display contract as the header; do not fall back to `auto` after the
+        // concrete turn route has resolved.
+        app.effective_route_identity_display()
     };
     lines.push(format!("Route: {provider} · {model}"));
+
+    let auto_receipt = app
+        .active_turn
+        .as_ref()
+        .filter(|turn| turn.route.as_ref().is_some_and(|route| route.auto_model))
+        .and_then(|turn| turn.auto_route_receipt.as_ref())
+        .or_else(|| {
+            app.pending_turn_route
+                .as_ref()
+                .filter(|(_, _, auto_model)| *auto_model)
+                .and(app.pending_auto_route_receipt.as_ref())
+        })
+        .or_else(|| {
+            app.auto_model
+                .then_some(app.last_auto_route_receipt.as_ref())
+                .flatten()
+        });
+    if let Some(receipt) = auto_receipt {
+        lines.push(format!(
+            "Auto decision: {} · {}",
+            receipt.tier.label(),
+            receipt.reason.label()
+        ));
+        let pair = receipt.pair.fast.as_deref().map_or_else(
+            || format!("{} (no runnable fast sibling)", receipt.pair.strong),
+            |fast| format!("{} strong · {fast} fast", receipt.pair.strong),
+        );
+        lines.push(format!("Auto pair: {pair}"));
+        lines.push(format!("Auto scope: {}", receipt.scope.label()));
+        lines.push(format!("Auto data: {}", receipt.data_path.label()));
+    }
 
     let session = &app.session;
     match (session.last_prompt_tokens, session.last_completion_tokens) {
@@ -1573,15 +1660,57 @@ fn turn_route_lines(app: &App) -> Vec<String> {
     }
 
     let cost = app.displayed_session_cost_for_currency(app.cost_currency);
-    if cost > 0.0 {
-        lines.push(format!("Cost (session): {}", app.format_cost_amount(cost)));
+    let chip = crate::route_billing::usage_chip(
+        app.billing_presentation,
+        app.api_provider,
+        &app.model,
+        cost,
+        app.cost_currency,
+        None,
+    );
+    match chip {
+        crate::route_billing::UsageChip::Money(amount) => {
+            lines.push(format!("Cost (session): {amount}"));
+        }
+        crate::route_billing::UsageChip::Allowance { label, used_pct } => {
+            lines.push(match used_pct {
+                Some(pct) => format!("Usage plan: {label} ({pct:.0}% used)"),
+                None => format!("Usage plan: {label}"),
+            });
+        }
+        crate::route_billing::UsageChip::Local => {
+            lines.push("Cost: local".to_string());
+        }
+        crate::route_billing::UsageChip::Unknown => {
+            lines.push("Cost: unknown".to_string());
+        }
+        crate::route_billing::UsageChip::Hidden => {}
     }
 
     lines
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResultDetail {
+    /// Pager content is the review surface and must retain the complete final
+    /// response. Width wrapping belongs to `PagerView`, not data assembly.
+    Full,
+    /// The exported handoff is intentionally a compact overview.
+    Compact,
+}
+
+fn cleaned_turn_text(text: &str, detail: ResultDetail, max_width: usize) -> String {
+    if detail == ResultDetail::Compact {
+        return one_line_summary(text, max_width);
+    }
+
+    let mut cleaned = String::with_capacity(text.len());
+    crate::tui::osc8::strip_ansi_into(text, &mut cleaned);
+    cleaned.trim().to_string()
+}
+
 /// Section 9 — final result / current status.
-fn turn_result_lines(app: &App, start: usize, end: usize) -> Vec<String> {
+fn turn_result_lines(app: &App, start: usize, end: usize, detail: ResultDetail) -> Vec<String> {
     let mut lines = Vec::new();
 
     let status = match app.runtime_turn_status.as_deref() {
@@ -1595,8 +1724,8 @@ fn turn_result_lines(app: &App, start: usize, end: usize) -> Vec<String> {
         .rev()
         .find_map(|idx| match app.cell_at_virtual_index(idx) {
             Some(HistoryCell::Assistant { content, .. }) => {
-                let summary = one_line_summary(content, 200);
-                (!summary.is_empty()).then_some(summary)
+                let text = cleaned_turn_text(content, detail, 200);
+                (!text.is_empty()).then_some(text)
             }
             _ => None,
         });
@@ -1612,8 +1741,8 @@ fn turn_result_lines(app: &App, start: usize, end: usize) -> Vec<String> {
         .rev()
         .find_map(|idx| match app.cell_at_virtual_index(idx) {
             Some(HistoryCell::Error { message, .. }) => {
-                let summary = one_line_summary(message, 160);
-                (!summary.is_empty()).then_some(summary)
+                let text = cleaned_turn_text(message, detail, 160);
+                (!text.is_empty()).then_some(text)
             }
             _ => None,
         });
@@ -1684,5 +1813,37 @@ mod tests {
         );
         assert!(joined.contains("Model attempted a repair"), "{joined}");
         assert!(joined.contains("still failing"), "{joined}");
+    }
+
+    #[test]
+    fn turn_route_lines_include_truthful_auto_receipt() {
+        let mut app = test_app();
+        app.auto_model = true;
+        app.last_effective_provider = Some(crate::config::ApiProvider::Zai);
+        app.last_effective_model = Some(crate::config::ZAI_GLM_5_TURBO_MODEL.to_string());
+        app.last_auto_route_receipt = Some(crate::model_routing::AutoRouteReceipt {
+            tier: crate::model_routing::AutoRouteTier::Fast,
+            pair: crate::model_routing::AutoRoutePair {
+                strong: crate::config::ZAI_GLM_5_2_MODEL.to_string(),
+                fast: Some(crate::config::ZAI_GLM_5_TURBO_MODEL.to_string()),
+            },
+            scope: crate::model_routing::AutoRouteScope::RunnableProviders,
+            data_path: crate::model_routing::AutoRouteDataPath::Classifier {
+                provider: crate::config::ApiProvider::Deepseek,
+                model: "deepseek-v4-flash".to_string(),
+            },
+            reason: crate::model_routing::AutoRouteReason::ClassifierRecommendation,
+        });
+
+        let joined = turn_route_lines(&app).join("\n");
+
+        assert!(joined.contains("Route: Zhipu AI / Z.ai · GLM-5-Turbo"));
+        assert!(joined.contains("Auto decision: fast · classifier recommendation"));
+        assert!(joined.contains("GLM-5.2 strong · GLM-5-Turbo fast"));
+        assert!(joined.contains("Auto scope: runnable providers"));
+        assert!(joined.contains(
+            "Auto data: latest request + bounded recent context -> DeepSeek / deepseek-v4-flash"
+        ));
+        assert!(!joined.contains("API_KEY"));
     }
 }

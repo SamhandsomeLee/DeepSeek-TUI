@@ -311,7 +311,6 @@ mod tests {
     use crate::tui::app::{App, AppAction, SidebarFocus, TuiOptions};
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
-    use std::sync::MutexGuard;
     use tempfile::tempdir;
 
     fn create_test_app() -> App {
@@ -432,6 +431,21 @@ mod tests {
             .find(|cmd| cmd.name == "links")
             .expect("links command should exist");
         assert_eq!(links.aliases, &["dashboard", "api", "lianjie"]);
+    }
+
+    #[test]
+    fn transcript_command_is_discoverable_and_opens_live_overlay() {
+        let transcript = command_infos()
+            .into_iter()
+            .find(|cmd| cmd.name == "transcript")
+            .expect("transcript command should exist");
+        assert_eq!(transcript.usage, "/transcript");
+        assert!(transcript.show_in_empty_discovery());
+
+        let mut app = create_test_app();
+        let result = execute("/transcript", &mut app);
+        assert!(!result.is_error);
+        assert!(matches!(result.action, Some(AppAction::OpenLiveTranscript)));
     }
 
     #[test]
@@ -1042,6 +1056,12 @@ mod tests {
         for cmd in ["/links", "/dashboard", "/api", "/lianjie"] {
             let result = execute(cmd, &mut app);
             let msg = result.message.expect("links commands should return text");
+            assert!(msg.contains("https://codewhale.net/en/docs"));
+            assert!(msg.contains("https://codewhale.net/en/community"));
+            assert!(msg.contains("https://github.com/Hmbown/CodeWhale"));
+            assert!(msg.contains("https://app.codewhale.net"));
+            assert!(msg.contains("separate sign-in"));
+            assert!(msg.contains("not connected to the current local session"));
             assert!(msg.contains("https://platform.deepseek.com"));
             assert!(result.action.is_none());
         }
@@ -1083,7 +1103,7 @@ mod tests {
 
     struct ConfigPathGuard {
         previous: Option<OsString>,
-        _lock: MutexGuard<'static, ()>,
+        _lock: crate::test_support::TestEnvLock,
     }
 
     impl ConfigPathGuard {
@@ -1115,7 +1135,7 @@ mod tests {
     }
 
     /// Build an App scoped to an isolated tempdir so dispatch-side-effects
-    /// (e.g. `/init` writing AGENTS.md, `/export` writing chat transcripts,
+    /// (e.g. `/init` writing AGENTS.md, explicit `/export <path>` writes, or
     /// `/logout` clearing credentials) don't pollute the repo working tree or
     /// the developer's real config when the smoke tests run.
     fn create_isolated_test_app() -> (App, tempfile::TempDir, ConfigPathGuard) {
@@ -1157,10 +1177,9 @@ mod tests {
     /// command, see it autocomplete, and then get an unhelpful "did you
     /// mean" suggestion. Also catches panics in handlers because the test
     /// runner unwinds the panic and reports the offending command.
-    /// `/save` and `/export` default their output paths to `cwd`-relative
-    /// filenames when no arg is supplied, which would scribble files into
-    /// `crates/tui/` when CI runs from there. Pass an explicit tempdir-
-    /// relative path for those two so the dispatch test stays sandboxed.
+    /// `/save` still defaults its output path, while `/export` accepts a legacy
+    /// direct file path. Pass explicit tempdir paths so this smoke test covers
+    /// both file handlers without touching the developer's clipboard.
     fn invocation_for(command_name: &str, alias_or_name: &str, tmpdir: &std::path::Path) -> String {
         match command_name {
             "save" => format!("/{alias_or_name} {}", tmpdir.join("session.json").display()),
@@ -1397,5 +1416,97 @@ mod tests {
         let mut app = create_test_app();
         let result = execute("/help", &mut app);
         assert!(!result.is_error);
+    }
+
+    fn write_test_skill(root: &Path, name: &str) {
+        let skill_dir = root.join("skills").join(name);
+        std::fs::create_dir_all(&skill_dir).expect("skill directory");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!(
+                "---\nname: {name}\ndescription: Test {name} skill\n---\nFollow the test instructions."
+            ),
+        )
+        .expect("skill fixture");
+    }
+
+    #[test]
+    fn task_bearing_skill_invocations_send_the_task_on_the_activated_turn() {
+        for invocation in ["$foo do X", "/foo do X", "/skill foo do X"] {
+            let (mut app, tmpdir, _guard) = create_isolated_test_app();
+            write_test_skill(tmpdir.path(), "foo");
+
+            let result = execute(invocation, &mut app);
+
+            assert!(!result.is_error, "{invocation}: {result:?}");
+            assert!(
+                result
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("Skill 'foo' activated")),
+                "{invocation}: {result:?}"
+            );
+            assert!(
+                matches!(result.action, Some(AppAction::SendMessage(ref task)) if task == "do X"),
+                "{invocation}: {result:?}"
+            );
+            assert!(
+                app.active_skill
+                    .as_deref()
+                    .is_some_and(|instruction| instruction.contains("# Skill: foo")),
+                "{invocation} did not arm foo for the dispatched task"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_dollar_skill_still_arms_the_next_message() {
+        let (mut app, tmpdir, _guard) = create_isolated_test_app();
+        write_test_skill(tmpdir.path(), "foo");
+
+        let result = execute("$foo", &mut app);
+
+        assert!(!result.is_error, "{result:?}");
+        assert!(result.action.is_none());
+        assert!(
+            app.active_skill
+                .as_deref()
+                .is_some_and(|instruction| instruction.contains("# Skill: foo"))
+        );
+    }
+
+    #[test]
+    fn shorthand_can_invoke_a_skill_named_install_without_stealing_management_commands() {
+        for invocation in ["$install do X", "/install do X"] {
+            let (mut app, tmpdir, _guard) = create_isolated_test_app();
+            write_test_skill(tmpdir.path(), "install");
+
+            let result = execute(invocation, &mut app);
+
+            assert!(!result.is_error, "{invocation}: {result:?}");
+            assert!(
+                matches!(result.action, Some(AppAction::SendMessage(ref task)) if task == "do X"),
+                "{invocation}: {result:?}"
+            );
+            assert!(
+                app.active_skill
+                    .as_deref()
+                    .is_some_and(|instruction| instruction.contains("# Skill: install")),
+                "{invocation} did not activate the install skill"
+            );
+        }
+
+        let (mut app, tmpdir, _guard) = create_isolated_test_app();
+        write_test_skill(tmpdir.path(), "install");
+        let result = execute("/skill install", &mut app);
+        assert!(result.is_error, "management subcommand should show usage");
+        assert!(
+            result
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("/skill install"))
+        );
+        assert!(result.action.is_none());
+        assert!(app.active_skill.is_none());
     }
 }

@@ -13,12 +13,17 @@ use uuid::Uuid;
 use crate::command_safety::{SafetyLevel, analyze_command};
 use crate::dependencies::ExternalTool;
 use crate::task_manager::{
-    NewTaskRequest, TaskArtifactRef, TaskAttemptRecord, TaskGateRecord, TaskRecord,
+    NewTaskRequest, TaskArtifactRef, TaskAttemptRecord, TaskCancelDisposition, TaskGateRecord,
+    TaskRecord,
 };
 use crate::tools::shell::BashTool;
 use crate::tools::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
     optional_bool, optional_str, optional_u64, required_str,
+};
+use crate::work_graph::{
+    CancelOutcome, OperationIntent, OperationObservation, OperationOwnerSnapshot, OwnerState,
+    task_owner_snapshot,
 };
 
 const MAX_SUMMARY_CHARS: usize = 900;
@@ -98,8 +103,9 @@ impl ToolSpec for TaskCreateTool {
         let workspace = optional_str(&input, "workspace")
             .map(PathBuf::from)
             .unwrap_or_else(|| context.workspace.clone());
+        let prompt = required_str(&input, "prompt")?.to_string();
         let req = NewTaskRequest {
-            prompt: required_str(&input, "prompt")?.to_string(),
+            prompt: prompt.clone(),
             model: optional_str(&input, "model").map(ToString::to_string),
             workspace: Some(workspace),
             mode: optional_str(&input, "mode").map(ToString::to_string),
@@ -107,11 +113,42 @@ impl ToolSpec for TaskCreateTool {
             trust_mode: input.get("trust_mode").and_then(Value::as_bool),
             auto_approve: input.get("auto_approve").and_then(Value::as_bool),
         };
-        let task = manager
-            .add_task(req)
-            .await
-            .map_err(|e| ToolError::execution_failed(e.to_string()))?;
-        task_result("task_create", &task)
+        let task_id = crate::task_manager::TaskManager::new_task_id();
+        if let Some(work) = context.runtime.work.as_ref() {
+            work.register_operation(
+                &context.state_namespace,
+                OperationIntent::new(
+                    format!("task:{task_id}"),
+                    prompt,
+                    true,
+                    "task_create",
+                    &task_id,
+                ),
+            )
+            .map_err(ToolError::execution_failed)?;
+        }
+        let task = match manager.add_task_with_id(req, task_id.clone()).await {
+            Ok(task) => task,
+            Err(err) => {
+                if let Some(work) = context.runtime.work.as_ref() {
+                    let _ = work.reconcile_operation(
+                        &context.state_namespace,
+                        OperationOwnerSnapshot::new(
+                            format!("task:{task_id}"),
+                            OwnerState::Failed,
+                            1,
+                            Utc::now().timestamp_millis(),
+                        ),
+                    );
+                }
+                return Err(ToolError::execution_failed(err.to_string()));
+            }
+        };
+        let lifecycle_warning = reconcile_task_record(context, &task).err().map(|err| {
+            tracing::warn!(task_id = %task.id, error = %err, "task was created but Work lifecycle reconciliation failed");
+            err.to_string()
+        });
+        task_result_with_lifecycle_warning("task_create", &task, lifecycle_warning.as_deref())
     }
 }
 
@@ -237,12 +274,64 @@ impl ToolSpec for TaskCancelTool {
             .task_manager
             .as_ref()
             .ok_or_else(|| ToolError::not_available("TaskManager is not attached"))?;
-        let task = manager
+        let cancellation = manager
             .cancel_task(required_str(&input, "task_id")?)
             .await
             .map_err(|e| ToolError::execution_failed(e.to_string()))?;
-        task_result("task_cancel", &task)
+        let task = cancellation.task;
+        let cancel_outcome = match cancellation.disposition {
+            TaskCancelDisposition::Forced => CancelOutcome::Forced,
+            TaskCancelDisposition::Requested => CancelOutcome::Requested,
+            TaskCancelDisposition::AlreadyFinished => CancelOutcome::AlreadyFinished,
+        };
+        let mut lifecycle_warnings = Vec::new();
+        if let Some(work) = context.runtime.work.as_ref() {
+            let external = format!("task:{}", task.id);
+            if work.has_operation_binding(Some(&context.state_namespace), &external)
+                && let Err(err) = work.reconcile_observation(
+                    &context.state_namespace,
+                    &external,
+                    OperationObservation::CancelUpdate {
+                        outcome: cancel_outcome,
+                        at: Utc::now().timestamp_millis(),
+                    },
+                )
+            {
+                tracing::warn!(task_id = %task.id, error = %err, "task was cancelled but Work cancel reconciliation failed");
+                lifecycle_warnings.push(err);
+            }
+        }
+        if let Err(err) = reconcile_task_record(context, &task) {
+            tracing::warn!(task_id = %task.id, error = %err, "task cancellation succeeded but owner-state reconciliation failed");
+            lifecycle_warnings.push(err.to_string());
+        }
+        let lifecycle_warning =
+            (!lifecycle_warnings.is_empty()).then(|| lifecycle_warnings.join("; "));
+        task_result_with_lifecycle_warning("task_cancel", &task, lifecycle_warning.as_deref())
     }
+}
+
+fn reconcile_task_record(context: &ToolContext, task: &TaskRecord) -> Result<(), ToolError> {
+    let Some(work) = context.runtime.work.as_ref() else {
+        return Ok(());
+    };
+    let external = format!("task:{}", task.id);
+    if !work.has_operation_binding(Some(&context.state_namespace), &external) {
+        return Ok(());
+    }
+    work.reconcile_operation(
+        &context.state_namespace,
+        task_owner_snapshot(
+            &task.id,
+            task.status,
+            task.lifecycle_seq,
+            task.created_at,
+            task.started_at,
+            task.ended_at,
+        ),
+    )
+    .map(|_| ())
+    .map_err(ToolError::execution_failed)
 }
 
 #[async_trait]
@@ -803,9 +892,18 @@ impl ToolSpec for PrAttemptPreflightTool {
 }
 
 fn task_result(label: &str, task: &TaskRecord) -> Result<ToolResult, ToolError> {
+    task_result_with_lifecycle_warning(label, task, None)
+}
+
+fn task_result_with_lifecycle_warning(
+    label: &str,
+    task: &TaskRecord,
+    lifecycle_warning: Option<&str>,
+) -> Result<ToolResult, ToolError> {
     ToolResult::json(&json!({
         "summary": format!("{label}: {} ({:?})", task.id, task.status),
         "task": task,
+        "lifecycle_warning": lifecycle_warning,
     }))
     .map_err(|e| ToolError::execution_failed(e.to_string()))
 }

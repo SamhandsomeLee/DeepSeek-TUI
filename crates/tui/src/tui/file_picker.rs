@@ -10,23 +10,25 @@
 //! Enter emits a [`ViewEvent::FilePickerSelected`] which the UI handler turns
 //! into an `@<path>` insertion at the composer cursor.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::Path;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ignore::WalkBuilder;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Modifier, Style},
+    style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Padding, Paragraph, Widget},
+    widgets::{Paragraph, Widget},
 };
 
+use crate::localization::{Locale, MessageId, tr};
 use crate::palette;
 use crate::tui::views::{
-    ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, centered_modal_area,
-    render_modal_footer, render_modal_surface,
+    ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, render_modal_footer,
+    render_panel_scroll_rail, render_underwater_surface,
 };
 use crate::workspace_discovery::{DISCOVERY_ALWAYS_DIRS, path_is_excluded_from_discovery};
 
@@ -126,6 +128,10 @@ pub struct FilePickerView {
     selected: usize,
     /// Top of the visible window within `filtered`.
     scroll: usize,
+    /// Exact visible row targets from the last render for mouse parity.
+    last_row_hitboxes: RefCell<Vec<(u16, usize)>>,
+    /// UI locale captured from the app at construction (#4057 wave 2).
+    locale: Locale,
 }
 
 impl FilePickerView {
@@ -135,7 +141,7 @@ impl FilePickerView {
     /// `mention_walk_depth`.
     #[cfg(test)]
     pub fn new_with_relevance(workspace_root: &Path, relevance: FilePickerRelevance) -> Self {
-        Self::new_with_relevance_and_depth(workspace_root, relevance, WALK_DEPTH)
+        Self::new_with_relevance_and_depth(workspace_root, relevance, WALK_DEPTH, Locale::En)
     }
 
     /// Build a picker with working-set relevance hints and an explicit walk
@@ -145,6 +151,7 @@ impl FilePickerView {
         workspace_root: &Path,
         relevance: FilePickerRelevance,
         walk_depth: usize,
+        locale: Locale,
     ) -> Self {
         let max_depth = if walk_depth == 0 {
             None
@@ -159,6 +166,8 @@ impl FilePickerView {
             query: String::new(),
             selected: 0,
             scroll: 0,
+            last_row_hitboxes: RefCell::new(Vec::new()),
+            locale,
         };
         view.refilter();
         view
@@ -325,33 +334,50 @@ impl ModalView for FilePickerView {
         }
     }
 
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.move_selection(-1);
+                ViewAction::None
+            }
+            MouseEventKind::ScrollDown => {
+                self.move_selection(1);
+                ViewAction::None
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let hit = self
+                    .last_row_hitboxes
+                    .borrow()
+                    .iter()
+                    .find_map(|(y, idx)| (*y == mouse.row).then_some(*idx));
+                let Some(idx) = hit else {
+                    return ViewAction::None;
+                };
+                if idx == self.selected {
+                    if let Some(path) = self.selected_path() {
+                        return ViewAction::EmitAndClose(ViewEvent::FilePickerSelected {
+                            path: path.to_string(),
+                        });
+                    }
+                } else {
+                    self.selected = idx;
+                    self.adjust_scroll();
+                }
+                ViewAction::None
+            }
+            _ => ViewAction::None,
+        }
+    }
+
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let popup_area = centered_modal_area(area, 80, (VISIBLE_ROWS as u16) + 7, 44, 8);
-
-        render_modal_surface(area, popup_area, buf);
-
         let match_count = self.filtered.len();
-        // The match count moves into the title so the footer only carries the
-        // navigation hints, which now wrap inside the body via the shared
-        // helper instead of clipping off the border edge (#3732).
-        let title = Line::from(vec![Span::styled(
-            format!(
-                " File Picker ({match_count} match{}) ",
-                if match_count == 1 { "" } else { "es" },
-            ),
-            Style::default()
-                .fg(palette::WHALE_ACCENT_PRIMARY)
-                .add_modifier(Modifier::BOLD),
-        )]);
-        let block = Block::default()
-            .title(title)
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(palette::BORDER_COLOR))
-            .style(Style::default().bg(palette::WHALE_BG))
-            .padding(Padding::uniform(1));
-
-        let inner = block.inner(popup_area);
-        block.render(popup_area, buf);
+        let title = if match_count == 1 {
+            tr(self.locale, MessageId::FilePickerMatchSingular).into_owned()
+        } else {
+            tr(self.locale, MessageId::FilePickerMatchesPlural)
+                .replace("{count}", &match_count.to_string())
+        };
+        let inner = render_underwater_surface(area, buf, title);
 
         let content = render_modal_footer(
             inner,
@@ -361,6 +387,15 @@ impl ModalView for FilePickerView {
                 ActionHint::new("Enter", "insert @path"),
                 ActionHint::new("Esc", "close"),
             ],
+        );
+        let visible = VISIBLE_ROWS.min(content.height.saturating_sub(2) as usize);
+        let content = render_panel_scroll_rail(
+            content,
+            buf,
+            self.filtered.len(),
+            self.scroll,
+            visible,
+            true,
         );
 
         let mut lines: Vec<Line<'static>> = Vec::new();
@@ -377,8 +412,8 @@ impl ModalView for FilePickerView {
         ]));
         lines.push(Line::from(""));
 
-        let visible = VISIBLE_ROWS.min(content.height.saturating_sub(2) as usize);
         let end = (self.scroll + visible).min(self.filtered.len());
+        self.last_row_hitboxes.borrow_mut().clear();
         if self.filtered.is_empty() {
             lines.push(Line::from(Span::styled(
                 "  No matches",
@@ -406,6 +441,10 @@ impl ModalView for FilePickerView {
                     truncate_path(path, (content.width as usize).saturating_sub(reserved));
                 let mut line = Line::from(format!("{prefix}{marker_field}{display}"));
                 line.style = style;
+                let y = content
+                    .y
+                    .saturating_add(u16::try_from(lines.len()).unwrap_or(u16::MAX));
+                self.last_row_hitboxes.borrow_mut().push((y, idx));
                 lines.push(line);
             }
         }

@@ -38,14 +38,13 @@ pub fn prune_older_than(workspace: &Path, max_age: Duration) -> io::Result<usize
 mod tests {
     use super::*;
     use crate::test_support::lock_test_env;
-    use std::sync::MutexGuard;
     use tempfile::tempdir;
 
     /// Same guard shape as in `repo::tests` — pins HOME for the lifetime
     /// of one test under the process-wide env mutex.
     struct ScopedHome {
         prev: Option<std::ffi::OsString>,
-        _guard: MutexGuard<'static, ()>,
+        _guard: crate::test_support::TestEnvLock,
     }
     impl Drop for ScopedHome {
         fn drop(&mut self) {

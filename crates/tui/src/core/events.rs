@@ -5,8 +5,10 @@
 
 use std::{path::PathBuf, sync::Arc};
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
+use crate::config::ApiProvider;
 use crate::error_taxonomy::ErrorEnvelope;
 use crate::models::{Message, SystemPrompt, Tool, Usage};
 use crate::tools::goal::GoalSnapshot;
@@ -20,6 +22,21 @@ pub enum TurnOutcomeStatus {
     Completed,
     Interrupted,
     Failed,
+}
+
+/// Provider/model route resolved for a model-backed turn.
+///
+/// Carried with `TurnStarted` so hosts can retain provenance until the matching
+/// `TurnComplete` without relying on mutable global selection state. Non-model
+/// turns such as composer `!` shell commands use no route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnRoute {
+    pub provider: ApiProvider,
+    /// Exact non-secret configured route key. Named custom providers all map
+    /// to [`ApiProvider::Custom`], so the enum alone is not provenance.
+    pub provider_identity: String,
+    pub model: String,
+    pub auto_model: bool,
 }
 
 /// Events emitted by the engine to update the UI.
@@ -72,6 +89,13 @@ pub enum Event {
         input: Value,
     },
 
+    /// Best-effort liveness pulse while a tool future remains pending.
+    ///
+    /// This carries no output and must not change user-visible status or the
+    /// transcript. It only prevents the TUI from declaring a healthy,
+    /// deliberately long-running tool turn stale.
+    ToolCallHeartbeat,
+
     /// Tool call completed
     ToolCallComplete {
         id: String,
@@ -81,7 +105,11 @@ pub enum Event {
 
     // === Turn Lifecycle ===
     /// A new turn has started (user sent a message)
-    TurnStarted { turn_id: String },
+    TurnStarted {
+        turn_id: String,
+        created_at: DateTime<Utc>,
+        route: Option<TurnRoute>,
+    },
 
     /// The turn is complete (no more tool calls)
     TurnComplete {

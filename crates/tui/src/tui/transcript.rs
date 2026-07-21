@@ -47,6 +47,9 @@ struct CachedCell {
     /// Rendered lines for this cell (without trailing inter-cell spacers),
     /// shared via `Arc` so cache enumeration is O(N) not O(N*lines).
     lines: Arc<Vec<Line<'static>>>,
+    /// Hyperlinks aligned with `lines`, in display columns relative to each
+    /// line. Targets never enter the ratatui cell buffer.
+    links: Arc<Vec<Vec<crate::tui::osc8::LineLink>>>,
     /// Copy separators aligned with `lines`. These preserve source hard
     /// newlines while allowing copy to remove visual soft-wrap breaks.
     copy_separators: Arc<Vec<CopyLineSeparator>>,
@@ -63,6 +66,13 @@ struct CachedCell {
     /// Whether this cell is conversational (User/Assistant/Thinking). Used
     /// for spacer calculations.
     is_conversational: bool,
+    /// Whether this cell is model reasoning. Thinking and the answer that
+    /// follows are one response unit, so they should not acquire the same
+    /// full turn gap used between user and assistant messages.
+    is_thinking: bool,
+    /// Whether this cell is assistant prose. Kept separate from the broader
+    /// conversational flag so spacer policy can join it to adjacent thinking.
+    is_assistant: bool,
     /// Whether this cell is a System or Tool cell (affects spacer rules).
     is_system_or_tool: bool,
     /// Whether this cell participates in the compact tool-card rail group.
@@ -83,6 +93,8 @@ pub struct TranscriptViewCache {
     per_cell: Vec<CachedCell>,
     /// Flattened lines reassembled from `per_cell` plus spacers.
     lines: Vec<Line<'static>>,
+    /// Per-line hyperlink metadata aligned with `lines`.
+    line_links: Vec<Vec<crate::tui::osc8::LineLink>>,
     /// Per-line metadata aligned with `lines`.
     line_meta: Vec<TranscriptLineMeta>,
     /// Per-line rail-prefix display-column count (`0` or `2`), aligned with
@@ -102,6 +114,7 @@ impl TranscriptViewCache {
             folded_cells: HashSet::new(),
             per_cell: Vec::new(),
             lines: Vec::new(),
+            line_links: Vec::new(),
             line_meta: Vec::new(),
             rail_prefix_widths: Vec::new(),
         }
@@ -268,10 +281,16 @@ impl TranscriptViewCache {
             let folded = folded_cells.contains(&original_idx);
             let rendered = cell.lines_with_copy_metadata_folded(render_width, options, folded);
             let mut lines = Vec::with_capacity(rendered.len());
+            let mut links = Vec::with_capacity(rendered.len());
             let mut copy_separators = Vec::with_capacity(rendered.len());
             let mut copy_prefix_widths = Vec::with_capacity(rendered.len());
             for rendered_line in rendered {
-                lines.push(rendered_line.line);
+                let mut line = rendered_line.line;
+                if is_tool_groupable {
+                    strip_cell_local_tool_rail(&mut line);
+                }
+                lines.push(line);
+                links.push(rendered_line.links);
                 copy_prefix_widths.push(rendered_line.copy_prefix_width);
                 copy_separators.push(rendered_line.copy_separator_after);
             }
@@ -279,11 +298,14 @@ impl TranscriptViewCache {
             new_per_cell.push(CachedCell {
                 revision: current_rev,
                 lines: Arc::new(lines),
+                links: Arc::new(links),
                 copy_separators: Arc::new(copy_separators),
                 copy_prefix_widths: Arc::new(copy_prefix_widths),
                 is_empty,
                 is_stream_continuation: cell.is_stream_continuation(),
                 is_conversational: cell.is_conversational(),
+                is_thinking: matches!(cell, HistoryCell::Thinking { .. }),
+                is_assistant: matches!(cell, HistoryCell::Assistant { .. }),
                 is_system_or_tool: matches!(
                     cell,
                     HistoryCell::System { .. }
@@ -316,6 +338,7 @@ impl TranscriptViewCache {
     /// Reassemble flat `lines` / `line_meta` from `per_cell` plus spacers.
     fn flatten(&mut self, spacing: TranscriptSpacing) {
         self.lines.clear();
+        self.line_links.clear();
         self.line_meta.clear();
         self.rail_prefix_widths.clear();
         self.append_flattened_cells(spacing, 0);
@@ -341,6 +364,7 @@ impl TranscriptViewCache {
             })
             .unwrap_or(self.lines.len());
         self.lines.truncate(truncate_at);
+        self.line_links.truncate(truncate_at);
         self.line_meta.truncate(truncate_at);
         self.rail_prefix_widths.truncate(truncate_at);
         self.append_flattened_cells(spacing, first_cell);
@@ -356,19 +380,22 @@ impl TranscriptViewCache {
             // Deref is zero-cost and gives us &[Line].
             let rendered_line_count = cached.lines.len();
             for (line_in_cell, line) in cached.lines.iter().enumerate() {
-                let final_line = line_with_group_rail(
-                    line,
-                    tool_group_rail(
-                        self.per_cell.as_slice(),
-                        cell_index,
-                        line_in_cell,
-                        rendered_line_count,
-                    ),
+                let rail = tool_group_rail(
+                    self.per_cell.as_slice(),
+                    cell_index,
+                    line_in_cell,
+                    rendered_line_count,
+                );
+                let final_line = line_with_group_rail(line, rail, usize::from(self.width));
+                let final_links = links_with_group_rail(
+                    cached.links.get(line_in_cell).map_or(&[], Vec::as_slice),
+                    rail,
                     usize::from(self.width),
                 );
                 self.rail_prefix_widths
                     .push(compute_rail_prefix_width(&final_line));
                 self.lines.push(final_line);
+                self.line_links.push(final_links);
                 self.line_meta.push(TranscriptLineMeta::CellLine {
                     cell_index,
                     line_in_cell,
@@ -389,6 +416,7 @@ impl TranscriptViewCache {
                 let spacer_rows = spacer_rows_between(cached, next, spacing);
                 for _ in 0..spacer_rows {
                     self.lines.push(Line::from(""));
+                    self.line_links.push(Vec::new());
                     self.line_meta.push(TranscriptLineMeta::Spacer);
                     self.rail_prefix_widths.push(0);
                 }
@@ -400,6 +428,12 @@ impl TranscriptViewCache {
     #[must_use]
     pub fn lines(&self) -> &[Line<'static>] {
         &self.lines
+    }
+
+    /// Return hyperlinks aligned with [`Self::lines`].
+    #[must_use]
+    pub fn line_links(&self) -> &[Vec<crate::tui::osc8::LineLink>] {
+        &self.line_links
     }
 
     /// Return cached line metadata.
@@ -427,6 +461,21 @@ impl TranscriptViewCache {
     }
 }
 
+/// Tool cells still render their own rail when used outside the transcript
+/// cache (pager, clipboard, focused detail). Inside the live transcript this
+/// cache owns grouping across adjacent cells, so retaining both rails produces
+/// doubled prefixes such as `╭ ╭`. Replace the cell-local decoration with the
+/// group rail added by `line_with_group_rail` during flattening.
+fn strip_cell_local_tool_rail(line: &mut Line<'static>) {
+    if line
+        .spans
+        .first()
+        .is_some_and(|span| matches!(span.content.as_ref(), "─ " | "╭ " | "│ " | "╰ "))
+    {
+        line.spans.remove(0);
+    }
+}
+
 fn spacer_rows_between(
     current: &CachedCell,
     next: &CachedCell,
@@ -440,9 +489,22 @@ fn spacer_rows_between(
         return 0;
     }
 
+    // Reasoning and answer prose are two states of one model response, not
+    // separate turns. Keep that bundle visually continuous; whitespace then
+    // marks the actual handoff between the user and Codewhale and avoids the
+    // stacked-card rhythm seen at compact release sizes.
+    if (current.is_thinking && (next.is_thinking || next.is_assistant))
+        || (current.is_assistant && next.is_thinking)
+    {
+        return 0;
+    }
+
     let conversational_gap = match spacing {
-        TranscriptSpacing::Compact => 0,
-        TranscriptSpacing::Comfortable => 1,
+        // Compact still separates distinct people/turn blocks. It removes
+        // secondary chrome and tool gaps, not the boundary between a user and
+        // an assistant; without this floor dense 89-column transcripts read
+        // as one uninterrupted paragraph.
+        TranscriptSpacing::Compact | TranscriptSpacing::Comfortable => 1,
         TranscriptSpacing::Spacious => 2,
     };
     let secondary_gap = match spacing {
@@ -515,6 +577,26 @@ fn line_with_group_rail(
     spans.extend(rendered.spans);
     rendered.spans = truncate_spans_to_width(spans, max_width);
     rendered
+}
+
+fn links_with_group_rail(
+    links: &[crate::tui::osc8::LineLink],
+    rail: Option<crate::tui::widgets::tool_card::CardRail>,
+    max_width: usize,
+) -> Vec<crate::tui::osc8::LineLink> {
+    let shift = rail
+        .map(crate::tui::widgets::tool_card::rail_glyph)
+        .filter(|glyph| !glyph.is_empty())
+        .map_or(0, |glyph| unicode_width::UnicodeWidthStr::width(glyph) + 1);
+    links
+        .iter()
+        .map(|link| link.shifted(shift))
+        .filter(|link| link.col_start < max_width)
+        .map(|mut link| {
+            link.col_end = link.col_end.min(max_width.saturating_sub(1));
+            link
+        })
+        .collect()
 }
 
 /// Return the display-column count of consecutive visual-only decorative
@@ -1018,6 +1100,54 @@ mod tests {
         assert!(
             !lines.iter().any(String::is_empty),
             "adjacent tool cells should not be separated by blank spacer rows: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn compact_spacing_keeps_conversation_blocks_separate() {
+        let cells = vec![
+            user_cell("Please verify the release."),
+            assistant_cell("I will check the receipts.", false),
+        ];
+        let revisions = vec![1u64, 1];
+        let mut cache = TranscriptViewCache::new();
+        let options = TranscriptRenderOptions {
+            spacing: TranscriptSpacing::Compact,
+            ..TranscriptRenderOptions::default()
+        };
+
+        cache.ensure(&cells, &revisions, 89, options);
+        let lines = plain_lines(&cache);
+
+        assert!(
+            lines.iter().any(String::is_empty),
+            "compact density still needs one user/assistant boundary: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn compact_spacing_keeps_reasoning_and_answer_in_one_response_block() {
+        let cells = vec![
+            HistoryCell::Thinking {
+                content: "I should verify the release receipts first.".to_string(),
+                streaming: false,
+                duration_secs: Some(0.4),
+            },
+            assistant_cell("The release receipts are green.", false),
+        ];
+        let revisions = vec![1u64, 1];
+        let mut cache = TranscriptViewCache::new();
+        let options = TranscriptRenderOptions {
+            spacing: TranscriptSpacing::Compact,
+            ..TranscriptRenderOptions::default()
+        };
+
+        cache.ensure(&cells, &revisions, 89, options);
+        let lines = plain_lines(&cache);
+
+        assert!(
+            !lines.iter().any(String::is_empty),
+            "reasoning and its answer should read as one response block: {lines:?}"
         );
     }
 

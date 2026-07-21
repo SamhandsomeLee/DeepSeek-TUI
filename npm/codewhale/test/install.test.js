@@ -64,6 +64,13 @@ test("install script remains parseable before the Node support guard runs", () =
   assert.equal(installScript.includes("?."), false);
 });
 
+test("native shortcut has its own platform asset and installed path", () => {
+  const paths = _internal.binaryPaths();
+  assert.match(paths.codew.asset, /^codew-/);
+  assert.equal(path.basename(paths.codew.target), process.platform === "win32" ? "codew.exe" : "codew");
+  assert.notEqual(paths.codew.target, paths.codewhale.target);
+});
+
 test("install failure hint explains release base override for blocked GitHub downloads", () => {
   const previous = process.env.DEEPSEEK_TUI_RELEASE_BASE_URL;
   delete process.env.DEEPSEEK_TUI_RELEASE_BASE_URL;
@@ -112,10 +119,10 @@ test("install failure hint checks configured release base when override is alrea
   }
 });
 
-test("glibc preflight message is CodeWhale-branded and actionable", () => {
+test("glibc preflight message is Codewhale-branded and actionable", () => {
   const message = glibcInternal.glibcCompatibilityMessage([2, 39, 0], [2, 35, 0]);
 
-  assert.match(message, /Prebuilt CodeWhale Linux binaries require GLIBC_2\.39/);
+  assert.match(message, /Prebuilt Codewhale Linux binaries require GLIBC_2\.39/);
   assert.match(message, /this system has glibc 2\.35/);
   assert.match(message, /cargo install codewhale-cli --locked/);
   assert.match(message, /Linux x64 release asset is a static \(musl\) build/);
@@ -262,4 +269,16 @@ test("resolvePackageVersion honors codewhaleBinaryVersion precedence (#3769)", (
     ),
     "8.8.8",
   );
+});
+
+test("httpRequest handles invalid URL parsing errors", async () => {
+  const { httpRequest } = _internal;
+  const invalidUrl = "not-a-valid-url";
+  try {
+    await httpRequest(invalidUrl);
+    assert.fail("httpRequest should throw for an invalid URL");
+  } catch (err) {
+    assert.equal(err.name, "NonRetryableError");
+    assert.match(err.message, /Invalid URL: not-a-valid-url/);
+  }
 });

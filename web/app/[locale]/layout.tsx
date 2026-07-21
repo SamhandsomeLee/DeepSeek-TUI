@@ -1,12 +1,12 @@
 import type { Metadata } from "next";
-import { Fraunces, IBM_Plex_Sans, JetBrains_Mono, Noto_Serif_SC } from "next/font/google";
+import { IBM_Plex_Sans, JetBrains_Mono, Noto_Serif_SC, Space_Grotesk } from "next/font/google";
 import { Nav } from "@/components/nav";
 import { Footer } from "@/components/footer";
 import { locales, type Locale } from "@/lib/i18n/config";
 import { buildPageMetadata } from "@/lib/page-meta";
 import "../globals.css";
 
-const display = Fraunces({
+const display = Space_Grotesk({
   subsets: ["latin"],
   weight: ["400", "500", "600", "700"],
   variable: "--font-display",
@@ -47,11 +47,11 @@ export async function generateMetadata({ params }: { params: Promise<{ locale: s
     path: "/",
     locale,
     title: isZh
-      ? "CodeWhale — 适配任意模型的终端编程智能体，开放模型优先"
-      : "CodeWhale — the terminal coding agent for any model, open models first",
+      ? "Codewhale — 一个运行时，所有模型，你的机器"
+      : "Codewhale — One runtime. Every model. Your machine.",
     description: isZh
-      ? "开源终端编程智能体：适配任意模型，开放模型优先。从 DeepSeek、本地 vLLM/Ollama 到原生 Claude 与 OpenAI，内置审批制工具、沙箱隔离与 /restore 回滚。"
-      : "Open-source terminal coding agent for any model, open models first: provider-honest routing from DeepSeek and local vLLM/Ollama to native Claude and OpenAI, with approval-gated tools, sandboxing, rollback, and durable Fleet/Workflow runs.",
+      ? "开源终端编程智能体，适配任意模型，开放模型优先。TUI、CLI 与本地工具——运行在你自己的机器上。Rust 编写，MIT 许可。"
+      : "Open-source terminal coding agent for any model, open models first. TUI, CLI, and local tools — runs on your machine. Rust, MIT.",
   });
 }
 

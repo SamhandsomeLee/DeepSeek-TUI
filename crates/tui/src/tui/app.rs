@@ -5,7 +5,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use ratatui::layout::Rect;
+use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -16,11 +18,12 @@ use crate::artifacts::ArtifactRecord;
 use crate::client::{CacheWarmupKey, PromptInspection};
 use crate::compaction::CompactionConfig;
 use crate::config::{
-    ApiProvider, Config, DEFAULT_TEXT_MODEL, SavedCredential, has_api_key, has_api_key_for,
-    save_api_key, save_api_key_for,
+    ApiProvider, ApprovalPolicyControl, Config, DEFAULT_TEXT_MODEL, SavedCredential, has_api_key,
+    has_api_key_for, save_api_key, save_api_key_for,
 };
 use crate::config_ui::ConfigUiMode;
 use crate::core::authority::{ModeSessionPrefs, base_policy_for_mode};
+use crate::core::events::TurnRoute;
 use crate::hooks::{HookContext, HookEvent, HookExecutor, HookResult};
 use crate::localization::{Locale, MessageId, resolve_locale, tr};
 use crate::models::{Message, SystemPrompt, Tool};
@@ -50,6 +53,19 @@ use crate::tui::views::ViewStack;
 
 // === Types ===
 
+/// Lifecycle identity retained until the matching `TurnComplete` arrives.
+///
+/// This survives local cancellation clearing the visible runtime status, so
+/// observer records still carry a stable id, start time, and effective route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveTurnMetadata {
+    pub turn_id: String,
+    pub created_at: DateTime<Utc>,
+    pub route: Option<TurnRoute>,
+    /// Auto decision metadata captured with this exact authoritative route.
+    pub auto_route_receipt: Option<crate::model_routing::AutoRouteReceipt>,
+}
+
 /// State machine for onboarding new users.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnboardingState {
@@ -61,6 +77,7 @@ pub enum OnboardingState {
     Provider,
     ApiKey,
     TrustDirectory,
+    MentalModels,
     Tips,
     None,
 }
@@ -143,7 +160,10 @@ fn initial_onboarding_state(
     }
 
     if was_onboarded && needs_api_key {
-        OnboardingState::ApiKey
+        // Missing-key recovery uses the canonical provider picker so it can
+        // preserve the configured provider, endpoint, and model route before
+        // asking for a replacement secret.
+        OnboardingState::Provider
     } else if was_onboarded && needs_workspace_trust {
         OnboardingState::TrustDirectory
     } else {
@@ -178,6 +198,9 @@ pub struct TurnCacheRecord {
     /// API provider used for the turn. This is recorded so cache misses can be
     /// correlated with provider/model route changes.
     pub provider: Option<ApiProvider>,
+    /// Exact non-secret configured route key. This distinguishes named custom
+    /// providers which all share [`ApiProvider::Custom`].
+    pub provider_identity: Option<String>,
     /// Concrete model used for the turn. For auto-model turns this is the
     /// routed model, not the literal `auto` setting.
     pub model: Option<String>,
@@ -226,20 +249,49 @@ pub enum ReasoningEffort {
     Max,
 }
 
+impl From<ReasoningEffort> for crate::work_graph::ReasoningEffortTier {
+    fn from(value: ReasoningEffort) -> Self {
+        match value {
+            ReasoningEffort::Off => Self::Off,
+            ReasoningEffort::Low => Self::Low,
+            ReasoningEffort::Medium => Self::Medium,
+            ReasoningEffort::High => Self::High,
+            ReasoningEffort::Auto => Self::Auto,
+            ReasoningEffort::Max => Self::Max,
+        }
+    }
+}
+
 impl ReasoningEffort {
-    /// Parse a config-file string into an effort tier. Unknown values fall
-    /// back to the default (`Max`) rather than erroring out.
+    /// Parse an operator-supplied effort value.
+    ///
+    /// This is deliberately the one canonical spelling table for every
+    /// human-facing route.  Callers that read an old persisted config may use
+    /// [`Self::from_setting`] for its compatibility fallback, but a new CLI,
+    /// settings, or tool input must reject an unknown value instead of quietly
+    /// turning it into `max`.
+    pub fn parse_strict(value: &str) -> Result<Self, String> {
+        let trimmed = value.trim();
+        match trimmed.to_ascii_lowercase().as_str() {
+            "off" | "disabled" | "none" | "false" => Ok(Self::Off),
+            "low" | "minimum" | "minimal" | "light" => Ok(Self::Low),
+            "medium" | "mid" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "auto" | "automatic" => Ok(Self::Auto),
+            "max" | "maximum" | "xhigh" | "ultra" | "ultracode" => Ok(Self::Max),
+            _ => Err(format!(
+                "Unrecognized reasoning effort {trimmed:?}. Expected: auto, off, low, medium, high, or max."
+            )),
+        }
+    }
+
+    /// Parse a persisted config-file string into an effort tier. Unknown
+    /// legacy values fall back to the default (`Max`) so an old malformed
+    /// settings file never prevents startup.  New user input should use
+    /// [`Self::parse_strict`] instead.
     #[must_use]
     pub fn from_setting(value: &str) -> Self {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "off" | "disabled" | "none" | "false" => Self::Off,
-            "low" | "minimal" => Self::Low,
-            "medium" | "mid" => Self::Medium,
-            "high" => Self::High,
-            "auto" | "automatic" => Self::Auto,
-            "max" | "maximum" | "xhigh" | "ultracode" => Self::Max,
-            _ => Self::default(),
-        }
+        Self::parse_strict(value).unwrap_or_default()
     }
 
     #[must_use]
@@ -305,6 +357,44 @@ impl ReasoningEffort {
         }
     }
 
+    /// Resolve an effort against the exact provider route that will receive
+    /// the request. Both K3 routes are always-thinking, so `off` becomes the
+    /// lowest supported tier. The Kimi Code membership route otherwise keeps
+    /// its low/high/max mapping; direct Moonshot K3 additionally maps `medium`
+    /// to `high`. Generic Moonshot and every other non-Codex route retain the
+    /// historic high coercion. This intentionally does not change
+    /// [`Self::normalize_for_provider`], whose generic wire semantics are used
+    /// by older callers that do not yet have a route receipt.
+    #[must_use]
+    pub fn normalize_for_route(
+        self,
+        provider: ApiProvider,
+        base_url: &str,
+        wire_model: &str,
+    ) -> Self {
+        let normalized = self.normalize_for_provider(provider);
+        if crate::config::is_exact_kimi_code_k3_route(provider, base_url, wire_model) {
+            return match normalized {
+                Self::Off => Self::Low,
+                other => other,
+            };
+        }
+        if crate::config::is_exact_direct_moonshot_k3_route(provider, base_url, wire_model) {
+            return match normalized {
+                Self::Off => Self::Low,
+                Self::Medium => Self::High,
+                other => other,
+            };
+        }
+        if provider == ApiProvider::OpenaiCodex {
+            return normalized;
+        }
+        match normalized {
+            Self::Low | Self::Medium => Self::High,
+            other => other,
+        }
+    }
+
     #[must_use]
     pub fn api_value_for_provider(self, provider: ApiProvider) -> Option<&'static str> {
         if provider != ApiProvider::OpenaiCodex {
@@ -320,10 +410,34 @@ impl ReasoningEffort {
         })
     }
 
+    /// Provider-facing value after exact-route normalization.
+    #[must_use]
+    pub fn api_value_for_route(
+        self,
+        provider: ApiProvider,
+        base_url: &str,
+        wire_model: &str,
+    ) -> Option<&'static str> {
+        self.normalize_for_route(provider, base_url, wire_model)
+            .api_value_for_provider(provider)
+    }
+
     #[must_use]
     pub fn as_setting_for_provider(self, provider: ApiProvider) -> &'static str {
         self.api_value_for_provider(provider)
             .unwrap_or_else(|| self.as_setting())
+    }
+
+    /// Persist the canonical setting after exact-route normalization.
+    #[must_use]
+    pub fn as_setting_for_route(
+        self,
+        provider: ApiProvider,
+        base_url: &str,
+        wire_model: &str,
+    ) -> &'static str {
+        self.normalize_for_route(provider, base_url, wire_model)
+            .as_setting_for_provider(provider)
     }
 
     /// Cycle through the three behaviorally distinct tiers.
@@ -610,6 +724,54 @@ fn remove_char_at(text: &mut String, char_index: usize) -> bool {
     let end = start + ch.len_utf8();
     text.replace_range(start..end, "");
     true
+}
+
+/// Remove the chars in `[start_char, end_char)`. Returns true when anything
+/// was removed. Range endpoints are clamped to the text length.
+fn remove_char_range(text: &mut String, start_char: usize, end_char: usize) -> bool {
+    if start_char >= end_char {
+        return false;
+    }
+    let start = byte_index_at_char(text, start_char);
+    let end = byte_index_at_char(text, end_char);
+    if start >= end {
+        return false;
+    }
+    text.replace_range(start..end, "");
+    true
+}
+
+/// Char index of the grapheme-cluster boundary at or before `char_index - 1` —
+/// i.e. where the cursor lands after one "left" step. Grapheme-aware so a
+/// single step never splits a CJK char + combining mark, emoji ZWJ sequence,
+/// or flag pair. Returns `0` when `char_index` is `0`.
+pub(crate) fn prev_grapheme_boundary(text: &str, char_index: usize) -> usize {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut acc = 0usize;
+    for g in text.graphemes(true) {
+        let next = acc + g.chars().count();
+        if next >= char_index {
+            return acc;
+        }
+        acc = next;
+    }
+    acc
+}
+
+/// Char index of the first grapheme-cluster boundary strictly after
+/// `char_index` — i.e. where the cursor lands after one "right" step.
+/// Returns the total char count when already at or past the end.
+pub(crate) fn next_grapheme_boundary(text: &str, char_index: usize) -> usize {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut acc = 0usize;
+    for g in text.graphemes(true) {
+        let next = acc + g.chars().count();
+        if next > char_index {
+            return next;
+        }
+        acc = next;
+    }
+    acc
 }
 
 fn normalize_paste_text(text: &str) -> String {
@@ -970,15 +1132,14 @@ const MAX_COMPOSER_DISPLAY_CHARS: usize = 4_000;
 const MAX_DRAFT_HISTORY: usize = 50;
 
 impl AppMode {
-    /// Keyboard cycle order: Plan -> Act -> Operate -> Plan.
+    /// Productive keyboard cycle: Plan -> Act -> Operate -> Plan.
     ///
     /// `Auto` remains an internal variant while the real implementation is
     /// redesigned; do not expose it through user-facing mode selection (#3733).
     /// `Yolo` is kept for parse/back-compat only and is not in the Tab cycle.
+    /// Operate joins the visible cycle because ordinary messages can now
+    /// coordinate background workers without requiring a Workflow definition.
     pub const CYCLE: [Self; 3] = [Self::Plan, Self::Agent, Self::Operate];
-
-    /// User-facing picker / numeric command order: 1 Act / 2 Plan / 3 Operate.
-    pub const CHOICES: [Self; 3] = [Self::Agent, Self::Plan, Self::Operate];
 
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
@@ -1094,11 +1255,9 @@ impl AppMode {
             AppMode::Agent | AppMode::Auto => {
                 "Act mode - direct work in the current session with tools"
             }
-            AppMode::Yolo => "Act mode with Full Access (legacy YOLO permission shorthand)",
+            AppMode::Yolo => "Act mode with Full Access (legacy compatibility setting)",
             AppMode::Plan => "Plan mode - research and design before implementing",
-            AppMode::Operate => {
-                "Operate mode - manage Fleet, subagents, and workflow lanes (spawn, wait, verify, hand off)"
-            }
+            AppMode::Operate => "Operate mode - send tasks while Fleet workers run in parallel",
         }
     }
 
@@ -1175,6 +1334,57 @@ pub enum InitialInput {
     Submit(String),
 }
 
+/// Pre-session launch menu state for the underwater shell.
+///
+/// This is deliberately separate from onboarding and from the post-launch
+/// empty session. It selects real session/worktree actions before the
+/// transcript and composer become active.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchState {
+    pub visible: bool,
+    pub selected: usize,
+    pub worktree_input: Option<String>,
+    pub status: Option<String>,
+    pub workspace_session_count: usize,
+    pub worktree_available: bool,
+    /// Row hitboxes from the most recent launch render.
+    pub row_areas: Vec<Rect>,
+}
+
+impl LaunchState {
+    #[must_use]
+    pub fn new(visible: bool, workspace: &std::path::Path) -> Self {
+        let workspace_session_count = crate::session_manager::SessionManager::default_location()
+            .and_then(|manager| manager.list_sessions())
+            .map(|sessions| {
+                sessions
+                    .into_iter()
+                    .filter(|session| {
+                        crate::session_manager::workspace_scope_matches(
+                            &session.workspace,
+                            workspace,
+                        )
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        let worktree_available = std::process::Command::new("git")
+            .current_dir(workspace)
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .is_ok_and(|output| output.status.success());
+        Self {
+            visible,
+            selected: 0,
+            worktree_input: None,
+            status: None,
+            workspace_session_count,
+            worktree_available,
+            row_areas: Vec::new(),
+        }
+    }
+}
+
 // === Sub-state structs for App field organization (#377) ===
 
 /// Vim modal editing mode for the composer input area.
@@ -1236,22 +1446,6 @@ pub struct MentionCompletionCache {
     pub entries: Vec<String>,
 }
 
-/// Cached full candidate walk for @-mention completions. One workspace walk
-/// serves every subsequent keystroke of the same mention token — the
-/// per-keystroke synchronous re-walk was the dominant composer latency on
-/// large repos (#3757). Path-like partials (containing `/` or starting with
-/// `.`) bypass this cache because local path-reference completions are
-/// needle-dependent.
-#[derive(Debug, Clone)]
-pub struct MentionCandidateCache {
-    pub workspace: PathBuf,
-    pub cwd: Option<PathBuf>,
-    pub walk_depth: usize,
-    pub follow_links: bool,
-    pub collected_at: std::time::Instant,
-    pub candidates: Vec<String>,
-}
-
 /// Composer input state — grouped fields for the text input area.
 pub struct ComposerState {
     /// Current composer text content.
@@ -1283,9 +1477,12 @@ pub struct ComposerState {
     /// Cached @-mention completions to avoid re-walking the filesystem when
     /// the cursor moves inside the same mention token.
     pub mention_completion_cache: Option<MentionCompletionCache>,
-    /// Cached full candidate list so successive keystrokes inside one mention
-    /// token filter in memory instead of re-walking the workspace (#3757).
-    pub mention_candidate_cache: Option<MentionCandidateCache>,
+    /// Serialized background discovery and its bounded candidate cache. All
+    /// filesystem traversal for composer completions lives behind this owner.
+    pub(crate) mention_discovery: crate::tui::mention_completion::MentionDiscovery,
+    /// Launch directory captured once so rendering a completion popup never
+    /// needs to call `getcwd` on the UI thread.
+    pub(crate) mention_cwd: Option<PathBuf>,
     /// Whether vim modal editing is enabled for this composer.
     /// Sourced from `Settings::composer_vim_mode` at startup.
     pub vim_enabled: bool,
@@ -1322,7 +1519,8 @@ impl Default for ComposerState {
             mention_menu_selected: 0,
             mention_menu_hidden: false,
             mention_completion_cache: None,
-            mention_candidate_cache: None,
+            mention_discovery: crate::tui::mention_completion::MentionDiscovery::default(),
+            mention_cwd: std::env::current_dir().ok(),
             vim_enabled: false,
             vim_mode: VimMode::Normal,
             vim_pending_d: false,
@@ -1342,12 +1540,16 @@ pub struct ViewportState {
     pub transcript_scrollbar_dragging: bool,
     pub last_transcript_area: Option<Rect>,
     pub last_composer_area: Option<Rect>,
+    /// Painted band occupied by the active inline approval. Stored so wheel
+    /// routing can prefer the visible card over side surfaces underneath it.
+    pub last_approval_area: Option<Rect>,
     /// Outer rect of the right-hand sidebar (when visible), stored at render
     /// time so mouse hit-testing can keep scroll events over the sidebar from
     /// leaking into the transcript viewport.
     pub last_sidebar_area: Option<Rect>,
     /// WorkflowPanel rect above the composer (#4121), for mouse toggle/cancel.
     pub last_workflow_panel_area: Option<Rect>,
+    pub last_workflow_cancel_area: Option<Rect>,
     pub last_transcript_top: usize,
     pub last_transcript_visible: usize,
     pub last_transcript_total: usize,
@@ -1376,8 +1578,10 @@ impl Default for ViewportState {
             transcript_scrollbar_dragging: false,
             last_transcript_area: None,
             last_composer_area: None,
+            last_approval_area: None,
             last_sidebar_area: None,
             last_workflow_panel_area: None,
+            last_workflow_cancel_area: None,
             last_transcript_top: 0,
             last_transcript_visible: 0,
             last_transcript_total: 0,
@@ -1485,6 +1689,11 @@ pub struct SidebarHoverState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidebarRowAction {
     Command(String),
+    /// Put a destructive command in the composer instead of executing it.
+    /// The user confirms with Enter or cancels by editing/clearing the draft.
+    #[allow(dead_code)] // destructive confirm path; mouse_ui already matches it (TUI-DOG-008)
+    PrefillCommand(String),
+    HotbarSlot(u8),
     ToggleAgentDetails {
         agent_id: String,
     },
@@ -1497,6 +1706,13 @@ pub enum SidebarRowAction {
     CancelAgent {
         agent_id: String,
     },
+    /// Open the Work Graph inspector in the shared pager. Any lifecycle stop
+    /// action is carried into that inspector instead of consuming row width.
+    InspectWork {
+        title: String,
+        body: String,
+        stop_action: Option<Box<SidebarRowAction>>,
+    },
 }
 
 impl SidebarRowAction {
@@ -1504,9 +1720,12 @@ impl SidebarRowAction {
     pub fn as_command(&self) -> Option<&str> {
         match self {
             Self::Command(command) => Some(command.as_str()),
-            Self::ToggleAgentDetails { .. }
+            Self::PrefillCommand(_)
+            | Self::HotbarSlot(_)
+            | Self::ToggleAgentDetails { .. }
             | Self::OpenAgentDetail { .. }
-            | Self::CancelAgent { .. } => None,
+            | Self::CancelAgent { .. }
+            | Self::InspectWork { .. } => None,
         }
     }
 
@@ -1514,8 +1733,12 @@ impl SidebarRowAction {
     pub fn is_cancel_action(&self) -> bool {
         match self {
             Self::Command(command) => command.contains(" cancel "),
+            Self::PrefillCommand(command) => command.contains(" cancel "),
             Self::CancelAgent { .. } => true,
-            Self::ToggleAgentDetails { .. } | Self::OpenAgentDetail { .. } => false,
+            Self::ToggleAgentDetails { .. }
+            | Self::OpenAgentDetail { .. }
+            | Self::InspectWork { .. }
+            | Self::HotbarSlot(_) => false,
         }
     }
 }
@@ -1610,6 +1833,8 @@ pub(crate) struct PendingProviderSwitch {
     pub previous_model: String,
     pub previous_model_ids_passthrough: bool,
     pub previous_route_limits: Option<RouteLimits>,
+    pub previous_route_base_url: String,
+    pub previous_context_window_source: crate::route_runtime::ContextWindowSource,
     pub previous_context_window_override: Option<u32>,
     pub previous_config: Config,
     pub previous_onboarding: OnboardingState,
@@ -1628,6 +1853,9 @@ pub struct App {
     pub composer: ComposerState,
     /// Viewport sub-state (scroll, cache, selection).
     pub viewport: ViewportState,
+    /// Ocean work-surface state. Kept separate from transcript/sidebar state
+    /// so the replacement shell can be removed or promoted as one unit.
+    pub work_surface: crate::tui::work_surface::WorkSurfaceState,
     /// Goal sub-state.
     pub hunt: HuntState,
     /// Session sub-state (cost, tokens, telemetry).
@@ -1691,13 +1919,34 @@ pub struct App {
     pub auto_model: bool,
     /// Last concrete model chosen while `auto_model` is active.
     pub last_effective_model: Option<String>,
-    /// Route selected for the in-flight turn. Consumed by `TurnComplete` to
-    /// annotate `/cache` telemetry without widening the engine event surface.
+    /// Provider that actually served the latest auto-routed turn.
+    pub last_effective_provider: Option<ApiProvider>,
+    /// Exact non-secret identity for the provider that served the latest Auto
+    /// turn. This matters for named custom providers, which all share the
+    /// `ApiProvider::Custom` enum variant.
+    pub(crate) last_effective_provider_identity: Option<String>,
+    /// Auto decision metadata for the most recently resolved Auto turn.
+    pub(crate) last_auto_route_receipt: Option<crate::model_routing::AutoRouteReceipt>,
+    /// Route selected for the next turn, retained for in-flight UI details
+    /// until the engine confirms the authoritative `TurnStarted` route.
     pub pending_turn_route: Option<(ApiProvider, String, bool)>,
+    /// Auto decision metadata waiting to be paired with `pending_turn_route`.
+    pub(crate) pending_auto_route_receipt: Option<crate::model_routing::AutoRouteReceipt>,
+    /// Authoritative lifecycle metadata attached to the most recent
+    /// `TurnStarted`. Kept separate from `pending_turn_route` so a preceding
+    /// compaction completion cannot consume the next model turn's route.
+    pub active_turn: Option<ActiveTurnMetadata>,
     /// Current API provider (mirrors `Config::api_provider`).
     /// Updated by `/provider` switches so the UI/commands can read the
     /// active backend without re-deriving it from the live config.
     pub api_provider: ApiProvider,
+    /// Exact configured provider key for persistence and route restoration.
+    /// Built-ins use their canonical slug; named custom providers retain the
+    /// user-owned key instead of collapsing to `custom`.
+    pub(crate) provider_identity: String,
+    /// Additive exact configured id for persistence. `None` preserves the
+    /// legacy root-level custom route even when a same-key table appears.
+    pub(crate) provider_exact_id: Option<String>,
     /// Primary provider plus configured fallback providers for this session.
     pub provider_chain: Option<ProviderChain>,
     /// Per-provider auth/local readiness snapshot for the fallback chain (#2574).
@@ -1709,6 +1958,10 @@ pub struct App {
     /// ready)` pairs; lookups fall back to "ready" for providers not present so
     /// an unknown entry is tried rather than silently skipped.
     provider_readiness: Vec<(ApiProvider, bool)>,
+    /// Session-local evidence from real provider requests and verification
+    /// probes. Unlike `provider_readiness` above, this never treats a saved key
+    /// as proof that the endpoint is healthy.
+    pub(crate) provider_health: crate::provider_readiness::ProviderReadinessSnapshot,
     /// Human-readable description of the last provider fallback event.
     pub last_fallback_reason: Option<String>,
     /// True when the active provider/base URL accepts arbitrary model IDs
@@ -1716,6 +1969,14 @@ pub struct App {
     pub model_ids_passthrough: bool,
     /// Resolved provider/model route limits for the active runtime route.
     pub active_route_limits: Option<RouteLimits>,
+    /// Exact resolved endpoint for the active runtime route. This stays
+    /// separate from persisted config so endpoint-sensitive compatibility
+    /// (notably Kimi Code's bare `k3`) is never inferred from a provider name
+    /// alone.
+    pub active_route_base_url: String,
+    /// Provenance for `active_route_limits`' effective context window. This
+    /// is an operator-facing receipt, not a claim about provider billing.
+    pub active_context_window_source: crate::route_runtime::ContextWindowSource,
     /// User-configured provider context-window override for the active route.
     pub active_context_window_override: Option<u32>,
     /// Pending provider transition for transactional rollback when the next
@@ -1724,11 +1985,21 @@ pub struct App {
     /// Current reasoning-effort tier for DeepSeek thinking mode.
     /// Cycled via Shift+Tab; initialized from config at startup.
     pub reasoning_effort: ReasoningEffort,
+    /// Whether the current effort came from an explicit user setting rather
+    /// than compatibility inference from a retiring model alias.
+    pub(crate) reasoning_effort_explicit: bool,
     /// Last concrete thinking tier chosen while `reasoning_effort` is auto.
     pub last_effective_reasoning_effort: Option<ReasoningEffort>,
     pub workspace: PathBuf,
+    /// Immutable plugin catalogue scoped to this App's effective workspace.
+    pub plugin_registry: std::sync::Arc<crate::plugins::PluginRegistry>,
     pub config_path: Option<PathBuf>,
     pub config_profile: Option<String>,
+    /// Legacy executable plugin-tool directory resolved from the already
+    /// loaded configuration. Slash-command inventory must not reload the full
+    /// config (and thereby re-read credential-bearing fields) merely to find
+    /// this path.
+    pub legacy_plugin_tools_dir: Option<PathBuf>,
     pub mcp_config_path: PathBuf,
     pub skills_dir: PathBuf,
     pub skills_scan_codewhale_only: bool,
@@ -1782,10 +2053,31 @@ pub struct App {
     pub auto_compact_threshold_percent: f64,
     pub calm_mode: bool,
     pub low_motion: bool,
-    /// Pending #61 (animated working strip). Set from config but not read
-    /// until the footer widget consumes it.
-    #[allow(dead_code)]
+    pub constrained_frame_rate: bool,
+    pub ocean_started_at: Instant,
+    /// Start of the underwater shell's one-shot successful-turn exhale.
+    /// Kept separate from the ambient ocean clock so completion can settle
+    /// once without restarting or repainting the transcript field.
+    pub ocean_completion_started_at: Option<Instant>,
+    /// History length at the current turn boundary. Successful completion
+    /// uses this stable index to settle only the receipts produced by that
+    /// turn, never old transcript rows.
+    pub ocean_turn_history_start: usize,
+    /// First committed history cell participating in the current one-shot
+    /// receipt-settle cascade.
+    pub ocean_receipt_settle_start: Option<usize>,
+    /// Enables the authored underwater phase and ambient motion system.
     pub fancy_animations: bool,
+    /// Typed appearance treatment; appearance is independent from motion
+    /// settings, and every underwater treatment keeps ambient life.
+    pub ocean_treatment: crate::tui::ocean::OceanTreatment,
+    /// Distinct pre-session menu. Once dismissed, the normal idle ocean owns
+    /// the empty session and this state stays hidden.
+    pub launch: LaunchState,
+    /// Mouse-selected launch action, consumed by the async UI loop.
+    pub pending_launch_action: Option<crate::tui::underwater::LaunchAction>,
+    /// Mouse-selected hotbar slot, consumed by the async UI loop.
+    pub pending_hotbar_slot: Option<u8>,
     /// Whether the renderer should wrap each frame in DEC mode 2026
     /// synchronized output. Resolved from `Settings::synchronized_output`
     /// at construction; `auto`/`on` → `true`, `off` → `false`. The Ptyxis
@@ -1794,16 +2086,19 @@ pub struct App {
     /// the draw loop the decision is already made. See the
     /// `Settings::synchronized_output` doc for the user-facing knob.
     pub synchronized_output_enabled: bool,
-    /// Header status-indicator chip mode. One of `"whale"` (default, cycles
-    /// 🐳→🐋 frames keyed off `turn_started_at`), `"dots"` (geometric ◌
-    /// frames), or `"off"` (chip hidden entirely). Loaded from settings;
-    /// changed via `/config status_indicator <whale|dots|off>`.
+    /// Header status-indicator chip mode. `"cw"` is the static default;
+    /// `"whale"` and `"dots"` preserve the animated legacy choices, while
+    /// `"off"` hides the chip. Loaded from settings and changed via
+    /// `/config status_indicator <cw|whale|dots|off>`.
     pub status_indicator: String,
     pub show_thinking: bool,
     pub verbose_transcript: bool,
     pub show_tool_details: bool,
     pub ui_locale: Locale,
     pub cost_currency: CostCurrency,
+    /// Route payment truth. Model pricing alone cannot distinguish metered
+    /// API calls from OAuth or token-plan quota.
+    pub billing_presentation: crate::route_billing::BillingPresentation,
     pub composer_density: ComposerDensity,
     pub composer_border: bool,
     /// Voice input state — toggled by `/voice` and the voice hotbar action.
@@ -1912,6 +2207,11 @@ pub struct App {
     /// budget-only chatter is paced under fan-out (#4095 residual).
     pub last_workflow_budget_redraw: Option<Instant>,
     pub ui_theme: UiTheme,
+    /// Parsed `background_color` setting, kept separately from `ui_theme` so
+    /// an explicit override remains distinguishable even when it happens to
+    /// equal the current named theme's default surface and can still carry
+    /// into previews of other themes.
+    pub background_color_override: Option<Color>,
     /// Active named theme. Drives the cell-level color remap in
     /// `tui::color_compat::ColorCompatBackend` so community presets
     /// (Catppuccin, Tokyo Night, Dracula, Gruvbox) propagate to every
@@ -1922,6 +2222,13 @@ pub struct App {
     pub onboarding_needs_api_key: bool,
     pub onboarding_provider: ApiProvider,
     pub onboarding_workspace_trust_gate: bool,
+    /// True when onboarding opened only because a returning user's configured
+    /// provider is missing its key. Esc then exits to the offline composer
+    /// instead of walking back through first-run steps.
+    pub onboarding_missing_key_recovery: bool,
+    /// First-run route receipts used by the mental-model screen's Back action.
+    pub onboarding_had_api_key_step: bool,
+    pub onboarding_had_trust_step: bool,
     pub api_key_env_only: bool,
     pub api_key_input: String,
     pub api_key_cursor: usize,
@@ -1940,6 +2247,10 @@ pub struct App {
     /// True when config/requirements supplied an approval policy. In that
     /// case the TUI-only Shift+Tab preference must not loosen it.
     approval_policy_locked: bool,
+    /// True only when the controlling policy is the user's editable root
+    /// config.toml key. An explicit Shift+Tab may migrate that key to the
+    /// durable TUI posture; higher-precedence sources remain immutable.
+    approval_policy_root_editable: bool,
     /// True only when an organization requirements file owns approval policy.
     /// Unlike a user-owned config key, this source cannot be edited in-app.
     approval_policy_requirements_managed: bool,
@@ -1991,6 +2302,9 @@ pub struct App {
     pub plan_state: SharedPlanState,
     /// Whether a plan follow-up prompt is waiting for user input
     pub plan_prompt_pending: bool,
+    /// Exact graph proposal rendered in the current Plan confirmation. Plan
+    /// acceptance must present this identity again or fail closed.
+    pub pending_plan_proposal_id: Option<crate::work_graph::ProposalId>,
     /// Whether update_plan was called during the current turn
     pub plan_tool_used_in_turn: bool,
     /// Todo list for `TodoWriteTool`. Read by the plan confirmation modal to
@@ -2005,11 +2319,14 @@ pub struct App {
     /// the user runs `/mcp` for the first time. `0` hides the chip.
     pub mcp_configured_count: usize,
     /// Set after in-TUI MCP config edits because the engine caches its MCP pool.
-    pub mcp_restart_required: bool,
+    pub mcp_reload_required: bool,
     /// Tool execution log
     pub tool_log: Vec<String>,
     /// Active skill to apply to next user message
     pub active_skill: Option<String>,
+    /// Content-bound plugin authority carried with `active_skill`, when the
+    /// selected skill came from a reviewed plugin bundle.
+    pub active_skill_provenance: Option<crate::plugins::types::PluginAuthority>,
     /// Cached (name, description) pairs from the skill registry.
     /// Populated once at startup and refreshed on install/uninstall so
     /// the slash menu can show skills without filesystem I/O on every keystroke.
@@ -2183,6 +2500,8 @@ pub struct App {
     pub workspace_context_refreshed_at: Option<Instant>,
     /// Cached background tasks for sidebar rendering.
     pub task_panel: Vec<TaskPanelEntry>,
+    /// Session-local quieting and command detectors for event-driven tips.
+    pub behavioral_tips: crate::tui::behavioral_tips::BehavioralTipState,
     /// Active decision card (v0.8.43 truth-surface). When set, keyboard input
     /// is routed through the card navigation instead of the composer.
     pub decision_card: Option<crate::tui::widgets::decision_card::DecisionCard>,
@@ -2280,6 +2599,7 @@ pub struct App {
 pub struct QueuedMessage {
     pub display: String,
     pub skill_instruction: Option<String>,
+    pub skill_provenance: Option<crate::plugins::types::PluginAuthority>,
 }
 
 /// How a freshly-typed user input should be sent.
@@ -2331,7 +2651,6 @@ pub struct TaskPanelEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskPanelEntryKind {
     Background,
-    ModelReasoning,
 }
 
 impl QueuedMessage {
@@ -2339,7 +2658,17 @@ impl QueuedMessage {
         Self {
             display,
             skill_instruction,
+            skill_provenance: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_skill_provenance(
+        mut self,
+        provenance: Option<crate::plugins::types::PluginAuthority>,
+    ) -> Self {
+        self.skill_provenance = provenance;
+        self
     }
 
     #[allow(dead_code)] // Tests and queue helpers use the display-only form; send path resolves @mentions.
@@ -2431,6 +2760,12 @@ impl App {
         self.session.last_reasoning_replay_tokens = None;
         self.session.turn_cache_history.clear();
         self.pending_turn_route = None;
+        self.pending_auto_route_receipt = None;
+        self.active_turn = None;
+        self.last_effective_model = None;
+        self.last_effective_provider = None;
+        self.last_effective_provider_identity = None;
+        self.last_auto_route_receipt = None;
         self.last_pinned_prefix_hash = None;
     }
 
@@ -2438,8 +2773,22 @@ impl App {
         tr(self.ui_locale, id)
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[cfg(test)]
     pub fn new(options: TuiOptions, config: &Config) -> Self {
+        let workspace = options.workspace.clone();
+        Self::new_with_plugin_registry(
+            options,
+            config,
+            std::sync::Arc::new(crate::plugins::PluginRegistry::empty(&workspace)),
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub fn new_with_plugin_registry(
+        options: TuiOptions,
+        config: &Config,
+        plugin_registry: std::sync::Arc<crate::plugins::PluginRegistry>,
+    ) -> Self {
         let TuiOptions {
             model,
             workspace,
@@ -2458,11 +2807,68 @@ impl App {
             start_in_agent_mode,
             skip_onboarding,
             yolo,
-            resume_session_id: _,
+            resume_session_id,
             initial_input,
         } = options;
 
-        let settings = Settings::load().unwrap_or_else(|_| Settings::default());
+        // Start from disk-only preferences so one-time migrations can never
+        // persist terminal/environment overlays such as NO_ANIMATIONS. Apply
+        // those overlays only after any normalized settings write succeeds.
+        let mut settings = Settings::load_persisted().unwrap_or_else(|_| Settings::default());
+        let legacy_yolo_default = settings.legacy_yolo_default_detected();
+        let legacy_yolo_full_access = if legacy_yolo_default {
+            let control = config.approval_policy_control(
+                config_path.as_deref(),
+                config_profile.as_deref(),
+                &workspace,
+            );
+            match control {
+                crate::config::ApprovalPolicyControl::Unset => {
+                    if let Err(error) = settings.save() {
+                        tracing::warn!(
+                            "failed to normalize legacy YOLO settings; retrying next launch: {error:#}"
+                        );
+                    }
+                    true
+                }
+                crate::config::ApprovalPolicyControl::RootConfig => {
+                    let active_config_path =
+                        crate::config::resolve_load_config_path(config_path.clone());
+                    match crate::config_persistence::persist_unset_root_key(
+                        active_config_path.as_deref(),
+                        "approval_policy",
+                    ) {
+                        Ok(_) => {
+                            if let Err(error) = settings.save() {
+                                tracing::warn!(
+                                    "removed legacy approval_policy but could not normalize settings; retrying next launch: {error:#}"
+                                );
+                            }
+                            true
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                "could not migrate legacy YOLO approval policy; keeping the controlling policy: {error:#}"
+                            );
+                            false
+                        }
+                    }
+                }
+                source => {
+                    tracing::warn!(
+                        "legacy YOLO setting was not allowed to override {}",
+                        source.label()
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        settings.apply_env_overrides();
+        let launch_visible =
+            settings.launch_screen && resume_session_id.is_none() && initial_input.is_none();
+        let launch = LaunchState::new(launch_visible, &workspace);
 
         // If settings.toml exists on disk but couldn't be parsed (we fell back
         // to defaults), surface a warning in the TUI so the user knows their
@@ -2495,18 +2901,34 @@ impl App {
         // Let settings preserve runtime switches only when config/CLI did not
         // explicitly select a provider. A configured provider must not be
         // pushed back to a stale saved setting on restart.
-        if config
+        let config_explicitly_selects_provider = config
             .provider
             .as_deref()
-            .and_then(ApiProvider::parse)
-            .is_none()
+            .is_some_and(|provider| !provider.trim().is_empty());
+        let mut provider_identity_record = config
+            .active_provider_identity(provider)
+            .unwrap_or_else(|_| {
+                let key = config.provider_identity_for(provider);
+                let exact_id = (!(provider == ApiProvider::Custom
+                    && config.uses_legacy_literal_custom_route()))
+                .then(|| key.clone());
+                crate::config::ProviderIdentity {
+                    provider,
+                    key,
+                    exact_id,
+                }
+            });
+        if !config_explicitly_selects_provider
             && let Some(ref provider_str) = settings.default_provider
-            && let Some(parsed) = ApiProvider::parse(provider_str)
+            && let Ok(resolved) = config.resolve_provider_identity(provider_str)
         {
-            provider = parsed;
+            provider = resolved.provider;
+            provider_identity_record = resolved;
         }
+        let provider_identity = provider_identity_record.key;
+        let provider_exact_id = provider_identity_record.exact_id;
         let mut effective_auth_config = config.clone();
-        effective_auth_config.provider = Some(provider.as_str().to_string());
+        effective_auth_config.provider = Some(provider_identity.clone());
         let model_ids_passthrough = effective_auth_config.model_ids_pass_through();
         let provider_chain = provider
             .kind()
@@ -2543,7 +2965,11 @@ impl App {
         let auto_compact_threshold_percent = settings.auto_compact_threshold_percent;
         let calm_mode = settings.calm_mode;
         let low_motion = settings.low_motion;
+        let constrained_frame_rate = settings.constrained_frame_rate;
         let fancy_animations = settings.fancy_animations;
+        let ocean_treatment = crate::tui::ocean::OceanTreatment::parse(&settings.ocean_treatment);
+        let work_surface_placement =
+            crate::tui::work_surface::WorkSurfacePlacement::parse(&settings.work_surface_placement);
         let synchronized_output_enabled = settings.synchronized_output_enabled();
         let status_indicator = settings.status_indicator.clone();
         let show_thinking = settings.show_thinking;
@@ -2570,16 +2996,16 @@ impl App {
         let theme_id =
             palette::ThemeId::from_name(&settings.theme).unwrap_or(palette::ThemeId::System);
         let mut ui_theme = theme_id.ui_theme();
-        if let Some(background) = settings
+        let background_color_override = settings
             .background_color
             .as_deref()
-            .and_then(palette::parse_hex_rgb_color)
-        {
+            .and_then(palette::parse_hex_rgb_color);
+        if let Some(background) = background_color_override {
             ui_theme = ui_theme.with_background_color(background);
         }
         let provider_models = settings.provider_models.clone().unwrap_or_default();
         let model = provider_models
-            .get(provider.as_str())
+            .get(&provider_identity)
             .cloned()
             .or_else(|| {
                 // default_model is a DeepSeek-centric setting; other providers
@@ -2593,25 +3019,48 @@ impl App {
             .unwrap_or(model);
         let auto_model = model.trim().eq_ignore_ascii_case("auto");
         let active_context_window_override = config.context_window_for_provider_config(provider);
-        let active_route_limits = if auto_model {
-            active_context_window_override.map(|window| RouteLimits {
-                context_tokens: Some(u64::from(window)),
-                ..RouteLimits::default()
-            })
-        } else {
-            let saved_provider_model = config
-                .provider_config_for(provider)
-                .and_then(|provider| provider.model.as_deref());
-            crate::route_runtime::resolve_route_candidate(
-                provider,
-                Some(&model),
-                saved_provider_model,
-                Some(effective_auth_config.deepseek_base_url()),
-                active_context_window_override,
-            )
-            .ok()
-            .and_then(|candidate| crate::route_budget::known_route_limits(candidate.limits))
-        };
+        let configured_route_base_url = effective_auth_config.deepseek_base_url();
+        let (active_route_limits, active_route_base_url, active_context_window_source) =
+            if auto_model {
+                (
+                    active_context_window_override.map(|window| RouteLimits {
+                        context_tokens: Some(u64::from(window)),
+                        ..RouteLimits::default()
+                    }),
+                    configured_route_base_url,
+                    if active_context_window_override.is_some() {
+                        crate::route_runtime::ContextWindowSource::Configured
+                    } else {
+                        crate::route_runtime::ContextWindowSource::Fallback
+                    },
+                )
+            } else {
+                let saved_provider_model = config
+                    .provider_config_for(provider)
+                    .and_then(|provider| provider.model.as_deref());
+                crate::route_runtime::resolve_route_candidate_with_context_metadata(
+                    provider,
+                    Some(&model),
+                    saved_provider_model,
+                    Some(configured_route_base_url.clone()),
+                    active_context_window_override,
+                    None,
+                )
+                .map(|resolution| {
+                    (
+                        crate::route_budget::known_route_limits(resolution.candidate.limits()),
+                        resolution.candidate.endpoint().base_url.clone(),
+                        resolution.context_window.source,
+                    )
+                })
+                .unwrap_or((
+                    None,
+                    configured_route_base_url,
+                    crate::route_runtime::ContextWindowSource::Fallback,
+                ))
+            };
+        let reasoning_effort_explicit =
+            settings.reasoning_effort.is_some() || config.reasoning_effort_is_explicit();
         let configured_reasoning_effort = settings
             .reasoning_effort
             .as_deref()
@@ -2636,15 +3085,37 @@ impl App {
                 active_route_limits,
             )
         };
-        let reasoning_effort = if auto_model {
+        let mut reasoning_effort = if auto_model {
             ReasoningEffort::Auto
         } else {
             configured_reasoning_effort.map_or_else(ReasoningEffort::default, |s| {
                 ReasoningEffort::from_setting_for_provider(s, provider)
             })
         };
+        if !auto_model
+            && !reasoning_effort_explicit
+            && let Some(effort) = crate::config::legacy_deepseek_alias_effort_for_route(
+                provider,
+                &effective_auth_config.deepseek_base_url(),
+                &model,
+            )
+        {
+            reasoning_effort = ReasoningEffort::from_setting_for_provider(effort, provider);
+        }
+        if !auto_model
+            && crate::config::is_exact_direct_moonshot_k3_route(
+                provider,
+                &active_route_base_url,
+                &model,
+            )
+        {
+            // Keep the visible/effective tier truthful on first launch too;
+            // direct K3 cannot honor a persisted `off` setting.
+            reasoning_effort =
+                reasoning_effort.normalize_for_route(provider, &active_route_base_url, &model);
+        }
 
-        // Start in Act mode with bypass approvals when --yolo or default_mode=yolo.
+        // Resolve the saved mode separately from the permission posture.
         let preferred_mode = AppMode::from_setting(&settings.default_mode);
         let yolo_compat = yolo || (preferred_mode == AppMode::Yolo && !start_in_agent_mode);
         let initial_mode = if yolo_compat || start_in_agent_mode {
@@ -2659,6 +3130,7 @@ impl App {
             needs_api_key,
             needs_workspace_trust,
         );
+        let onboarding_missing_key_recovery = !skip_onboarding && was_onboarded && needs_api_key;
         let onboarding_workspace_trust_gate = onboarding_is_workspace_trust_gate(
             skip_onboarding,
             was_onboarded,
@@ -2680,12 +3152,24 @@ impl App {
         // documented, while an explicit `allow_shell = false` still hides it.
         // Trust is never part of the Agent baseline (it is YOLO-only authority).
         // Approval mirrors the configured policy.
-        let explicit_approval_mode = config
-            .approval_policy
-            .as_deref()
+        let explicit_approval_mode = (!legacy_yolo_full_access)
+            .then_some(config.approval_policy.as_deref())
+            .flatten()
             .and_then(ApprovalMode::from_config_value);
-        let approval_policy_locked = config.approval_policy_is_managed();
-        let approval_policy_requirements_managed = config.approval_policy_is_requirements_managed();
+        let approval_policy_control = if legacy_yolo_full_access {
+            ApprovalPolicyControl::Unset
+        } else {
+            config.approval_policy_control(
+                config_path.as_deref(),
+                config_profile.as_deref(),
+                &workspace,
+            )
+        };
+        let approval_policy_locked = approval_policy_control != ApprovalPolicyControl::Unset;
+        let approval_policy_root_editable =
+            approval_policy_control == ApprovalPolicyControl::RootConfig;
+        let approval_policy_requirements_managed =
+            approval_policy_control == ApprovalPolicyControl::Requirements;
         let saved_permission_posture = if approval_policy_locked {
             None
         } else {
@@ -2720,13 +3204,21 @@ impl App {
 
         // Initialize plan state
         let plan_state = new_shared_plan_state();
+        let todos = new_shared_todo_list();
+        let work_runtime =
+            crate::work_graph::new_shared_work_runtime(todos.clone(), plan_state.clone());
 
         let skills_scan_codewhale_only = config.skills_config().scan_codewhale_only();
         let skills_dir = resolve_skills_dir(&workspace, &global_skills_dir, config);
-        let cached_skills =
-            Self::discover_cached_skills(&workspace, &skills_dir, skills_scan_codewhale_only);
+        let cached_skills = Self::discover_cached_skills(
+            &workspace,
+            &skills_dir,
+            skills_scan_codewhale_only,
+            plugin_registry.as_ref(),
+        );
 
         let input_history = crate::composer_history::load_history();
+        let mention_cwd = std::env::current_dir().ok();
         let (initial_input_text, initial_input_cursor, auto_submit_initial_input) =
             match initial_input {
                 // #451: pre-populate the composer when invoked via
@@ -2743,10 +3235,13 @@ impl App {
                 }
                 _ => (String::new(), 0, false),
             };
-        let mcp_configured_count =
-            crate::mcp::load_config_with_workspace(&mcp_config_path, &workspace)
-                .map(|cfg| cfg.servers.len())
-                .unwrap_or(0);
+        let mcp_configured_count = crate::mcp::load_config_with_workspace_and_plugins(
+            &mcp_config_path,
+            &workspace,
+            plugin_registry.as_ref(),
+        )
+        .map(|cfg| cfg.servers.len())
+        .unwrap_or(0);
         let mut hotbar_actions = HotbarActionRegistry::with_configured_routes(
             config,
             provider,
@@ -2778,13 +3273,17 @@ impl App {
                 mention_menu_selected: 0,
                 mention_menu_hidden: false,
                 mention_completion_cache: None,
-                mention_candidate_cache: None,
+                mention_discovery: crate::tui::mention_completion::MentionDiscovery::default(),
+                mention_cwd,
                 vim_enabled: composer_vim_enabled,
                 vim_mode: VimMode::Normal,
                 vim_pending_d: false,
                 selection_anchor: None,
             },
             viewport: ViewportState::default(),
+            work_surface: crate::tui::work_surface::WorkSurfaceState::with_placement(
+                work_surface_placement,
+            ),
             hunt: HuntState::default(),
             session: SessionState::default(),
             active_allowed_tools: None,
@@ -2814,20 +3313,37 @@ impl App {
             provider_models,
             auto_model,
             last_effective_model: None,
+            last_effective_provider: None,
+            last_effective_provider_identity: None,
+            last_auto_route_receipt: None,
             pending_turn_route: None,
+            pending_auto_route_receipt: None,
+            active_turn: None,
             api_provider: provider,
+            provider_identity,
+            provider_exact_id,
             provider_chain,
             provider_readiness,
+            provider_health: crate::provider_readiness::ProviderReadinessSnapshot::default(),
             last_fallback_reason: None,
             model_ids_passthrough,
             active_route_limits,
+            active_route_base_url,
+            active_context_window_source,
             active_context_window_override,
             pending_provider_switch: None,
             reasoning_effort,
+            reasoning_effort_explicit,
             last_effective_reasoning_effort: None,
             workspace,
+            plugin_registry,
             config_path,
             config_profile,
+            legacy_plugin_tools_dir: config
+                .tools
+                .as_ref()
+                .and_then(|tools| tools.plugin_dir.as_deref())
+                .map(PathBuf::from),
             mcp_config_path: mcp_config_path.clone(),
             skills_dir,
             skills_scan_codewhale_only,
@@ -2845,7 +3361,16 @@ impl App {
             auto_compact_threshold_percent,
             calm_mode,
             low_motion,
+            constrained_frame_rate,
+            ocean_started_at: Instant::now(),
+            ocean_completion_started_at: None,
+            ocean_turn_history_start: 0,
+            ocean_receipt_settle_start: None,
             fancy_animations,
+            ocean_treatment,
+            launch,
+            pending_launch_action: None,
+            pending_hotbar_slot: None,
             synchronized_output_enabled,
             status_indicator,
             show_thinking,
@@ -2853,6 +3378,7 @@ impl App {
             show_tool_details,
             ui_locale,
             cost_currency,
+            billing_presentation: crate::route_billing::for_route(config, provider),
             composer_density,
             composer_border,
             voice_enabled: false,
@@ -2902,11 +3428,15 @@ impl App {
             last_agent_progress_redraw: None,
             last_workflow_budget_redraw: None,
             ui_theme,
+            background_color_override,
             theme_id,
             onboarding,
             onboarding_needs_api_key: needs_api_key,
             onboarding_provider: provider,
             onboarding_workspace_trust_gate,
+            onboarding_missing_key_recovery,
+            onboarding_had_api_key_step: !was_onboarded && needs_api_key,
+            onboarding_had_trust_step: !was_onboarded && needs_workspace_trust,
             api_key_env_only,
             api_key_input: String::new(),
             api_key_cursor: 0,
@@ -2916,6 +3446,7 @@ impl App {
             keybinding_migration_notified: false,
             mode_prefs,
             approval_policy_locked,
+            approval_policy_root_editable,
             approval_policy_requirements_managed,
             clipboard: ClipboardHandler::new(),
             approval_session_approved: HashSet::new(),
@@ -2942,10 +3473,12 @@ impl App {
             project_doc: None,
             plan_state,
             plan_prompt_pending: false,
+            pending_plan_proposal_id: None,
             plan_tool_used_in_turn: false,
-            todos: new_shared_todo_list(),
+            todos,
             runtime_services: RuntimeToolServices {
                 shell_manager: Some(shell_manager),
+                work: Some(work_runtime),
                 ..RuntimeToolServices::default()
             },
             mcp_snapshot: None,
@@ -2955,9 +3488,10 @@ impl App {
             // the JSON files); errors fall through to zero so a missing
             // or malformed config simply hides the chip.
             mcp_configured_count,
-            mcp_restart_required: false,
+            mcp_reload_required: false,
             tool_log: Vec::new(),
             active_skill: None,
+            active_skill_provenance: None,
             cached_skills,
             tool_cells: HashMap::new(),
             tool_details_by_cell: HashMap::new(),
@@ -3004,6 +3538,7 @@ impl App {
             workspace_context_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
             workspace_context_refreshed_at: None,
             task_panel: Vec::new(),
+            behavioral_tips: crate::tui::behavioral_tips::BehavioralTipState::default(),
             decision_card: None,
             workflow_panel: None,
             session_started_at: chrono::Utc::now(),
@@ -3052,12 +3587,15 @@ impl App {
         workspace: &std::path::Path,
         skills_dir: &std::path::Path,
         scan_codewhale_only: bool,
+        plugins: &crate::plugins::PluginRegistry,
     ) -> Vec<(String, String)> {
-        crate::skills::discover_for_workspace_and_dir_with_mode(
+        crate::skills::discover_for_workspace_and_dir_with_mode_and_plugins(
             workspace,
             skills_dir,
             crate::skills::SkillDiscoveryMode::from_codewhale_only(scan_codewhale_only),
+            Some(plugins),
         )
+        .into_enabled()
         .list()
         .iter()
         .map(|s| (s.name.clone(), s.description.clone()))
@@ -3066,11 +3604,14 @@ impl App {
 
     pub fn refresh_skill_cache(&mut self) {
         let skills_dir = self.skills_dir.clone();
-        self.cached_skills = Self::discover_cached_skills(
+        let cached_skills = Self::discover_cached_skills(
             &self.workspace,
             &skills_dir,
             self.skills_scan_codewhale_only,
+            self.plugin_registry.as_ref(),
         );
+        self.hotbar_actions.replace_skills(&cached_skills);
+        self.cached_skills = cached_skills;
     }
 
     pub fn submit_api_key(&mut self) -> Result<SavedCredential, ApiKeyError> {
@@ -3104,13 +3645,10 @@ impl App {
         self.needs_redraw = true;
     }
 
-    /// Show the one-time first-run follow-up nudge. Idempotent and
-    /// gated by a persisted `Settings::feature_intro_shown` flag, so it appears
-    /// exactly once per install: after first-run setup handoff when no
-    /// constitution checkpoint is due, and on the next launch for returning
-    /// users who haven't seen it (called from `run_tui` after `App::new`).
-    /// Plain copy, no marketing language. Stays silent while onboarding is
-    /// still in progress.
+    /// Mark the first-run follow-up as seen without inserting a transcript
+    /// message. The empty underwater launch surface owns setup guidance; a
+    /// synthetic history cell would hide that surface before the user sends
+    /// anything.
     pub fn maybe_show_feature_intro(&mut self) {
         if self.onboarding != OnboardingState::None {
             return;
@@ -3121,7 +3659,7 @@ impl App {
         if self.onboarding_needs_api_key {
             return;
         }
-        let mut settings = Settings::load().unwrap_or_default();
+        let mut settings = Settings::load_persisted().unwrap_or_default();
         if settings.feature_intro_shown {
             return;
         }
@@ -3130,21 +3668,8 @@ impl App {
             self.status_message = Some(format!("Failed to save feature-intro flag: {err}"));
             // Still show the nudge; the flag write may simply retry next launch.
         }
-        self.add_message(HistoryCell::System {
-            content: Self::feature_intro_content(),
-        });
+        self.status_message = Some(self.tr(MessageId::FleetReadyNotice).into_owned());
         self.needs_redraw = true;
-    }
-
-    /// The one-time first-run follow-up copy. Plain language, no
-    /// marketing. Pure so it can be unit-tested without touching disk or env.
-    pub(crate) fn feature_intro_content() -> String {
-        "Your CodeWhale setup is ready.\n\n\
-         • Constitution — review or personalize standing guidance with `/constitution`; run `/setup` for the full checkpoint any time.\n\
-         • Provider and model — adjust the active route later with `/provider` or `/model`.\n\
-         • Optional later — use `/hotbar` for Hotbar shortcuts (`/hotbar off` hides it) and `/fleet setup` for Fleet loadouts.\n\n\
-         This tip won't show again."
-            .to_string()
     }
 
     /// Apply a locale tag selected from the onboarding language picker (#566).
@@ -3154,7 +3679,7 @@ impl App {
     /// and rewrites on exit, mirroring the pattern used by the `/config`
     /// surface.
     pub fn set_locale_from_onboarding(&mut self, tag: &str) -> anyhow::Result<()> {
-        let mut settings = Settings::load().unwrap_or_else(|_| Settings::default());
+        let mut settings = Settings::load_persisted().unwrap_or_else(|_| Settings::default());
         settings.set("locale", tag)?;
         settings.save()?;
         self.ui_locale = crate::localization::resolve_locale(&settings.locale);
@@ -3221,6 +3746,7 @@ impl App {
 
         if mode != AppMode::Plan {
             self.plan_prompt_pending = false;
+            self.pending_plan_proposal_id = None;
             self.plan_tool_used_in_turn = false;
         }
 
@@ -3249,12 +3775,12 @@ impl App {
         }
         // Persist the flag best-effort; toast still fires even if the write
         // fails (retries on the next attempt).
-        if let Ok(mut settings) = crate::settings::Settings::load() {
+        if let Ok(mut settings) = crate::settings::Settings::load_persisted() {
             settings.yolo_deprecation_shown = true;
             let _ = settings.save();
         }
         self.push_status_toast(
-            "YOLO mode is deprecated — use Act + Bypass permissions (Shift+Tab)".to_string(),
+            "Legacy full-access mode is deprecated — use Act + Full Access (Shift+Tab)".to_string(),
             StatusToastLevel::Warning,
             Some(8_000),
         );
@@ -3293,7 +3819,7 @@ impl App {
         }
     }
 
-    /// Cycle through modes: Plan → Act → Operate → Plan.
+    /// Cycle through productive modes: Plan → Act → Operate → Plan.
     pub fn cycle_mode(&mut self) {
         if self.reject_setting_change_while_busy("Mode") {
             return;
@@ -3317,28 +3843,49 @@ impl App {
         if self.reject_setting_change_while_busy("Thinking") {
             return;
         }
-        self.reasoning_effort = self
+        self.apply_reasoning_effort_cycle();
+    }
+
+    /// Advance reasoning effort to the next tier for the active provider and
+    /// surface the change: set a status message and refresh the compaction
+    /// budget. Shared by the Ctrl+T shortcut (`cycle_effort`) and the hotbar
+    /// `reasoning.cycle` action so the two paths cannot drift.
+    pub(crate) fn apply_reasoning_effort_cycle(&mut self) {
+        let requested = self
             .reasoning_effort
             .cycle_next_for_provider(self.api_provider);
+        let effective = self.effective_reasoning_effort_for_active_route(requested);
+        let provider = self.provider_identity_for_persistence().to_string();
+        if let Some(work) = self.runtime_services.work.clone()
+            && let Err(err) = work.record_reasoning_effort_change(
+                self.current_session_id.as_deref(),
+                requested.into(),
+                effective.into(),
+                &provider,
+            )
+        {
+            self.status_message = Some(format!(
+                "Reasoning effort unchanged: Work receipt failed ({err})"
+            ));
+            self.needs_redraw = true;
+            return;
+        }
+        self.reasoning_effort = requested;
+        self.reasoning_effort_explicit = true;
         self.last_effective_reasoning_effort = None;
+        self.update_model_compaction_budget();
+        self.status_message = Some(format!(
+            "Reasoning effort: {}",
+            Self::reasoning_effort_resolution_label(requested, effective, self.api_provider)
+        ));
         self.needs_redraw = true;
-        // Effort chip in the header is canonical — no duplicate toast.
     }
 
     /// Cycle the durable Agent permission posture: Ask → Auto-Review → Bypass.
     pub fn cycle_approval_posture(&mut self) -> bool {
-        if self.reject_setting_change_while_busy("Permissions") {
+        let Some(next) = self.next_approval_posture(false) else {
             return false;
-        }
-        if self.mode == AppMode::Plan {
-            self.push_status_toast(
-                "Plan is Read Only; switch to Act or Operate to change permissions".to_string(),
-                StatusToastLevel::Info,
-                Some(5_000),
-            );
-            self.needs_redraw = true;
-            return false;
-        }
+        };
         if self.approval_policy_locked() {
             self.push_status_toast(
                 "Permissions are controlled by config or managed requirements".to_string(),
@@ -3348,19 +3895,7 @@ impl App {
             self.needs_redraw = true;
             return false;
         }
-        let next = self.mode_prefs.agent_approval_mode.cycle_permission_next();
-        let persisted = match next {
-            ApprovalMode::Suggest => "ask",
-            ApprovalMode::Auto => "auto-review",
-            ApprovalMode::Bypass => "full-access",
-            ApprovalMode::Never => "never",
-        };
-        let persistence_result = (|| -> anyhow::Result<()> {
-            let mut settings = Settings::load()?;
-            settings.permission_posture = Some(persisted.to_string());
-            settings.save()
-        })();
-        if let Err(err) = persistence_result {
+        if let Err(err) = Self::persist_permission_posture(next) {
             self.push_status_toast(
                 format!("Permissions were not changed: could not save TUI posture ({err})"),
                 StatusToastLevel::Warning,
@@ -3369,18 +3904,133 @@ impl App {
             self.needs_redraw = true;
             return false;
         }
+        self.finish_approval_posture_change(next);
+        true
+    }
+
+    /// Cycle permissions when the only controlling source is the user's
+    /// editable root `config.toml` key. Shift+Tab is an explicit request to
+    /// adopt the TUI posture, so persist the next setting first, then remove
+    /// the shadowing root key. Roll back the setting if that removal fails.
+    pub fn cycle_root_approval_posture(&mut self) -> bool {
+        let Some(next) = self.next_approval_posture(true) else {
+            return false;
+        };
+        if !self.approval_policy_root_editable {
+            self.push_status_toast(
+                "Permissions are controlled by a non-editable policy source".to_string(),
+                StatusToastLevel::Warning,
+                Some(6_000),
+            );
+            self.needs_redraw = true;
+            return false;
+        }
+
+        let mut settings = match Settings::load_persisted() {
+            Ok(settings) => settings,
+            Err(err) => {
+                self.push_status_toast(
+                    format!("Permissions were not changed: could not load TUI settings ({err})"),
+                    StatusToastLevel::Warning,
+                    Some(8_000),
+                );
+                return false;
+            }
+        };
+        let previous = settings.permission_posture.clone();
+        settings.permission_posture = Some(Self::approval_posture_setting(next).to_string());
+        if let Err(err) = settings.save() {
+            self.push_status_toast(
+                format!("Permissions were not changed: could not save TUI posture ({err})"),
+                StatusToastLevel::Warning,
+                Some(8_000),
+            );
+            return false;
+        }
+
+        let active_config_path = crate::config::resolve_load_config_path(self.config_path.clone());
+        if let Err(err) = crate::config_persistence::persist_unset_root_key(
+            active_config_path.as_deref(),
+            "approval_policy",
+        ) {
+            settings.permission_posture = previous;
+            let rollback = settings.save().err();
+            let rollback_note = rollback
+                .map(|rollback| format!("; settings rollback also failed: {rollback}"))
+                .unwrap_or_default();
+            self.push_status_toast(
+                format!(
+                    "Permissions were not changed: could not release root config policy ({err}){rollback_note}"
+                ),
+                StatusToastLevel::Warning,
+                Some(8_000),
+            );
+            self.needs_redraw = true;
+            return false;
+        }
+
+        self.clear_saved_approval_policy_lock();
+        self.finish_approval_posture_change(next);
+        true
+    }
+
+    fn next_approval_posture(&mut self, allow_root_policy: bool) -> Option<ApprovalMode> {
+        if self.reject_setting_change_while_busy("Permissions") {
+            return None;
+        }
+        if self.mode == AppMode::Plan {
+            self.push_status_toast(
+                "Plan is Read Only; switch to Act to change permissions".to_string(),
+                StatusToastLevel::Info,
+                Some(5_000),
+            );
+            self.needs_redraw = true;
+            return None;
+        }
+        if allow_root_policy && !self.approval_policy_root_editable {
+            return None;
+        }
+        Some(self.mode_prefs.agent_approval_mode.cycle_permission_next())
+    }
+
+    fn approval_posture_setting(mode: ApprovalMode) -> &'static str {
+        match mode {
+            ApprovalMode::Suggest => "ask",
+            ApprovalMode::Auto => "auto-review",
+            ApprovalMode::Bypass => "full-access",
+            ApprovalMode::Never => "never",
+        }
+    }
+
+    fn persist_permission_posture(next: ApprovalMode) -> anyhow::Result<()> {
+        let mut settings = Settings::load_persisted()?;
+        settings.permission_posture = Some(Self::approval_posture_setting(next).to_string());
+        settings.save()
+    }
+
+    fn finish_approval_posture_change(&mut self, next: ApprovalMode) {
         self.set_agent_approval_posture(next);
         self.needs_redraw = true;
         // Footer permission chip is canonical — no status toast for the new
         // value, only the one-shot rebinding notice.
         self.notify_keybinding_migration_once();
-        true
     }
 
-    /// Update the durable Act/Operate baseline and project it onto the live
-    /// runtime when the current mode uses that baseline. Plan remains read-only.
-    pub fn set_agent_approval_posture(&mut self, next: ApprovalMode) {
-        self.mode_prefs.agent_approval_mode = next;
+    /// Replace the complete durable Act baseline and project it onto the live
+    /// runtime when the current mode uses that baseline. Keeping these three
+    /// fields together prevents setup presets from updating a live mirror while
+    /// leaving the next Plan → Act transition stale.
+    pub fn set_agent_runtime_baseline(
+        &mut self,
+        allow_shell: bool,
+        trust_mode: bool,
+        approval_mode: ApprovalMode,
+    ) {
+        self.mode_prefs = ModeSessionPrefs {
+            agent_allow_shell: allow_shell,
+            agent_trust_mode: trust_mode,
+            agent_approval_mode: approval_mode,
+        };
         if self.mode.uses_agent_baseline() {
             let policy = base_policy_for_mode(self.mode, &self.mode_prefs);
             self.allow_shell = policy.allow_shell;
@@ -3391,10 +4041,36 @@ impl App {
     }
 
     #[must_use]
+    pub(crate) fn agent_trust_baseline(&self) -> bool {
+        self.mode_prefs.agent_trust_mode
+    }
+
+    /// Update the durable Act shell choice without disturbing trust or
+    /// approval. The live mirror changes only while Act owns the runtime.
+    pub fn set_agent_shell_access(&mut self, allow_shell: bool) {
+        self.set_agent_runtime_baseline(
+            allow_shell,
+            self.mode_prefs.agent_trust_mode,
+            self.mode_prefs.agent_approval_mode,
+        );
+    }
+
+    /// Update the durable Act approval choice without changing its saved shell
+    /// or trust choices. Plan remains read-only.
+    pub fn set_agent_approval_posture(&mut self, next: ApprovalMode) {
+        self.set_agent_runtime_baseline(
+            self.mode_prefs.agent_allow_shell,
+            self.mode_prefs.agent_trust_mode,
+            next,
+        );
+    }
+
+    #[must_use]
     pub fn approval_policy_locked(&self) -> bool {
         self.approval_policy_locked
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn approval_policy_requirements_managed(&self) -> bool {
         self.approval_policy_requirements_managed
@@ -3415,8 +4091,30 @@ impl App {
                 .any(|task| matches!(task.status.as_str(), "queued" | "running"))
     }
 
+    /// Whether the interface is asking the user to make a decision. Ambient
+    /// motion yields across the whole frame while this is true; freezing one
+    /// task marker still leaves distracting movement in peripheral vision.
+    #[must_use]
+    pub fn attention_hold_active(&self) -> bool {
+        !self.view_stack.is_empty()
+            || self.pending_user_input_prompt.is_some()
+            || self.plan_prompt_pending
+            || self
+                .task_panel
+                .iter()
+                .any(|task| matches!(task.status.as_str(), "waiting" | "needs_user"))
+    }
+
     pub fn mark_approval_policy_locked(&mut self) {
         self.approval_policy_locked = true;
+        self.approval_policy_root_editable = true;
+    }
+
+    pub fn clear_saved_approval_policy_lock(&mut self) {
+        if !self.approval_policy_requirements_managed {
+            self.approval_policy_locked = false;
+            self.approval_policy_root_editable = false;
+        }
     }
 
     /// Execute hooks for a specific event with the given context
@@ -3569,7 +4267,7 @@ impl App {
         )
     }
 
-    fn cost_display_currency(&self, currency: CostCurrency) -> CostCurrency {
+    pub(crate) fn cost_display_currency(&self, currency: CostCurrency) -> CostCurrency {
         if currency == CostCurrency::Cny
             && self.session.session_cost_cny == 0.0
             && self.session.subagent_cost_cny == 0.0
@@ -4235,6 +4933,7 @@ impl App {
                     .or_else(|| workflow_id.clone())
                     .unwrap_or_else(|| "workflow".to_string());
                 let mut panel = WorkflowPanel::new(run_id.clone(), label, *at_ms);
+                panel.locale = self.ui_locale;
                 panel.budget_total = *token_budget;
                 panel.budget_remaining = *token_budget;
                 self.workflow_panel = Some(panel);
@@ -4243,6 +4942,7 @@ impl App {
                 // No panel yet and event is not a start — seed a shell panel
                 // so late events still surface rather than being dropped.
                 let mut panel = WorkflowPanel::new("workflow", "workflow", 0);
+                panel.locale = self.ui_locale;
                 panel.apply_event(event);
                 self.workflow_panel = Some(panel);
             }
@@ -4265,15 +4965,6 @@ impl App {
         let _ = panel.toggle_expanded();
         self.needs_redraw = true;
         true
-    }
-
-    /// Request cancel from the workflow panel. Returns the run id when the
-    /// host should dispatch `workflow` action=cancel.
-    pub fn request_workflow_panel_cancel(&mut self) -> Option<String> {
-        let panel = self.workflow_panel.as_mut()?;
-        let run_id = panel.request_cancel()?;
-        self.needs_redraw = true;
-        Some(run_id)
     }
 
     pub fn push_status_toast(
@@ -4473,30 +5164,31 @@ impl App {
         }
     }
 
+    fn prune_expired_status_toasts(&mut self, now: Instant) {
+        let queued_before = self.status_toasts.len();
+        self.status_toasts.retain(|toast| !toast.is_expired(now));
+        let queued_removed = self.status_toasts.len() != queued_before;
+        let sticky_removed = self
+            .sticky_status
+            .as_ref()
+            .is_some_and(|toast| toast.is_expired(now));
+        if sticky_removed {
+            self.sticky_status = None;
+        }
+        if queued_removed || sticky_removed {
+            self.needs_redraw = true;
+        }
+    }
+
     /// Up to `limit` currently-active toasts, most recent last (so a stacked
     /// renderer iterating top-to-bottom shows the freshest message at the
-    /// bottom, like a chat log). Drains expired toasts off the front as a
-    /// side effect — same cleanup as `active_status_toast` so callers see a
-    /// consistent queue. Whalescale#439.
+    /// bottom, like a chat log). Prunes expired toasts throughout the queue as
+    /// a side effect — the same cleanup as `active_status_toast` so callers see
+    /// a consistent queue. Whalescale#439.
     pub fn active_status_toasts(&mut self, limit: usize) -> Vec<StatusToast> {
         self.sync_status_message_to_toasts();
         let now = Instant::now();
-        while self
-            .status_toasts
-            .front()
-            .is_some_and(|toast| toast.is_expired(now))
-        {
-            self.status_toasts.pop_front();
-            self.needs_redraw = true;
-        }
-        if self
-            .sticky_status
-            .as_ref()
-            .is_some_and(|toast| toast.is_expired(now))
-        {
-            self.sticky_status = None;
-            self.needs_redraw = true;
-        }
+        self.prune_expired_status_toasts(now);
 
         let mut out: Vec<StatusToast> = Vec::with_capacity(limit);
         if let Some(sticky) = self.sticky_status.clone() {
@@ -4521,29 +5213,7 @@ impl App {
     pub fn active_status_toast(&mut self) -> Option<StatusToast> {
         self.sync_status_message_to_toasts();
         let now = Instant::now();
-        let mut removed = false;
-
-        while self
-            .status_toasts
-            .front()
-            .is_some_and(|toast| toast.is_expired(now))
-        {
-            self.status_toasts.pop_front();
-            removed = true;
-        }
-
-        if self
-            .sticky_status
-            .as_ref()
-            .is_some_and(|toast| toast.is_expired(now))
-        {
-            self.sticky_status = None;
-            removed = true;
-        }
-
-        if removed {
-            self.needs_redraw = true;
-        }
+        self.prune_expired_status_toasts(now);
 
         self.sticky_status
             .clone()
@@ -4575,6 +5245,7 @@ impl App {
         self.viewport.transcript_selection.clear();
 
         self.viewport.last_transcript_area = None;
+        self.viewport.last_approval_area = None;
         self.viewport.last_transcript_top = 0;
         // Seed visible height from the resize event so paging keys use a
         // useful page size immediately, before the next render updates it.
@@ -4814,11 +5485,22 @@ impl App {
         }
     }
 
-    /// Paste from clipboard into input
-    pub fn paste_from_clipboard(&mut self) {
+    /// Paste from clipboard into input.
+    ///
+    /// Returns whether content was inserted. In SSH sessions without a
+    /// forwarded graphical display, the terminal client owns paste, so direct
+    /// clipboard shortcuts surface the local terminal-paste instruction while
+    /// `Event::Paste` remains the data path.
+    pub fn paste_from_clipboard(&mut self) -> bool {
+        if self.clipboard.requires_terminal_paste() {
+            self.status_message = Some(self.tr(MessageId::ClipboardSshPasteHint).into_owned());
+            return false;
+        }
         if let Some(content) = self.clipboard.read(self.workspace.as_path()) {
             self.apply_clipboard_content(content);
+            return true;
         }
+        false
     }
 
     pub fn apply_clipboard_content(&mut self, content: ClipboardContent) {
@@ -4834,10 +5516,16 @@ impl App {
         }
     }
 
-    pub fn paste_api_key_from_clipboard(&mut self) {
+    pub fn paste_api_key_from_clipboard(&mut self) -> bool {
+        if self.clipboard.requires_terminal_paste() {
+            self.status_message = Some(self.tr(MessageId::ClipboardSshPasteHint).into_owned());
+            return false;
+        }
         if let Some(ClipboardContent::Text(text)) = self.clipboard.read(self.workspace.as_path()) {
             self.insert_api_key_str(&text);
+            return true;
         }
+        false
     }
 
     pub fn scroll_up(&mut self, amount: usize) {
@@ -4899,8 +5587,12 @@ impl App {
         if self.cursor_position == 0 {
             return;
         }
-        let target = self.cursor_position.saturating_sub(1);
-        let removed = remove_char_at(&mut self.input, target);
+        // Grapheme-aware: Backspace removes the whole cluster before the
+        // cursor (emoji ZWJ sequence, flag pair, CJK char + combining mark),
+        // never a lone scalar out of the middle of one.
+        let cursor = self.cursor_position.min(char_count(&self.input));
+        let target = prev_grapheme_boundary(&self.input, cursor);
+        let removed = remove_char_range(&mut self.input, target, cursor);
         if removed {
             self.cursor_position = target;
             self.slash_menu_hidden = false;
@@ -4920,8 +5612,11 @@ impl App {
         if self.input.is_empty() {
             return;
         }
+        // Grapheme-aware: forward-delete removes the whole cluster at the
+        // cursor rather than a single scalar from inside it.
         let target = self.cursor_position;
-        let removed = remove_char_at(&mut self.input, target);
+        let end = next_grapheme_boundary(&self.input, target);
+        let removed = remove_char_range(&mut self.input, target, end);
         if !removed {
             self.cursor_position = char_count(&self.input);
         }
@@ -5120,13 +5815,15 @@ impl App {
     }
 
     pub fn move_cursor_left(&mut self) {
-        self.cursor_position = self.cursor_position.saturating_sub(1);
+        let cursor = self.cursor_position.min(char_count(&self.input));
+        self.cursor_position = prev_grapheme_boundary(&self.input, cursor);
         self.needs_redraw = true;
     }
 
     pub fn move_cursor_right(&mut self) {
-        if self.cursor_position < char_count(&self.input) {
-            self.cursor_position += 1;
+        let total = char_count(&self.input);
+        if self.cursor_position < total {
+            self.cursor_position = next_grapheme_boundary(&self.input, self.cursor_position);
             self.needs_redraw = true;
         }
     }
@@ -5260,12 +5957,37 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// Select the entire composer contents: anchor at the start, cursor at
+    /// the end. Expands an oversized-paste preview first so the selection
+    /// covers the real draft, not a truncated placeholder (#3263).
+    pub fn select_all(&mut self) {
+        self.auto_expand_oversized_paste();
+        if self.input.is_empty() {
+            self.selection_anchor = None;
+            return;
+        }
+        self.selection_anchor = Some(0);
+        self.cursor_position = char_count(&self.input);
+        self.needs_redraw = true;
+    }
+
     /// Delete the selected text, place cursor at the start of the deleted range.
     /// Returns true if a selection was deleted.
+    ///
+    /// When the selection spans the whole draft (e.g. select-all then type or
+    /// Backspace), the outgoing text is stashed exactly like `Ctrl+U` so the
+    /// destruction is recoverable with `Ctrl+Z` / the draft history.
     pub fn delete_selection(&mut self) -> bool {
         let Some((start, end)) = self.selection_range() else {
             return false;
         };
+        if start == 0 && end == char_count(&self.input) {
+            let draft = self.input.clone();
+            if !draft.trim().is_empty() {
+                self.clear_undo_buffer = Some(draft.clone());
+                self.remember_draft_for_recovery(draft);
+            }
+        }
         let sb = byte_index_at_char(&self.input, start);
         let eb = byte_index_at_char(&self.input, end);
         self.input.replace_range(sb..eb, "");
@@ -5329,7 +6051,9 @@ impl App {
             return;
         }
         let pos = self.cursor_position;
-        remove_char_at(&mut self.input, pos);
+        // Grapheme-aware: `x` deletes the whole cluster under the cursor.
+        let end = next_grapheme_boundary(&self.input, pos);
+        remove_char_range(&mut self.input, pos, end);
         // Keep cursor in bounds after deletion.
         let new_total = char_count(&self.input);
         if self.cursor_position > 0 && self.cursor_position >= new_total {
@@ -6109,11 +6833,23 @@ impl App {
     /// Capture the durable Work state without ever converting lock contention
     /// into an empty snapshot.
     pub fn work_state_snapshot(&self) -> Result<Option<SessionWorkState>, String> {
+        if let Some(work) = self.runtime_services.work.as_ref() {
+            return work
+                .capture(self.current_session_id.as_deref())
+                .map(|state| {
+                    state.map(|state| SessionWorkState {
+                        graph: Some(state.graph),
+                        todos: state.todos,
+                        plan: state.plan,
+                    })
+                });
+        }
         let todos = Self::retry_lock(&self.todos, 100)
             .ok_or_else(|| "To-do state is busy; try saving again".to_string())?;
         let plan = Self::retry_lock(&self.plan_state, 100)
             .ok_or_else(|| "Plan state is busy; try saving again".to_string())?;
         let state = SessionWorkState {
+            graph: None,
             todos: todos.snapshot(),
             plan: plan.snapshot(),
         };
@@ -6124,6 +6860,19 @@ impl App {
     /// must skip a contended first save instead of pausing the UI or writing a
     /// false empty state.
     pub fn try_work_state_snapshot(&mut self) -> Result<Option<SessionWorkState>, String> {
+        if let Some(work) = self.runtime_services.work.as_ref() {
+            let state = work
+                .try_capture(self.current_session_id.as_deref())
+                .map(|state| {
+                    state.map(|state| SessionWorkState {
+                        graph: Some(state.graph),
+                        todos: state.todos,
+                        plan: state.plan,
+                    })
+                })?;
+            self.last_known_work_state = Some(state.clone());
+            return Ok(state);
+        }
         let todos = self
             .todos
             .try_lock()
@@ -6133,6 +6882,7 @@ impl App {
             .try_lock()
             .map_err(|_| "Plan state is busy".to_string())?;
         let state = SessionWorkState {
+            graph: None,
             todos: todos.snapshot(),
             plan: plan.snapshot(),
         };
@@ -6144,7 +6894,33 @@ impl App {
     }
 
     /// Atomically replace the live Work state from a saved session.
-    pub fn restore_work_state(&mut self, state: Option<&SessionWorkState>) -> Result<(), String> {
+    pub fn restore_work_state(
+        &mut self,
+        session_id: &str,
+        workspace: &Path,
+        state: Option<&SessionWorkState>,
+    ) -> Result<(), String> {
+        self.pending_plan_proposal_id = None;
+        if let Some(work) = self.runtime_services.work.as_ref() {
+            let empty = SessionWorkState::default();
+            let state = state.unwrap_or(&empty);
+            work.restore_with_workspace_owner_bindings(
+                session_id,
+                workspace,
+                state.graph.as_ref(),
+                &state.todos,
+                &state.plan,
+            )?;
+            let restored = work.capture(Some(session_id))?;
+            let normalized_state = restored.map(|state| SessionWorkState {
+                graph: Some(state.graph),
+                todos: state.todos,
+                plan: state.plan,
+            });
+            self.cached_work_summary = None;
+            self.last_known_work_state = Some(normalized_state);
+            return Ok(());
+        }
         let (restored_todos, restored_plan) = match state {
             Some(state) => (
                 TodoList::from_snapshot(&state.todos)?,
@@ -6153,6 +6929,7 @@ impl App {
             None => (TodoList::new(), PlanState::default()),
         };
         let normalized_state = SessionWorkState {
+            graph: None,
             todos: restored_todos.snapshot(),
             plan: restored_plan.snapshot(),
         };
@@ -6172,6 +6949,14 @@ impl App {
     }
 
     pub fn clear_todos(&mut self) -> bool {
+        if let Some(work) = self.runtime_services.work.as_ref() {
+            if !work.clear(self.current_session_id.as_deref()) {
+                return false;
+            }
+            self.cached_work_summary = None;
+            self.last_known_work_state = Some(None);
+            return true;
+        }
         // Acquire both stores before mutating either one. `/clear` must never
         // report success after clearing only half of the Work surface.
         let Some(mut todos) = Self::retry_lock(&self.todos, 100) else {
@@ -6187,6 +6972,20 @@ impl App {
         self.cached_work_summary = None;
         self.last_known_work_state = Some(None);
         true
+    }
+
+    /// Publish a validated Work Graph transaction after a synchronous caller
+    /// has completed its atomic session write.
+    pub fn publish_pending_work_state(&mut self) -> Result<bool, String> {
+        let published = self
+            .runtime_services
+            .work
+            .as_ref()
+            .map_or(Ok(false), |work| work.publish_pending_sync())?;
+        if published {
+            self.cached_work_summary = None;
+        }
+        Ok(published)
     }
 
     pub fn update_model_compaction_budget(&mut self) {
@@ -6210,8 +7009,36 @@ impl App {
         self.active_route_limits = crate::route_budget::known_route_limits(limits);
     }
 
+    /// Install an already-resolved runtime route receipt in one operation so
+    /// endpoint-sensitive reasoning and context reporting cannot drift apart.
+    pub fn set_active_route_resolution(
+        &mut self,
+        base_url: impl Into<String>,
+        limits: RouteLimits,
+        context_window_source: crate::route_runtime::ContextWindowSource,
+    ) {
+        self.active_route_base_url = base_url.into();
+        self.set_active_route_limits(limits);
+        self.active_context_window_source = context_window_source;
+    }
+
+    /// Whether the currently selected onboarding route is Kimi Code's
+    /// membership-plan `k3` endpoint. The check is deliberately exact: the
+    /// Moonshot public API must never inherit Kimi Code plan guidance.
+    pub fn onboarding_uses_kimi_code_plan(&self) -> bool {
+        crate::config::is_exact_kimi_code_k3_route(
+            self.onboarding_provider,
+            &self.active_route_base_url,
+            &self.model,
+        )
+    }
+
     pub fn set_active_context_window_override(&mut self, context_window: Option<u32>) {
         self.active_context_window_override = context_window;
+        if context_window.is_some() {
+            self.active_context_window_source =
+                crate::route_runtime::ContextWindowSource::Configured;
+        }
         if self.active_route_limits.is_none() {
             self.active_route_limits = self.context_window_override_limits();
         }
@@ -6234,6 +7061,10 @@ impl App {
         };
         self.auto_model = auto_model;
         self.last_effective_model = None;
+        self.last_effective_provider = None;
+        self.last_effective_provider_identity = None;
+        self.last_auto_route_receipt = None;
+        self.pending_auto_route_receipt = None;
         self.last_effective_reasoning_effort = None;
         if auto_model {
             self.reasoning_effort = ReasoningEffort::Auto;
@@ -6252,9 +7083,104 @@ impl App {
         }
     }
 
+    /// Atomic latest Auto route metadata for session snapshots. The provider,
+    /// exact identity, model, and receipt are either persisted together or
+    /// omitted together so a resumed session cannot display a mixed route.
+    #[must_use]
+    pub(crate) fn auto_route_for_persistence(
+        &self,
+    ) -> Option<crate::session_manager::SavedAutoRouteReceipt> {
+        if !self.auto_model {
+            return None;
+        }
+        let (provider, model, receipt) = (
+            self.last_effective_provider?,
+            self.last_effective_model.as_ref()?,
+            self.last_auto_route_receipt.as_ref()?,
+        );
+        if model.trim().is_empty() {
+            return None;
+        }
+        let provider_identity = self
+            .last_effective_provider_identity
+            .clone()
+            .unwrap_or_else(|| {
+                if provider == ApiProvider::Custom {
+                    self.provider_identity_for_persistence().to_string()
+                } else {
+                    provider.as_str().to_string()
+                }
+            });
+        Some(crate::session_manager::SavedAutoRouteReceipt {
+            provider,
+            provider_identity,
+            model: model.clone(),
+            receipt: receipt.clone(),
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn provider_identity_for_persistence(&self) -> &str {
+        if self.api_provider == ApiProvider::Custom {
+            &self.provider_identity
+        } else {
+            self.api_provider.as_str()
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn provider_id_for_persistence(&self) -> Option<&str> {
+        self.provider_exact_id.as_deref()
+    }
+
+    pub(crate) fn set_provider_identity(
+        &mut self,
+        provider: ApiProvider,
+        identity: impl Into<String>,
+    ) {
+        let identity = identity.into();
+        self.api_provider = provider;
+        self.provider_exact_id = (!(provider == ApiProvider::Custom
+            && identity.eq_ignore_ascii_case(ApiProvider::Custom.as_str())))
+        .then(|| identity.clone());
+        self.provider_identity = identity;
+    }
+
+    pub(crate) fn set_provider_identity_record(
+        &mut self,
+        identity: crate::config::ProviderIdentity,
+    ) {
+        self.api_provider = identity.provider;
+        self.provider_identity = identity.key;
+        self.provider_exact_id = identity.exact_id;
+    }
+
     pub fn accepts_custom_model_ids(&self) -> bool {
         self.model_ids_passthrough
             || crate::config::provider_passes_model_through(self.api_provider)
+    }
+
+    pub(crate) fn apply_provider_switch_reasoning_effort(
+        &mut self,
+        provider: ApiProvider,
+        base_url: &str,
+        model_override: Option<&str>,
+    ) {
+        let wire_model = model_override.unwrap_or(&self.model);
+        let inferred = model_override.and_then(|model| {
+            crate::config::legacy_deepseek_alias_effort_for_route(provider, base_url, model)
+        });
+        self.reasoning_effort = if self.reasoning_effort_explicit {
+            self.reasoning_effort
+                .normalize_for_route(provider, base_url, wire_model)
+        } else if let Some(effort) = inferred {
+            ReasoningEffort::from_setting(effort)
+                .normalize_for_route(provider, base_url, wire_model)
+        } else {
+            self.reasoning_effort
+                .normalize_for_route(provider, base_url, wire_model)
+        };
+        self.last_effective_reasoning_effort = None;
     }
 
     pub fn effective_model_for_budget(&self) -> &str {
@@ -6280,30 +7206,123 @@ impl App {
         self.model.clone()
     }
 
-    pub fn reasoning_effort_display_label(&self) -> String {
-        if self.auto_model || self.reasoning_effort == ReasoningEffort::Auto {
-            if let Some(effective) = self.last_effective_reasoning_effort {
-                return format!(
-                    "auto: {}",
-                    effective.display_label_for_provider(self.api_provider)
-                );
-            }
-            return "auto".to_string();
+    /// Provider/model identity used by the in-flight or most recent request.
+    /// This is the display contract for auto routing and must match billing.
+    #[must_use]
+    pub fn effective_route_display(&self) -> (ApiProvider, String) {
+        if let Some((provider, model, _)) = self.pending_turn_route.as_ref() {
+            return (*provider, model.clone());
         }
-        self.reasoning_effort
-            .display_label_for_provider(self.api_provider)
-            .to_string()
+        if self.auto_model
+            && let (Some(provider), Some(model)) = (
+                self.last_effective_provider,
+                self.last_effective_model.as_ref(),
+            )
+        {
+            return (provider, model.clone());
+        }
+        (self.api_provider, self.model_display_label())
+    }
+
+    /// Exact non-secret route label for user-visible status surfaces.
+    #[must_use]
+    pub fn effective_route_identity_display(&self) -> (String, String) {
+        let (provider, model) = self.effective_route_display();
+        let identity = if provider == ApiProvider::Custom {
+            if self.pending_turn_route.is_none() && self.auto_model {
+                self.last_effective_provider_identity
+                    .as_deref()
+                    .unwrap_or_else(|| self.provider_identity_for_persistence())
+            } else {
+                self.provider_identity_for_persistence()
+            }
+        } else {
+            provider.display_name()
+        };
+        (identity.to_string(), model)
+    }
+
+    fn effective_reasoning_effort_for_active_route(
+        &self,
+        requested: ReasoningEffort,
+    ) -> ReasoningEffort {
+        if self.auto_model || requested == ReasoningEffort::Auto {
+            return self
+                .last_effective_reasoning_effort
+                .unwrap_or(ReasoningEffort::Auto);
+        }
+        requested.normalize_for_route(self.api_provider, &self.active_route_base_url, &self.model)
+    }
+
+    fn reasoning_effort_resolution_label(
+        requested: ReasoningEffort,
+        effective: ReasoningEffort,
+        provider: ApiProvider,
+    ) -> String {
+        if requested == effective {
+            return effective.display_label_for_provider(provider).to_string();
+        }
+        let effective = effective.display_label_for_provider(provider);
+        if requested == ReasoningEffort::Auto {
+            format!("auto: {effective}")
+        } else {
+            format!("{}→{effective}", requested.short_label())
+        }
+    }
+
+    pub fn reasoning_effort_display_label(&self) -> String {
+        let requested = if self.auto_model {
+            ReasoningEffort::Auto
+        } else {
+            self.reasoning_effort
+        };
+        let effective = self.effective_reasoning_effort_for_active_route(requested);
+        Self::reasoning_effort_resolution_label(requested, effective, self.api_provider)
     }
 
     pub fn compaction_config(&self) -> CompactionConfig {
+        let mut config = self.compaction_config_for_route(
+            self.api_provider,
+            self.effective_model_for_budget(),
+            self.active_route_limits,
+        );
+        // These cached fields are the active-route compatibility authority and
+        // are updated together by `update_model_compaction_budget`. Commands
+        // and embedders may also adjust them directly between route updates.
+        config.enabled = self.auto_compact;
+        config.token_threshold = self.compact_threshold;
+        config
+    }
+
+    /// Build compaction policy from one already-resolved provider route.
+    ///
+    /// Auto routing can select a provider/model whose context limits differ
+    /// from the route currently displayed by the app. Callers dispatching that
+    /// turn must derive every compaction input from the selected descriptor,
+    /// not from the previous route cached in `App`.
+    pub(crate) fn compaction_config_for_route(
+        &self,
+        provider: ApiProvider,
+        model: &str,
+        route_limits: Option<RouteLimits>,
+    ) -> CompactionConfig {
         CompactionConfig {
-            enabled: self.auto_compact,
-            token_threshold: self.compact_threshold,
-            model: self.effective_model_for_budget().to_string(),
+            enabled: if self.auto_compact_user_configured {
+                self.auto_compact
+            } else {
+                crate::route_budget::auto_compact_default_for_route(provider, model, route_limits)
+            },
+            token_threshold: crate::route_budget::compaction_threshold_for_route_at_percent(
+                provider,
+                model,
+                route_limits,
+                self.auto_compact_threshold_percent,
+            ),
+            model: model.to_string(),
             effective_context_window: Some(crate::route_budget::route_context_window_tokens(
-                self.api_provider,
-                self.effective_model_for_budget(),
-                self.active_route_limits,
+                provider,
+                model,
+                route_limits,
             )),
             ..Default::default()
         }
@@ -6415,7 +7434,7 @@ impl App {
             return None;
         };
 
-        self.api_provider = next_provider;
+        self.set_provider_identity(next_provider, next_provider.as_str());
         self.last_fallback_reason = Some(format!(
             "Fell back to {} after recoverable provider error: {reason}{skipped}",
             next_provider.as_str()
@@ -6479,6 +7498,14 @@ pub enum AppAction {
     OpenModePicker,
     /// Refresh the engine prompt after the UI operating mode changes.
     ModeChanged(AppMode),
+    /// Synchronize a saved top-level approval policy into the live Config,
+    /// then refresh the engine prompt from the App's updated permission mode.
+    ApprovalPolicyPersisted {
+        policy: Option<String>,
+    },
+    /// Rebuild the engine's Skill/MCP catalogue from the App's newly replaced
+    /// immutable plugin snapshot after trust, enable, revoke, or reload.
+    PluginRegistryChanged,
     /// Open the `/statusline` multi-select picker for footer items.
     OpenStatusPicker,
     /// Open the `/feedback` picker for GitHub issue/security destinations.
@@ -6551,6 +7578,8 @@ pub enum AppAction {
         api_timeout_secs: u64,
         heartbeat_timeout_secs: u64,
     },
+    /// Open the live transcript overlay through a terminal-safe command path.
+    OpenLiveTranscript,
     OpenContextInspector,
     CompactContext,
     PurgeContext,

@@ -5,9 +5,18 @@
 //! event handling, tool planning/execution, LSP post-edit hooks, capacity
 //! checkpoints, and loop termination.
 
+use super::dispatch::{ReadRepeatExecutionPlan, plan_read_repeat_execution};
+use super::read_repeat_guard::{RECEIPT_THRESHOLD, ReadRepeatGuard};
+use super::stuck_guard::{
+    RUNTIME_NOTICE as STUCK_RUNTIME_NOTICE, StepFingerprint, StuckGuard, StuckSignal,
+};
 use super::*;
 use crate::core::ops::UserInputProvenance;
 use crate::prompt_zones::PinnedPrefix;
+use crate::runtime_handoff::{
+    subagent_completion_runtime_message, waiting_for_subagents_runtime_message,
+};
+use crate::tools::spec::ToolTerminalStatus;
 
 const MAX_APPROVAL_INTENT_SUMMARY_CHARS: usize = 2_000;
 const TOOL_ERROR_DEGRADATION_THRESHOLD: u32 = 2;
@@ -41,6 +50,22 @@ pub(super) fn registered_tool_approval_required(
         return true;
     }
     !auto_approve
+}
+
+pub(super) fn registered_tool_blocked_in_full_access(
+    tool_name: &str,
+    requirement: ApprovalRequirement,
+    auto_approve: bool,
+) -> bool {
+    auto_approve && registered_tool_forces_prompt(tool_name, requirement)
+}
+
+pub(super) fn registered_tool_forces_prompt(
+    tool_name: &str,
+    requirement: ApprovalRequirement,
+) -> bool {
+    requirement != ApprovalRequirement::Auto
+        && registered_tool_requires_non_bypassable_approval(tool_name)
 }
 
 pub(super) fn tool_error_degradation_runtime_hint(
@@ -204,10 +229,10 @@ impl Engine {
     async fn drain_subagent_completion_events(&mut self, status_label: &str) -> usize {
         let mut completions: Vec<crate::tools::subagent::SubAgentCompletion> = Vec::new();
         while let Ok(completion) = self.rx_subagent_completion.try_recv() {
-            if self
-                .delivered_subagent_completion_ids
-                .insert(completion.agent_id.clone())
-            {
+            if let Some(completion) = super::claim_subagent_completion(
+                &mut self.delivered_subagent_completion_ids,
+                completion,
+            ) {
                 completions.push(completion);
             }
         }
@@ -217,13 +242,12 @@ impl Engine {
             manager.terminal_results_excluding(&self.delivered_subagent_completion_ids)
         };
         for result in synthesized {
-            if self
-                .delivered_subagent_completion_ids
-                .insert(result.agent_id.clone())
-            {
-                completions.push(crate::tools::subagent::subagent_completion_from_result(
-                    &result,
-                ));
+            let completion = crate::tools::subagent::subagent_completion_from_result(&result);
+            if let Some(completion) = super::claim_subagent_completion(
+                &mut self.delivered_subagent_completion_ids,
+                completion,
+            ) {
+                completions.push(completion);
             }
         }
 
@@ -259,17 +283,23 @@ impl Engine {
         force_update_plan_first: bool,
         dynamic_active_tools: Vec<&'static str>,
     ) -> (TurnOutcomeStatus, Option<String>) {
-        // Signal to the terminal / taskbar that a turn is in progress
-        // (OSC 9 ; 4 indeterminate progress + title spinner).
-        crate::tui::notifications::set_taskbar_progress_busy();
-        crate::tui::notifications::start_title_animation("CodeWhale");
+        // Only interactive TUI hosts own terminal chrome. Headless exec,
+        // app-server, and stream-json stdout must remain byte-clean.
+        if self.config.terminal_chrome_enabled {
+            crate::tui::notifications::set_taskbar_progress_busy();
+            crate::tui::notifications::start_title_animation("Codewhale");
+        }
 
         let client = self
-            .deepseek_client
+            .model_client
             .clone()
-            .expect("DeepSeek client should be configured");
+            .expect("model client should be configured");
 
         let mut consecutive_tool_error_steps = 0u32;
+        let mut stuck_guard = StuckGuard::default();
+        // Scoped to this external user turn: counts survive all model/tool
+        // steps below, then reset before the next user prompt.
+        let mut read_repeat_guard = ReadRepeatGuard::default();
         let mut turn_error: Option<String> = None;
         let mut context_recovery_attempts = 0u8;
         let mut tool_catalog = tools.unwrap_or_default();
@@ -293,7 +323,6 @@ impl Engine {
                 .map(std::string::ToString::to_string),
         );
         let mut goal_continuations_this_turn = 0u32;
-
         // Outer stream-retry counter: when the chunked-transfer connection
         // dies mid-stream and either nothing useful was streamed (#103
         // Phase 3) or the host slept mid-turn (#2990), we silently re-issue
@@ -344,10 +373,29 @@ impl Engine {
                 break;
             }
 
-            let compaction_pins = self
-                .session
-                .working_set
-                .pinned_message_indices(&self.session.messages, &self.session.workspace);
+            // A tool-producing response can spend the remaining goal budget
+            // before this loop reaches the no-tool continuation check below.
+            // Stop at the provider-request boundary so tool results remain in
+            // the transcript, but no additional model request is authorized.
+            // GoalState remains untouched here: the outer turn bookkeeping
+            // records this usage once, then the normal cross-turn reconciler
+            // publishes the terminal Blocked projection.
+            if let Some(snapshot) = self.goal_snapshot_with_current_turn_usage(&turn.usage)
+                && let Some(budget) = snapshot.token_budget
+                && snapshot.tokens_used >= u64::from(budget)
+            {
+                let _ = self
+                    .tx_event
+                    .send(Event::status(format!(
+                        "Goal token budget reached ({} / {budget} tokens); ending turn before another provider request.",
+                        snapshot.tokens_used
+                    )))
+                    .await;
+                break;
+            }
+
+            let compaction_pins =
+                self.compaction_pins_for_active_turn(turn.active_slop_gate_message.as_ref());
             let compaction_paths = self.session.working_set.top_paths(24);
 
             if self.config.compaction.enabled
@@ -372,7 +420,7 @@ impl Engine {
                     .await;
                 let auto_messages_before = self.session.messages.len();
                 match compact_messages_safe(
-                    &client,
+                    client.as_ref(),
                     &self.session.messages,
                     &self.config.compaction,
                     Some(&self.session.workspace),
@@ -451,7 +499,11 @@ impl Engine {
                     }
 
                     if self
-                        .recover_context_overflow(&client, "preflight token budget")
+                        .recover_context_overflow(
+                            client.as_ref(),
+                            "preflight token budget",
+                            turn.active_slop_gate_message.as_ref(),
+                        )
                         .await
                     {
                         context_recovery_attempts = context_recovery_attempts.saturating_add(1);
@@ -492,6 +544,8 @@ impl Engine {
                 self.session.reasoning_effort.as_deref(),
                 &self.session.messages,
                 self.api_provider,
+                &self.api_config.deepseek_base_url(),
+                &self.config.model,
             );
 
             // Check prefix-cache stability before building the request.
@@ -641,7 +695,11 @@ impl Engine {
                     if is_context_length_error_message(&message)
                         && context_recovery_attempts < MAX_CONTEXT_RECOVERY_ATTEMPTS
                         && self
-                            .recover_context_overflow(&client, "provider context-length rejection")
+                            .recover_context_overflow(
+                                client.as_ref(),
+                                "provider context-length rejection",
+                                turn.active_slop_gate_message.as_ref(),
+                            )
                             .await
                     {
                         context_recovery_attempts = context_recovery_attempts.saturating_add(1);
@@ -1303,6 +1361,27 @@ impl Engine {
                 .await;
             }
 
+            if tool_uses.is_empty() {
+                match stuck_guard.observe(StepFingerprint::assistant_no_tool(&current_text_visible))
+                {
+                    Some(StuckSignal::Warn) => {
+                        self.add_session_message(self.runtime_text_message_with_turn_metadata(
+                            STUCK_RUNTIME_NOTICE.to_string(),
+                            UserInputProvenance::Runtime,
+                        ))
+                        .await;
+                        turn.next_step();
+                        continue;
+                    }
+                    Some(StuckSignal::Stop) => {
+                        let reason = "stuck loop detected after repeated no-progress messages";
+                        let _ = self.tx_event.send(Event::status(reason)).await;
+                        return (TurnOutcomeStatus::Failed, Some(reason.to_string()));
+                    }
+                    None => {}
+                }
+            }
+
             // If no tool uses, check for inline REPL blocks (paper §2) or
             // finish the turn.
             if tool_uses.is_empty() {
@@ -1491,6 +1570,7 @@ impl Engine {
                     .goal_continuation_message_if_needed(
                         tool_registry,
                         &mut goal_continuations_this_turn,
+                        &turn.usage,
                     )
                     .await
                 {
@@ -1591,6 +1671,7 @@ impl Engine {
                 let mut supports_parallel = false;
                 let mut read_only = false;
                 let mut detached_start = false;
+                let mut resources = vec![ResourceClaim::GlobalExclusive];
                 let mut blocked_error: Option<ToolError> = None;
                 let guard_result: Option<ToolResult> = None;
                 // #3026: set by a hook `ask` decision; applied AFTER the
@@ -1598,18 +1679,7 @@ impl Engine {
                 // clobbered by it.
                 let mut hook_requires_approval = false;
 
-                if mode == AppMode::Plan
-                    && matches!(
-                        tool_name.as_str(),
-                        "exec_shell"
-                            | "exec_shell_wait"
-                            | "exec_shell_interact"
-                            | "exec_wait"
-                            | "exec_interact"
-                            | CODE_EXECUTION_TOOL_NAME
-                            | JS_EXECUTION_TOOL_NAME
-                    )
-                {
+                if mode_blocks_command_execution(mode, &tool_name) {
                     blocked_error = Some(ToolError::permission_denied(format!(
                         "'{tool_name}' is not available in Plan mode — switch to Act mode (`/mode act`) to run commands and code."
                     )));
@@ -1670,6 +1740,26 @@ impl Engine {
                     )));
                 }
 
+                // Prepare before hooks so every input-specific authority and
+                // scheduling field has one inspectable owner. Preparation is
+                // side-effect free; execution remains below the full gate
+                // stack exactly as before.
+                let mut prepared_policy = match prepare_tool_call(
+                    &tool_name,
+                    tool_input.clone(),
+                    tool_registry,
+                    self.session.auto_approve,
+                ) {
+                    Ok(policy) => Some(policy),
+                    Err(error) => {
+                        if blocked_error.is_none() {
+                            blocked_error = Some(error);
+                        }
+                        None
+                    }
+                };
+                let mut reprepared_after_hook = false;
+
                 if blocked_error.is_none()
                     && let Some(hook_executor) = self.config.hook_executor.as_ref()
                     && hook_executor.has_hooks_for_event(crate::hooks::HookEvent::ToolCallBefore)
@@ -1721,6 +1811,19 @@ impl Engine {
                         }
                         if let Some(updated) = fold.updated_input {
                             tool_input = updated;
+                            reprepared_after_hook = true;
+                            prepared_policy = match reprepare_tool_call_after_hook(
+                                &tool_name,
+                                tool_input.clone(),
+                                tool_registry,
+                                self.session.auto_approve,
+                            ) {
+                                Ok(policy) => Some(policy),
+                                Err(error) => {
+                                    blocked_error = Some(error);
+                                    None
+                                }
+                            };
                         }
                         if let Some(context) = fold.additional_context {
                             hook_contexts.insert(tool_id.clone(), context);
@@ -1728,46 +1831,57 @@ impl Engine {
                     }
                 }
 
-                if McpPool::is_mcp_tool(&tool_name) {
-                    read_only = mcp_tool_is_read_only(&tool_name);
-                    supports_parallel = mcp_tool_is_parallel_safe(&tool_name);
-                    approval_required = !read_only && !self.session.auto_approve;
-                    approval_description = mcp_tool_approval_description(&tool_name);
-                } else if let Some(registry) = tool_registry
-                    && let Some(spec) = registry.get(&tool_name)
-                {
-                    approval_required = registered_tool_approval_required(
+                if let Some(prepared) = prepared_policy {
+                    let registered_non_bypassable =
+                        registered_tool_forces_prompt(&tool_name, prepared.call.approval);
+                    if registered_tool_blocked_in_full_access(
                         &tool_name,
-                        spec.approval_requirement_for(&tool_input),
-                        registry.context().auto_approve,
-                    );
-                    approval_description = spec.description().to_string();
-                    supports_parallel = spec.supports_parallel_for(&tool_input);
-                    read_only = spec.is_read_only_for(&tool_input);
-                    detached_start = spec.starts_detached_for(&tool_input);
-                } else if tool_name == CODE_EXECUTION_TOOL_NAME {
-                    approval_required = !self.session.auto_approve;
-                    approval_description =
-                        "Run model-provided Python code in local execution sandbox".to_string();
-                    supports_parallel = false;
-                    read_only = false;
-                } else if tool_name == JS_EXECUTION_TOOL_NAME {
-                    approval_required = !self.session.auto_approve;
-                    approval_description =
-                        "Run model-provided JavaScript code in local Node.js execution sandbox"
-                            .to_string();
-                    supports_parallel = false;
-                    read_only = false;
-                } else if is_tool_search_tool(&tool_name) {
-                    approval_required = false;
-                    approval_description = "Search tool catalog".to_string();
-                    supports_parallel = false;
-                    read_only = true;
+                        prepared.call.approval,
+                        prepared.auto_approve,
+                    ) {
+                        approval_required = false;
+                        blocked_error = Some(ToolError::permission_denied(format!(
+                            "Tool '{tool_name}' requires explicit approval and is blocked in Full Access because this posture does not open tool-approval prompts. Switch to Ask to review this call."
+                        )));
+                    } else {
+                        approval_required = registered_tool_approval_required(
+                            &tool_name,
+                            prepared.call.approval,
+                            prepared.auto_approve,
+                        );
+                        // Preserve the typed non-bypassable hold through UI
+                        // posture races: an Ask-planned request received after
+                        // switching to Full Access must fail closed, never take
+                        // the ordinary Full Access auto-approval path.
+                        approval_force_prompt = registered_non_bypassable;
+                    }
+                    approval_description = prepared.call.description;
+                    supports_parallel = prepared.call.supports_parallel;
+                    read_only = prepared.call.read_only;
+                    detached_start = prepared.call.starts_detached;
+                    tool_input = prepared.call.input;
+                    resources = prepared.call.resources;
+
+                    let approval = match prepared.call.approval {
+                        ApprovalRequirement::Auto => "auto",
+                        ApprovalRequirement::Suggest => "suggest",
+                        ApprovalRequirement::Required => "required",
+                    };
+                    emit_tool_audit(json!({
+                        "event": "tool.prepared",
+                        "tool_id": tool_id.clone(),
+                        "tool_name": tool_name.clone(),
+                        "read_only": read_only,
+                        "supports_parallel": supports_parallel,
+                        "starts_detached": detached_start,
+                        "approval": approval,
+                        "resources": &resources,
+                        "reprepared_after_hook": reprepared_after_hook,
+                    }));
                 }
 
                 if blocked_error.is_none()
-                    && mode == AppMode::Plan
-                    && plan_mode_blocks_write_capable_tool(&tool_name, read_only)
+                    && mode_blocks_write_capable_tool(mode, &tool_name, read_only)
                 {
                     blocked_error = Some(ToolError::permission_denied(format!(
                         "'{tool_name}' is not available in Plan mode - switch to Act mode (`/mode act`) to modify files or run write-capable tools."
@@ -1841,9 +1955,9 @@ impl Engine {
                         AutoReviewPlanDecision::NoChange => {}
                         AutoReviewPlanDecision::ForcePrompt(reason) => {
                             // The built-in safety floor is deliberately
-                            // non-bypassable: YOLO auto-approves ordinary tool
-                            // calls, but publish-like and background/headless
-                            // destructive holds still require review.
+                            // non-bypassable. Ask/Auto-Review surface the hold;
+                            // Full Access turns this disposition into a hard
+                            // block below, without opening a modal.
                             approval_required = true;
                             approval_description = reason;
                             approval_force_prompt = true;
@@ -1881,9 +1995,17 @@ impl Engine {
                     }));
                     match decision {
                         crate::repo_law::RepoLawPlanDecision::ForcePrompt(reason) => {
-                            approval_required = true;
-                            approval_description = reason;
-                            approval_force_prompt = true;
+                            if self.session.auto_approve {
+                                approval_required = false;
+                                approval_force_prompt = false;
+                                blocked_error = Some(ToolError::permission_denied(format!(
+                                    "Repository law blocked tool '{tool_name}' in Full Access: {reason}. Switch to Ask to review this protected change."
+                                )));
+                            } else {
+                                approval_required = true;
+                                approval_description = reason;
+                                approval_force_prompt = true;
+                            }
                         }
                         crate::repo_law::RepoLawPlanDecision::Block(reason) => {
                             approval_required = false;
@@ -1940,6 +2062,7 @@ impl Engine {
                     supports_parallel,
                     read_only,
                     detached_start,
+                    resources,
                     blocked_error,
                     guard_result,
                 });
@@ -1963,7 +2086,25 @@ impl Engine {
             };
 
             let plan_count = plans.len();
-            let batches = plan_tool_execution_batches(plans);
+            let ReadRepeatExecutionPlan {
+                executable,
+                coalesced: coalesced_read_plans,
+                occurrences: read_repeat_occurrences,
+            } = plan_read_repeat_execution(plans, &mut read_repeat_guard);
+            let coalesced_read_indices = coalesced_read_plans
+                .iter()
+                .map(|plan| plan.follower.index)
+                .collect::<std::collections::HashSet<_>>();
+            if !coalesced_read_plans.is_empty() {
+                let _ = self
+                    .tx_event
+                    .send(Event::status(format!(
+                        "Coalesced {} duplicate read-only call(s) onto the first execution",
+                        coalesced_read_plans.len()
+                    )))
+                    .await;
+            }
+            let batches = plan_tool_execution_batches(executable);
             let parallel_chunks = batches
                 .iter()
                 .filter_map(|batch| match batch {
@@ -2026,7 +2167,8 @@ impl Engine {
                 // Interrupted. This branch is a no-op on the normal path.
                 if self.cancel_token.is_cancelled() {
                     for plan in plans {
-                        let result = Ok(interrupted_tool_result());
+                        let terminal = ToolExecutionOutcome::cancelled(interrupted_tool_result());
+                        let result = terminal.legacy_result();
                         let _ = self
                             .tx_event
                             .send(Event::ToolCallComplete {
@@ -2041,13 +2183,24 @@ impl Engine {
                             name: plan.name,
                             input: plan.input,
                             started_at: Instant::now(),
-                            result,
+                            terminal,
                         });
                     }
                     continue;
                 }
 
                 if parallel_allowed {
+                    let parallel_plan_receipts: Vec<_> = plans
+                        .iter()
+                        .map(|plan| {
+                            (
+                                plan.index,
+                                plan.id.clone(),
+                                plan.name.clone(),
+                                plan.input.clone(),
+                            )
+                        })
+                        .collect();
                     let mut tool_tasks = FuturesUnordered::new();
                     let shell_permits =
                         Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL_SHELL_EXEC));
@@ -2068,7 +2221,7 @@ impl Engine {
                                 name: plan.name,
                                 input: plan.input,
                                 started_at: Instant::now(),
-                                result,
+                                terminal: ToolExecutionOutcome::from_legacy(result),
                             });
                             continue;
                         }
@@ -2079,7 +2232,7 @@ impl Engine {
                                 name: plan.name,
                                 input: plan.input,
                                 started_at: Instant::now(),
-                                result: Err(err),
+                                terminal: ToolExecutionOutcome::from_legacy(Err(err)),
                             });
                             continue;
                         }
@@ -2147,14 +2300,55 @@ impl Engine {
                                 name: plan.name,
                                 input: plan.input,
                                 started_at,
-                                result,
+                                terminal: ToolExecutionOutcome::from_legacy(result),
                             }
                         });
                     }
 
-                    while let Some(outcome) = tool_tasks.next().await {
-                        let index = outcome.index;
-                        outcomes[index] = Some(outcome);
+                    let mut parallel_cancelled = false;
+                    loop {
+                        tokio::select! {
+                            biased;
+                            () = self.cancel_token.cancelled() => {
+                                parallel_cancelled = true;
+                                break;
+                            }
+                            outcome = tool_tasks.next() => {
+                                let Some(outcome) = outcome else { break; };
+                                let index = outcome.index;
+                                outcomes[index] = Some(outcome);
+                            }
+                        }
+                    }
+                    // Dropping FuturesUnordered drops every still-active tool
+                    // future (including MCP transport calls) instead of merely
+                    // waiting for cooperative cancellation inside each tool.
+                    drop(tool_tasks);
+                    if parallel_cancelled {
+                        for (index, id, name, input) in parallel_plan_receipts {
+                            if outcomes[index].is_some() {
+                                continue;
+                            }
+                            let terminal =
+                                ToolExecutionOutcome::cancelled(interrupted_tool_result());
+                            let result = terminal.legacy_result();
+                            let _ = self
+                                .tx_event
+                                .send(Event::ToolCallComplete {
+                                    id: id.clone(),
+                                    name: name.clone(),
+                                    result: result.clone(),
+                                })
+                                .await;
+                            outcomes[index] = Some(ToolExecOutcome {
+                                index,
+                                id,
+                                name,
+                                input,
+                                started_at: Instant::now(),
+                                terminal,
+                            });
+                        }
                     }
                 } else {
                     for plan in plans {
@@ -2179,7 +2373,7 @@ impl Engine {
                                 name: tool_name,
                                 input: tool_input,
                                 started_at: Instant::now(),
-                                result,
+                                terminal: ToolExecutionOutcome::from_legacy(result),
                             });
                             continue;
                         }
@@ -2200,20 +2394,26 @@ impl Engine {
                                 name: tool_name,
                                 input: tool_input,
                                 started_at: Instant::now(),
-                                result,
+                                terminal: ToolExecutionOutcome::from_legacy(result),
                             });
                             continue;
                         }
 
                         if tool_name == MULTI_TOOL_PARALLEL_NAME {
                             let started_at = Instant::now();
-                            let result = self
-                                .execute_parallel_tool(
+                            let cancel_token = self.cancel_token.clone();
+                            let terminal = tokio::select! {
+                                biased;
+                                () = cancel_token.cancelled() => {
+                                    ToolExecutionOutcome::cancelled(interrupted_tool_result())
+                                },
+                                result = self.execute_parallel_tool(
                                     tool_input.clone(),
                                     tool_registry,
                                     tool_exec_lock.clone(),
-                                )
-                                .await;
+                                ) => ToolExecutionOutcome::from_legacy(result),
+                            };
+                            let result = terminal.legacy_result();
 
                             let _ = self
                                 .tx_event
@@ -2230,7 +2430,7 @@ impl Engine {
                                 name: tool_name,
                                 input: tool_input,
                                 started_at,
-                                result,
+                                terminal,
                             });
                             continue;
                         }
@@ -2259,23 +2459,37 @@ impl Engine {
                                 name: tool_name,
                                 input: tool_input,
                                 started_at,
-                                result,
+                                terminal: ToolExecutionOutcome::from_legacy(result),
                             });
                             continue;
                         }
 
                         if tool_name == REQUEST_USER_INPUT_NAME {
                             let started_at = Instant::now();
-                            let result = match UserInputRequest::from_value(&tool_input) {
-                                Ok(request) => self
-                                    .await_user_input(&tool_id, request)
-                                    .await
-                                    .and_then(|response| {
-                                        ToolResult::json(&response)
-                                            .map_err(|e| ToolError::execution_failed(e.to_string()))
-                                    }),
-                                Err(err) => Err(err),
-                            };
+                            let result =
+                                if crate::core::authority::permission_posture_allows_questions(
+                                    self.session.approval_mode,
+                                ) {
+                                    match UserInputRequest::from_value(&tool_input) {
+                                        Ok(request) => self
+                                            .await_user_input(&tool_id, request)
+                                            .await
+                                            .and_then(|response| {
+                                                ToolResult::json(&response).map_err(|e| {
+                                                    ToolError::execution_failed(e.to_string())
+                                                })
+                                            }),
+                                        Err(err) => Err(err),
+                                    }
+                                } else {
+                                    Ok(ToolResult::success(
+                                    "Auto-Review does not pause for user questions. Decide from the available context and continue autonomously.",
+                                )
+                                .with_metadata(json!({
+                                    "auto_resolved": true,
+                                    "permission_posture": "auto-review",
+                                })))
+                                };
 
                             let _ = self
                                 .tx_event
@@ -2292,7 +2506,7 @@ impl Engine {
                                 name: tool_name,
                                 input: tool_input,
                                 started_at,
-                                result,
+                                terminal: ToolExecutionOutcome::from_legacy(result),
                             });
                             continue;
                         }
@@ -2407,23 +2621,29 @@ impl Engine {
                         }
 
                         let started_at = Instant::now();
-                        let mut result = if let Some(result_override) = result_override {
-                            result_override
-                        } else {
-                            Self::execute_tool_with_lock(
-                                tool_exec_lock.clone(),
-                                plan.supports_parallel,
-                                plan.interactive,
-                                self.tx_event.clone(),
-                                tool_name.clone(),
-                                tool_input.clone(),
-                                self.session.workspace.clone(),
-                                tool_registry,
-                                mcp_pool.clone(),
-                                context_override,
-                            )
-                            .await
-                        };
+                        let (mut result, cancelled_before_completion) =
+                            if let Some(result_override) = result_override {
+                                (result_override, false)
+                            } else {
+                                tokio::select! {
+                                    biased;
+                                    () = self.cancel_token.cancelled() => {
+                                        (Ok(interrupted_tool_result()), true)
+                                    },
+                                    result = Self::execute_tool_with_lock(
+                                        tool_exec_lock.clone(),
+                                        plan.supports_parallel,
+                                        plan.interactive,
+                                        self.tx_event.clone(),
+                                        tool_name.clone(),
+                                        tool_input.clone(),
+                                        self.session.workspace.clone(),
+                                        tool_registry,
+                                        mcp_pool.clone(),
+                                        context_override,
+                                    ) => (result, false),
+                                }
+                            };
 
                         if let Some(approval_stamp) = approval_stamp
                             && let Ok(tool_result) = result.as_mut()
@@ -2464,16 +2684,81 @@ impl Engine {
                             })
                             .await;
 
+                        let terminal = if cancelled_before_completion {
+                            ToolExecutionOutcome::cancelled(
+                                result.expect("cancelled tool result is always model-visible"),
+                            )
+                        } else {
+                            ToolExecutionOutcome::from_legacy(result)
+                        };
                         outcomes[plan.index] = Some(ToolExecOutcome {
                             index: plan.index,
                             id: tool_id,
                             name: tool_name,
                             input: tool_input,
                             started_at,
-                            result,
+                            terminal,
                         });
                     }
                 }
+            }
+
+            // Same-batch read-only duplicates subscribe to the first physical
+            // execution, but retain their own provider tool-call/result pair.
+            // Counts five and above receive a compact pointer instead of a
+            // repeated body; cancellation retains its explicit terminal state.
+            for coalesced in coalesced_read_plans {
+                let occurrence = &coalesced.occurrence;
+                let follower = coalesced.follower;
+                let leader = outcomes
+                    .get(coalesced.leader_index)
+                    .and_then(Option::as_ref);
+                let (leader_id, leader_status, leader_result) = match leader {
+                    Some(leader) => (
+                        leader.id.clone(),
+                        Some(leader.terminal.status),
+                        leader.terminal.legacy_result(),
+                    ),
+                    None => (
+                        format!("missing-leader-{}", coalesced.leader_index),
+                        None,
+                        Err(ToolError::execution_failed(
+                            "coalesced read leader did not produce a terminal result",
+                        )),
+                    ),
+                };
+                let result =
+                    read_repeat_guard.coalesced_result(occurrence, &leader_id, &leader_result);
+                emit_tool_audit(json!({
+                    "event": "tool.read_repeat_coalesced",
+                    "tool_id": follower.id.clone(),
+                    "tool_name": follower.name.clone(),
+                    "leader_tool_id": leader_id,
+                    "count": occurrence.count,
+                    "receipt": occurrence.count >= RECEIPT_THRESHOLD,
+                }));
+                let _ = self
+                    .tx_event
+                    .send(Event::ToolCallComplete {
+                        id: follower.id.clone(),
+                        name: follower.name.clone(),
+                        result: result.clone(),
+                    })
+                    .await;
+                let terminal = match result {
+                    Ok(result) if leader_status == Some(ToolTerminalStatus::Cancelled) => {
+                        ToolExecutionOutcome::cancelled(result)
+                    }
+                    result => ToolExecutionOutcome::from_legacy(result),
+                };
+                outcomes[follower.index] = Some(ToolExecOutcome {
+                    index: follower.index,
+                    id: follower.id,
+                    name: follower.name,
+                    input: follower.input,
+                    started_at: Instant::now(),
+                    terminal,
+                });
             }
 
             let mut step_error_count = 0usize;
@@ -2491,22 +2776,65 @@ impl Engine {
             // sidebar "Goal:" line stays stale for the whole (possibly long)
             // goal-loop turn while get_goal already reflects the new objective.
             let mut goal_tool_ran = false;
+            let mut stuck_signal = None;
+            let mut read_repeat_stop: Option<(String, usize)> = None;
 
             for outcome in outcomes.into_iter().flatten() {
                 let tool_input = outcome.input.clone();
                 let tool_name_for_ws = outcome.name.clone();
+                let terminal_status = outcome.terminal.status;
+                let mut result = outcome.terminal.into_legacy_result();
+                if let Some(occurrence) = read_repeat_occurrences.get(&outcome.index) {
+                    if let Ok(output) = result.as_mut() {
+                        read_repeat_guard.remember_success(occurrence, &outcome.id, output);
+                        read_repeat_guard.decorate_model_result(occurrence, output);
+                    }
+                    if ReadRepeatGuard::should_stop(occurrence) {
+                        read_repeat_stop = Some((outcome.name.clone(), occurrence.count));
+                    }
+                }
+                // Read-only repetition has its own non-consecutive 3/5/8
+                // policy. Feeding the same calls into the older consecutive
+                // stuck guard would stop at five and defeat the receipt lane.
+                let observed_signal =
+                    if read_repeat_occurrences.contains_key(&outcome.index) {
+                        None
+                    } else {
+                        match &result {
+                            Ok(output) if output.success => stuck_guard
+                                .observe(StepFingerprint::tool(&outcome.name, &tool_input, None)),
+                            Ok(output) => stuck_guard.observe(StepFingerprint::tool(
+                                &outcome.name,
+                                &tool_input,
+                                Some(&output.content),
+                            )),
+                            Err(error) => stuck_guard.observe(StepFingerprint::tool(
+                                &outcome.name,
+                                &tool_input,
+                                Some(&error.to_string()),
+                            )),
+                        }
+                    };
+                if matches!(observed_signal, Some(StuckSignal::Stop)) {
+                    stuck_signal = Some(StuckSignal::Stop);
+                } else if matches!(observed_signal, Some(StuckSignal::Warn))
+                    && stuck_signal.is_none()
+                {
+                    stuck_signal = Some(StuckSignal::Warn);
+                }
                 if matches!(outcome.name.as_str(), "create_goal" | "update_goal") {
                     goal_tool_ran = true;
                 }
                 let should_stop_this_turn =
-                    should_stop_after_plan_tool(mode, &outcome.name, &outcome.result);
+                    should_stop_after_plan_tool(mode, &outcome.name, &result);
 
-                match outcome.result {
+                match result {
                     Ok(output) => {
                         emit_tool_audit(json!({
                             "event": "tool.result",
                             "tool_id": outcome.id.clone(),
                             "tool_name": outcome.name.clone(),
+                            "status": terminal_status.as_str(),
                             "success": output.success,
                         }));
                         let output_for_context = compact_tool_result_for_route(
@@ -2522,12 +2850,14 @@ impl Engine {
                             .and_then(|metadata| metadata.get("executed"))
                             .and_then(serde_json::Value::as_bool)
                             .unwrap_or(true);
-                        self.session.working_set.observe_tool_call(
-                            &tool_name_for_ws,
-                            &tool_input,
-                            Some(&output_for_context),
-                            &self.session.workspace,
-                        );
+                        if tool_was_executed {
+                            self.session.working_set.observe_tool_call(
+                                &tool_name_for_ws,
+                                &tool_input,
+                                Some(&output_for_context),
+                                &self.session.workspace,
+                            );
+                        }
 
                         // #136: post-edit LSP diagnostics hook. We only run
                         // this on success — failed edits leave the file
@@ -2564,6 +2894,7 @@ impl Engine {
                             "event": "tool.result",
                             "tool_id": outcome.id.clone(),
                             "tool_name": outcome.name.clone(),
+                            "status": terminal_status.as_str(),
                             "success": false,
                             "error": e.to_string(),
                             "category": envelope.category.to_string(),
@@ -2573,13 +2904,30 @@ impl Engine {
                         step_error_categories.push(envelope.category);
                         step_error_tool_names.push(outcome.name.clone());
                         step_error_tool_inputs.push(tool_input.clone());
-                        let error = format_tool_error(&e, &outcome.name);
-                        self.session.working_set.observe_tool_call(
-                            &tool_name_for_ws,
-                            &tool_input,
-                            Some(&error),
-                            &self.session.workspace,
-                        );
+                        let input_schema = tool_catalog
+                            .iter()
+                            .find(|tool| tool.name == outcome.name)
+                            .map(|tool| &tool.input_schema);
+                        let mut error =
+                            format_tool_error_with_schema(&e, &outcome.name, input_schema);
+                        if let Some(occurrence) = read_repeat_occurrences.get(&outcome.index)
+                            && let Some(nudge) = ReadRepeatGuard::corrective_nudge(occurrence)
+                        {
+                            error.push_str("\n\n");
+                            error.push_str(nudge);
+                        }
+                        // A raw ToolError has no result metadata where the
+                        // coalescer can record `executed: false`. Keep the
+                        // follower model-visible, but do not count it as a
+                        // second physical working-set touch.
+                        if !coalesced_read_indices.contains(&outcome.index) {
+                            self.session.working_set.observe_tool_call(
+                                &tool_name_for_ws,
+                                &tool_input,
+                                Some(&error),
+                                &self.session.workspace,
+                            );
+                        }
                         self.add_session_message(Message {
                             role: "user".to_string(),
                             content: vec![ContentBlock::ToolResult {
@@ -2602,6 +2950,33 @@ impl Engine {
             // applies it behind a `changed` guard).
             if goal_tool_ran {
                 self.emit_goal_updated().await;
+            }
+
+            if let Some((tool_name, count)) = read_repeat_stop {
+                let reason = format!(
+                    "read-only repetition limit reached for '{tool_name}' at occurrence {count}; stopping turn deterministically"
+                );
+                emit_tool_audit(json!({
+                    "event": "tool.read_repeat_stopped",
+                    "tool_name": tool_name,
+                    "count": count,
+                }));
+                let _ = self.tx_event.send(Event::status(reason.clone())).await;
+                return (TurnOutcomeStatus::Failed, Some(reason));
+            }
+
+            if let Some(signal) = stuck_signal {
+                if matches!(signal, StuckSignal::Warn) {
+                    self.add_session_message(self.runtime_text_message_with_turn_metadata(
+                        STUCK_RUNTIME_NOTICE.to_string(),
+                        UserInputProvenance::Runtime,
+                    ))
+                    .await;
+                } else {
+                    let reason = "stuck loop detected after repeated tool actions/results";
+                    let _ = self.tx_event.send(Event::status(reason)).await;
+                    return (TurnOutcomeStatus::Failed, Some(reason.to_string()));
+                }
             }
 
             if stop_after_plan_tool {
@@ -2648,27 +3023,45 @@ impl Engine {
         (TurnOutcomeStatus::Completed, None)
     }
 
+    fn goal_snapshot_with_current_turn_usage(
+        &self,
+        current_turn_usage: &Usage,
+    ) -> Option<GoalSnapshot> {
+        let mut snapshot = match self.config.goal_state.lock() {
+            Ok(state) => state.snapshot(),
+            Err(err) => {
+                tracing::warn!("goal state lock poisoned during current-turn budget check: {err}");
+                return None;
+            }
+        };
+        if !snapshot.is_active() {
+            return None;
+        }
+
+        // GoalState is updated once, after the full engine turn finishes. Add
+        // this turn's cumulative provider usage only to a transient snapshot
+        // so request and continuation decisions see already-spent tokens
+        // without recording the same usage twice later.
+        let current_turn_tokens = u64::from(current_turn_usage.input_tokens)
+            .saturating_add(u64::from(current_turn_usage.output_tokens));
+        snapshot.tokens_used = snapshot.tokens_used.saturating_add(current_turn_tokens);
+        Some(snapshot)
+    }
+
     async fn goal_continuation_message_if_needed(
         &self,
         tool_registry: Option<&crate::tools::ToolRegistry>,
         continuations_this_turn: &mut u32,
+        current_turn_usage: &Usage,
     ) -> Option<String> {
         let registry = tool_registry?;
         if !registry.contains("update_goal") {
             return None;
         }
 
-        let mut snapshot = match self.config.goal_state.lock() {
-            Ok(state) => state.snapshot(),
-            Err(err) => {
-                tracing::warn!("goal state lock poisoned during continuation check: {err}");
-                return None;
-            }
-        };
-
-        if !snapshot.is_active() {
-            return None;
-        }
+        let mut snapshot = self.goal_snapshot_with_current_turn_usage(current_turn_usage)?;
+        let current_turn_tokens = u64::from(current_turn_usage.input_tokens)
+            .saturating_add(u64::from(current_turn_usage.output_tokens));
 
         let per_turn_max = crate::tools::goal::MAX_GOAL_CONTINUATIONS_PER_TURN;
         if *continuations_this_turn >= per_turn_max {
@@ -2716,6 +3109,7 @@ impl Engine {
             Ok(mut state) => {
                 state.record_continuation();
                 snapshot = state.snapshot();
+                snapshot.tokens_used = snapshot.tokens_used.saturating_add(current_turn_tokens);
             }
             Err(err) => {
                 tracing::warn!("goal state lock poisoned while recording continuation: {err}")
@@ -2737,71 +3131,6 @@ impl Engine {
 
     pub(super) fn messages_with_turn_metadata(&self) -> Vec<Message> {
         self.session.messages.clone().into()
-    }
-}
-
-pub(super) fn subagent_completion_runtime_text(payload: &str) -> String {
-    format!(
-        "<codewhale:runtime_event kind=\"subagent_completion\" visibility=\"internal\">\n\
-This is an internal runtime event, not user input. Use the sub-agent completion \
-data below to continue coordinating the current task. Do not tell the user they \
-pasted sentinels, do not explain the sentinel protocol, and do not quote the raw \
-XML unless the user explicitly asks to debug sub-agent internals.\n\n\
-{payload}\n\
-</codewhale:runtime_event>"
-    )
-}
-
-fn waiting_for_subagents_runtime_message(running: usize) -> Message {
-    Message {
-        role: "user".to_string(),
-        content: vec![
-            ContentBlock::Text {
-                text: format!(
-                    "<codewhale:runtime_event kind=\"waiting_for_subagents\" visibility=\"internal\">\n\
-This is an internal runtime event, not user input. Your {running} sub-agent(s) \
-are still running. Do NOT poll them with agent(action=\"peek\") or \
-agent(action=\"status\"). Do NOT use sleep or any shell blocking primitive as a \
-waiting strategy. The runtime will deliver <codewhale:subagent.done> sentinels \
-automatically when each child finishes — polling will never make that happen \
-sooner. Stop immediately: emit zero tool calls and end the turn.\n\
-</codewhale:runtime_event>"
-                ),
-                cache_control: None,
-            },
-            runtime_event_turn_metadata_block(UserInputProvenance::SubAgentHandoff),
-        ],
-    }
-}
-
-fn subagent_completion_runtime_message(payload: &str) -> Message {
-    // Role is "user", not "system": some OpenAI-compatible backends apply a
-    // strict chat template (e.g. vLLM serving Qwen3) that requires any system
-    // message to be messages[0]. A system message appended mid-conversation
-    // makes the template raise "System message must be at the beginning",
-    // which surfaces as a 400 BadRequest and breaks the whole sub-agent
-    // hand-off in the parent turn. The `visibility="internal"` tag already
-    // tells the model this is a runtime event rather than user input, so the
-    // role carries no semantic weight here — only template-compatibility cost.
-    Message {
-        role: "user".to_string(),
-        content: vec![
-            ContentBlock::Text {
-                text: subagent_completion_runtime_text(payload),
-                cache_control: None,
-            },
-            runtime_event_turn_metadata_block(UserInputProvenance::SubAgentHandoff),
-        ],
-    }
-}
-
-fn runtime_event_turn_metadata_block(provenance: UserInputProvenance) -> ContentBlock {
-    ContentBlock::Text {
-        text: format!(
-            "<turn_meta>\nInput provenance: {}\nInput authority: non_authoritative\n</turn_meta>",
-            provenance.as_str()
-        ),
-        cache_control: None,
     }
 }
 
@@ -2894,9 +3223,24 @@ fn should_pre_tool_snapshot(
         && matches!(tool_name, "write_file" | "edit_file" | "apply_patch")
 }
 
-fn plan_mode_blocks_write_capable_tool(tool_name: &str, read_only: bool) -> bool {
-    matches!(tool_name, "write_file" | "edit_file" | "apply_patch")
-        || (McpPool::is_mcp_tool(tool_name) && !read_only)
+fn mode_blocks_command_execution(mode: AppMode, tool_name: &str) -> bool {
+    mode == AppMode::Plan
+        && matches!(
+            tool_name,
+            "exec_shell"
+                | "exec_shell_wait"
+                | "exec_shell_interact"
+                | "exec_wait"
+                | "exec_interact"
+                | CODE_EXECUTION_TOOL_NAME
+                | JS_EXECUTION_TOOL_NAME
+        )
+}
+
+fn mode_blocks_write_capable_tool(mode: AppMode, tool_name: &str, read_only: bool) -> bool {
+    mode == AppMode::Plan
+        && (matches!(tool_name, "write_file" | "edit_file" | "apply_patch")
+            || (McpPool::is_mcp_tool(tool_name) && !read_only))
 }
 
 /// Synthesize the tool result recorded for a tool call that never executed
@@ -2976,21 +3320,51 @@ mod pre_tool_snapshot_gate_tests {
     }
 
     #[test]
-    fn plan_mode_blocks_file_and_mcp_write_tools() {
-        for tool in ["write_file", "edit_file", "apply_patch"] {
-            assert!(plan_mode_blocks_write_capable_tool(tool, false));
+    fn plan_blocks_write_capable_tools_without_narrowing_operate() {
+        for tool in [
+            "exec_shell",
+            "exec_shell_wait",
+            "exec_shell_interact",
+            CODE_EXECUTION_TOOL_NAME,
+            JS_EXECUTION_TOOL_NAME,
+        ] {
+            assert!(mode_blocks_command_execution(AppMode::Plan, tool));
+            assert!(
+                !mode_blocks_command_execution(AppMode::Operate, tool),
+                "Operate must not add a mode-only command denial for {tool}"
+            );
         }
 
-        assert!(plan_mode_blocks_write_capable_tool(
+        for tool in ["write_file", "edit_file", "apply_patch"] {
+            assert!(mode_blocks_write_capable_tool(AppMode::Plan, tool, false));
+            assert!(
+                !mode_blocks_write_capable_tool(AppMode::Operate, tool, false),
+                "Operate must not add a mode-only write denial for {tool}"
+            );
+        }
+
+        assert!(mode_blocks_write_capable_tool(
+            AppMode::Plan,
             "mcp_filesystem_write",
             false
         ));
-        assert!(!plan_mode_blocks_write_capable_tool(
+        assert!(!mode_blocks_write_capable_tool(
+            AppMode::Operate,
+            "mcp_filesystem_write",
+            false
+        ));
+        assert!(!mode_blocks_write_capable_tool(
+            AppMode::Plan,
             "mcp_filesystem_read",
             true
         ));
-        assert!(!plan_mode_blocks_write_capable_tool("read_file", true));
-        assert!(!plan_mode_blocks_write_capable_tool(
+        assert!(!mode_blocks_write_capable_tool(
+            AppMode::Plan,
+            "read_file",
+            true
+        ));
+        assert!(!mode_blocks_write_capable_tool(
+            AppMode::Plan,
             "request_user_input",
             false
         ));
@@ -3187,6 +3561,8 @@ fn resolve_auto_effort(
     reasoning_effort: Option<&str>,
     messages: &[Message],
     provider: crate::config::ApiProvider,
+    base_url: &str,
+    wire_model: &str,
 ) -> Option<String> {
     match reasoning_effort {
         Some(effort) if effort == REASONING_EFFORT_AUTO => {
@@ -3219,10 +3595,10 @@ fn resolve_auto_effort(
             // their own turn pass and can pass is_subagent=true when they
             // call this function directly.
             let tier = crate::auto_reasoning::select(false, &last_msg);
-            let resolved =
-                crate::model_routing::normalize_auto_route_effort_for_provider(provider, tier)
-                    .as_setting()
-                    .to_string();
+            let resolved = tier
+                .normalize_for_route(provider, base_url, wire_model)
+                .as_setting()
+                .to_string();
             tracing::debug!(
                 reasoning_effort = %resolved,
                 is_subagent = false,
@@ -3461,10 +3837,48 @@ mod tests {
             resolve_auto_effort(
                 Some("auto"),
                 &messages,
-                crate::config::ApiProvider::Deepseek
+                crate::config::ApiProvider::Deepseek,
+                crate::config::DEFAULT_DEEPSEEK_BASE_URL,
+                "deepseek-v4-pro",
             ),
             Some("high".to_string()),
             "auto thinking should classify the user request, not stored metadata"
+        );
+    }
+
+    #[test]
+    fn resolve_auto_effort_selects_a_concrete_kimi_code_tier() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "inspect this repository and fix the failing tests".to_string(),
+                cache_control: None,
+            }],
+        }];
+
+        let resolved = resolve_auto_effort(
+            Some("auto"),
+            &messages,
+            crate::config::ApiProvider::Moonshot,
+            crate::config::DEFAULT_KIMI_CODE_BASE_URL,
+            crate::config::KIMI_CODE_K3_MODEL,
+        )
+        .expect("Auto dispatch must select a concrete tier");
+
+        assert!(
+            matches!(resolved.as_str(), "low" | "medium" | "high" | "max"),
+            "dispatched Auto must never reach the client as a provider-default sentinel: {resolved}"
+        );
+        assert_eq!(
+            resolve_auto_effort(
+                None,
+                &messages,
+                crate::config::ApiProvider::Moonshot,
+                crate::config::DEFAULT_KIMI_CODE_BASE_URL,
+                crate::config::KIMI_CODE_K3_MODEL,
+            ),
+            None,
+            "only an omitted reasoning setting leaves the provider default in control"
         );
     }
 

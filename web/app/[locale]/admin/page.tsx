@@ -17,6 +17,8 @@ const TYPE_LABELS: Record<string, { en: string; zh: string }> = {
   stale: { en: "Stale Nudge", zh: "过期提醒" },
   dupes: { en: "Duplicate", zh: "重复检测" },
   digest: { en: "Weekly Digest", zh: "每周摘要" },
+  linkcheck: { en: "Broken Link", zh: "失效链接" },
+  "semantic-drift": { en: "Content Drift", zh: "内容漂移" },
 };
 
 function LoginForm({ locale, error }: { locale: string; error: boolean }) {

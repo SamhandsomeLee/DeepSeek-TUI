@@ -2,7 +2,8 @@
 //!
 //! These scenarios cover the live TUI checks that unit tests cannot prove:
 //! six-worker fanout liveness/cancellation, multi-terminal route isolation,
-//! and queued steering via Ctrl+S. Every provider is a loopback wiremock
+//! and queued steering via the terminal-safe Ctrl+G shortcut. Every provider is a loopback
+//! wiremock
 //! server and every process receives a sealed HOME.
 
 #![cfg(unix)]
@@ -23,6 +24,7 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 const BOOT_TIMEOUT: Duration = Duration::from_secs(20);
 const INTERACTION_TIMEOUT: Duration = Duration::from_secs(15);
+const PASTE_GUARD_SETTLE: Duration = Duration::from_millis(180);
 const COMPOSER_READY_TEXT: &str = "Write a task";
 const MUSE_MODEL: &str = "muse-spark-1.1";
 const GPT_MODEL: &str = "gpt-5.6-terra";
@@ -84,6 +86,12 @@ fn fanout_tool_call_sse_n(count: usize) -> String {
                     "arguments": serde_json::to_string(&json!({
                         "message": format!("stay busy worker {worker} until the parent QA turn is cancelled"),
                         "agent_type": "explorer",
+                        // Explicit fresh context: this harness dispatches mock
+                        // responses on request content, and an auto-forked
+                        // child would carry the parent conversation (including
+                        // the parent prompt) in its requests. Explicit false
+                        // always wins over the auto-fork policy.
+                        "fork_context": false,
                         "session_name": format!("qa-worker-{worker}")
                     }))
                     .expect("agent arguments")
@@ -174,6 +182,13 @@ fn common_tui_builder(ws: &SealedWorkspace) -> qa_harness::harness::HarnessBuild
         .size(42, 150)
 }
 
+/// Release scenarios exercise the direct-session runtime. The optional launch
+/// screen is not enabled in these sealed homes.
+fn enter_launch_session(harness: &mut Harness) -> Result<()> {
+    harness.wait_for_text(COMPOSER_READY_TEXT, BOOT_TIMEOUT)?;
+    Ok(())
+}
+
 fn wait_for_counter(
     harness: &mut Harness,
     counter: &AtomicUsize,
@@ -199,7 +214,13 @@ fn wait_for_counter(
 
 fn type_and_submit(harness: &mut Harness, text: &str) -> Result<()> {
     harness.send(keys::key::text(text))?;
-    harness.wait_for_idle(Duration::from_millis(150), Duration::from_secs(2))?;
+    // Rapid PTY writes intentionally exercise paste-burst detection. Wait
+    // beyond its 120 ms trailing-Enter suppression window before submitting.
+    // Ambient ocean life keeps repainting even when the runtime is idle, so
+    // visual frame stability is not a valid readiness signal.
+    harness.wait_for_text(text, Duration::from_secs(3))?;
+    std::thread::sleep(PASTE_GUARD_SETTLE);
+    harness.pump();
     harness.send(keys::key::enter())?;
     Ok(())
 }
@@ -208,6 +229,162 @@ fn type_and_tab(harness: &mut Harness, text: &str) -> Result<()> {
     harness.send(keys::key::text(text))?;
     harness.wait_for_text(text, Duration::from_secs(3))?;
     harness.send(b"\t")?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn underwater_footer_moves_from_working_through_one_shot_completion() -> Result<()> {
+    let _guard = RELEASE_RUNTIME_QA_LOCK.lock().await;
+    let server = MockServer::start().await;
+    mount_models(&server, &[DEEPSEEK_TEST_MODEL]).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            sse_response(text_sse(DEEPSEEK_TEST_MODEL, "local phase proof"))
+                .set_delay(Duration::from_millis(850)),
+        )
+        .mount(&server)
+        .await;
+
+    let ws = make_sealed_workspace()?;
+    let mut tui = common_tui_builder(&ws)
+        .env("CODEWHALE_PROVIDER", "deepseek")
+        .env("DEEPSEEK_API_KEY", "deepseek-local-test-key")
+        .env("DEEPSEEK_BASE_URL", server.uri())
+        .env("DEEPSEEK_MODEL", DEEPSEEK_TEST_MODEL)
+        .spawn()?;
+    enter_launch_session(&mut tui)?;
+
+    type_and_submit(&mut tui, "show the underwater phase transition")?;
+    // TUI-DOG-008: live phases (working/finishing/done) render on the phase
+    // strip ABOVE the composer, so the bottom row is no longer the phase
+    // owner. Assert the phase words anywhere in the frame — the mock reply
+    // ("local phase proof") and the prompt contain none of them.
+    tui.wait_for(|frame| frame.contains("working"), INTERACTION_TIMEOUT)?;
+    tui.wait_for(
+        |frame| frame.contains("finishing") || frame.contains("✓ done"),
+        INTERACTION_TIMEOUT,
+    )?;
+    tui.wait_for(|frame| frame.contains("✓ done"), INTERACTION_TIMEOUT)?;
+
+    let _ = tui.shutdown();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn underwater_theme_picker_emits_each_live_palette_to_the_terminal() -> Result<()> {
+    let _guard = RELEASE_RUNTIME_QA_LOCK.lock().await;
+    let ws = make_sealed_workspace()?;
+    let mut tui = common_tui_builder(&ws)
+        .env("CODEWHALE_PROVIDER", "deepseek")
+        .env("DEEPSEEK_API_KEY", "deepseek-local-test-key")
+        .env("DEEPSEEK_BASE_URL", "http://127.0.0.1:1")
+        .env("DEEPSEEK_MODEL", DEEPSEEK_TEST_MODEL)
+        .env("COLORTERM", "truecolor")
+        .env("RUST_BACKTRACE", "1")
+        .spawn()?;
+    enter_launch_session(&mut tui)?;
+    // A bracketed paste plus trailing space makes this an explicit command
+    // invocation, outside both autocomplete and unbracketed burst handling.
+    tui.paste("/theme ")?;
+    tui.wait_for_text("/theme", Duration::from_secs(3))?;
+    std::thread::sleep(PASTE_GUARD_SETTLE);
+    tui.pump();
+    tui.send(keys::key::enter())?;
+    std::thread::sleep(Duration::from_millis(300));
+    tui.pump();
+    if let Some(status) = tui.wait_for_exit(Duration::from_millis(1)) {
+        let logs = std::fs::read_dir(ws.home().join(".codewhale/logs"))
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(anyhow!(
+            "theme picker process exited with {status}:\n{}\nlogs:\n{logs}",
+            tui.debug_dump(),
+        ));
+    }
+    if tui
+        .wait_for_text("Pick a theme", Duration::from_secs(1))
+        .is_err()
+    {
+        // A PTY can deliver the first Enter inside the paste guard's trailing
+        // suppression window. Once that window expires, the next deliberate
+        // Enter must execute the retained draft.
+        std::thread::sleep(PASTE_GUARD_SETTLE);
+        tui.pump();
+        tui.send(keys::key::enter())?;
+        tui.wait_for_text("Pick a theme", INTERACTION_TIMEOUT)?;
+    }
+
+    let labels = [
+        "System",
+        "Terminal",
+        "Blue Stage",
+        "Blue Stage Light",
+        "Grayscale",
+        "Catppuccin Mocha",
+        "Tokyo Night",
+        "Dracula",
+        "Gruvbox Dark",
+        "Claude",
+        "Matrix",
+        "Solarized Light",
+    ];
+    let mut previous_signature = None;
+    for (index, label) in labels.iter().enumerate() {
+        let selected = format!("▶ {}.", index + 1);
+        tui.wait_for(
+            |frame| frame.text().contains(&selected),
+            INTERACTION_TIMEOUT,
+        )?;
+        let frame = tui.frame();
+        let signature = (
+            frame.colors_at(0, 0).expect("theme surface cell"),
+            frame
+                .first_symbol_colors("▶")
+                .expect("selected theme pointer cell"),
+        );
+        assert!(
+            frame.text().contains(label),
+            "missing theme row {label}:\n{}",
+            frame.debug_dump()
+        );
+        if let Some(previous) = previous_signature {
+            assert_ne!(
+                signature,
+                previous,
+                "live ANSI palette did not change from {} to {label}",
+                labels[index - 1]
+            );
+        }
+        previous_signature = Some(signature);
+        if index + 1 < labels.len() {
+            tui.send(b"\x1b[B")?;
+            std::thread::sleep(Duration::from_millis(250));
+            tui.pump();
+            if let Some(status) = tui.wait_for_exit(Duration::from_millis(1)) {
+                let logs = std::fs::read_dir(ws.home().join(".codewhale/logs"))
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return Err(anyhow!(
+                    "theme preview exited with {status}:\n{}\nlogs:\n{logs}",
+                    tui.debug_dump()
+                ));
+            }
+        }
+    }
+
+    tui.send(b"\x1b")?;
+    let _ = tui.shutdown();
     Ok(())
 }
 
@@ -256,8 +433,8 @@ async fn release_multi_terminal_muse_and_gpt_routes_stay_isolated() -> Result<()
 
     let mut meta_tui = meta_builder.spawn()?;
     let mut openai_tui = openai_builder.spawn()?;
-    meta_tui.wait_for_text(COMPOSER_READY_TEXT, BOOT_TIMEOUT)?;
-    openai_tui.wait_for_text(COMPOSER_READY_TEXT, BOOT_TIMEOUT)?;
+    enter_launch_session(&mut meta_tui)?;
+    enter_launch_session(&mut openai_tui)?;
 
     // Change terminal B's model through the live command path while terminal A
     // remains open on Meta. Both processes share one sealed settings file.
@@ -361,19 +538,27 @@ async fn release_six_worker_fanout_keeps_typing_render_and_esc_cancel_live() -> 
         .env("DEEPSEEK_MODEL", DEEPSEEK_TEST_MODEL)
         .args(["--yolo", "--max-subagents", "6"])
         .spawn()?;
-    tui.wait_for_text(COMPOSER_READY_TEXT, BOOT_TIMEOUT)?;
+    enter_launch_session(&mut tui)?;
 
     type_and_submit(
         &mut tui,
         "launch six QA workers and keep the parent turn open",
     )?;
     wait_for_counter(&mut tui, &child_requests, 6, INTERACTION_TIMEOUT)?;
-    tui.wait_for_text("6 running / 6", Duration::from_secs(5))?;
+    tui.wait_for(
+        |frame| {
+            let text = frame.text();
+            text.matches("Agent ").count() >= 6
+                || text.matches("delegate scout [running]").count() >= 6
+        },
+        Duration::from_secs(5),
+    )?;
 
     let fanout_frame = tui.debug_dump();
     assert!(
-        fanout_frame.contains("6 running / 6"),
-        "all six workers were not visible in the sidebar:\n{fanout_frame}"
+        fanout_frame.matches("Agent ").count() >= 6
+            || fanout_frame.matches("delegate scout [running]").count() >= 6,
+        "all six workers were not visible in the live runtime projection:\n{fanout_frame}"
     );
 
     // The provider is deliberately holding every child open. Prove keyboard
@@ -401,6 +586,12 @@ async fn release_six_worker_fanout_keeps_typing_render_and_esc_cancel_live() -> 
         "Esc cancellation exceeded the five-second liveness budget"
     );
 
+    // Let the raw-key paste-burst window from the pre-cancel marker expire.
+    // Without this guard, the first character of the next marker can remain
+    // retained while cancellation repaints, making this a paste-heuristic
+    // race instead of the intended post-cancel composer-liveness assertion.
+    std::thread::sleep(PASTE_GUARD_SETTLE);
+    tui.pump();
     tui.send(keys::key::text("post-cancel-live"))?;
     tui.wait_for_text("post-cancel-live", Duration::from_secs(3))?;
     assert_eq!(child_requests.load(Ordering::SeqCst), 6);
@@ -419,21 +610,23 @@ impl Respond for SteeringResponder {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let body = request.body_json::<Value>().unwrap_or(Value::Null);
         let raw = body.to_string();
-        if raw.contains("queued steering from ctrl-s") {
+        if raw.contains("queued steering from ctrl-g") {
             self.steer_requests.fetch_add(1, Ordering::SeqCst);
             return sse_response(text_sse(DEEPSEEK_TEST_MODEL, "steering-applied"));
         }
         if raw.contains("initial slow turn") {
             self.initial_requests.fetch_add(1, Ordering::SeqCst);
             return sse_response(text_sse(DEEPSEEK_TEST_MODEL, "initial-turn-output"))
-                .set_delay(Duration::from_secs(3));
+                // Leave enough room for the real launch transition plus the
+                // queued-preview assertion on slower release-gate machines.
+                .set_delay(Duration::from_secs(8));
         }
         sse_response(text_sse(DEEPSEEK_TEST_MODEL, "unexpected-request"))
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn release_queued_steering_ctrl_s_sends_now_with_clear_status() -> Result<()> {
+async fn release_queued_steering_ctrl_g_sends_now_with_clear_status() -> Result<()> {
     let _guard = RELEASE_RUNTIME_QA_LOCK.lock().await;
     let server = MockServer::start().await;
     mount_models(&server, &[DEEPSEEK_TEST_MODEL]).await;
@@ -455,26 +648,30 @@ async fn release_queued_steering_ctrl_s_sends_now_with_clear_status() -> Result<
         .env("DEEPSEEK_BASE_URL", server.uri())
         .env("DEEPSEEK_MODEL", DEEPSEEK_TEST_MODEL)
         .spawn()?;
-    tui.wait_for_text(COMPOSER_READY_TEXT, BOOT_TIMEOUT)?;
+    enter_launch_session(&mut tui)?;
 
     type_and_submit(&mut tui, "initial slow turn")?;
-    wait_for_counter(&mut tui, &initial_requests, 1, Duration::from_secs(3))?;
+    // Use the same bounded interaction budget as the rest of this PTY gate.
+    // Cold debug binaries can take more than three seconds to reach the
+    // loopback server while release builds and workspace tests run in parallel.
+    // A dead engine still fails closed because the counter never advances.
+    wait_for_counter(&mut tui, &initial_requests, 1, INTERACTION_TIMEOUT)?;
 
-    type_and_tab(&mut tui, "queued steering from ctrl-s")?;
-    tui.wait_for_text("Ctrl+S send now", Duration::from_secs(5))?;
+    type_and_tab(&mut tui, "queued steering from ctrl-g")?;
+    tui.wait_for_text("Ctrl+G send", Duration::from_secs(5))?;
     assert!(
-        tui.frame().contains("queued steering from ctrl-s"),
+        tui.frame().contains("queued steering from ctrl-g"),
         "queued steering preview was not readable:\n{}",
         tui.debug_dump()
     );
 
     let steer_started = Instant::now();
-    tui.send(b"\x13")?;
+    tui.send(b"\x07")?;
     wait_for_counter(&mut tui, &steer_requests, 1, INTERACTION_TIMEOUT)?;
     tui.wait_for_text("steering-applied", INTERACTION_TIMEOUT)?;
     assert!(
         steer_started.elapsed() < Duration::from_secs(10),
-        "Ctrl+S steering was not incorporated promptly"
+        "Ctrl+G steering was not incorporated promptly"
     );
 
     let _ = tui.shutdown();
@@ -549,7 +746,7 @@ async fn release_bench_thirty_two_worker_fanout_stays_live() -> Result<()> {
         .env("DEEPSEEK_MODEL", DEEPSEEK_TEST_MODEL)
         .args(["--yolo", "--max-subagents", &WORKERS.to_string()])
         .spawn()?;
-    tui.wait_for_text(COMPOSER_READY_TEXT, BOOT_TIMEOUT)?;
+    enter_launch_session(&mut tui)?;
     let pid = tui.pid();
     let rss_idle = pid.and_then(rss_kib);
 
@@ -560,7 +757,18 @@ async fn release_bench_thirty_two_worker_fanout_stays_live() -> Result<()> {
     )?;
     wait_for_counter(&mut tui, &child_requests, WORKERS, Duration::from_secs(60))?;
     let all_children_live = spawn_started.elapsed();
-    tui.wait_for_text(&format!("{WORKERS} running"), Duration::from_secs(10))?;
+    // The Ocean work surface reports both the active count and the worker
+    // count in its compact summary. Do not couple this runtime benchmark to
+    // the retired sidebar phrase ("N running").
+    tui.wait_for(
+        |frame| {
+            let text = frame.text();
+            (text.contains(&format!("Active {WORKERS}"))
+                && text.contains(&format!("Workers {WORKERS}")))
+                || (text.contains(&format!("run ×{WORKERS}")) && text.contains("[open] [stop]"))
+        },
+        Duration::from_secs(10),
+    )?;
     let sidebar_visible = spawn_started.elapsed();
     let rss_storm = pid.and_then(rss_kib);
 

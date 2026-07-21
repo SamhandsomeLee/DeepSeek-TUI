@@ -604,7 +604,7 @@ fn legacy_binary_message(current_exe: &Path) -> String {
 this binary ({exe}) is using the legacy deepseek/deepseek-tui command name.
 
 The package has been renamed to `codewhale`. This update will install canonical
-CodeWhale binaries (`codewhale` and, when present, `codewhale-tui`) beside the
+Codewhale binaries (`codewhale` and, when present, `codewhale-tui`) beside the
 legacy command when the install directory is writable. DeepSeek provider support
 is unchanged.
 
@@ -1095,7 +1095,7 @@ fn release_tag_from_github_release_html(body: &str) -> Option<String> {
 
 fn fetch_latest_beta_release_from_url(url: &str, proxy: Option<&Proxy>) -> Result<Release> {
     let body = fetch_release_json(url, "release list", proxy)?;
-    // GitHub caps this endpoint at 100 releases per page. CodeWhale uses the
+    // GitHub caps this endpoint at 100 releases per page. Codewhale uses the
     // first page as the latest-beta search window, matching GitHub's ordering.
     let releases: Vec<Release> = serde_json::from_str(&body).with_context(|| {
         format!("failed to parse release list JSON from GitHub API. Response: {body}")
@@ -1308,7 +1308,7 @@ fn glibc_compatibility_message(
     };
     format!(
         "\
-Prebuilt CodeWhale asset `{asset_name}` requires GLIBC_{required}, but {host_line}
+Prebuilt Codewhale asset `{asset_name}` requires GLIBC_{required}, but {host_line}
 
 Official Linux release binaries are GNU libc builds. Ubuntu 22.04 ships glibc
 2.35, so it cannot run a binary that was built against Ubuntu 24.04/glibc 2.39.
@@ -2078,6 +2078,7 @@ mod tests {
             ("codewhale", "macos", "x86_64", "codewhale-macos-x64"),
             ("codewhale", "linux", "x86_64", "codewhale-linux-x64"),
             ("codewhale", "windows", "x86_64", "codewhale-windows-x64"),
+            ("codewhale", "windows", "aarch64", "codewhale-windows-arm64"),
             (
                 "codewhale-tui",
                 "macos",
@@ -2252,7 +2253,7 @@ mod tests {
             Some(GlibcVersion::new(2, 35, 0)),
         );
 
-        assert!(message.contains("Prebuilt CodeWhale asset `codewhale-linux-x64`"));
+        assert!(message.contains("Prebuilt Codewhale asset `codewhale-linux-x64`"));
         assert!(message.contains("requires GLIBC_2.39"));
         assert!(message.contains("this system has glibc 2.35"));
         assert!(message.contains("cargo install codewhale-cli --locked"));
@@ -2337,10 +2338,12 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
             { "name": "codewhale-macos-arm64",        "browser_download_url": "https://example.invalid/codewhale-macos-arm64" },
             { "name": "codewhale-windows-x64.exe",    "browser_download_url": "https://example.invalid/codewhale-windows-x64.exe" },
             { "name": "codewhale-windows-x64.exe.sha256", "browser_download_url": "https://example.invalid/codewhale-windows-x64.exe.sha256" },
+            { "name": "codewhale-windows-arm64.exe",  "browser_download_url": "https://example.invalid/codewhale-windows-arm64.exe" },
             { "name": "codewhale-tui-linux-x64",      "browser_download_url": "https://example.invalid/codewhale-tui-linux-x64" },
             { "name": "codewhale-tui-macos-x64",      "browser_download_url": "https://example.invalid/codewhale-tui-macos-x64" },
             { "name": "codewhale-tui-macos-arm64",    "browser_download_url": "https://example.invalid/codewhale-tui-macos-arm64" },
-            { "name": "codewhale-tui-windows-x64.exe","browser_download_url": "https://example.invalid/codewhale-tui-windows-x64.exe" }
+            { "name": "codewhale-tui-windows-x64.exe","browser_download_url": "https://example.invalid/codewhale-tui-windows-x64.exe" },
+            { "name": "codewhale-tui-windows-arm64.exe","browser_download_url": "https://example.invalid/codewhale-tui-windows-arm64.exe" }
           ]
         }"#;
         serde_json::from_str(json).expect("mock release JSON")
@@ -2354,6 +2357,7 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
             ("macos", "x86_64", "codewhale-macos-x64"),
             ("linux", "x86_64", "codewhale-linux-x64"),
             ("windows", "x86_64", "codewhale-windows-x64.exe"),
+            ("windows", "aarch64", "codewhale-windows-arm64.exe"),
         ];
 
         for (os, arch, expected) in cases {
@@ -2374,6 +2378,12 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
         );
         let asset = select_platform_asset(&release, &stem).expect("TUI platform asset");
         assert_eq!(asset.name, "codewhale-tui-macos-arm64");
+
+        let windows_stem =
+            release_asset_stem_for(Path::new("C:\\codewhale-tui.exe"), "windows", "aarch64");
+        let windows_asset =
+            select_platform_asset(&release, &windows_stem).expect("Windows ARM64 TUI asset");
+        assert_eq!(windows_asset.name, "codewhale-tui-windows-arm64.exe");
     }
 
     #[test]
@@ -2458,6 +2468,17 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
         assert!(
             select_platform_asset(&release, "codewhale-tui-windows-x64")
                 .is_some_and(|asset| asset.name == "codewhale-tui-windows-x64.exe")
+        );
+
+        let arm_release = release_from_mirror_base_url(
+            "https://mirror.example/releases/v0.9.1",
+            "v0.9.1",
+            "windows",
+            "aarch64",
+        );
+        assert!(
+            select_platform_asset(&arm_release, "codewhale-windows-arm64")
+                .is_some_and(|asset| asset.name == "codewhale-windows-arm64.exe")
         );
     }
 

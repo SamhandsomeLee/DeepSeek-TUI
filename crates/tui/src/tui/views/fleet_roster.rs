@@ -20,18 +20,19 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Padding, Paragraph, Widget, Wrap},
+    widgets::{Block, Clear, Paragraph, Widget, Wrap},
 };
 
 use crate::config::Config;
 use crate::fleet::profile::AgentProfile;
 use crate::fleet::roster::{FleetRoster, ProfileOrigin};
 use crate::fleet::worker_runtime::roster_member_agent_type;
+use crate::localization::{Locale, MessageId, tr};
 use crate::palette;
 use crate::tui::app::App;
 use crate::tui::views::{
-    ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, centered_modal_area,
-    render_modal_footer, render_modal_surface, truncate_view_text,
+    ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, render_modal_footer,
+    truncate_view_text,
 };
 use crate::worker_profile::{ShellPolicy, WorkerRuntimeProfile};
 
@@ -54,8 +55,13 @@ impl OperatorInfo {
         } else {
             app.model.clone()
         };
+        let provider = if app.api_provider == crate::config::ApiProvider::Custom {
+            app.provider_identity_for_persistence().to_string()
+        } else {
+            app.api_provider.display_name().to_string()
+        };
         Self {
-            provider: app.api_provider.display_name().to_string(),
+            provider,
             model,
             reasoning: app.reasoning_effort_display_label(),
         }
@@ -68,15 +74,19 @@ pub struct FleetRosterView {
     /// Selected row: 0 is the pinned operator row, members follow at 1..
     selected: usize,
     detail_scroll: usize,
+    /// UI locale captured from the app at construction (#4057 wave 2).
+    locale: Locale,
 }
 
 impl FleetRosterView {
     #[must_use]
     pub fn new(app: &App, config: &Config) -> Self {
-        Self::from_parts(
+        let mut view = Self::from_parts(
             OperatorInfo::from_app(app),
             FleetRoster::load(&config.fleet_config(), &app.workspace),
-        )
+        );
+        view.locale = app.ui_locale;
+        view
     }
 
     fn from_parts(operator: OperatorInfo, roster: FleetRoster) -> Self {
@@ -95,6 +105,7 @@ impl FleetRosterView {
                 .collect(),
             selected: 0,
             detail_scroll: 0,
+            locale: Locale::En,
         }
     }
 
@@ -128,6 +139,7 @@ impl FleetRosterView {
         vec![
             ActionHint::new("↑/↓", "select"),
             ActionHint::new("s/Enter", "setup"),
+            ActionHint::new("w", tr(self.locale, MessageId::FleetRosterWorkers)),
             ActionHint::new("PgUp/PgDn", "scroll detail"),
             ActionHint::new("Esc", "close"),
         ]
@@ -166,6 +178,9 @@ impl ModalView for FleetRosterView {
                     ViewAction::EmitAndClose(ViewEvent::FleetRosterOpenSetupRequested)
                 }
             }
+            KeyCode::Char('w') => {
+                ViewAction::EmitAndClose(ViewEvent::FleetRosterOpenWorkersRequested)
+            }
             KeyCode::Home => {
                 self.detail_scroll = 0;
                 ViewAction::None
@@ -183,51 +198,66 @@ impl ModalView for FleetRosterView {
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let popup_area = centered_modal_area(area, 100, 30, 60, 16);
-        render_modal_surface(area, popup_area, buf);
-
-        let block = Block::default()
-            .title(Line::from(Span::styled(
-                " Fleet — workers and orchestration ",
-                Style::default()
-                    .fg(palette::WHALE_ACCENT_PRIMARY)
-                    .add_modifier(Modifier::BOLD),
-            )))
-            .title_bottom(
-                Line::from(Span::styled(
-                    format!(" {} members ", self.members.len()),
-                    Style::default().fg(palette::TEXT_MUTED),
-                ))
-                .alignment(ratatui::layout::Alignment::Right),
-            )
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(palette::BORDER_COLOR))
+        Clear.render(area, buf);
+        Block::default()
             .style(Style::default().bg(palette::WHALE_BG))
-            .padding(Padding::uniform(1));
-
-        let inner = block.inner(popup_area);
-        block.render(popup_area, buf);
+            .render(area, buf);
 
         let hints = self.footer_hints();
-        let content = render_modal_footer(inner, buf, &hints);
+        let content = render_modal_footer(area, buf, &hints);
 
-        // Header (framing) above the roster body.
+        // Hairline shell shared with the HTML route/config/Fleet surfaces.
+        // This replaces the centered legacy card: Fleet is a product room,
+        // not a popup floating over an unrelated transcript.
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(2), Constraint::Min(1)])
+            .constraints([Constraint::Length(3), Constraint::Min(1)])
             .split(content);
         let header = vec![
-            Line::from(Span::styled(
-                "Worker readiness and status (Operate posture)",
-                Style::default().fg(palette::WHALE_INFO).bold(),
-            )),
-            Line::from(Span::styled(
-                "Built-ins < config [fleet.profiles] < project .codewhale/agents. s edits.",
-                Style::default().fg(palette::TEXT_MUTED),
-            )),
+            Line::from(vec![
+                Span::styled(
+                    format!("─ {} ", tr(self.locale, MessageId::FleetRosterHeaderLabel)),
+                    Style::default().fg(palette::WHALE_ACTION).bold(),
+                ),
+                Span::styled(
+                    "──────────────────────── ",
+                    Style::default().fg(palette::BORDER_COLOR),
+                ),
+                Span::styled(
+                    tr(self.locale, MessageId::FleetRosterTabRoster),
+                    Style::default().fg(palette::WHALE_INFO).bold(),
+                ),
+                Span::styled(
+                    format!(
+                        "  {}  {} ",
+                        tr(self.locale, MessageId::FleetRosterTabSetup),
+                        tr(self.locale, MessageId::FleetRosterWorkers)
+                    ),
+                    Style::default().fg(palette::TEXT_MUTED),
+                ),
+                Span::styled("─".repeat(24), Style::default().fg(palette::BORDER_COLOR)),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(
+                    format!(
+                        "  {}",
+                        tr(self.locale, MessageId::FleetRosterMembersCount)
+                            .replace("{count}", &(self.members.len() + 1).to_string())
+                    ),
+                    Style::default().fg(palette::TEXT_SECONDARY),
+                ),
+                Span::styled(
+                    format!(
+                        " · {}",
+                        tr(self.locale, MessageId::FleetRosterOperatorFirst)
+                    ),
+                    Style::default().fg(palette::TEXT_MUTED),
+                ),
+            ]),
         ];
         Paragraph::new(header)
-            .wrap(Wrap { trim: true })
+            .wrap(Wrap { trim: false })
             .render(chunks[0], buf);
 
         self.render_body(chunks[1], buf);
@@ -246,9 +276,13 @@ impl FleetRosterView {
         let (list_area, detail_area) = if area.width >= 56 {
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Length(28), Constraint::Min(20)])
+                .constraints([
+                    Constraint::Percentage(45),
+                    Constraint::Length(2),
+                    Constraint::Min(20),
+                ])
                 .split(area);
-            (cols[0], cols[1])
+            (cols[0], cols[2])
         } else {
             let list_height =
                 (self.row_count() as u16 + 1).min(area.height.saturating_sub(1).max(1));
@@ -274,18 +308,23 @@ impl FleetRosterView {
         let mut list_lines: Vec<Line> = Vec::with_capacity(visible_rows);
         for idx in first..(first + visible_rows).min(self.row_count()) {
             let is_selected = idx == self.selected;
-            let pointer = if is_selected { "> " } else { "  " };
+            let pointer = if is_selected { "▸ " } else { "  " };
             let (text, base_style) = if idx == 0 {
                 (
-                    format!("{pointer}operator  [session]"),
+                    format!(
+                        "{pointer}@ {}  {}",
+                        tr(self.locale, MessageId::FleetRosterOperatorRow),
+                        self.operator.model
+                    ),
                     Style::default()
-                        .fg(palette::WHALE_ACCENT_PRIMARY)
+                        .fg(palette::WHALE_ACTION)
                         .add_modifier(Modifier::BOLD),
                 )
             } else {
                 let member = &self.members[idx - 1];
+                let mark = member_role_mark(member);
                 (
-                    format!("{pointer}{}  [{}]", member.id, member.origin),
+                    format!("{pointer}{mark} {}  {}", member.id, member_routing(member)),
                     Style::default().fg(palette::TEXT_PRIMARY),
                 )
             };
@@ -329,6 +368,24 @@ impl FleetRosterView {
             .wrap(Wrap { trim: true })
             .scroll((scroll as u16, 0))
             .render(detail_area, buf);
+    }
+}
+
+fn member_role_mark(member: &AgentProfile) -> &'static str {
+    match member.id.as_str() {
+        "manager" | "scout" => crate::tui::glyphs::ROLE_MANAGER,
+        "builder" => crate::tui::glyphs::ROLE_BUILDER,
+        "reviewer" => crate::tui::glyphs::ROLE_REVIEWER,
+        "verifier" => crate::tui::glyphs::ROLE_VERIFIER,
+        "synthesizer" => crate::tui::glyphs::ROLE_SYNTHESIZER,
+        _ => match roster_member_agent_type(member).as_str() {
+            "scout" | "manager" => crate::tui::glyphs::ROLE_MANAGER,
+            "builder" => crate::tui::glyphs::ROLE_BUILDER,
+            "reviewer" => crate::tui::glyphs::ROLE_REVIEWER,
+            "verifier" => crate::tui::glyphs::ROLE_VERIFIER,
+            "synthesizer" => crate::tui::glyphs::ROLE_SYNTHESIZER,
+            _ => crate::tui::glyphs::NEUTRAL,
+        },
     }
 }
 
@@ -445,6 +502,9 @@ fn member_detail_lines(member: &AgentProfile) -> Vec<Line<'static>> {
                 ProfileOrigin::Workspace => {
                     format!("custom overlay ({})", member.source.display())
                 }
+                ProfileOrigin::Personal => {
+                    format!("personal overlay ({})", member.source.display())
+                }
                 _ => "custom overlay".to_string(),
             }
         } else {
@@ -512,6 +572,7 @@ mod tests {
             members,
             selected: 0,
             detail_scroll: 0,
+            locale: Locale::En,
         }
     }
 
@@ -535,6 +596,24 @@ mod tests {
             .collect()
     }
 
+    /// #4208: every role mark and control glyph on the roster — operator,
+    /// role shapes, selection arrows, scroll rails — must narrow to an
+    /// ASCII-safe alternative.
+    #[test]
+    fn fleet_roster_glyphs_all_have_ascii_alternatives() {
+        let rows = render_through_stack(view_with_overrides, 100, 30);
+        for ch in rows.join("\n").chars().filter(|ch| !ch.is_ascii()) {
+            let mut cell = ratatui::buffer::Cell::default();
+            cell.set_symbol(&ch.to_string());
+            crate::tui::color_compat::adapt_cell_symbol_for_ascii(&mut cell);
+            assert!(
+                cell.symbol().is_ascii(),
+                "fleet glyph {ch:?} (U+{:04X}) lacks an ASCII-safe alternative",
+                ch as u32
+            );
+        }
+    }
+
     #[test]
     fn operator_row_is_pinned_first_with_the_session_model() {
         let rows = render_through_stack(built_in_view, 100, 30);
@@ -553,7 +632,7 @@ mod tests {
             operator_row < first_member_row,
             "operator must render above the first member"
         );
-        assert!(text.contains("> operator"), "operator selected on open");
+        assert!(text.contains("▸ @ operator"), "operator selected on open");
         assert!(text.contains("deepseek-v4-pro"), "session model shown");
         assert!(text.contains("full session authority"), "{text}");
     }
@@ -611,6 +690,15 @@ mod tests {
     }
 
     #[test]
+    fn w_opens_the_live_workers_tab() {
+        let mut view = built_in_view();
+        assert!(matches!(
+            view.handle_key(key(KeyCode::Char('w'))),
+            ViewAction::EmitAndClose(ViewEvent::FleetRosterOpenWorkersRequested)
+        ));
+    }
+
+    #[test]
     fn esc_closes() {
         let mut view = built_in_view();
         assert!(matches!(
@@ -653,13 +741,14 @@ mod tests {
         );
         assert_eq!(member_routing(&reviewer), "inherit session route");
 
-        // Built-in scout: fast route preset is the routing truth.
+        // Built-in scout: no setup means the session route, just like every
+        // other built-in role.
         let scout = FleetRoster::built_ins_only().get("scout").unwrap().clone();
         assert_eq!(
             member_posture(&scout),
             "explore worker · read-only · shell read-only"
         );
-        assert_eq!(member_routing(&scout), "route preset fast");
+        assert_eq!(member_routing(&scout), "inherit session route");
 
         // Builder writes with full shell.
         let builder = FleetRoster::built_ins_only()
@@ -758,7 +847,7 @@ mod tests {
                 assert!(text.contains("close"), "{label} {w}x{h}: missing footer");
                 // The first impression names Fleet as the worker/orchestration surface.
                 assert!(
-                    text.contains("Fleet") && text.contains("workers"),
+                    text.contains("fleet") && text.contains("workers"),
                     "{label} {w}x{h}: missing framing"
                 );
                 // The selected row's detail is on screen.
@@ -791,6 +880,6 @@ mod tests {
             24,
         );
         let text = rows.join("\n");
-        assert!(text.contains("> general"), "{text}");
+        assert!(text.contains("▸ · general"), "{text}");
     }
 }

@@ -11,10 +11,10 @@ export async function generateMetadata({ params }: { params: Promise<{ locale: s
   return buildPageMetadata({
     path: "/install",
     locale,
-    title: isZh ? "安装 · CodeWhale" : "Install · CodeWhale",
+    title: isZh ? "安装 · Codewhale" : "Install · Codewhale",
     description: isZh
-      ? "一行 curl -fsSL https://codewhale.net/install.sh | sh 安装或更新 CodeWhale，也支持 npm、Cargo、GitHub Releases、CNB 镜像、Homebrew、预编译二进制、Docker 和源码编译。"
-      : "Install or update CodeWhale with curl -fsSL https://codewhale.net/install.sh | sh, or via npm, cargo, GitHub Releases, the CNB mirror, Homebrew, prebuilt binaries, Docker, or from source.",
+      ? "一行 curl -fsSL https://codewhale.net/install.sh | sh 安装或更新 Codewhale，也支持 npm、Cargo、GitHub Releases、CNB 镜像、Homebrew、预编译二进制、Docker 和源码编译。"
+      : "Install or update Codewhale with curl -fsSL https://codewhale.net/install.sh | sh, or via npm, cargo, GitHub Releases, the CNB mirror, Homebrew, prebuilt binaries, Docker, or from source.",
   });
 }
 
@@ -257,16 +257,23 @@ codewhale doctor`;
             <p className="mt-3 text-sm text-ink-soft leading-relaxed">
               {isZh ? (
                 <>
-                  默认 Plan 模式（只读调查）。按{" "}
+                  新会话默认以 Act 模式打开。输入区空闲时，按{" "}
                   <kbd className="font-mono text-xs px-1 hairline-t hairline-b hairline-l hairline-r">Tab</kbd>{" "}
-                  切换到 Agent 模式（执行工具，按需审批）。再按一次进入 YOLO 模式（自动批准）。
+                  循环 Plan → Act → Operate；按{" "}
+                  <kbd className="font-mono text-xs px-1 hairline-t hairline-b hairline-l hairline-r">Shift+Tab</kbd>{" "}
+                  循环 Ask → Auto-Review → Full Access 权限姿态。也可以运行{" "}
+                  <code className="inline">/mode</code> 选择模式或运行 <code className="inline">/config</code>{" "}
+                  查看权限。Plan 始终只读；Full Access 仅应用于你信任的工作区。
                 </>
               ) : (
                 <>
-                  Plan mode (read-only) is the default. Press{" "}
+                  New sessions open in Act mode by default. When the composer is idle, press{" "}
                   <kbd className="font-mono text-xs px-1 hairline-t hairline-b hairline-l hairline-r">Tab</kbd>{" "}
-                  to switch to Agent mode (tool execution, per-action approval). Press again for
-                  YOLO (auto-approve).
+                  to cycle Plan → Act → Operate; press{" "}
+                  <kbd className="font-mono text-xs px-1 hairline-t hairline-b hairline-l hairline-r">Shift+Tab</kbd>{" "}
+                  to cycle Ask → Auto-Review → Full Access permission postures. You can also run{" "}
+                  <code className="inline">/mode</code> to choose a mode or <code className="inline">/config</code>{" "}
+                  to inspect permissions. Plan stays read-only; use Full Access only in a workspace you trust.
                 </>
               )}
             </p>
@@ -286,8 +293,8 @@ codewhale doctor`;
           </h2>
           <p className="text-sm text-ink-soft max-w-2xl mb-10">
             {isZh
-              ? "如果上面的脚本路径不适合你，从下面找到匹配你情况的一条。每条都安装同一组 codewhale / codewhale-tui 二进制。"
-              : "If the script above doesn't fit your setup, pick the row that matches your situation. Every path installs the same codewhale / codewhale-tui binary pair."}
+              ? "如果上面的脚本路径不适合你，请从下面选择匹配你环境的方式。各渠道的命令和打包形式有所不同，说明会明确列出安装内容。"
+              : "If the script above doesn't fit your setup, choose the channel that matches your environment. Command availability and packaging differ by channel, and each description states exactly what it installs."}
           </p>
 
           <div className="space-y-10">
@@ -499,7 +506,7 @@ codewhale doctor`;
             {isZh ? (
               <>
                 <strong className="text-ink">codewhale.net</strong> 和{" "}
-                <strong className="text-ink">www.codewhale.net</strong> 是 CodeWhale 的官方站点，
+                <strong className="text-ink">www.codewhale.net</strong> 是 Codewhale 的官方站点，
                 部署在 Cloudflare 上。网站源码位于{" "}
                 <code className="inline">Hmbown/CodeWhale</code> 仓库的{" "}
                 <code className="inline">web/</code> 目录下，任何人都可自行部署为镜像。
@@ -507,7 +514,7 @@ codewhale doctor`;
             ) : (
               <>
                 <strong className="text-ink">codewhale.net</strong> and{" "}
-                <strong className="text-ink">www.codewhale.net</strong> are the official CodeWhale
+                <strong className="text-ink">www.codewhale.net</strong> are the official Codewhale
                 sites, deployed on Cloudflare. The website source lives under{" "}
                 <code className="inline">web/</code> in the{" "}
                 <code className="inline">Hmbown/CodeWhale</code> repository — anyone can
@@ -547,16 +554,16 @@ codewhale doctor`;
               <div className="eyebrow mb-1 text-indigo">{isZh ? "TUNA / 包镜像" : "TUNA / package mirrors"}</div>
               <p>
                 {isZh
-                  ? "Cargo 用户可通过 TUNA（清华大学开源镜像站）加速下载。这些镜像由第三方维护，CodeWhale 项目不控制镜像内容。"
-                  : "Cargo users can accelerate downloads via TUNA (Tsinghua University Open Source Mirror). These mirrors are maintained by third parties; the CodeWhale project does not control mirror content."}
+                  ? "Cargo 用户可通过 TUNA（清华大学开源镜像站）加速下载。这些镜像由第三方维护，Codewhale 项目不控制镜像内容。"
+                  : "Cargo users can accelerate downloads via TUNA (Tsinghua University Open Source Mirror). These mirrors are maintained by third parties; the Codewhale project does not control mirror content."}
               </p>
             </div>
             <div>
               <div className="eyebrow mb-1 text-indigo">{isZh ? "自行部署" : "Self-deployed"}</div>
               <p>
                 {isZh
-                  ? "自行部署的网站副本、镜像站和第三方包不受 CodeWhale 项目控制。请验证下载来源和校验和。"
-                  : "Self-deployed website copies, mirror sites, and third-party packages are not controlled by the CodeWhale project. Verify download sources and checksums."}
+                  ? "自行部署的网站副本、镜像站和第三方包不受 Codewhale 项目控制。请验证下载来源和校验和。"
+                  : "Self-deployed website copies, mirror sites, and third-party packages are not controlled by the Codewhale project. Verify download sources and checksums."}
               </p>
             </div>
           </div>

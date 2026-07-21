@@ -7,12 +7,60 @@ use crate::test_support::{EnvVarGuard, lock_test_env};
 use anyhow::{Context, bail};
 use futures_util::StreamExt;
 use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::sleep;
 use uuid::Uuid;
 
 struct MockExecutor;
+
+#[test]
+fn thread_route_credential_error_is_bad_request_not_not_found() {
+    let credential = map_thread_err(anyhow::anyhow!("DeepSeek API key not found"));
+    assert_eq!(credential.status, StatusCode::BAD_REQUEST);
+
+    let missing = map_thread_err(anyhow::anyhow!("thread 'thr_missing' not found"));
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+}
+
+#[test]
+fn runtime_tui_settings_reject_legacy_modes_and_do_not_save_env_overlays() -> Result<()> {
+    let _lock = lock_test_env();
+    let tmp = tempfile::tempdir()?;
+    let settings_dir = tmp.path().join(".codewhale");
+    fs::create_dir_all(&settings_dir)?;
+    fs::write(
+        settings_dir.join("settings.toml"),
+        "default_mode = \"plan\"\nlow_motion = false\nfancy_animations = true\nauto_compact = true\n",
+    )?;
+    let _config_path = EnvVarGuard::set(
+        "DEEPSEEK_CONFIG_PATH",
+        settings_dir.join("config.toml").as_os_str(),
+    );
+    let _no_animations = EnvVarGuard::set("NO_ANIMATIONS", "1");
+
+    for legacy in ["operate", "yolo"] {
+        let error = persist_runtime_tui_setting("default_mode", legacy)
+            .expect_err("legacy startup mode must be rejected");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(
+        crate::settings::Settings::load_persisted()?.default_mode,
+        "plan",
+        "a rejected write must leave the saved startup mode intact"
+    );
+
+    persist_runtime_tui_setting("default_mode", "agent")
+        .expect("agent should be a valid startup mode");
+    persist_runtime_tui_setting("auto_compact", "false").expect("strict boolean should persist");
+    let saved = crate::settings::Settings::load_persisted()?;
+    assert_eq!(saved.default_mode, "agent");
+    assert!(!saved.auto_compact);
+    assert!(!saved.low_motion, "NO_ANIMATIONS is runtime-only");
+    assert!(saved.fancy_animations, "NO_ANIMATIONS is runtime-only");
+    Ok(())
+}
 
 #[async_trait::async_trait]
 impl crate::task_manager::TaskExecutor for MockExecutor {
@@ -53,6 +101,7 @@ fn saved_session_with_blocks(blocks: Vec<crate::models::ContentBlock>) -> SavedS
             total_tokens: 0,
             model: "test-model".to_string(),
             model_provider: "deepseek".to_string(),
+            model_provider_id: None,
             workspace: PathBuf::from("."),
             mode: None,
             cost: Default::default(),
@@ -68,6 +117,7 @@ fn saved_session_with_blocks(blocks: Vec<crate::models::ContentBlock>) -> SavedS
         context_references: Vec::new(),
         artifacts: Vec::new(),
         work_state: None,
+        last_auto_route: None,
     }
 }
 
@@ -175,6 +225,8 @@ fn messages_from_thread_detail_batches_tool_results() {
         created_at: now,
         updated_at: now,
         model: DEFAULT_TEXT_MODEL.to_string(),
+        model_provider: None,
+        model_provider_id: None,
         workspace: PathBuf::from("."),
         mode: "agent".to_string(),
         allow_shell: false,
@@ -200,6 +252,8 @@ fn messages_from_thread_detail_batches_tool_results() {
         duration_ms: Some(0),
         usage: None,
         effective_provider: None,
+        effective_provider_id: None,
+        effective_billing_surface: None,
         effective_model: None,
         error: None,
         item_ids: vec![
@@ -292,6 +346,9 @@ fn messages_from_thread_detail_batches_tool_results() {
             ),
         ],
         latest_seq: 0,
+        pending_approvals: Vec::new(),
+        pending_user_inputs: Vec::new(),
+        pending_dynamic_tool_calls: Vec::new(),
     };
 
     let messages = messages_from_thread_detail(&detail);
@@ -334,6 +391,74 @@ fn messages_from_thread_detail_batches_tool_results() {
         }
         other => panic!("expected second tool result, got {other:?}"),
     }
+}
+
+#[test]
+fn legacy_exact_thread_export_normalizes_provider_kind_and_id() {
+    let now = Utc::now();
+    let detail = ThreadDetail {
+        thread: ThreadRecord {
+            schema_version: 2,
+            id: "thr_legacy_custom".to_string(),
+            created_at: now,
+            updated_at: now,
+            model: "local-model".to_string(),
+            // Pre-additive records overloaded this legacy field with the exact id.
+            model_provider: Some("lm-studio".to_string()),
+            model_provider_id: None,
+            workspace: PathBuf::from("."),
+            mode: "agent".to_string(),
+            allow_shell: false,
+            trust_mode: false,
+            auto_approve: false,
+            latest_turn_id: None,
+            latest_response_bookmark: None,
+            archived: false,
+            system_prompt: None,
+            task_id: None,
+            title: None,
+            session_id: None,
+        },
+        turns: Vec::new(),
+        items: Vec::new(),
+        latest_seq: 0,
+        pending_approvals: Vec::new(),
+        pending_user_inputs: Vec::new(),
+        pending_dynamic_tool_calls: Vec::new(),
+    };
+    let config = Config {
+        provider: Some("lm-studio".to_string()),
+        providers: Some(crate::config::ProvidersConfig {
+            custom: std::collections::HashMap::from([(
+                "lm-studio".to_string(),
+                crate::config::ProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    base_url: Some("http://127.0.0.1:1234/v1".to_string()),
+                    model: Some("local-model".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut session = crate::session_manager::create_saved_session_with_mode(
+        &[],
+        "local-model",
+        std::path::Path::new("."),
+        0,
+        None,
+        Some("agent"),
+    );
+
+    sessions::stamp_session_provider_from_thread(&config, &detail, &mut session.metadata)
+        .expect("normalize legacy exact provider");
+
+    assert_eq!(session.metadata.model_provider, "custom");
+    assert_eq!(
+        session.metadata.model_provider_id.as_deref(),
+        Some("lm-studio")
+    );
 }
 
 #[test]
@@ -483,8 +608,20 @@ async fn spawn_test_server_with_root_token_mobile_workspace(
         mobile_enabled,
         workspace,
         None,
+        None,
     )
     .await
+}
+
+#[derive(Default)]
+struct TestServerOverrides {
+    sub_agent_manager: Option<SharedSubAgentManager>,
+    fleet_codewhale_binary: Option<String>,
+    config_path: Option<PathBuf>,
+    config_profile: Option<String>,
+    web: Option<web::RuntimeWebState>,
+    compat_stream_test_hook: Option<mpsc::UnboundedSender<CompatStreamTestPoint>>,
+    plugin_discovery: Option<Arc<crate::plugins::PluginDiscoveryContext>>,
 }
 
 async fn spawn_test_server_with_root_token_mobile_workspace_and_subagents(
@@ -494,6 +631,7 @@ async fn spawn_test_server_with_root_token_mobile_workspace_and_subagents(
     mobile_enabled: bool,
     workspace: PathBuf,
     sub_agent_manager: Option<SharedSubAgentManager>,
+    fleet_codewhale_binary: Option<String>,
 ) -> Result<
     Option<(
         SocketAddr,
@@ -501,26 +639,28 @@ async fn spawn_test_server_with_root_token_mobile_workspace_and_subagents(
         tokio::task::JoinHandle<()>,
     )>,
 > {
-    spawn_test_server_with_root_token_mobile_workspace_subagents_and_config_path(
+    spawn_test_server_with_root_token_mobile_workspace_and_overrides(
         root,
         sessions_dir,
         runtime_token,
         mobile_enabled,
         workspace,
-        sub_agent_manager,
-        None,
+        TestServerOverrides {
+            sub_agent_manager,
+            fleet_codewhale_binary,
+            ..TestServerOverrides::default()
+        },
     )
     .await
 }
 
-async fn spawn_test_server_with_root_token_mobile_workspace_subagents_and_config_path(
+async fn spawn_test_server_with_root_token_mobile_workspace_and_overrides(
     root: PathBuf,
     sessions_dir: PathBuf,
     runtime_token: Option<String>,
     mobile_enabled: bool,
     workspace: PathBuf,
-    sub_agent_manager: Option<SharedSubAgentManager>,
-    config_path: Option<PathBuf>,
+    overrides: TestServerOverrides,
 ) -> Result<
     Option<(
         SocketAddr,
@@ -532,6 +672,11 @@ async fn spawn_test_server_with_root_token_mobile_workspace_subagents_and_config
     fs::create_dir_all(&sessions_dir)?;
     fs::create_dir_all(&workspace)?;
     let config = Config {
+        // Runtime-API tests that exercise a real turn boundary must pass the
+        // same synchronous client preflight as production. Keep the client
+        // hermetic; any later request fails fast against loopback.
+        api_key: Some("runtime-api-test-key".to_string()),
+        base_url: Some("http://127.0.0.1:1/v1".to_string()),
         mcp_config_path: Some(root.join("mcp.json").to_string_lossy().to_string()),
         ..Config::default()
     };
@@ -560,37 +705,51 @@ async fn spawn_test_server_with_root_token_mobile_workspace_subagents_and_config
     runtime_threads.attach_automation_manager(automations.clone());
 
     let auth_required = runtime_token.is_some();
-    let sub_agent_manager =
-        sub_agent_manager.unwrap_or_else(|| runtime_api_sub_agent_manager(&workspace, 2));
-    let state = RuntimeApiState {
-        config: Arc::new(parking_lot::RwLock::new(config)),
-        workspace,
-        task_manager: manager,
-        runtime_threads: runtime_threads.clone(),
-        cors_origins: Vec::new(),
-        sessions_dir,
-        config_path: config_path.clone(),
-        mcp_pool: Arc::new(Mutex::new(None)),
-        automations,
-        sub_agent_manager,
-        runtime_token,
-        skill_state: Arc::new(Mutex::new(
-            SkillStateStore::load_from(root.join("skills_state.toml")).unwrap_or_default(),
-        )),
-        auth_required,
-        bind_host: "127.0.0.1".to_string(),
-        bind_port: 0,
-        mobile_enabled,
-    };
-    let app = build_router(state);
+    let sub_agent_manager = overrides
+        .sub_agent_manager
+        .unwrap_or_else(|| runtime_api_sub_agent_manager(&workspace, 2));
     let listener = match TcpListener::bind("127.0.0.1:0").await {
         Ok(listener) => listener,
         Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return Ok(None),
         Err(err) => return Err(err.into()),
     };
     let addr = listener.local_addr()?;
+    let state = RuntimeApiState {
+        config: Arc::new(parking_lot::RwLock::new(config)),
+        workspace,
+        plugin_discovery: overrides
+            .plugin_discovery
+            .unwrap_or_else(crate::plugins::PluginDiscoveryContext::capture_pre_dotenv),
+        task_manager: manager,
+        runtime_threads: runtime_threads.clone(),
+        cors_origins: Vec::new(),
+        sessions_dir,
+        config_path: overrides.config_path.clone(),
+        config_profile: overrides.config_profile,
+        mcp_pool: Arc::new(Mutex::new(None)),
+        automations,
+        sub_agent_manager,
+        runtime_token,
+        skill_state: Arc::new(Mutex::new(
+            SkillStateStore::load_from(root.join("skills_state.toml")).unwrap(),
+        )),
+        auth_required,
+        bind_host: "127.0.0.1".to_string(),
+        bind_port: addr.port(),
+        mobile_enabled,
+        web: overrides.web,
+        fleet_codewhale_binary: overrides
+            .fleet_codewhale_binary
+            .unwrap_or_else(configured_codewhale_binary),
+        compat_stream_test_hook: overrides.compat_stream_test_hook,
+    };
+    let app = build_router(state);
     let handle = tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await;
     });
     Ok(Some((addr, runtime_threads, handle)))
 }
@@ -620,14 +779,45 @@ async fn spawn_test_server_with_config_path(
     let sessions_dir = root.join("sessions");
     let workspace = root.join("workspace");
     fs::create_dir_all(&root)?;
-    spawn_test_server_with_root_token_mobile_workspace_subagents_and_config_path(
+    spawn_test_server_with_root_token_mobile_workspace_and_overrides(
         root,
         sessions_dir,
         None,
         false,
         workspace,
+        TestServerOverrides {
+            config_path: Some(config_path),
+            ..TestServerOverrides::default()
+        },
+    )
+    .await
+}
+
+async fn spawn_test_server_with_config_path_and_profile(
+    config_path: PathBuf,
+    config_profile: String,
+) -> Result<
+    Option<(
+        SocketAddr,
+        SharedRuntimeThreadManager,
+        tokio::task::JoinHandle<()>,
+    )>,
+> {
+    let root = std::env::temp_dir().join(format!("codewhale-config-api-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&root)?;
+    spawn_test_server_with_root_token_mobile_workspace_and_overrides(
+        root,
+        sessions_dir,
         None,
-        Some(config_path),
+        false,
+        workspace,
+        TestServerOverrides {
+            config_path: Some(config_path),
+            config_profile: Some(config_profile),
+            ..TestServerOverrides::default()
+        },
     )
     .await
 }
@@ -651,6 +841,103 @@ async fn read_first_sse_frame(resp: reqwest::Response) -> Result<String> {
             bail!("SSE frame exceeded 64KB without delimiter");
         }
     }
+}
+
+fn take_complete_sse_frame(buffer: &mut Vec<u8>) -> Result<Option<String>> {
+    let text = String::from_utf8_lossy(buffer);
+    let lf = text.find("\n\n").map(|index| (index, 2));
+    let crlf = text.find("\r\n\r\n").map(|index| (index, 4));
+    let delimiter = match (lf, crlf) {
+        (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
+        (Some(found), None) | (None, Some(found)) => Some(found),
+        (None, None) => None,
+    };
+    let Some((index, delimiter_len)) = delimiter else {
+        return Ok(None);
+    };
+    let frame = String::from_utf8(buffer[..index].to_vec())?;
+    buffer.drain(..index + delimiter_len);
+    Ok(Some(frame))
+}
+
+async fn collect_sse_frames(
+    response: reqwest::Response,
+    frame_tx: mpsc::UnboundedSender<(String, serde_json::Value)>,
+) -> Result<Vec<(String, serde_json::Value)>> {
+    let mut stream = response.bytes_stream();
+    let mut buffer = Vec::new();
+    let mut frames = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        buffer.extend_from_slice(&chunk?);
+        while let Some(raw) = take_complete_sse_frame(&mut buffer)? {
+            if raw.trim().is_empty() || raw.trim_start().starts_with(':') {
+                continue;
+            }
+            let frame = parse_sse_frame(&raw)?;
+            frame_tx
+                .send(frame.clone())
+                .map_err(|_| anyhow::anyhow!("SSE frame observer closed"))?;
+            frames.push(frame);
+        }
+        if buffer.len() > 64 * 1024 {
+            bail!("SSE frame exceeded 64KB without delimiter");
+        }
+    }
+    Ok(frames)
+}
+
+#[cfg(unix)]
+fn write_fake_fleet_binary(root: &Path, marker: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let binary = root.join("fake-codewhale");
+    fs::write(
+        &binary,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nprintf '{{\"type\":\"content\",\"content\":\"restarted through Runtime API\"}}\\n'\nexit 0\n",
+            marker.display()
+        ),
+    )?;
+    let mut permissions = fs::metadata(&binary)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&binary, permissions)?;
+    Ok(binary)
+}
+
+#[cfg(windows)]
+fn write_fake_fleet_binary(root: &Path, marker: &Path) -> Result<PathBuf> {
+    // Exercise the same executable/Job Object path as a released Windows
+    // Codewhale binary. A `.cmd` fake introduces an extra `cmd.exe` wrapper
+    // whose lifetime can end before the Fleet host attaches its Job Object,
+    // making the test race a process topology production does not use.
+    let source = root.join("fake-codewhale.rs");
+    let binary = root.join("fake-codewhale.exe");
+    let helper = format!(
+        r##"fn main() {{
+    std::fs::File::create({marker:?}).expect("create Fleet restart marker");
+    println!("{{}}", r#"{{"type":"content","content":"restarted through Runtime API"}}"#);
+    std::thread::sleep(std::time::Duration::from_millis(750));
+}}
+"##,
+        marker = marker.to_string_lossy().as_ref(),
+    );
+    fs::write(&source, helper)?;
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let output = std::process::Command::new(rustc)
+        .arg("--edition=2024")
+        .arg("--crate-name=codewhale_fleet_test_helper")
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .context("compile Windows Fleet restart helper")?;
+    if !output.status.success() {
+        bail!(
+            "failed to compile Windows Fleet restart helper: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(binary)
 }
 
 fn parse_sse_frame(frame: &str) -> Result<(String, serde_json::Value)> {
@@ -937,6 +1224,158 @@ async fn runtime_token_guard_protects_v1_routes() -> Result<()> {
 }
 
 #[tokio::test]
+async fn web_bootstrap_sets_strict_cookie_once_and_preserves_v1_auth() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("codewhale-web-api-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let workspace = root.join("workspace");
+    let token = "cwrt_runtime_secret_never_in_browser_storage".to_string();
+    let (web, nonce) = web::RuntimeWebState::new();
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace_and_overrides(
+            root,
+            sessions_dir,
+            Some(token.clone()),
+            false,
+            workspace,
+            TestServerOverrides {
+                web: Some(web),
+                ..TestServerOverrides::default()
+            },
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client_builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+
+    let page = client.get(format!("http://{addr}/")).send().await?;
+    assert_eq!(page.status(), StatusCode::OK);
+    assert_eq!(
+        page.headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .and_then(|value| value.to_str().ok()),
+        Some(
+            "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'"
+        )
+    );
+    let page_body = page.text().await?;
+    assert!(!page_body.contains(&token));
+    assert!(!page_body.contains(&nonce));
+
+    let wrong = client
+        .get(format!(
+            "http://{addr}/__codewhale/bootstrap/cwwb_00000000000000000000000000000000"
+        ))
+        .send()
+        .await?;
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+    let exchange = client
+        .get(format!("http://{addr}/__codewhale/bootstrap/{nonce}"))
+        .send()
+        .await?;
+    assert_eq!(exchange.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        exchange
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("/")
+    );
+    let set_cookie = exchange
+        .headers()
+        .get(header::SET_COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .context("missing bootstrap Set-Cookie")?
+        .to_string();
+    assert!(set_cookie.starts_with("codewhale_web_session=cwws_"));
+    assert!(set_cookie.ends_with("; HttpOnly; SameSite=Strict; Path=/"));
+    assert!(!set_cookie.contains(&token));
+
+    let unauthorized = client
+        .get(format!("http://{addr}/v1/threads/summary"))
+        .send()
+        .await?;
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let cookie_pair = set_cookie
+        .split(';')
+        .next()
+        .context("missing web session cookie pair")?;
+    let authorized = client
+        .get(format!("http://{addr}/v1/threads/summary"))
+        .header(header::COOKIE, cookie_pair)
+        .send()
+        .await?;
+    assert_eq!(authorized.status(), StatusCode::OK);
+
+    let same_origin_cookie_post = client
+        .post(format!("http://{addr}/v1/threads"))
+        .header(header::COOKIE, cookie_pair)
+        .header(header::ORIGIN, format!("http://{addr}"))
+        .header("sec-fetch-site", "same-origin")
+        .json(&json!({}))
+        .send()
+        .await?;
+    assert_eq!(same_origin_cookie_post.status(), StatusCode::CREATED);
+
+    let cross_origin_cookie_post = client
+        .post(format!("http://{addr}/v1/threads"))
+        .header(header::COOKIE, cookie_pair)
+        .header(header::ORIGIN, "http://127.0.0.1:3000")
+        .header("sec-fetch-site", "same-site")
+        .json(&json!({}))
+        .send()
+        .await?;
+    assert_eq!(cross_origin_cookie_post.status(), StatusCode::UNAUTHORIZED);
+
+    let originless_cookie_post = client
+        .post(format!("http://{addr}/v1/threads"))
+        .header(header::COOKIE, cookie_pair)
+        .json(&json!({}))
+        .send()
+        .await?;
+    assert_eq!(originless_cookie_post.status(), StatusCode::UNAUTHORIZED);
+
+    let bearer_post = client
+        .post(format!("http://{addr}/v1/threads"))
+        .bearer_auth(&token)
+        .header(header::ORIGIN, "http://127.0.0.1:3000")
+        .json(&json!({}))
+        .send()
+        .await?;
+    assert_eq!(bearer_post.status(), StatusCode::CREATED);
+
+    let reused = client
+        .get(format!("http://{addr}/__codewhale/bootstrap/{nonce}"))
+        .send()
+        .await?;
+    assert_eq!(reused.status(), StatusCode::UNAUTHORIZED);
+
+    let mobile = client.get(format!("http://{addr}/mobile")).send().await?;
+    assert_eq!(mobile.status(), StatusCode::NOT_FOUND);
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn web_assets_are_absent_outside_web_mode() -> Result<()> {
+    let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    for path in ["/", "/assets/codewhale-web.css", "/assets/codewhale-web.js"] {
+        let response = client.get(format!("http://{addr}{path}")).send().await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "path={path}");
+    }
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_summary_includes_workspace_branch_metadata() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let root = tmp.path().join("runtime");
@@ -1214,6 +1653,8 @@ async fn fleet_status_runtime_api_exposes_state_and_actions() -> Result<()> {
         },
         1,
     )?;
+    let restarted_marker = root.join("restarted-worker-ran");
+    let fake_codewhale = write_fake_fleet_binary(&root, &restarted_marker)?;
     let worker_id = report.worker_ids[0].clone();
     let sessions_dir = root.join("sessions");
     let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, 2);
@@ -1247,6 +1688,7 @@ async fn fleet_status_runtime_api_exposes_state_and_actions() -> Result<()> {
             false,
             workspace,
             Some(sub_agent_manager),
+            Some(fake_codewhale.display().to_string()),
         )
         .await?
     else {
@@ -1304,7 +1746,47 @@ async fn fleet_status_runtime_api_exposes_state_and_actions() -> Result<()> {
         .json()
         .await?;
     assert_eq!(restarted["action"], "restart");
+    assert_eq!(restarted["execution"], "scheduled");
     assert_eq!(restarted["worker"]["status"], "busy");
+
+    let terminal_status = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let status = manager.run_status(&report.run_id).unwrap();
+            if status.queued == 0 && status.running == 0 {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("Runtime API restart never drove the replacement attempt to completion")?;
+    assert_eq!(
+        terminal_status.completed, 1,
+        "replacement attempt did not complete successfully: {terminal_status:?}"
+    );
+    assert_eq!(
+        terminal_status.failed, 0,
+        "replacement attempt failed: {terminal_status:?}"
+    );
+    assert!(
+        restarted_marker.is_file(),
+        "Runtime API reported a restart without launching its Fleet worker"
+    );
+    let ledger_state = manager.rebuild_state()?;
+    let restarted_task = ledger_state
+        .tasks
+        .values()
+        .find(|task| task.entry.run_id == report.run_id && task.entry.task_id == "task-a")
+        .context("missing restarted task")?;
+    assert_eq!(restarted_task.entry.attempts, 2);
+    assert_eq!(restarted_task.status, FleetTaskLedgerStatus::Completed);
+    let receipt = ledger_state
+        .receipts
+        .values()
+        .find(|receipt| receipt.run_id == report.run_id && receipt.task_id == "task-a")
+        .context("missing restarted receipt")?;
+    assert_eq!(receipt.attempt, Some(2));
+    assert!(receipt.terminal_seq.is_some());
 
     let stopped: serde_json::Value = client
         .post(format!(
@@ -1317,8 +1799,8 @@ async fn fleet_status_runtime_api_exposes_state_and_actions() -> Result<()> {
         .json()
         .await?;
     assert_eq!(stopped["action"], "stop");
-    assert_eq!(stopped["stopped"], 1);
-    assert_eq!(stopped["status"]["cancelled"], 1);
+    assert_eq!(stopped["stopped"], 0);
+    assert_eq!(stopped["status"]["completed"], 1);
 
     handle.abort();
     Ok(())
@@ -1541,6 +2023,562 @@ async fn stream_requires_prompt() -> Result<()> {
 }
 
 #[tokio::test]
+async fn compatibility_stream_closes_losslessly_across_replay_live_handoff() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().join("server");
+    let sessions_dir = root.join("sessions");
+    let workspace = root.join("workspace");
+    let (hook_tx, mut hook_rx) = mpsc::unbounded_channel();
+    let Some((addr, runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace_and_overrides(
+            root,
+            sessions_dir,
+            None,
+            false,
+            workspace,
+            TestServerOverrides {
+                compat_stream_test_hook: Some(hook_tx),
+                ..TestServerOverrides::default()
+            },
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+
+    let client = crate::tls::reqwest_client();
+    let stream_client = client.clone();
+    let stream_task = tokio::spawn(async move {
+        let response = stream_client
+            .post(format!("http://{addr}/v1/stream"))
+            .json(&json!({ "prompt": "cross the replay handoff" }))
+            .send()
+            .await?
+            .error_for_status()?;
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let body = response.text().await?;
+        Ok::<_, anyhow::Error>((content_type, body))
+    });
+
+    let created = tokio::time::timeout(Duration::from_secs(2), hook_rx.recv())
+        .await
+        .context("compatibility stream did not create its thread")?
+        .context("compatibility stream test hook closed")?;
+    let (thread_id, resume_created) = match created {
+        CompatStreamTestPoint::ThreadCreated { thread_id, resume } => (thread_id, resume),
+        CompatStreamTestPoint::SubscribedBeforeReplay { .. }
+        | CompatStreamTestPoint::ReplayLoaded { .. } => {
+            bail!("compatibility stream loaded replay before its thread was prepared")
+        }
+    };
+
+    let harness = crate::core::engine::mock_engine_handle();
+    runtime_threads
+        .install_test_engine(&thread_id, harness.handle.clone())
+        .await?;
+    let mut rx_op = harness.rx_op;
+    let tx_event = harness.tx_event;
+    let (release_overlap, wait_for_overlap_release) = oneshot::channel();
+    let (release_terminal, wait_for_terminal_release) = oneshot::channel();
+    let engine_task = tokio::spawn(async move {
+        if !matches!(rx_op.recv().await, Some(Op::SendMessage { .. })) {
+            return;
+        }
+        let _ = wait_for_overlap_release.await;
+        let _ = tx_event
+            .send(EngineEvent::TurnStarted {
+                turn_id: "mock_compat_handoff".to_string(),
+                created_at: chrono::Utc::now(),
+                route: None,
+            })
+            .await;
+        let _ = tx_event
+            .send(EngineEvent::MessageStarted { index: 0 })
+            .await;
+        let _ = tx_event
+            .send(EngineEvent::MessageDelta {
+                index: 0,
+                content: "handoff".to_string(),
+            })
+            .await;
+        let _ = wait_for_terminal_release.await;
+        let _ = tx_event
+            .send(EngineEvent::MessageComplete { index: 0 })
+            .await;
+        let _ = tx_event
+            .send(EngineEvent::TurnComplete {
+                usage: Usage {
+                    input_tokens: 3,
+                    output_tokens: 1,
+                    ..Usage::default()
+                },
+                status: TurnOutcomeStatus::Completed,
+                error: None,
+                tool_catalog: None,
+                base_url: None,
+            })
+            .await;
+    });
+    resume_created
+        .send(())
+        .map_err(|_| anyhow::anyhow!("compatibility stream dropped thread-create handoff"))?;
+
+    let subscribed = tokio::time::timeout(Duration::from_secs(2), hook_rx.recv())
+        .await
+        .context("compatibility stream did not subscribe before replay")?
+        .context("compatibility stream test hook closed")?;
+    let (subscribed_thread_id, subscribed_turn_id, resume_subscribed) = match subscribed {
+        CompatStreamTestPoint::SubscribedBeforeReplay {
+            thread_id,
+            turn_id,
+            resume,
+        } => (thread_id, turn_id, resume),
+        CompatStreamTestPoint::ThreadCreated { .. }
+        | CompatStreamTestPoint::ReplayLoaded { .. } => {
+            bail!("compatibility stream did not expose its subscribe-before-replay boundary")
+        }
+    };
+    assert_eq!(subscribed_thread_id, thread_id);
+
+    release_overlap
+        .send(())
+        .map_err(|_| anyhow::anyhow!("mock engine dropped overlap release"))?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if runtime_threads
+                .events_since(&thread_id, None)
+                .is_ok_and(|events| {
+                    events.iter().any(|event| {
+                        event.turn_id.as_deref() == Some(&subscribed_turn_id)
+                            && event.event == "item.delta"
+                    })
+                })
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("overlap event was not persisted before compatibility replay")?;
+    resume_subscribed
+        .send(())
+        .map_err(|_| anyhow::anyhow!("compatibility stream dropped subscribe handoff"))?;
+
+    let replay_loaded = tokio::time::timeout(Duration::from_secs(2), hook_rx.recv())
+        .await
+        .context("compatibility stream did not reach its replay/live handoff")?
+        .context("compatibility stream test hook closed")?;
+    let (replay_thread_id, turn_id, resume_replay) = match replay_loaded {
+        CompatStreamTestPoint::ReplayLoaded {
+            thread_id,
+            turn_id,
+            resume,
+        } => (thread_id, turn_id, resume),
+        CompatStreamTestPoint::ThreadCreated { .. }
+        | CompatStreamTestPoint::SubscribedBeforeReplay { .. } => {
+            bail!("compatibility stream created more than one thread")
+        }
+    };
+    assert_eq!(replay_thread_id, thread_id);
+    assert_eq!(turn_id, subscribed_turn_id);
+
+    release_terminal
+        .send(())
+        .map_err(|_| anyhow::anyhow!("mock engine dropped terminal release"))?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if runtime_threads
+                .events_since(&thread_id, None)
+                .is_ok_and(|events| {
+                    events.iter().any(|event| {
+                        event.turn_id.as_deref() == Some(&turn_id)
+                            && event.event == "turn.completed"
+                    })
+                })
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("terminal event was not persisted during compatibility handoff")?;
+    resume_replay
+        .send(())
+        .map_err(|_| anyhow::anyhow!("compatibility stream dropped replay handoff"))?;
+
+    let (content_type, body) = tokio::time::timeout(Duration::from_secs(3), stream_task)
+        .await
+        .context("compatibility stream hung after its terminal event")?
+        .context("compatibility stream request task panicked")??;
+    engine_task.await.context("mock engine task panicked")?;
+
+    assert!(content_type.starts_with("text/event-stream"));
+    assert_eq!(body.matches("event: message.delta").count(), 1, "{body}");
+    assert_eq!(body.matches("event: turn.completed").count(), 1, "{body}");
+    assert_eq!(body.matches("event: done").count(), 1, "{body}");
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn compatibility_stream_exposes_and_resolves_user_input_without_answer_echo() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().join("server");
+    let sessions_dir = root.join("sessions");
+    let workspace = root.join("workspace");
+    let (hook_tx, mut hook_rx) = mpsc::unbounded_channel();
+    let Some((addr, runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace_and_overrides(
+            root.clone(),
+            sessions_dir,
+            None,
+            false,
+            workspace,
+            TestServerOverrides {
+                compat_stream_test_hook: Some(hook_tx),
+                ..TestServerOverrides::default()
+            },
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+
+    let client = crate::tls::reqwest_client();
+    let stream_client = client.clone();
+    let request_task = tokio::spawn(async move {
+        let response = stream_client
+            .post(format!("http://{addr}/v1/stream"))
+            .json(&json!({ "prompt": "ask before continuing" }))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok::<_, anyhow::Error>(response)
+    });
+
+    let created = tokio::time::timeout(Duration::from_secs(2), hook_rx.recv())
+        .await
+        .context("compatibility stream did not create its interaction thread")?
+        .context("compatibility stream interaction hook closed")?;
+    let (thread_id, resume_created) = match created {
+        CompatStreamTestPoint::ThreadCreated { thread_id, resume } => (thread_id, resume),
+        CompatStreamTestPoint::SubscribedBeforeReplay { .. }
+        | CompatStreamTestPoint::ReplayLoaded { .. } => {
+            bail!("compatibility interaction stream advanced before engine installation")
+        }
+    };
+
+    let mut harness = crate::core::engine::mock_engine_handle();
+    runtime_threads
+        .install_test_engine(&thread_id, harness.handle.clone())
+        .await?;
+    let (submission_tx, submission_rx) = oneshot::channel();
+    let (release_completion, wait_for_completion_release) = oneshot::channel();
+    let engine_task = tokio::spawn(async move {
+        if !matches!(harness.rx_op.recv().await, Some(Op::SendMessage { .. })) {
+            bail!("compatibility interaction engine did not receive a prompt");
+        }
+        harness
+            .tx_event
+            .send(EngineEvent::TurnStarted {
+                turn_id: "mock_compat_input".to_string(),
+                created_at: chrono::Utc::now(),
+                route: None,
+            })
+            .await?;
+        let request = crate::tools::user_input::UserInputRequest {
+            questions: vec![crate::tools::user_input::UserInputQuestion {
+                header: "Continue".to_string(),
+                id: "choice".to_string(),
+                question: "Continue the compatibility turn?".to_string(),
+                options: vec![
+                    crate::tools::user_input::UserInputOption {
+                        label: "Continue".to_string(),
+                        description: "Finish the turn".to_string(),
+                    },
+                    crate::tools::user_input::UserInputOption {
+                        label: "Stop".to_string(),
+                        description: "Cancel the turn".to_string(),
+                    },
+                ],
+                allow_free_text: false,
+                multi_select: false,
+            }],
+        };
+        harness
+            .tx_event
+            .send(EngineEvent::ToolCallStarted {
+                id: "input_compat".to_string(),
+                name: "request_user_input".to_string(),
+                input: serde_json::to_value(&request)?,
+            })
+            .await?;
+        harness
+            .tx_event
+            .send(EngineEvent::UserInputRequired {
+                id: "input_compat".to_string(),
+                request,
+            })
+            .await?;
+        let submission = harness.recv_user_input_submission().await;
+        let tool_result = submission
+            .as_ref()
+            .map(|(_, response)| crate::tools::spec::ToolResult::json(response))
+            .transpose()?
+            .context("compatibility user input was canceled before tool completion")?;
+        let _ = submission_tx.send(submission);
+        wait_for_completion_release
+            .await
+            .context("compatibility interaction test dropped completion release")?;
+        harness
+            .tx_event
+            .send(EngineEvent::ToolCallComplete {
+                id: "input_compat".to_string(),
+                name: "request_user_input".to_string(),
+                result: Ok(tool_result),
+            })
+            .await?;
+        harness
+            .tx_event
+            .send(EngineEvent::MessageStarted { index: 0 })
+            .await?;
+        harness
+            .tx_event
+            .send(EngineEvent::MessageDelta {
+                index: 0,
+                content: "continued".to_string(),
+            })
+            .await?;
+        harness
+            .tx_event
+            .send(EngineEvent::MessageComplete { index: 0 })
+            .await?;
+        harness
+            .tx_event
+            .send(EngineEvent::TurnComplete {
+                usage: Usage::default(),
+                status: TurnOutcomeStatus::Completed,
+                error: None,
+                tool_catalog: None,
+                base_url: None,
+            })
+            .await?;
+        Ok::<_, anyhow::Error>(())
+    });
+    resume_created
+        .send(())
+        .map_err(|_| anyhow::anyhow!("compatibility interaction stream dropped create hook"))?;
+
+    let subscribed = tokio::time::timeout(Duration::from_secs(2), hook_rx.recv())
+        .await
+        .context("compatibility interaction stream did not subscribe")?
+        .context("compatibility stream interaction hook closed")?;
+    let (subscribed_thread_id, turn_id, resume_subscribed) = match subscribed {
+        CompatStreamTestPoint::SubscribedBeforeReplay {
+            thread_id,
+            turn_id,
+            resume,
+        } => (thread_id, turn_id, resume),
+        CompatStreamTestPoint::ThreadCreated { .. }
+        | CompatStreamTestPoint::ReplayLoaded { .. } => {
+            bail!("compatibility interaction stream missed subscribe-before-replay hook")
+        }
+    };
+    assert_eq!(subscribed_thread_id, thread_id);
+    resume_subscribed
+        .send(())
+        .map_err(|_| anyhow::anyhow!("compatibility interaction stream dropped subscribe hook"))?;
+
+    let replay_loaded = tokio::time::timeout(Duration::from_secs(2), hook_rx.recv())
+        .await
+        .context("compatibility interaction stream did not load replay")?
+        .context("compatibility stream interaction hook closed")?;
+    let (replay_thread_id, replay_turn_id, resume_replay) = match replay_loaded {
+        CompatStreamTestPoint::ReplayLoaded {
+            thread_id,
+            turn_id,
+            resume,
+        } => (thread_id, turn_id, resume),
+        CompatStreamTestPoint::ThreadCreated { .. }
+        | CompatStreamTestPoint::SubscribedBeforeReplay { .. } => {
+            bail!("compatibility interaction stream missed replay-loaded hook")
+        }
+    };
+    assert_eq!(replay_thread_id, thread_id);
+    assert_eq!(replay_turn_id, turn_id);
+    resume_replay
+        .send(())
+        .map_err(|_| anyhow::anyhow!("compatibility interaction stream dropped replay hook"))?;
+
+    let response = tokio::time::timeout(Duration::from_secs(2), request_task)
+        .await
+        .context("compatibility interaction request did not return SSE headers")?
+        .context("compatibility interaction request task panicked")??;
+    let (frame_tx, mut frame_rx) = mpsc::unbounded_channel();
+    let body_task = tokio::spawn(collect_sse_frames(response, frame_tx));
+
+    let required_payload = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let (event, payload) = frame_rx
+                .recv()
+                .await
+                .context("compatibility interaction stream ended before user input")?;
+            if event == "user_input.required" {
+                break Ok::<_, anyhow::Error>(payload);
+            }
+        }
+    })
+    .await
+    .context("compatibility stream did not expose required user input")??;
+    assert_eq!(required_payload["id"], "input_compat");
+    assert_eq!(required_payload["input_id"], "input_compat");
+    assert_eq!(required_payload["thread_id"], thread_id);
+    assert_eq!(required_payload["turn_id"], turn_id);
+    assert_eq!(required_payload["status"], "required");
+    assert_eq!(required_payload["request"]["questions"][0]["id"], "choice");
+    assert!(required_payload.get("answers").is_none());
+
+    const SECRET_ANSWER: &str = "compat-answer-must-not-be-echoed";
+    let submitted: serde_json::Value = client
+        .post(format!(
+            "http://{addr}/v1/user-input/{thread_id}/input_compat"
+        ))
+        .json(&json!({
+            "answers": [{
+                "id": "choice",
+                "label": "Continue",
+                "value": SECRET_ANSWER,
+            }],
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(submitted["delivered"], true);
+    let (submitted_id, submitted_response) =
+        tokio::time::timeout(Duration::from_secs(2), submission_rx)
+            .await
+            .context("mock engine did not receive compatibility user input")?
+            .context("mock engine dropped compatibility user input")?
+            .context("compatibility user input was canceled instead of submitted")?;
+    assert_eq!(submitted_id, "input_compat");
+    assert_eq!(submitted_response.answers[0].value, SECRET_ANSWER);
+    release_completion
+        .send(())
+        .map_err(|_| anyhow::anyhow!("mock interaction engine dropped completion release"))?;
+
+    let frames = tokio::time::timeout(Duration::from_secs(3), body_task)
+        .await
+        .context("compatibility interaction stream did not terminate")?
+        .context("compatibility interaction body task panicked")??;
+    engine_task
+        .await
+        .context("compatibility interaction engine task panicked")??;
+
+    let answered = frames
+        .iter()
+        .find(|(event, _)| event == "user_input.answered")
+        .context("compatibility stream omitted submitted user-input lifecycle")?;
+    assert_eq!(answered.1["id"], "input_compat");
+    assert_eq!(answered.1["status"], "submitted");
+    assert!(answered.1.get("answers").is_none());
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|(event, _)| event == "user_input.required")
+            .count(),
+        1
+    );
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|(event, _)| event == "user_input.answered")
+            .count(),
+        1
+    );
+    assert!(
+        !frames
+            .iter()
+            .any(|(event, _)| event == "user_input.canceled")
+    );
+    assert!(frames.iter().any(|(event, _)| event == "turn.completed"));
+    assert_eq!(
+        frames.iter().filter(|(event, _)| event == "done").count(),
+        1
+    );
+    assert!(
+        !serde_json::to_string(&frames)?.contains(SECRET_ANSWER),
+        "submitted answer leaked into compatibility SSE"
+    );
+    let detail = runtime_threads.get_thread_detail(&thread_id).await?;
+    let serialized_detail = serde_json::to_string(&detail)?;
+    assert!(
+        !serialized_detail.contains(SECRET_ANSWER),
+        "submitted answer leaked into the thread snapshot"
+    );
+    let redacted_item = detail
+        .items
+        .iter()
+        .find(|item| {
+            item.metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("tool_name"))
+                .and_then(Value::as_str)
+                == Some("request_user_input")
+        })
+        .context("request_user_input Runtime receipt was not persisted")?;
+    assert_eq!(
+        redacted_item.detail.as_deref(),
+        Some("User input submitted")
+    );
+    assert_eq!(
+        redacted_item
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("response_redacted"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    let durable_events = runtime_threads.events_since(&thread_id, None)?;
+    assert!(
+        !serde_json::to_string(&durable_events)?.contains(SECRET_ANSWER),
+        "submitted answer leaked into the durable Runtime event log"
+    );
+    let leaked_file = ignore::WalkBuilder::new(root.join("runtime"))
+        .hidden(false)
+        .build()
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+        .find_map(|entry| {
+            fs::read_to_string(entry.path())
+                .ok()
+                .filter(|contents| contents.contains(SECRET_ANSWER))
+                .map(|_| entry.path().to_path_buf())
+        });
+    assert!(
+        leaked_file.is_none(),
+        "submitted answer leaked into Runtime file {}",
+        leaked_file
+            .as_deref()
+            .map(std::path::Path::display)
+            .map(|path| path.to_string())
+            .unwrap_or_default()
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_endpoints_expose_lifecycle_contract() -> Result<()> {
     let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
         return Ok(());
@@ -1667,6 +2705,8 @@ async fn thread_endpoints_expose_lifecycle_contract() -> Result<()> {
                     let _ = tx_event
                         .send(EngineEvent::TurnStarted {
                             turn_id: "mock_lifecycle".to_string(),
+                            created_at: chrono::Utc::now(),
+                            route: None,
                         })
                         .await;
                     let _ = tx_event
@@ -1695,7 +2735,7 @@ async fn thread_endpoints_expose_lifecycle_contract() -> Result<()> {
                         })
                         .await;
                 }
-                Op::CompactContext => {
+                Op::CompactContext { .. } => {
                     let _ = tx_event
                         .send(EngineEvent::TurnComplete {
                             usage: Usage {
@@ -1841,6 +2881,8 @@ async fn events_endpoint_respects_since_seq_cursor() -> Result<()> {
         let _ = tx_event
             .send(EngineEvent::TurnStarted {
                 turn_id: "mock_cursor".to_string(),
+                created_at: chrono::Utc::now(),
+                route: None,
             })
             .await;
         let _ = tx_event
@@ -1929,6 +2971,94 @@ async fn events_endpoint_respects_since_seq_cursor() -> Result<()> {
 }
 
 #[tokio::test]
+async fn event_handoff_replays_and_dedupes_interaction_prompts_without_a_gap() -> Result<()> {
+    let Some((_addr, runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let initial_seq = runtime_threads
+        .events_since(&thread.id, None)?
+        .last()
+        .context("thread creation should emit an event")?
+        .seq;
+
+    // Deterministically place approval.required in the old vulnerable window:
+    // the receiver exists, but durable replay has not been read yet.
+    let live = runtime_threads.subscribe_events();
+    let approval = runtime_threads
+        .emit_event_for_test(
+            &thread.id,
+            None,
+            "approval.required",
+            json!({
+                "approval_id": "approval-handoff",
+                "tool_name": "exec_command",
+                "description": "Run a local check",
+            }),
+        )
+        .await?;
+    let backlog = runtime_threads.events_since(&thread.id, Some(initial_seq))?;
+    let (backlog_tx, backlog_rx) = mpsc::channel(1);
+    backlog_tx
+        .send(Ok(backlog))
+        .await
+        .map_err(|_| anyhow::anyhow!("failed to seed replay backlog"))?;
+    drop(backlog_tx);
+
+    // This request lands after the replay read and is therefore live-only.
+    let input = runtime_threads
+        .emit_event_for_test(
+            &thread.id,
+            None,
+            "user_input.required",
+            json!({
+                "id": "input-handoff",
+                "request": {
+                    "questions": [{
+                        "id": "choice",
+                        "question": "Continue?",
+                        "options": [],
+                    }],
+                },
+            }),
+        )
+        .await?;
+
+    let stream = replay_live_thread_events(
+        runtime_threads.clone(),
+        thread.id.clone(),
+        initial_seq,
+        backlog_rx,
+        live,
+    )
+    .take(2);
+    let body =
+        axum::body::to_bytes(Sse::new(stream).into_response().into_body(), usize::MAX).await?;
+    let rendered = String::from_utf8(body.to_vec())?;
+    let frames = rendered
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|frame| !frame.is_empty())
+        .map(parse_sse_frame)
+        .collect::<Result<Vec<_>>>()?;
+
+    assert_eq!(frames.len(), 2, "unexpected SSE frames: {rendered}");
+    assert_eq!(frames[0].0, "approval.required");
+    assert_eq!(frames[0].1["seq"], approval.seq);
+    assert_eq!(frames[0].1["previous_seq"], initial_seq);
+    assert_eq!(frames[1].0, "user_input.required");
+    assert_eq!(frames[1].1["seq"], input.seq);
+    assert_eq!(frames[1].1["previous_seq"], approval.seq);
+    assert_eq!(rendered.matches("approval-handoff").count(), 1);
+    assert_eq!(rendered.matches("input-handoff").count(), 1);
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn steer_and_interrupt_endpoints_work_on_active_turn() -> Result<()> {
     let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
         return Ok(());
@@ -1963,6 +3093,8 @@ async fn steer_and_interrupt_endpoints_work_on_active_turn() -> Result<()> {
         let _ = tx_event
             .send(EngineEvent::TurnStarted {
                 turn_id: "engine_turn_api".to_string(),
+                created_at: chrono::Utc::now(),
+                route: None,
             })
             .await;
         let _ = tx_event
@@ -2129,9 +3261,148 @@ async fn stream_compat_mapping_handles_expected_runtime_events() -> Result<()> {
     assert!(text.contains("event: tool.completed"));
     assert!(text.contains("\"success\":true"));
 
-    let unknown = RuntimeEventRecord {
+    let user_input_required = RuntimeEventRecord {
         schema_version: 1,
         seq: 4,
+        timestamp: chrono::Utc::now(),
+        thread_id: "thr_test".to_string(),
+        turn_id: Some("turn_test".to_string()),
+        item_id: None,
+        event: "user_input.required".to_string(),
+        payload: json!({
+            "id": "input_test",
+            "request": {
+                "questions": [{
+                    "header": "Continue",
+                    "id": "choice",
+                    "question": "Continue?",
+                    "options": [
+                        { "label": "Yes", "description": "Continue" },
+                        { "label": "No", "description": "Stop" }
+                    ]
+                }]
+            },
+            "internal_secret": "required-secret",
+        }),
+    };
+    let mapped = map_compat_stream_event(&user_input_required)
+        .context("missing user_input.required event")?;
+    let stream = async_stream::stream! {
+        yield Ok::<_, Infallible>(mapped);
+    };
+    let body =
+        axum::body::to_bytes(Sse::new(stream).into_response().into_body(), usize::MAX).await?;
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("event: user_input.required"));
+    assert!(text.contains("\"input_id\":\"input_test\""));
+    assert!(text.contains("\"status\":\"required\""));
+    assert!(!text.contains("required-secret"));
+
+    let user_input_answered = RuntimeEventRecord {
+        schema_version: 1,
+        seq: 5,
+        timestamp: chrono::Utc::now(),
+        thread_id: "thr_test".to_string(),
+        turn_id: Some("turn_test".to_string()),
+        item_id: None,
+        event: "user_input.answered".to_string(),
+        payload: json!({
+            "input_id": "input_test",
+            "answers": [{ "id": "choice", "value": "answer-secret" }],
+        }),
+    };
+    let mapped = map_compat_stream_event(&user_input_answered)
+        .context("missing user_input.answered event")?;
+    let stream = async_stream::stream! {
+        yield Ok::<_, Infallible>(mapped);
+    };
+    let body =
+        axum::body::to_bytes(Sse::new(stream).into_response().into_body(), usize::MAX).await?;
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("event: user_input.answered"));
+    assert!(text.contains("\"status\":\"submitted\""));
+    assert!(!text.contains("answer-secret"));
+    assert!(!text.contains("\"answers\""));
+
+    let user_input_canceled = RuntimeEventRecord {
+        schema_version: 1,
+        seq: 6,
+        timestamp: chrono::Utc::now(),
+        thread_id: "thr_test".to_string(),
+        turn_id: Some("turn_test".to_string()),
+        item_id: None,
+        event: "user_input.canceled".to_string(),
+        payload: json!({ "id": "input_test", "terminal": true }),
+    };
+    let mapped = map_compat_stream_event(&user_input_canceled)
+        .context("missing user_input.canceled event")?;
+    let stream = async_stream::stream! {
+        yield Ok::<_, Infallible>(mapped);
+    };
+    let body =
+        axum::body::to_bytes(Sse::new(stream).into_response().into_body(), usize::MAX).await?;
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("event: user_input.canceled"));
+    assert!(text.contains("\"status\":\"canceled\""));
+    assert!(text.contains("\"terminal\":true"));
+
+    let approval_required = RuntimeEventRecord {
+        schema_version: 1,
+        seq: 7,
+        timestamp: chrono::Utc::now(),
+        thread_id: "thr_test".to_string(),
+        turn_id: Some("turn_test".to_string()),
+        item_id: None,
+        event: "approval.required".to_string(),
+        payload: json!({
+            "approval_id": "approval_test",
+            "tool_name": "exec_command",
+            "description": "Run tests",
+            "input": { "token": "approval-secret" },
+        }),
+    };
+    let mapped =
+        map_compat_stream_event(&approval_required).context("missing approval.required event")?;
+    let stream = async_stream::stream! {
+        yield Ok::<_, Infallible>(mapped);
+    };
+    let body =
+        axum::body::to_bytes(Sse::new(stream).into_response().into_body(), usize::MAX).await?;
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("event: approval.required"));
+    assert!(text.contains("\"approval_id\":\"approval_test\""));
+    assert!(!text.contains("approval-secret"));
+
+    let approval_decided = RuntimeEventRecord {
+        schema_version: 1,
+        seq: 8,
+        timestamp: chrono::Utc::now(),
+        thread_id: "thr_test".to_string(),
+        turn_id: Some("turn_test".to_string()),
+        item_id: None,
+        event: "approval.decided".to_string(),
+        payload: json!({
+            "approval_id": "approval_test",
+            "decision": "allow",
+            "remember": false,
+            "internal_secret": "approval-decision-secret",
+        }),
+    };
+    let mapped =
+        map_compat_stream_event(&approval_decided).context("missing approval.decided event")?;
+    let stream = async_stream::stream! {
+        yield Ok::<_, Infallible>(mapped);
+    };
+    let body =
+        axum::body::to_bytes(Sse::new(stream).into_response().into_body(), usize::MAX).await?;
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("event: approval.decided"));
+    assert!(text.contains("\"decision\":\"allow\""));
+    assert!(!text.contains("approval-decision-secret"));
+
+    let unknown = RuntimeEventRecord {
+        schema_version: 1,
+        seq: 9,
         timestamp: chrono::Utc::now(),
         thread_id: "thr_test".to_string(),
         turn_id: Some("turn_test".to_string()),
@@ -2180,6 +3451,8 @@ async fn stream_endpoint_remains_backward_compatible() -> Result<()> {
         let _ = tx_event
             .send(EngineEvent::TurnStarted {
                 turn_id: "mock_stream".to_string(),
+                created_at: chrono::Utc::now(),
+                route: None,
             })
             .await;
         let _ = tx_event
@@ -2328,6 +3601,63 @@ async fn session_resume_thread_returns_404_for_missing_session() -> Result<()> {
 }
 
 #[tokio::test]
+async fn session_resume_thread_returns_400_when_saved_custom_provider_was_removed() -> Result<()> {
+    let root = std::env::temp_dir().join(format!(
+        "codewhale-session-removed-provider-{}",
+        Uuid::new_v4()
+    ));
+    let sessions_dir = root.join("sessions");
+    fs::create_dir_all(&sessions_dir)?;
+    let session = json!({
+        "schema_version": 1,
+        "metadata": {
+            "id": "sess_removed_custom_provider",
+            "title": "Removed custom provider",
+            "created_at": "2025-01-01T00:00:00Z",
+            "updated_at": "2025-01-01T00:10:00Z",
+            "message_count": 1,
+            "total_tokens": 10,
+            "model": "local-code-model",
+            "model_provider": "lm-studio",
+            "workspace": "/tmp/test",
+            "mode": "agent"
+        },
+        "messages": [{
+            "role": "user",
+            "content": [{ "type": "text", "text": "Resume me" }]
+        }],
+        "system_prompt": null
+    });
+    fs::write(
+        sessions_dir.join("sess_removed_custom_provider.json"),
+        serde_json::to_string_pretty(&session)?,
+    )?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root(root, sessions_dir).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let resp = client
+        .post(format!(
+            "http://{addr}/v1/sessions/sess_removed_custom_provider/resume-thread"
+        ))
+        .json(&json!({}))
+        .send()
+        .await?;
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = resp.json().await?;
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("[providers.lm-studio]"), "{message}");
+    assert!(message.contains("will not fall back"), "{message}");
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn session_resume_thread_creates_thread_from_saved_session() -> Result<()> {
     let root = std::env::temp_dir().join(format!("deepseek-session-resume-{}", Uuid::new_v4()));
     let sessions_dir = root.join("sessions");
@@ -2392,6 +3722,8 @@ async fn session_resume_thread_creates_thread_from_saved_session() -> Result<()>
         .json()
         .await?;
     assert_eq!(detail["thread"]["id"], thread_id);
+    assert_eq!(detail["thread"]["model_provider"], "deepseek");
+    assert_eq!(detail["thread"]["workspace"], "/tmp/test");
     assert_eq!(detail["turns"].as_array().map_or(0, Vec::len), 1);
     assert_eq!(detail["items"].as_array().map_or(0, Vec::len), 2);
 
@@ -2774,6 +4106,8 @@ async fn session_create_from_thread_rejects_active_turn() -> Result<()> {
         let _ = tx_event
             .send(EngineEvent::TurnStarted {
                 turn_id: "mock_active_session_save".to_string(),
+                created_at: chrono::Utc::now(),
+                route: None,
             })
             .await;
         let _ = tx_event
@@ -3371,7 +4705,7 @@ async fn mobile_page_is_available_only_when_enabled() -> Result<()> {
         .await?
         .error_for_status()?;
     let html = enabled.text().await?;
-    assert!(html.contains("CodeWhale Mobile"));
+    assert!(html.contains("Codewhale Mobile"));
     assert!(html.contains("/v1/approvals/"));
     assert!(html.contains("MAX_VISIBLE_EVENTS = 100"));
     assert!(html.contains("replay_limit="));
@@ -3400,7 +4734,7 @@ async fn mobile_page_serves_shell_when_auth_enabled() -> Result<()> {
         .await?
         .error_for_status()?;
     let html = shell.text().await?;
-    assert!(html.contains("CodeWhale Mobile"));
+    assert!(html.contains("Codewhale Mobile"));
     assert!(html.contains("TOKEN_COOKIE"));
 
     let bearer = client
@@ -3409,7 +4743,7 @@ async fn mobile_page_serves_shell_when_auth_enabled() -> Result<()> {
         .send()
         .await?
         .error_for_status()?;
-    assert!(bearer.text().await?.contains("CodeWhale Mobile"));
+    assert!(bearer.text().await?.contains("Codewhale Mobile"));
 
     handle.abort();
     Ok(())
@@ -3432,7 +4766,7 @@ async fn mobile_insecure_mode_allows_page_and_v1_routes_without_token() -> Resul
         .send()
         .await?
         .error_for_status()?;
-    assert!(page.text().await?.contains("CodeWhale Mobile"));
+    assert!(page.text().await?.contains("Codewhale Mobile"));
 
     let summary = client
         .get(format!("http://{addr}/v1/threads/summary"))
@@ -3457,6 +4791,70 @@ async fn decide_approval_404s_when_nothing_pending() -> Result<()> {
         .send()
         .await?;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn submit_user_input_404s_without_entering_engine_mailbox_for_unknown_id() -> Result<()> {
+    let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let mut harness = crate::core::engine::mock_engine_handle();
+    runtime_threads
+        .install_test_engine(&thread.id, harness.handle.clone())
+        .await?;
+
+    let response = crate::tls::reqwest_client()
+        .post(format!(
+            "http://{addr}/v1/user-input/{}/input-missing",
+            thread.id
+        ))
+        .json(&json!({
+            "answers": [{
+                "id": "choice",
+                "label": "Missing",
+                "value": "must-not-enter-engine-mailbox",
+            }],
+        }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(25),
+            harness.recv_user_input_submission()
+        )
+        .await
+        .is_err(),
+        "unknown user input reached the engine mailbox"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn events_endpoint_rejects_unbounded_tail_requests() -> Result<()> {
+    let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let response = crate::tls::reqwest_client()
+        .get(format!(
+            "http://{addr}/v1/threads/{}/events?replay_limit={}",
+            thread.id,
+            MAX_RUNTIME_EVENT_REPLAY_TAIL.saturating_add(1),
+        ))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     handle.abort();
     Ok(())
@@ -3523,7 +4921,17 @@ async fn dynamic_tool_result_endpoint_delivers_to_runtime() -> Result<()> {
         .json()
         .await?;
     let thread_id = thread["id"].as_str().context("thread id")?;
-    let rx = runtime_threads.register_pending_dynamic_tool_for_test("call_1");
+    let rx =
+        runtime_threads.register_pending_dynamic_tool_for_test(thread_id, "turn_1", "call_1")?;
+
+    let wrong_turn = client
+        .post(format!(
+            "http://{addr}/v1/threads/{thread_id}/turns/turn_wrong/tool-calls/call_1/result"
+        ))
+        .json(&json!({ "success": false }))
+        .send()
+        .await?;
+    assert_eq!(wrong_turn.status(), StatusCode::NOT_FOUND);
 
     let resp = client
         .post(format!(
@@ -3540,6 +4948,31 @@ async fn dynamic_tool_result_endpoint_delivers_to_runtime() -> Result<()> {
     let received = tokio::time::timeout(Duration::from_secs(1), rx).await??;
     assert!(received.success);
     assert_eq!(received.content.len(), 1);
+    let resolved = runtime_threads
+        .events_since(thread_id, None)?
+        .into_iter()
+        .filter(|event| event.event == "tool_call.resolved")
+        .collect::<Vec<_>>();
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].payload["call_id"], "call_1");
+    assert!(resolved[0].payload.get("content").is_none());
+
+    let duplicate = client
+        .post(format!(
+            "http://{addr}/v1/threads/{thread_id}/turns/turn_1/tool-calls/call_1/result"
+        ))
+        .json(&json!({ "success": true }))
+        .send()
+        .await?;
+    assert_eq!(duplicate.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        runtime_threads
+            .events_since(thread_id, None)?
+            .iter()
+            .filter(|event| event.event == "tool_call.resolved")
+            .count(),
+        1
+    );
 
     handle.abort();
     Ok(())
@@ -3563,6 +4996,104 @@ async fn skills_endpoint_includes_enabled_field() -> Result<()> {
             assert!(skill.get("enabled").is_some());
         }
     }
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn skills_endpoint_exposes_safe_plugin_provenance_and_shared_toggle() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().join("runtime");
+    let workspace = tmp.path().join("workspace");
+    let plugin_root = tmp.path().join("plugins/demo");
+    fs::create_dir_all(plugin_root.join("skills/review"))?;
+    fs::write(
+        plugin_root.join("plugin.toml"),
+        "schema_version = 1\n[plugin]\nname = \"demo\"\nversion = \"1.0.0\"\n[skills]\npath = \"skills\"\n",
+    )?;
+    fs::write(
+        plugin_root.join("skills/review/SKILL.md"),
+        "---\nname: review\ndescription: reviewed plugin Skill\n---\nbody\n",
+    )?;
+    let plugin_config = crate::plugins::discovery::DiscoveryConfig {
+        workspace: workspace.clone(),
+        user_plugins_dir: tmp.path().join("plugins"),
+        workspace_plugins_dir: workspace.join(".codewhale/plugins"),
+        builtin_plugin_dirs: Vec::new(),
+        state_path: tmp.path().join("plugin-state/state.json"),
+    };
+    let discovery = crate::plugins::PluginDiscoveryContext::from_config_and_environment(
+        &plugin_config,
+        crate::plugins::HostEnvironment::default(),
+    );
+    let mut plugins = discovery.registry_for_workspace(&workspace);
+    Arc::make_mut(&mut plugins)
+        .trust("demo")
+        .map_err(anyhow::Error::msg)?;
+    Arc::make_mut(&mut plugins)
+        .enable("demo")
+        .map_err(anyhow::Error::msg)?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace_and_overrides(
+            root.clone(),
+            root.join("sessions"),
+            None,
+            false,
+            workspace,
+            TestServerOverrides {
+                plugin_discovery: Some(discovery),
+                ..TestServerOverrides::default()
+            },
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let list = client
+        .get(format!("http://{addr}/v1/skills"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<serde_json::Value>()
+        .await?;
+    let plugin_skill = list["skills"]
+        .as_array()
+        .and_then(|skills| skills.iter().find(|skill| skill["name"] == "demo:review"))
+        .context("plugin Skill in runtime API catalog")?;
+    assert_eq!(plugin_skill["enabled"], true);
+    assert_eq!(plugin_skill["path"], serde_json::Value::Null);
+    assert_eq!(plugin_skill["source"], "reviewed-plugin-snapshot:demo");
+    assert!(plugin_skill["plugin_id"].as_str().is_some());
+    assert!(plugin_skill["plugin_generation"].as_u64().is_some());
+    assert!(plugin_skill["plugin_content_hash"].as_str().is_some());
+    assert!(
+        !plugin_skill
+            .to_string()
+            .contains(&plugin_root.display().to_string()),
+        "runtime API must not expose mutable or staged plugin paths"
+    );
+
+    client
+        .post(format!("http://{addr}/v1/skills/demo:review"))
+        .json(&json!({ "enabled": false }))
+        .send()
+        .await?
+        .error_for_status()?;
+    let after = client
+        .get(format!("http://{addr}/v1/skills"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<serde_json::Value>()
+        .await?;
+    let plugin_skill = after["skills"]
+        .as_array()
+        .and_then(|skills| skills.iter().find(|skill| skill["name"] == "demo:review"))
+        .context("plugin Skill after toggle")?;
+    assert_eq!(plugin_skill["enabled"], false);
 
     handle.abort();
     Ok(())
@@ -3712,6 +5243,7 @@ fn skill_entry_is_bundled_requires_configured_bundle_path() {
         localized_descriptions: std::collections::HashMap::new(),
         body: String::new(),
         path: bundled_skill_path,
+        source: crate::skills::SkillSource::Native,
     };
     let override_skill = crate::skills::Skill {
         name: "delegate".to_string(),
@@ -3719,6 +5251,7 @@ fn skill_entry_is_bundled_requires_configured_bundle_path() {
         localized_descriptions: std::collections::HashMap::new(),
         body: String::new(),
         path: override_skill_path,
+        source: crate::skills::SkillSource::Native,
     };
 
     assert!(skill_entry_is_bundled(&bundled_skill, &bundled_skills_dir));
@@ -4159,6 +5692,122 @@ async fn reload_config_reads_from_config_path_and_updates_in_memory_state() -> R
 }
 
 #[tokio::test]
+async fn zai_model_update_is_provider_scoped_and_preserves_deepseek_fallback() -> Result<()> {
+    let root = std::env::temp_dir().join(format!(
+        "codewhale-config-zai-model-scope-{}",
+        Uuid::new_v4()
+    ));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("custom-config.toml");
+    fs::write(
+        &config_file,
+        r#"provider = "zai"
+default_text_model = "deepseek-v4-pro"
+
+[providers.zai]
+api_key = "zai-test-key"
+model = "GLM-5.2"
+"#,
+    )?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let response = client
+        .post(format!("http://{addr}/v1/config/reload"))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let before = get_config(&client, &addr).await;
+    assert_eq!(before["provider"], "zai");
+    assert_eq!(before["model"], "GLM-5.2");
+    assert_eq!(before["default_model"], "deepseek-v4-pro");
+
+    let (status, body) = post_set_config(&client, &addr, "model", "glm-5-turbo", true).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["value"], "GLM-5-Turbo");
+
+    let persisted = fs::read_to_string(&config_file)?;
+    let persisted: toml::Value = toml::from_str(&persisted)?;
+    assert_eq!(
+        persisted["default_text_model"].as_str(),
+        Some("deepseek-v4-pro"),
+        "the active Z.ai model must not overwrite the DeepSeek fallback"
+    );
+    assert_eq!(
+        persisted["providers"]["zai"]["model"].as_str(),
+        Some("GLM-5-Turbo")
+    );
+
+    let (status, body) = post_set_config(&client, &addr, "model", "deepseek-v4-flash", true).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+
+    let response = client
+        .post(format!("http://{addr}/v1/config/reload"))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let after = get_config(&client, &addr).await;
+    assert_eq!(after["provider"], "zai");
+    assert_eq!(after["model"], "GLM-5-Turbo");
+    assert_eq!(after["default_model"], "deepseek-v4-pro");
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn reload_config_preserves_profile_selected_named_custom_route() -> Result<()> {
+    let root = std::env::temp_dir().join(format!(
+        "codewhale-config-reload-profile-{}",
+        Uuid::new_v4()
+    ));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("custom-config.toml");
+    fs::write(
+        &config_file,
+        r#"provider = "deepseek"
+default_text_model = "deepseek-v4-pro"
+
+[profiles.local]
+provider = "lm-studio"
+
+[profiles.local.providers.lm-studio]
+kind = "openai-compatible"
+base_url = "http://127.0.0.1:18190/v1"
+model = "profile-local-model"
+api_key = "profile-test-key"
+"#,
+    )?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path_and_profile(config_file, "local".to_string()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let response = client
+        .post(format!("http://{addr}/v1/config/reload"))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let config = get_config(&client, &addr).await;
+    assert_eq!(config["provider"], "lm-studio");
+    assert_eq!(config["model"], "profile-local-model");
+    assert_eq!(config["base_url"], "http://127.0.0.1:18190/v1");
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn reload_config_refreshes_mcp_config_path() -> Result<()> {
     // Fix #3: After reload, list_mcp_servers should see the new mcp_config_path
     // from the reloaded config (not a stale cached value).
@@ -4253,7 +5902,7 @@ async fn set_config_with_persist_false_does_not_write_to_disk() -> Result<()> {
     };
     let client = crate::tls::reqwest_client();
 
-    let (status, body) = post_set_config(&client, &addr, "model", "some-model", false).await;
+    let (status, body) = post_set_config(&client, &addr, "model", "deepseek-v4-flash", false).await;
     assert_eq!(
         status,
         StatusCode::OK,
@@ -4535,7 +6184,7 @@ async fn set_config_response_contains_all_expected_fields() -> Result<()> {
     let client = crate::tls::reqwest_client();
 
     // persist:true → persisted=true, requires_reload=true
-    let (status, body) = post_set_config(&client, &addr, "model", "shape-test-model", true).await;
+    let (status, body) = post_set_config(&client, &addr, "model", "deepseek-v4-flash", true).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(
         body["key"].as_str(),
@@ -4544,7 +6193,7 @@ async fn set_config_response_contains_all_expected_fields() -> Result<()> {
     );
     assert_eq!(
         body["value"].as_str(),
-        Some("shape-test-model"),
+        Some("deepseek-v4-flash"),
         "value field, body: {body}"
     );
     assert!(
@@ -4563,7 +6212,7 @@ async fn set_config_response_contains_all_expected_fields() -> Result<()> {
     );
 
     // persist:false → persisted=false, requires_reload=false
-    let (status, body) = post_set_config(&client, &addr, "model", "another-model", false).await;
+    let (status, body) = post_set_config(&client, &addr, "model", "deepseek-v4-pro", false).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(
         body["key"].as_str(),
@@ -4572,7 +6221,7 @@ async fn set_config_response_contains_all_expected_fields() -> Result<()> {
     );
     assert_eq!(
         body["value"].as_str(),
-        Some("another-model"),
+        Some("deepseek-v4-pro"),
         "value field, body: {body}"
     );
     assert_eq!(
@@ -4584,6 +6233,92 @@ async fn set_config_response_contains_all_expected_fields() -> Result<()> {
         body["requires_reload"].as_bool(),
         Some(false),
         "requires_reload should be false when persist:false, body: {body}"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn cors_layer_advertises_exact_supported_headers_and_never_an_extra() -> Result<()> {
+    let layer = cors_layer(&[]);
+    let router: Router = Router::new()
+        .route("/probe", get(|| async { "ok" }))
+        .layer(layer);
+
+    let listener = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    let addr = listener.local_addr()?;
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let client = crate::tls::reqwest_client();
+
+    let allowed = client
+        .request(reqwest::Method::OPTIONS, format!("http://{addr}/probe"))
+        .header("Origin", "http://localhost:1420")
+        .header("Access-Control-Request-Method", "POST")
+        .header(
+            "Access-Control-Request-Headers",
+            "authorization, content-type, accept, x-codewhale-runtime-token, x-deepseek-runtime-token",
+        )
+        .send()
+        .await?;
+
+    assert!(allowed.status().is_success());
+    assert_eq!(
+        allowed
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|value| value.to_str().ok()),
+        Some("http://localhost:1420")
+    );
+    let allow_headers = allowed
+        .headers()
+        .get("access-control-allow-headers")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let advertised = allow_headers
+        .split(',')
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected = [
+        "accept",
+        "authorization",
+        "content-type",
+        "x-codewhale-runtime-token",
+        "x-deepseek-runtime-token",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<std::collections::BTreeSet<_>>();
+
+    assert_eq!(advertised, expected);
+
+    let unapproved = client
+        .request(reqwest::Method::OPTIONS, format!("http://{addr}/probe"))
+        .header("Origin", "http://localhost:1420")
+        .header("Access-Control-Request-Method", "POST")
+        .header(
+            "Access-Control-Request-Headers",
+            "authorization, x-malicious-header",
+        )
+        .send()
+        .await?;
+    let unapproved_headers = unapproved
+        .headers()
+        .get("access-control-allow-headers")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(
+        !unapproved_headers.contains("x-malicious-header"),
+        "an unapproved request header must never be advertised to the browser"
     );
 
     handle.abort();

@@ -15,7 +15,7 @@ chosen over the available shell equivalent. Companion to `crates/tui/src/prompts
   for the same backing operation are a model trap — the LLM will alternate
   between them and the cache hit rate suffers.
 
-## Current surface (v0.8.49)
+## Current surface (v0.9.1)
 
 ### File operations
 
@@ -316,7 +316,10 @@ guidance.
 The old one-shot `rlm` model-facing tool is also replaced by persistent
 `rlm_open` / `rlm_eval` / `rlm_configure` / `rlm_close` sessions.
 
-v0.9.0 adds the following hidden-compat aliases (#2682, #2683):
+v0.9.0 ships the following hidden-compat aliases (#2682, #2683, #4132) —
+they are deliberately retained for transcript replay, not scheduled for
+removal (the earlier plan to drop `todo_*` at the next major was
+superseded by #4132):
 
 | Hidden alias | Canonical replacement | Status |
 |---|---|---|

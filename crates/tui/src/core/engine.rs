@@ -28,9 +28,9 @@ use crate::compaction::{
     CompactionConfig, compact_messages_safe, merge_system_prompts, should_compact,
 };
 use crate::config::{ApiProvider, Config, DEFAULT_MAX_SUBAGENTS, DEFAULT_TEXT_MODEL};
+use crate::core::model_client::SharedModelClient;
 use crate::error_taxonomy::{ErrorCategory, ErrorEnvelope, StreamError};
 use crate::features::{Feature, Features};
-use crate::llm_client::LlmClient;
 use crate::mcp::{McpConfig, McpPool};
 #[cfg(test)]
 use crate::models::ToolCaller;
@@ -41,22 +41,29 @@ use crate::models::{
 use crate::prompts;
 use crate::purge::{emit_purge_completed, emit_purge_failed, emit_purge_started, run_purge};
 use crate::resource_telemetry::ResourceTelemetry;
+#[cfg(test)]
 use crate::route_runtime::resolve_runtime_route;
+use crate::route_runtime::{
+    ResolvedRuntimeRoute, ValidatedRuntimeRoute, resolve_runtime_route_for_identity,
+};
 use crate::seam_manager::{SeamConfig, SeamManager};
 use crate::tools::goal::{GoalSnapshot, GoalStatus, SharedGoalState, new_shared_goal_state};
 use crate::tools::plan::{PlanSnapshot, SharedPlanState, new_shared_plan_state};
 use crate::tools::shell::{SharedShellManager, new_shared_shell_manager};
-use crate::tools::spec::RuntimeToolServices;
-use crate::tools::spec::{ApprovalRequirement, ToolError, ToolResult};
+use crate::tools::spec::{
+    ApprovalRequirement, ResourceClaim, ToolError, ToolExecutionOutcome, ToolResult,
+};
+use crate::tools::spec::{
+    RuntimeToolServices, SharedFileReadTracker, new_shared_file_read_tracker,
+};
 use crate::tools::subagent::{
     Mailbox, MailboxMessage, SharedSubAgentManager, SubAgentCompletion, SubAgentForkContext,
     SubAgentResult, SubAgentRuntime, SubAgentStatus, SubAgentThinking, SubAgentType,
-    ensure_subagent_model_for_provider, new_shared_subagent_manager_with_timeout,
-    resolve_subagent_assignment_route,
+    agent_worker_owner_snapshot, ensure_subagent_model_for_provider,
+    new_shared_subagent_manager_with_timeout, resolve_subagent_assignment_route,
 };
 use crate::tools::todo::{SharedTodoList, TodoListSnapshot, new_shared_todo_list};
 use crate::tools::user_input::{UserInputRequest, UserInputResponse};
-use crate::tools::workflow_trigger::{WorkflowTriggerSignals, evaluate_operate_admission};
 use crate::tools::{ToolContext, ToolRegistryBuilder};
 use crate::tui::app::AppMode;
 use crate::utils::spawn_supervised;
@@ -66,13 +73,16 @@ use crate::working_set::WorkingSet;
 #[cfg(test)]
 use super::authority::agent_approval_mode_for_turn;
 use super::authority::{TurnAuthority, effective_input_policy, shell_policy_for_mode};
-use super::events::{Event, TurnOutcomeStatus};
+use super::events::{Event, TurnOutcomeStatus, TurnRoute};
 use super::ops::{
     Op, ProviderRuntimeStatus, SessionSnapshot, USER_SHELL_TOOL_ID_PREFIX, UserInputProvenance,
 };
 use super::session::Session;
 use super::tool_parser;
 use super::turn::{TurnContext, post_turn_snapshot, pre_turn_snapshot};
+
+const ENGINE_OP_CHANNEL_CAPACITY: usize = 32;
+const GOAL_CONTINUATION_FAILURE_DETAIL_MAX_BYTES: usize = 512;
 
 /// Snapshot of parent state that can be passed to forked sub-agents without
 /// rewriting the parent transcript.
@@ -290,6 +300,10 @@ pub struct EngineConfig {
     /// Restrict skill discovery to CodeWhale-owned roots plus explicit
     /// `skills_dir` configuration.
     pub skills_scan_codewhale_only: bool,
+    /// Immutable plugin authority snapshot scoped to `workspace`. Normal App
+    /// hosts provide this explicitly; headless/embed callers that leave it
+    /// unset receive a fresh workspace-specific snapshot in [`Engine::new`].
+    pub plugin_registry: Option<Arc<crate::plugins::PluginRegistry>>,
     /// Sources injected as `<instructions source="…">` blocks in the system
     /// prompt (#454). Each entry is either a disk path (read at render time)
     /// or an inline string. Loaded in declared order from the user's
@@ -357,10 +371,11 @@ pub struct EngineConfig {
     pub runtime_services: RuntimeToolServices,
     /// Per-role/type sub-agent model overrides already resolved from config.
     pub subagent_model_overrides: HashMap<String, String>,
-    /// Merged fleet roster (built-ins + `[fleet.profiles]` + workspace agent
+    /// Merged fleet roster (built-ins + config + personal/workspace agent
     /// files) shared by model-spawned sub-agents and fleet dispatch
     /// (#fleet-roster cutover (v0.8.67)). Defaults to built-ins only; the
-    /// engine-config construction sites load the full roster once per session.
+    /// engine-config construction sites load it at session start and the setup
+    /// wizard refreshes it after each successful profile save.
     pub fleet_roster: std::sync::Arc<crate::fleet::roster::FleetRoster>,
     /// Whether the user-memory feature is enabled (#489). When `true` the
     /// engine reads `memory_path` on each prompt assembly and prepends a
@@ -401,8 +416,9 @@ pub struct EngineConfig {
     pub workshop: Option<crate::tools::large_output_router::WorkshopConfig>,
     /// Which search backend `web_search` should use. Default: DuckDuckGo.
     pub search_provider: crate::config::SearchProvider,
-    /// API key for Tavily, Bocha, Metaso, or Baidu. `None` for Bing or DuckDuckGo.
-    /// Metaso also falls back to `METASO_API_KEY` env var, then a built-in key.
+    /// API key for Tavily, Bocha, Metaso, Baidu, Volcengine, or Sofya.
+    /// `None` for Bing, DuckDuckGo, or SearXNG.
+    /// Metaso also falls back to the `METASO_API_KEY` env var.
     /// Baidu also falls back to `BAIDU_SEARCH_API_KEY`.
     pub search_api_key: Option<String>,
     /// Optional DuckDuckGo-compatible HTML endpoint override.
@@ -439,6 +455,10 @@ pub struct EngineConfig {
     pub workspace_follow_symlinks: bool,
     /// Ask-only permission rules loaded from sibling `permissions.toml`.
     pub exec_policy_engine: codewhale_execpolicy::ExecPolicyEngine,
+    /// Whether turn startup may write terminal title/taskbar OSC sequences.
+    /// Interactive TUI sessions enable this; headless and machine-readable
+    /// hosts disable it so stdout remains protocol-clean.
+    pub terminal_chrome_enabled: bool,
 }
 
 impl Default for EngineConfig {
@@ -453,6 +473,7 @@ impl Default for EngineConfig {
             mcp_config_path: PathBuf::from("mcp.json"),
             skills_dir: crate::skills::default_skills_dir(),
             skills_scan_codewhale_only: false,
+            plugin_registry: None,
             instructions: Vec::new(),
             project_context_pack_enabled: true,
             translation_enabled: false,
@@ -515,6 +536,7 @@ impl Default for EngineConfig {
             tools: None,
             workspace_follow_symlinks: false,
             exec_policy_engine: codewhale_execpolicy::ExecPolicyEngine::new(Vec::new(), Vec::new()),
+            terminal_chrome_enabled: true,
         }
     }
 }
@@ -574,6 +596,10 @@ pub struct EngineHandle {
     tx_steer: mpsc::Sender<String>,
     /// Shared pause flag set by the TUI and read by the turn loop.
     shared_paused: Arc<StdMutex<bool>>,
+    /// Whether the host must construct the route's concrete provider client
+    /// before it mutates turn state. Real engines own concrete provider I/O;
+    /// explicit injected/mock engines own that seam themselves.
+    client_preflight_required: bool,
 }
 
 // `impl EngineHandle { ... }` moved to `engine/handle.rs` so the
@@ -585,19 +611,48 @@ pub struct EngineHandle {
 pub struct Engine {
     config: EngineConfig,
     api_config: Config,
+    /// Runtime-host authority consulted only when constructing a later turn
+    /// descriptor (goal continuation, idle child completion, `/edit`). Active
+    /// turns keep their already-installed immutable descriptor.
+    authoritative_route_config: Option<Arc<parking_lot::RwLock<Config>>>,
     deepseek_client: Option<DeepSeekClient>,
+    /// Provider-neutral client used by the canonical main turn loop. Concrete
+    /// clients remain temporarily available to provider-specific helper tools
+    /// while those boundaries migrate independently.
+    model_client: Option<SharedModelClient>,
+    /// Test/embedding seam: an explicitly injected provider-neutral client
+    /// remains the I/O authority while typed routes still validate receipts,
+    /// endpoint metadata, and budgets.
+    model_client_injected: bool,
     deepseek_client_error: Option<String>,
     api_key_env_only_recovery: Option<String>,
     session: Session,
     subagent_manager: SharedSubAgentManager,
     shell_manager: SharedShellManager,
+    /// Read-before-edit snapshots live for the session, not for one turn's
+    /// transient `ToolContext` (#4475).
+    file_read_tracker: SharedFileReadTracker,
     mcp_pool: Option<Arc<AsyncMutex<McpPool>>>,
+    /// Workspace-scoped immutable plugin catalogue and authority receipts.
+    plugin_registry: Arc<crate::plugins::PluginRegistry>,
     api_provider: ApiProvider,
+    /// Exact configured route key. Named custom providers share the `Custom`
+    /// enum, so the enum alone cannot prove that the active client is current.
+    api_provider_identity: String,
+    /// Additive exact provider id. `None` preserves the legacy root-literal
+    /// custom route across snapshots and config reloads.
+    api_provider_id: Option<String>,
     active_route_limits: Option<codewhale_config::route::RouteLimits>,
+    active_route_capabilities: codewhale_config::route::RouteCapabilities,
     rx_op: mpsc::Receiver<Op>,
     /// Clone of the op-channel sender, so the engine can self-dispatch ops
     /// (e.g. a goal-continuation `SendMessage` after a turn completes).
     tx_op: mpsc::Sender<Op>,
+    /// At most one engine-owned continuation across capacity-waiting and
+    /// enqueued states. The authoritative dynamic-tool set stays here so a
+    /// later successful turn can refresh it without adding a second token.
+    scheduled_goal_continuation: Option<ScheduledGoalContinuation>,
+    goal_continuation_schedule_seq: u64,
     rx_approval: mpsc::Receiver<ApprovalDecision>,
     rx_user_input: mpsc::Receiver<UserInputDecision>,
     rx_steer: mpsc::Receiver<String>,
@@ -644,8 +699,8 @@ pub struct Engine {
     /// and forwarded as a synthetic user message before the next API call.
     pending_lsp_blocks: Vec<crate::lsp::DiagnosticBlock>,
     /// Cached SlopLedger gate block keyed by the ledger file's modified time.
-    /// This keeps prompt refreshes cheap while still noticing append/update
-    /// writes from slop ledger tools during the same session.
+    /// This keeps user-turn tail assembly cheap while still noticing
+    /// append/update writes from slop ledger tools during the same session.
     slop_ledger_gate_cache: Option<(Option<SystemTime>, Option<String>)>,
     /// Current operating mode. Updated on `ChangeMode` and `SendMessage`.
     current_mode: AppMode,
@@ -658,6 +713,53 @@ pub struct Engine {
     token_estimate_cache: TokenEstimateCache,
     /// Shared pause flag set by the TUI and read before tool execution.
     shared_paused: Arc<StdMutex<bool>>,
+}
+
+fn claim_subagent_completion(
+    delivered_ids: &mut HashSet<String>,
+    completion: SubAgentCompletion,
+) -> Option<SubAgentCompletion> {
+    delivered_ids
+        .insert(completion.agent_id.clone())
+        .then_some(completion)
+}
+
+enum GoalContinuationAction {
+    Inactive,
+    Dispatch {
+        content: String,
+        snapshot: Box<GoalSnapshot>,
+    },
+    Stopped {
+        message: String,
+    },
+}
+
+struct ScheduledGoalContinuation {
+    id: u64,
+    dynamic_tools: Vec<DynamicToolSpec>,
+    enqueued: bool,
+}
+
+enum SendMessageOutcome {
+    NotStarted {
+        error: Option<String>,
+    },
+    Finished {
+        status: TurnOutcomeStatus,
+        error: Option<String>,
+    },
+}
+
+enum EngineRunInput {
+    Operation(Box<Op>),
+    SubAgentCompletion(SubAgentCompletion),
+}
+
+impl SendMessageOutcome {
+    fn started(&self) -> bool {
+        matches!(self, Self::Finished { .. })
+    }
 }
 
 // === Internal tool helpers ===
@@ -704,43 +806,25 @@ impl Engine {
         .trim()
     }
 
-    /// Fail closed before a provider request when Operate cannot prove it will
-    /// leave the ordinary local Act loop and produce orchestration receipts.
-    fn operate_readiness_blocker(&self, mode: AppMode, content: &str) -> Option<String> {
-        if mode != AppMode::Operate {
-            return None;
+    fn permission_question_discipline(
+        approval_mode: crate::tui::approval::ApprovalMode,
+    ) -> &'static str {
+        use crate::tui::approval::ApprovalMode;
+
+        match approval_mode {
+            ApprovalMode::Suggest => {
+                "Tool approvals and user decisions are separate. Ask a concise question when an unresolved choice materially affects authority, cost, requested scope, or outcome; otherwise continue under the active approval policy."
+            }
+            ApprovalMode::Auto => {
+                "Auto-Review is fully autonomous. Do not ask the user questions or pause for a user decision. Resolve ambiguity from the available context, choose the safest reversible interpretation that still advances the request, and continue; if no safe in-scope action exists, report the constraint without opening a question prompt."
+            }
+            ApprovalMode::Bypass => {
+                "Tool calls do not need approval, but Full Access does not authorize invented intent. Ask one concise, deliberate question when a consequential choice cannot be recovered safely from context; otherwise proceed autonomously within the current sandbox, repository, and managed-policy boundaries."
+            }
+            ApprovalMode::Never => {
+                "Remain read-only. Ask when a missing user decision blocks a truthful plan or investigation; do not imply that this permission boundary can be bypassed."
+            }
         }
-
-        let mut signals = WorkflowTriggerSignals::product_defaults();
-        signals.auto_start_child_limit = self
-            .api_config
-            .workflow_config()
-            .auto_start_child_limit
-            .try_into()
-            .unwrap_or(usize::MAX);
-        let admission = evaluate_operate_admission(content, &signals);
-        if admission.allows_local_execution() {
-            return None;
-        }
-
-        let readiness_gap = if !self.config.subagents_enabled
-            || !self.config.features.enabled(Feature::Subagents)
-        {
-            "the sub-agent/Workflow runtime is disabled"
-        } else if self.config.max_subagents == 0 || self.config.launch_concurrency == 0 {
-            "the worker runtime has no launch capacity"
-        } else if self.config.max_spawn_depth == 0 {
-            "worker delegation depth is zero"
-        } else if self.deepseek_client.is_none() {
-            "no active provider route is loaded for workers"
-        } else {
-            "this build does not yet host-enforce Workflow dispatch and terminal receipt verification"
-        };
-
-        Some(format!(
-            "Operate readiness blocked: {} requires Fleet/Workflow orchestration, but {readiness_gap}. No provider request or solo tool chain was started. Run `/setup report` and `/setup fleet` to inspect and record the readiness gap. This release cannot start a verified Operate workflow until host-enforced dispatch and terminal receipts are available; switch to Act only for intentionally local execution.",
-            admission.reason()
-        ))
     }
 
     pub(super) async fn emit_compaction_started(
@@ -856,33 +940,75 @@ impl Engine {
         format!("{message}\n\n{hint}")
     }
 
-    fn activate_runtime_route(&mut self, provider: ApiProvider, model: &str) -> Result<(), String> {
-        if self.api_provider == provider
-            && self
-                .deepseek_client
-                .as_ref()
-                .is_some_and(|client| client.api_provider() == provider)
-        {
+    /// Install a route that the host already resolved and client-preflighted.
+    /// No identity guessing or config re-resolution is allowed at this
+    /// boundary: the descriptor is the single authority for the turn.
+    fn install_validated_runtime_route(&mut self, route: ValidatedRuntimeRoute) {
+        let provider = route.identity.provider;
+        let identity = route.identity.key;
+        let provider_id = route.identity.exact_id;
+        let model = route.model;
+        let limits = crate::route_budget::known_route_limits(route.candidate.limits());
+        let capabilities = route.candidate.capabilities();
+        let api_config = *route.config;
+        let client = route.client;
+
+        self.api_provider = provider;
+        self.api_provider_identity = identity;
+        self.api_provider_id = provider_id;
+        self.api_config = api_config;
+        self.active_route_limits = limits;
+        self.active_route_capabilities = capabilities;
+        self.api_key_env_only_recovery = Self::env_only_api_key_recovery_hint(&self.api_config);
+        self.deepseek_client = Some(client.clone());
+        if !self.model_client_injected {
+            self.model_client = Some(Arc::new(client.clone()));
+        }
+        self.deepseek_client_error = None;
+        self.session.model = model;
+        self.config.model.clone_from(&self.session.model);
+        self.seam_manager = self
+            .seam_manager
+            .as_ref()
+            .filter(|manager| manager.config().enabled)
+            .map(|manager| SeamManager::new(client, manager.config().clone()));
+    }
+
+    /// Activate a structurally resolved route at the engine boundary. Normal
+    /// engines construct the concrete client before any turn state changes.
+    /// Embedders/tests that explicitly injected a provider-neutral client keep
+    /// that client as the I/O authority while still installing the exact route
+    /// identity, model, config, and budget receipt.
+    fn install_resolved_runtime_route(
+        &mut self,
+        mut route: ResolvedRuntimeRoute,
+    ) -> Result<(), String> {
+        if !self.model_client_injected {
+            self.install_validated_runtime_route(route.validate()?);
             return Ok(());
         }
 
-        let route =
-            resolve_runtime_route(&self.api_config, provider, Some(model)).map_err(|reason| {
-                format!(
-                    "Failed to resolve provider route {} / {}: {reason}",
-                    provider.as_str(),
-                    model
-                )
-            })?;
-        let route_config = route.config;
-        match DeepSeekClient::from_candidate(&route_config, &route.candidate) {
+        let preflighted_client = route.take_preflighted_client();
+        let provider = route.identity.provider;
+        let identity = route.identity.key;
+        let provider_id = route.identity.exact_id;
+        let model = route.model;
+        let limits = crate::route_budget::known_route_limits(route.candidate.limits());
+        let capabilities = route.candidate.capabilities();
+        let api_config = *route.config;
+        let concrete_client = preflighted_client
+            .map(Ok)
+            .unwrap_or_else(|| DeepSeekClient::from_candidate(&api_config, &route.candidate));
+
+        self.api_provider = provider;
+        self.api_provider_identity = identity;
+        self.api_provider_id = provider_id;
+        self.api_config = api_config;
+        self.active_route_limits = limits;
+        self.active_route_capabilities = capabilities;
+        self.api_key_env_only_recovery = Self::env_only_api_key_recovery_hint(&self.api_config);
+        match concrete_client {
             Ok(client) => {
-                self.api_provider = provider;
-                self.api_config = route_config;
-                self.active_route_limits =
-                    crate::route_budget::known_route_limits(route.candidate.limits);
-                self.api_key_env_only_recovery =
-                    Self::env_only_api_key_recovery_hint(&self.api_config);
                 self.deepseek_client = Some(client.clone());
                 self.deepseek_client_error = None;
                 self.seam_manager = self
@@ -890,14 +1016,29 @@ impl Engine {
                     .as_ref()
                     .filter(|manager| manager.config().enabled)
                     .map(|manager| SeamManager::new(client, manager.config().clone()));
-                Ok(())
             }
-            Err(err) => Err(format!(
-                "Failed to configure provider route {} / {}: {err}",
-                provider.as_str(),
-                model
-            )),
+            Err(err) => {
+                self.deepseek_client = None;
+                self.deepseek_client_error = Some(err.to_string());
+                self.seam_manager = None;
+            }
         }
+        self.session.model = model;
+        self.config.model.clone_from(&self.session.model);
+        Ok(())
+    }
+
+    fn current_runtime_route(&self) -> Result<ResolvedRuntimeRoute, String> {
+        let config = self
+            .authoritative_route_config
+            .as_ref()
+            .map(|config| config.read().clone())
+            .unwrap_or_else(|| self.api_config.clone());
+        let identity = config.resolve_persisted_provider_identity(
+            Some(self.api_provider.as_str()),
+            self.api_provider_id.as_deref(),
+        )?;
+        resolve_runtime_route_for_identity(&config, &identity, Some(&self.session.model))
     }
 
     /// Create a new engine with the given configuration
@@ -913,7 +1054,7 @@ impl Engine {
             );
         }
 
-        let (tx_op, rx_op) = mpsc::channel(32);
+        let (tx_op, rx_op) = mpsc::channel(ENGINE_OP_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = mpsc::channel(256);
         let (tx_approval, rx_approval) = mpsc::channel(64);
         let (tx_user_input, rx_user_input) = mpsc::channel(32);
@@ -924,13 +1065,32 @@ impl Engine {
         let cancel_reason: Arc<StdMutex<Option<CancelReason>>> = Arc::new(StdMutex::new(None));
         let shared_paused = Arc::new(StdMutex::new(false));
         let tool_exec_lock = Arc::new(RwLock::new(()));
+        let plugin_registry = config
+            .plugin_registry
+            .as_ref()
+            .filter(|registry| registry.workspace() == config.workspace)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(crate::plugins::PluginRegistry::empty(&config.workspace)));
 
         // Create clients for both providers
         let (deepseek_client, deepseek_client_error) = match DeepSeekClient::new(api_config) {
             Ok(client) => (Some(client), None),
             Err(err) => (None, Some(err.to_string())),
         };
+        let model_client = deepseek_client
+            .as_ref()
+            .map(|client| Arc::new(client.clone()) as SharedModelClient);
         let api_provider = api_config.api_provider();
+        let (api_provider_identity, api_provider_id) = api_config
+            .active_provider_identity(api_provider)
+            .map(|identity| (identity.key, identity.exact_id))
+            .unwrap_or_else(|_| {
+                let key = api_config.provider_identity_for(api_provider);
+                let exact_id = (!(api_provider == ApiProvider::Custom
+                    && api_config.uses_legacy_literal_custom_route()))
+                .then(|| key.clone());
+                (key, exact_id)
+            });
         let api_key_env_only_recovery = Self::env_only_api_key_recovery_hint(api_config);
 
         let mut session = Session::new(
@@ -973,6 +1133,7 @@ impl Engine {
                     show_thinking: config.show_thinking,
                     verbosity: config.verbosity.as_deref(),
                     skills_scan_codewhale_only: config.skills_scan_codewhale_only,
+                    plugin_registry: Some(plugin_registry.as_ref()),
                 },
             );
         let stable_prompt = Some(system_prompt);
@@ -1004,6 +1165,7 @@ impl Engine {
             .shell_manager
             .clone()
             .unwrap_or_else(|| new_shared_shell_manager(config.workspace.clone()));
+        let file_read_tracker = new_shared_file_read_tracker();
         // Create Flash seam manager for layered context (#159). v0.7.5 keeps
         // this opt-in until the prefix-cache audit proves when seam production
         // is worth the extra request and transcript mutation.
@@ -1069,17 +1231,27 @@ impl Engine {
         let engine = Engine {
             config,
             api_config: api_config.clone(),
+            authoritative_route_config: None,
             deepseek_client,
+            model_client,
+            model_client_injected: false,
             deepseek_client_error,
             api_key_env_only_recovery,
             session,
             subagent_manager,
             shell_manager,
+            file_read_tracker,
             mcp_pool: None,
+            plugin_registry,
             api_provider,
+            api_provider_identity,
+            api_provider_id,
             active_route_limits,
+            active_route_capabilities: codewhale_config::route::RouteCapabilities::default(),
             rx_op,
             tx_op: tx_op.clone(),
+            scheduled_goal_continuation: None,
+            goal_continuation_schedule_seq: 0,
             rx_approval,
             rx_user_input,
             rx_steer,
@@ -1111,8 +1283,27 @@ impl Engine {
             tx_user_input,
             tx_steer,
             shared_paused,
+            client_preflight_required: true,
         };
 
+        (engine, handle)
+    }
+
+    /// Construct the real Engine with an injected provider-neutral model
+    /// client. The event loop, prompt assembly, tool registry/execution,
+    /// cancellation, and session projection are unchanged; only the model I/O
+    /// boundary is replaced.
+    #[allow(dead_code)] // Production injection seam; currently exercised by deterministic Engine tests.
+    pub fn new_with_model_client(
+        config: EngineConfig,
+        api_config: &Config,
+        client: SharedModelClient,
+    ) -> (Self, EngineHandle) {
+        let (mut engine, mut handle) = Self::new(config, api_config);
+        engine.model_client = Some(client);
+        engine.model_client_injected = true;
+        engine.deepseek_client_error = None;
+        handle.client_preflight_required = false;
         (engine, handle)
     }
 
@@ -1154,6 +1345,8 @@ impl Engine {
             .tx_event
             .send(Event::TurnStarted {
                 turn_id: turn_id.clone(),
+                created_at: chrono::Utc::now(),
+                route: None,
             })
             .await;
 
@@ -1400,26 +1593,194 @@ impl Engine {
         self.config.allow_shell = authority.allow_shell;
         self.session.trust_mode = authority.trust_mode;
         self.config.trust_mode = authority.trust_mode;
-        self.session.auto_approve = authority.auto_approve;
         self.session.approval_mode = authority.approval_mode_for_session();
+        self.session.auto_approve = authority.auto_approve
+            || self.session.approval_mode == crate::tui::approval::ApprovalMode::Bypass;
+    }
+
+    fn schedule_goal_continuation(&mut self, dynamic_tools: Vec<DynamicToolSpec>) {
+        if let Some(scheduled) = self.scheduled_goal_continuation.as_mut() {
+            // A normal user turn or idle child handoff can finish while the
+            // prior synthetic token is already queued. Refresh that one token
+            // instead of multiplying autonomous turns and provider spend.
+            scheduled.dynamic_tools = dynamic_tools;
+            self.try_flush_pending_goal_continuation();
+            return;
+        }
+
+        self.goal_continuation_schedule_seq =
+            self.goal_continuation_schedule_seq.wrapping_add(1).max(1);
+        self.scheduled_goal_continuation = Some(ScheduledGoalContinuation {
+            id: self.goal_continuation_schedule_seq,
+            dynamic_tools,
+            enqueued: false,
+        });
+        self.try_flush_pending_goal_continuation();
+    }
+
+    fn cancel_scheduled_goal_continuation(&mut self) {
+        if self.scheduled_goal_continuation.take().is_some() {
+            tracing::debug!(
+                "cancelled an outstanding goal continuation after a non-completed turn"
+            );
+        }
+    }
+
+    fn take_scheduled_goal_continuation(
+        &mut self,
+        engine_schedule_id: Option<u64>,
+        direct_dynamic_tools: Vec<DynamicToolSpec>,
+    ) -> Option<Vec<DynamicToolSpec>> {
+        let Some(schedule_id) = engine_schedule_id else {
+            return Some(direct_dynamic_tools);
+        };
+        let Some(scheduled) = self.scheduled_goal_continuation.take() else {
+            tracing::warn!(
+                schedule_id,
+                "discarding stale engine-owned goal continuation token"
+            );
+            return None;
+        };
+        if scheduled.id != schedule_id {
+            tracing::warn!(
+                schedule_id,
+                current_schedule_id = scheduled.id,
+                "discarding superseded engine-owned goal continuation token"
+            );
+            self.scheduled_goal_continuation = Some(scheduled);
+            return None;
+        }
+
+        // Clear before executing the synthetic turn. A successful execution
+        // may now schedule exactly one replacement; inactive/failed turns do
+        // not leave a phantom outstanding marker behind.
+        Some(scheduled.dynamic_tools)
+    }
+
+    fn has_scheduled_goal_continuation(&self) -> bool {
+        self.scheduled_goal_continuation.is_some()
+    }
+
+    fn bounded_redacted_goal_failure_detail(&self, detail: &str) -> Option<String> {
+        let detail = detail.trim();
+        if detail.is_empty() {
+            return None;
+        }
+        // This message becomes durable goal state. Reuse the model boundary's
+        // exact configured-secret redactor when available; that helper also
+        // applies the config persistence redactor as a universal backstop.
+        let detail = self.deepseek_client.as_ref().map_or_else(
+            || codewhale_config::persistence::redact_secrets(detail),
+            |client| client.redact_model_bound_text(detail),
+        );
+        Some(crate::utils::truncate_with_ellipsis(
+            &detail,
+            GOAL_CONTINUATION_FAILURE_DETAIL_MAX_BYTES,
+            "…",
+        ))
+    }
+
+    fn goal_continuation_failure_message(&self, error: Option<&str>) -> String {
+        self.bounded_redacted_goal_failure_detail(error.unwrap_or_default()).map_or_else(
+            || {
+                "Goal continuation blocked because the model turn failed without a provider reason. Fix the provider route or credentials, then resume the goal."
+                    .to_string()
+            },
+            |detail| {
+                format!(
+                    "Goal continuation blocked because the model turn failed: {detail}. Fix the failure, then resume the goal."
+                )
+            },
+        )
+    }
+
+    fn goal_turn_not_started_message(&self, error: Option<&str>) -> String {
+        self.bounded_redacted_goal_failure_detail(error.unwrap_or_default()).map_or_else(
+            || {
+                "Goal continuation blocked because the next model turn could not be started. Fix the provider route or credentials, then resume the goal."
+                    .to_string()
+            },
+            |detail| {
+                format!(
+                    "Goal continuation blocked because the next model turn could not be started: {detail}. Fix the provider route or credentials, then resume the goal."
+                )
+            },
+        )
+    }
+
+    fn try_flush_pending_goal_continuation(&mut self) {
+        let Some(scheduled) = self.scheduled_goal_continuation.as_ref() else {
+            return;
+        };
+        if scheduled.enqueued {
+            return;
+        }
+        let schedule_id = scheduled.id;
+
+        match self.tx_op.try_send(Op::ContinueGoal {
+            // The authoritative set stays in `scheduled_goal_continuation` so
+            // later completed turns can refresh it without moving this token.
+            dynamic_tools: Vec::new(),
+            engine_schedule_id: Some(schedule_id),
+        }) {
+            Ok(()) => {
+                if let Some(scheduled) = self.scheduled_goal_continuation.as_mut()
+                    && scheduled.id == schedule_id
+                {
+                    scheduled.enqueued = true;
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::warn!("goal continuation dropped because the engine mailbox is closed");
+                if self
+                    .scheduled_goal_continuation
+                    .as_ref()
+                    .is_some_and(|scheduled| scheduled.id == schedule_id)
+                {
+                    self.scheduled_goal_continuation = None;
+                }
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {}
+        }
+    }
+
+    async fn next_run_input(&mut self, host_managed_turns: bool) -> Option<EngineRunInput> {
+        // A full mailbox means queued controls must run first. Retrying at the
+        // top of each receive appends the continuation behind the remaining
+        // controls as soon as one slot becomes available.
+        self.try_flush_pending_goal_continuation();
+        if self.has_scheduled_goal_continuation() {
+            // The synthetic token sits behind every operation that was already
+            // queued when it was scheduled. Drain FIFO operations through that
+            // token before accepting an idle child completion, whether or not
+            // the mailbox happened to be full. Consuming or cancelling the
+            // schedule marker restores normal select fairness immediately.
+            self.rx_op
+                .recv()
+                .await
+                .map(|op| EngineRunInput::Operation(Box::new(op)))
+        } else {
+            tokio::select! {
+                op = self.rx_op.recv() => op.map(|op| EngineRunInput::Operation(Box::new(op))),
+                completion = self.rx_subagent_completion.recv(), if !host_managed_turns => {
+                    completion.map(EngineRunInput::SubAgentCompletion)
+                }
+            }
+        }
     }
 
     /// Run the engine event loop
     #[allow(clippy::too_many_lines)]
     pub async fn run(mut self) {
-        enum EngineRunInput {
-            Operation(Box<Op>),
-            SubAgentCompletion(SubAgentCompletion),
-        }
+        // RuntimeThreadManager owns durable turn claims and installs a thread
+        // id in runtime services. Only the interactive TUI may autonomously
+        // create a new turn while the engine is otherwise idle; a hosted
+        // engine must wait for its host to claim and explicitly dispatch the
+        // next turn so events cannot be attached to the wrong durable record.
+        let host_managed_turns = self.host_managed_turns();
 
         loop {
-            let input = tokio::select! {
-                op = self.rx_op.recv() => op.map(|op| EngineRunInput::Operation(Box::new(op))),
-                completion = self.rx_subagent_completion.recv() => {
-                    completion.map(EngineRunInput::SubAgentCompletion)
-                }
-            };
-            let Some(input) = input else {
+            let Some(input) = self.next_run_input(host_managed_turns).await else {
                 break;
             };
 
@@ -1431,9 +1792,7 @@ impl Engine {
                     Op::SendMessage {
                         content,
                         mode,
-                        provider,
-                        model,
-                        route_limits,
+                        route,
                         compaction,
                         goal_objective,
                         goal_token_budget,
@@ -1456,9 +1815,7 @@ impl Engine {
                         self.handle_send_message(
                             content,
                             mode,
-                            provider,
-                            model,
-                            route_limits,
+                            *route,
                             *compaction,
                             goal_objective,
                             goal_token_budget,
@@ -1479,6 +1836,76 @@ impl Engine {
                             provenance,
                         )
                         .await;
+                    }
+                    Op::ContinueGoal {
+                        dynamic_tools,
+                        engine_schedule_id,
+                    } => {
+                        let Some(dynamic_tools) = self
+                            .take_scheduled_goal_continuation(engine_schedule_id, dynamic_tools)
+                        else {
+                            continue;
+                        };
+                        // Status controls queued while the previous turn was
+                        // running are processed before this operation. Re-read
+                        // the live goal now so pause/clear/complete/blocked can
+                        // cancel a stale continuation without starting a turn.
+                        let (content, goal_snapshot) = match self.goal_continuation_if_active() {
+                            GoalContinuationAction::Inactive => continue,
+                            GoalContinuationAction::Dispatch { content, snapshot } => {
+                                (content, *snapshot)
+                            }
+                            GoalContinuationAction::Stopped { message } => {
+                                self.block_goal_continuation(message).await;
+                                continue;
+                            }
+                        };
+                        // Budget and inactive-state decisions are route
+                        // independent. Resolve the live route only for a real
+                        // dispatch so an exhausted goal still reaches its
+                        // truthful terminal state when provider config drifted.
+                        let route = match self.current_runtime_route() {
+                            Ok(route) => route,
+                            Err(err) => {
+                                let message = format!(
+                                    "Goal continuation blocked because its provider route is no longer valid: {err}. Fix the route, then resume the goal."
+                                );
+                                let _ = self
+                                    .tx_event
+                                    .send(Event::error(ErrorEnvelope::fatal_auth(format!(
+                                        "Goal continuation stopped because its provider route is no longer valid: {err}"
+                                    ))))
+                                    .await;
+                                self.block_goal_continuation(message).await;
+                                continue;
+                            }
+                        };
+
+                        let _ = self
+                            .handle_send_message(
+                                content,
+                                self.current_mode,
+                                route,
+                                self.config.compaction.clone(),
+                                goal_snapshot.objective,
+                                goal_snapshot.token_budget,
+                                GoalStatus::Active,
+                                self.session.reasoning_effort.clone(),
+                                self.session.reasoning_effort_auto,
+                                self.session.auto_model,
+                                self.session.allow_shell,
+                                self.session.trust_mode,
+                                self.session.auto_approve,
+                                self.session.approval_mode,
+                                self.config.translation_enabled,
+                                self.config.show_thinking,
+                                self.config.allowed_tools.clone(),
+                                dynamic_tools,
+                                self.config.hook_executor.clone(),
+                                self.config.verbosity.clone(),
+                                UserInputProvenance::Runtime,
+                            )
+                            .await;
                     }
                     Op::RunShellCommand {
                         command,
@@ -1550,6 +1977,7 @@ impl Engine {
                             Some(self.tx_event.clone()),
                             Arc::clone(&self.subagent_manager),
                         )
+                        .with_locale_tag(self.config.locale_tag.clone())
                         .with_role_models(self.subagent_role_models())
                         .with_api_config(self.api_config.clone())
                         .with_fleet_roster(self.config.fleet_roster.clone())
@@ -1720,6 +2148,11 @@ impl Engine {
                         self.session.model = model;
                         self.config.model.clone_from(&self.session.model);
                         self.active_route_limits = route_limits;
+                        // This lightweight operation carries no executable
+                        // route candidate, so old provider/model capability
+                        // facts must not bleed into the new model.
+                        self.active_route_capabilities =
+                            codewhale_config::route::RouteCapabilities::default();
                         self.refresh_system_prompt();
                         self.emit_session_updated().await;
                         let _ = self
@@ -1794,6 +2227,15 @@ impl Engine {
                             )))
                             .await;
                     }
+                    Op::SetFleetRoster { roster } => {
+                        self.config.fleet_roster = roster;
+                        let _ = self
+                            .tx_event
+                            .send(Event::status(
+                                "Fleet roster refreshed for subsequent turns".to_string(),
+                            ))
+                            .await;
+                    }
                     Op::SyncSession {
                         session_id,
                         messages,
@@ -1803,12 +2245,15 @@ impl Engine {
                         workspace,
                         mode,
                     } => {
+                        let plugin_workspace_changed =
+                            self.plugin_registry.workspace() != workspace.as_path();
                         if let Some(session_id) = session_id {
                             self.session.id = session_id;
                         } else if messages.is_empty() && system_prompt.is_none() {
                             self.session.id = uuid::Uuid::new_v4().to_string();
                         }
-                        self.session.messages = messages.into();
+                        self.session.messages =
+                            crate::runtime_handoff::project_messages_for_restore(&messages).into();
                         self.session.compaction_summary_prompt =
                             extract_compaction_summary_prompt(system_prompt.clone());
                         self.session.system_prompt = system_prompt;
@@ -1824,6 +2269,14 @@ impl Engine {
                         self.current_mode = mode;
                         self.config.model.clone_from(&self.session.model);
                         self.config.workspace = workspace.clone();
+                        if plugin_workspace_changed {
+                            self.plugin_registry =
+                                self.plugin_registry.rediscover_for_workspace(&workspace);
+                            self.config.plugin_registry = Some(Arc::clone(&self.plugin_registry));
+                            // A pool may contain plugin servers and authority
+                            // receipts from the previous workspace snapshot.
+                            self.mcp_pool = None;
+                        }
                         let ctx =
                             crate::project_context::load_project_context_with_parents(&workspace);
                         self.session.project_context = if ctx.has_instructions() {
@@ -1832,13 +2285,24 @@ impl Engine {
                             None
                         };
                         self.session.rebuild_working_set();
+                        self.reconcile_restored_work_bindings().await;
                         self.emit_session_updated().await;
                         let _ = self
                             .tx_event
                             .send(Event::status("Session context synced".to_string()))
                             .await;
                     }
-                    Op::CompactContext => {
+                    Op::CompactContext { route, compaction } => {
+                        if let Err(err) = self.install_resolved_runtime_route(*route) {
+                            let _ = self
+                                .tx_event
+                                .send(Event::error(ErrorEnvelope::fatal_auth(format!(
+                                    "Cannot compact context because its provider route is not ready: {err}"
+                                ))))
+                                .await;
+                            continue;
+                        }
+                        self.config.compaction = *compaction;
                         self.handle_manual_compaction().await;
                     }
                     Op::GetSessionSnapshot { tx } => {
@@ -1849,6 +2313,7 @@ impl Engine {
                             total_tokens,
                             model: self.session.model.clone(),
                             model_provider: self.api_provider.as_str().to_string(),
+                            model_provider_id: self.api_provider_id.clone(),
                             workspace: self.session.workspace.clone(),
                             system_prompt: self.session.system_prompt.clone(),
                             mode: self.current_mode.as_setting().to_string(),
@@ -1879,10 +2344,36 @@ impl Engine {
                             let _ = tx.send(status);
                         }
                     }
+                    Op::ReloadMcp { config_path, tx } => {
+                        let result = self.reload_mcp_pool(config_path).await.map_err(|error| {
+                            codewhale_config::persistence::redact_secrets(&format!("{error:#}"))
+                        });
+                        if let Some(tx) = tx.lock().ok().and_then(|mut guard| guard.take()) {
+                            let _ = tx.send(result);
+                        }
+                    }
                     Op::PurgeContext => {
                         self.handle_purge().await;
                     }
                     Op::EditLastTurn { new_message } => {
+                        let route = match self.current_runtime_route() {
+                            Ok(route) => route,
+                            Err(err) => {
+                                let _ = self
+                                    .tx_event
+                                    .send(Event::error(ErrorEnvelope::fatal_auth(format!(
+                                        "Cannot edit the last turn because its provider route is no longer valid: {err}"
+                                    ))))
+                                    .await;
+                                let outcome = SendMessageOutcome::NotStarted {
+                                    error: Some(format!(
+                                        "provider route is no longer valid: {err}"
+                                    )),
+                                };
+                                self.reconcile_non_completed_goal_turn(&outcome).await;
+                                continue;
+                            }
+                        };
                         // #383: /edit — remove the last user+assistant exchange
                         // from the session, then re-send with the new content.
                         // Pop messages from the tail until we've removed the
@@ -1905,9 +2396,7 @@ impl Engine {
                         self.handle_send_message(
                             new_message,
                             mode,
-                            Some(self.api_provider),
-                            self.session.model.clone(),
-                            self.active_route_limits,
+                            route,
                             self.config.compaction.clone(),
                             self.config.goal_objective.clone(),
                             self.config.goal_token_budget,
@@ -1952,6 +2441,10 @@ impl Engine {
             let mut guard = pool.lock().await;
             guard.shutdown_all().await;
         }
+    }
+
+    fn host_managed_turns(&self) -> bool {
+        self.config.runtime_services.active_thread_id.is_some()
     }
 
     async fn emit_session_updated(&self) {
@@ -2069,8 +2562,8 @@ impl Engine {
         if let Some(hit_tokens) = usage.cache_read_input_tokens {
             line.push_str(&format!(", cache hits {hit_tokens}"));
         }
-        if let Some(miss_tokens) = usage.cache_creation_input_tokens {
-            line.push_str(&format!(", cache misses {miss_tokens}"));
+        if let Some(write_tokens) = usage.cache_creation_input_tokens {
+            line.push_str(&format!(", cache writes {write_tokens}"));
         }
         Some(line)
     }
@@ -2130,6 +2623,15 @@ impl Engine {
             format!(
                 "Current mode policy:\n{}",
                 Self::mode_runtime_instructions(self.current_mode)
+            ),
+            format!(
+                "Current permission posture: {}",
+                self.session.approval_mode.permission_chip_label()
+            ),
+            "Current permission policy source: effective runtime authority".to_string(),
+            format!(
+                "Current question discipline: {}",
+                Self::permission_question_discipline(self.session.approval_mode)
             ),
             format!("Input provenance: {}", provenance.as_str()),
             format!(
@@ -2205,6 +2707,40 @@ impl Engine {
         )
     }
 
+    /// Snapshot the mutable completion gate once for a new top-level user
+    /// turn. Mid-turn steers stay inside the same `handle_deepseek_turn` and
+    /// reuse this already-present block; reinjecting it on every steer would
+    /// duplicate debt text and erase the token-economy benefit of this seam.
+    fn with_slop_ledger_gate_for_initial_user_turn(
+        &mut self,
+        message: Message,
+        provenance: UserInputProvenance,
+    ) -> Message {
+        if provenance != UserInputProvenance::ExternalUser {
+            return message;
+        }
+        Self::attach_slop_ledger_gate(message, self.slop_ledger_gate_block())
+    }
+
+    fn attach_slop_ledger_gate(mut message: Message, gate_block: Option<String>) -> Message {
+        let Some(gate_block) = gate_block else {
+            return message;
+        };
+
+        // Preserve the stable user-text prefix and keep `<turn_meta>` last.
+        // The debt gate changes with local ledger state, so placing it here
+        // avoids invalidating the fingerprinted system prompt for every turn.
+        let insert_at = message.content.len().saturating_sub(1);
+        message.content.insert(
+            insert_at,
+            ContentBlock::Text {
+                text: gate_block,
+                cache_control: None,
+            },
+        );
+        message
+    }
+
     fn user_text_message_with_turn_metadata_for_route_and_provenance(
         &self,
         text: String,
@@ -2243,15 +2779,54 @@ impl Engine {
     }
 
     async fn handle_idle_subagent_completion(&mut self, first: SubAgentCompletion) {
-        let mut completions = vec![first];
-        while let Ok(completion) = self.rx_subagent_completion.try_recv() {
+        let mut completions = Vec::new();
+        if let Some(completion) =
+            claim_subagent_completion(&mut self.delivered_subagent_completion_ids, first)
+        {
             completions.push(completion);
         }
+        while let Ok(completion) = self.rx_subagent_completion.try_recv() {
+            if let Some(completion) =
+                claim_subagent_completion(&mut self.delivered_subagent_completion_ids, completion)
+            {
+                completions.push(completion);
+            }
+        }
+
+        if completions.is_empty() {
+            return;
+        }
+
+        let claimed_ids = completions
+            .iter()
+            .map(|completion| completion.agent_id.clone())
+            .collect::<Vec<_>>();
+        let route = match self.current_runtime_route() {
+            Ok(route) => route,
+            Err(err) => {
+                for agent_id in claimed_ids {
+                    self.delivered_subagent_completion_ids.remove(&agent_id);
+                }
+                let _ = self
+                    .tx_event
+                    .send(Event::error(ErrorEnvelope::fatal_auth(format!(
+                        "Cannot resume the turn because its provider route is no longer valid: {err}"
+                    ))))
+                    .await;
+                let outcome = SendMessageOutcome::NotStarted {
+                    error: Some(format!("provider route is no longer valid: {err}")),
+                };
+                self.reconcile_non_completed_goal_turn(&outcome).await;
+                return;
+            }
+        };
 
         let count = completions.len();
         let content = completions
             .iter()
-            .map(|completion| turn_loop::subagent_completion_runtime_text(&completion.payload))
+            .map(|completion| {
+                crate::runtime_handoff::subagent_completion_runtime_text(&completion.payload)
+            })
             .collect::<Vec<_>>()
             .join("\n\n");
 
@@ -2262,47 +2837,58 @@ impl Engine {
             )))
             .await;
 
-        self.handle_send_message(
-            content,
-            self.current_mode,
-            Some(self.api_provider),
-            self.session.model.clone(),
-            self.active_route_limits,
-            self.config.compaction.clone(),
-            self.config.goal_objective.clone(),
-            self.config.goal_token_budget,
-            self.config.goal_status,
-            self.session.reasoning_effort.clone(),
-            self.session.reasoning_effort_auto,
-            self.session.auto_model,
-            self.session.allow_shell,
-            self.session.trust_mode,
-            self.session.auto_approve,
-            self.session.approval_mode,
-            self.config.translation_enabled,
-            self.config.show_thinking,
-            self.config.allowed_tools.clone(),
-            Vec::new(),
-            self.config.hook_executor.clone(),
-            self.config.verbosity.clone(),
-            UserInputProvenance::SubAgentHandoff,
-        )
-        .await;
+        let outcome = self
+            .handle_send_message(
+                content,
+                self.current_mode,
+                route,
+                self.config.compaction.clone(),
+                self.config.goal_objective.clone(),
+                self.config.goal_token_budget,
+                self.config.goal_status,
+                self.session.reasoning_effort.clone(),
+                self.session.reasoning_effort_auto,
+                self.session.auto_model,
+                self.session.allow_shell,
+                self.session.trust_mode,
+                self.session.auto_approve,
+                self.session.approval_mode,
+                self.config.translation_enabled,
+                self.config.show_thinking,
+                self.config.allowed_tools.clone(),
+                Vec::new(),
+                self.config.hook_executor.clone(),
+                self.config.verbosity.clone(),
+                UserInputProvenance::SubAgentHandoff,
+            )
+            .await;
+        if !outcome.started() {
+            for agent_id in claimed_ids {
+                self.delivered_subagent_completion_ids.remove(&agent_id);
+            }
+        }
     }
 
     /// Handle a send message operation
     #[allow(clippy::too_many_arguments)]
-    /// After a turn completes, check whether an active goal should keep going.
-    /// Returns a continuation message to re-dispatch as a new turn, or `None`
-    /// if the goal is complete, blocked, paused, or over an optional budget.
+    /// After a turn completes, decide whether an active goal should keep going.
+    /// Returns a continuation to dispatch, an explicit terminal budget stop,
+    /// or `Inactive` when no follow-up turn belongs in the queue.
     ///
     /// There is no continuation cap — a goal runs until the model self-reports
     /// done/blocked, the user pauses or clears, or an optional token/time
     /// budget is exhausted. The loop is "until done," not "until N turns."
-    fn goal_continuation_if_active(&self) -> Option<String> {
-        let snapshot = self.config.goal_state.lock().ok()?.snapshot();
+    fn goal_continuation_if_active(&self) -> GoalContinuationAction {
+        let mut state = match self.config.goal_state.lock() {
+            Ok(state) => state,
+            Err(err) => {
+                tracing::warn!("goal state lock poisoned during continuation check: {err}");
+                return GoalContinuationAction::Inactive;
+            }
+        };
+        let snapshot = state.snapshot();
         if !snapshot.is_active() {
-            return None;
+            return GoalContinuationAction::Inactive;
         }
 
         // The snapshot status is a string ("active", "paused", "complete",
@@ -2311,7 +2897,7 @@ impl Engine {
             "active" => crate::goal_loop::GoalRunStatus::Active,
             "complete" => crate::goal_loop::GoalRunStatus::Completed,
             // Paused / Blocked / unknown → no continuation.
-            _ => return None,
+            _ => return GoalContinuationAction::Inactive,
         };
 
         let decision = crate::goal_loop::decide_continuation(
@@ -2329,25 +2915,182 @@ impl Engine {
 
         match decision {
             crate::goal_loop::ContinuationDecision::Continue => {
-                Some(crate::tools::goal::render_continuation_prompt(
-                    &snapshot,
-                    snapshot.continuation_count,
-                ))
+                // A cross-turn dispatch is a real continuation pass just like
+                // the bounded intra-turn retry in `turn_loop`. Record it before
+                // rendering and carrying the snapshot so the durable prompt,
+                // telemetry, and next host sync all agree on the pass number.
+                state.record_continuation();
+                let snapshot = state.snapshot();
+                GoalContinuationAction::Dispatch {
+                    content: crate::tools::goal::render_continuation_prompt(
+                        &snapshot,
+                        snapshot.continuation_count,
+                    ),
+                    snapshot: Box::new(snapshot),
+                }
             }
-            // All stop reasons → no continuation. The caller (the async turn
-            // completion path) emits a status message for budget-exhaustion.
             crate::goal_loop::ContinuationDecision::Stop(reason) => {
                 tracing::info!(?reason, "goal continuation stopped");
-                None
+                let message = match reason {
+                    crate::goal_loop::StopReason::TokenBudget => format!(
+                        "Goal token budget reached ({} / {} tokens); automatic continuation stopped and the goal is blocked.",
+                        snapshot.tokens_used,
+                        snapshot.token_budget.unwrap_or_default(),
+                    ),
+                    crate::goal_loop::StopReason::TimeBudget => format!(
+                        "Goal time budget reached ({} seconds); automatic continuation stopped and the goal is blocked.",
+                        snapshot.time_used_seconds,
+                    ),
+                    crate::goal_loop::StopReason::ContinuationLimit => {
+                        "Goal continuation limit reached; automatic continuation stopped and the goal is blocked."
+                            .to_string()
+                    }
+                    crate::goal_loop::StopReason::Completed
+                    | crate::goal_loop::StopReason::Blocked => {
+                        return GoalContinuationAction::Inactive;
+                    }
+                };
+                GoalContinuationAction::Stopped { message }
             }
         }
+    }
+
+    /// Reconcile a turn that did not complete with the autonomous goal loop.
+    /// Hosted engines leave lifecycle decisions to their durable host. The
+    /// interactive engine must cancel any older queued synthetic token first,
+    /// then project an active goal into a truthful non-running state.
+    async fn reconcile_non_completed_goal_turn(&mut self, outcome: &SendMessageOutcome) {
+        if self.host_managed_turns() {
+            return;
+        }
+
+        self.cancel_scheduled_goal_continuation();
+        match outcome {
+            SendMessageOutcome::NotStarted { error } => {
+                let message = self.goal_turn_not_started_message(error.as_deref());
+                self.block_goal_continuation(message).await;
+            }
+            SendMessageOutcome::Finished {
+                status: TurnOutcomeStatus::Failed,
+                error,
+            } => {
+                let message = self.goal_continuation_failure_message(error.as_deref());
+                self.block_goal_continuation(message).await;
+            }
+            SendMessageOutcome::Finished {
+                status: TurnOutcomeStatus::Interrupted,
+                ..
+            } => self.pause_goal_after_interruption().await,
+            SendMessageOutcome::Finished {
+                status: TurnOutcomeStatus::Completed,
+                ..
+            } => {}
+        }
+    }
+
+    /// A route/client rejection can happen before normal turn setup copies the
+    /// host's just-declared goal into SharedGoalState. Seed only that goal
+    /// descriptor so the rejection can publish a truthful Blocked snapshot;
+    /// no user message or provider turn state is mutated here.
+    fn sync_unstarted_goal_for_terminal_projection(
+        &mut self,
+        objective: Option<&str>,
+        token_budget: Option<u32>,
+        status: GoalStatus,
+    ) {
+        let objective = normalized_goal_objective(objective);
+        if objective.is_none() || status != GoalStatus::Active {
+            return;
+        }
+        sync_goal_state_from_host(
+            &self.config.goal_state,
+            objective.as_deref(),
+            token_budget,
+            status,
+        );
+        self.config.goal_objective = objective;
+        self.config.goal_token_budget = token_budget;
+        self.config.goal_status = status;
+    }
+
+    /// Transition a still-active interactive goal to Blocked and publish every
+    /// host projection in one ordered path. Continuation failures happen
+    /// outside a model tool call, so without this bridge the loop can stop while
+    /// the prompt and sidebar continue to claim the goal is actively running.
+    async fn block_goal_continuation(&mut self, message: String) {
+        let snapshot = match self.config.goal_state.lock() {
+            Ok(mut state) => {
+                if state.is_active()
+                    && let Err(err) = state.mark_blocked(message.clone())
+                {
+                    tracing::warn!("failed to mark goal continuation blocked: {err}");
+                    return;
+                }
+                let snapshot = state.snapshot();
+                if snapshot.status != GoalStatus::Blocked.as_str() {
+                    tracing::warn!(
+                        status = %snapshot.status,
+                        "goal changed before continuation blocker could be published"
+                    );
+                    return;
+                }
+                snapshot
+            }
+            Err(err) => {
+                tracing::warn!("goal state lock poisoned while blocking continuation: {err}");
+                return;
+            }
+        };
+
+        self.config.goal_objective.clone_from(&snapshot.objective);
+        self.config.goal_token_budget = snapshot.token_budget;
+        self.config.goal_status = GoalStatus::Blocked;
+        self.refresh_system_prompt();
+        self.emit_session_updated().await;
+        let _ = self.tx_event.send(Event::GoalUpdated { snapshot }).await;
+        let _ = self.tx_event.send(Event::status(message)).await;
+    }
+
+    /// A user cancellation is neither success nor a provider failure. Pause a
+    /// still-active goal so the sidebar and stable prompt do not claim that an
+    /// autonomous run remains live, and require an explicit `/goal resume`.
+    async fn pause_goal_after_interruption(&mut self) {
+        let snapshot = match self.config.goal_state.lock() {
+            Ok(mut state) => {
+                if !state.is_active() {
+                    return;
+                }
+                let objective = state.objective().map(str::to_string);
+                let budget = state.token_budget();
+                state.sync_from_host_status(objective.as_deref(), budget, GoalStatus::Paused);
+                state.snapshot()
+            }
+            Err(err) => {
+                tracing::warn!("goal state lock poisoned while pausing interruption: {err}");
+                return;
+            }
+        };
+
+        self.config.goal_objective.clone_from(&snapshot.objective);
+        self.config.goal_token_budget = snapshot.token_budget;
+        self.config.goal_status = GoalStatus::Paused;
+        self.refresh_system_prompt();
+        self.emit_session_updated().await;
+        let _ = self.tx_event.send(Event::GoalUpdated { snapshot }).await;
+        let _ = self
+            .tx_event
+            .send(Event::status(
+                "Goal paused because its model turn was interrupted; use /goal resume to continue."
+                    .to_string(),
+            ))
+            .await;
     }
 
     /// Handle `/goal pause|resume|clear|complete|blocked` by writing the new
     /// status to `SharedGoalState` so the cross-turn continuation loop respects
     /// it. This does NOT dispatch a model turn — it's a control-plane update.
     async fn handle_set_goal_status(&mut self, status: GoalStatus, clear: bool) {
-        match self.config.goal_state.lock() {
+        let snapshot = match self.config.goal_state.lock() {
             Ok(mut state) => {
                 if clear {
                     // `/goal clear` — wipe the objective entirely.
@@ -2361,11 +3104,34 @@ impl Engine {
                     let budget = state.token_budget();
                     state.sync_from_host_status(objective.as_deref(), budget, status);
                 }
+                state.snapshot()
             }
             Err(err) => {
                 tracing::warn!("goal state lock poisoned during SetGoalStatus: {err}");
+                return;
             }
-        }
+        };
+
+        // Keep every host-side projection aligned with the authoritative
+        // SharedGoalState. In particular, a cleared state must also clear the
+        // configured fallback used by `goal_objective_for_prompt`; otherwise a
+        // prompt refresh would silently restore the old <session_goal> block.
+        self.config.goal_objective.clone_from(&snapshot.objective);
+        self.config.goal_token_budget = snapshot.token_budget;
+        self.config.goal_status = if snapshot.objective.is_some() {
+            status
+        } else {
+            GoalStatus::Active
+        };
+        self.refresh_system_prompt();
+        self.emit_session_updated().await;
+        // Unlike routine end-of-turn updates, an explicit clear must publish
+        // the canonical empty snapshot. Keeping this scoped to the control op
+        // avoids an unrelated no-goal turn racing with a newly declared goal in
+        // the UI while still letting the clear win over a preceding active
+        // TurnComplete snapshot.
+        let _ = self.tx_event.send(Event::GoalUpdated { snapshot }).await;
+
         let label = if clear {
             "cleared"
         } else {
@@ -2380,7 +3146,6 @@ impl Engine {
             .tx_event
             .send(Event::status(format!("Goal {label}.")))
             .await;
-        self.emit_goal_updated().await;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2388,9 +3153,7 @@ impl Engine {
         &mut self,
         content: String,
         mode: AppMode,
-        provider: Option<ApiProvider>,
-        model: String,
-        route_limits: Option<codewhale_config::route::RouteLimits>,
+        route: ResolvedRuntimeRoute,
         compaction: CompactionConfig,
         goal_objective: Option<String>,
         goal_token_budget: Option<u32>,
@@ -2409,7 +3172,28 @@ impl Engine {
         hook_executor: Option<std::sync::Arc<crate::hooks::HookExecutor>>,
         verbosity: Option<String>,
         provenance: UserInputProvenance,
-    ) {
+    ) -> SendMessageOutcome {
+        let effective_provider = route.identity.provider;
+        let provider_identity = route.identity.key.clone();
+        let model = route.model.clone();
+        let route_limits = crate::route_budget::known_route_limits(route.candidate.limits());
+        if let Err(err) = self.install_resolved_runtime_route(route) {
+            let _ = self
+                .tx_event
+                .send(Event::error(ErrorEnvelope::fatal_auth(format!(
+                    "Cannot start the turn because its provider route is not ready: {err}"
+                ))))
+                .await;
+            self.sync_unstarted_goal_for_terminal_projection(
+                goal_objective.as_deref(),
+                goal_token_budget,
+                goal_status,
+            );
+            let outcome = SendMessageOutcome::NotStarted { error: Some(err) };
+            self.reconcile_non_completed_goal_turn(&outcome).await;
+            return outcome;
+        }
+
         let input_policy = effective_input_policy(
             provenance,
             mode,
@@ -2436,6 +3220,12 @@ impl Engine {
         // Create turn context first so start event includes a stable turn id.
         let mut turn = TurnContext::new(self.config.max_steps);
         self.turn_counter = self.turn_counter.saturating_add(1);
+        let turn_route = TurnRoute {
+            provider: effective_provider,
+            provider_identity,
+            model: model.clone(),
+            auto_model,
+        };
 
         // Emit turn started event IMMEDIATELY so the UI knows the turn is
         // active. The snapshot below can take 30+ seconds on slow filesystems
@@ -2444,32 +3234,12 @@ impl Engine {
             .tx_event
             .send(Event::TurnStarted {
                 turn_id: turn.id.clone(),
+                created_at: chrono::Utc::now(),
+                route: Some(turn_route),
             })
             .await;
 
-        // Operate is not allowed to silently fall through to Act for work that
-        // is not provably one-step. Until the host can prove a Workflow/Fleet
-        // dispatch plus terminal receipt, return an actionable blocker before
-        // route activation, snapshots, or any provider request.
-        if let Some(message) = self.operate_readiness_blocker(input_policy.mode, &content) {
-            let _ = self
-                .tx_event
-                .send(Event::error(ErrorEnvelope::transient(message.clone())))
-                .await;
-            let _ = self
-                .tx_event
-                .send(Event::TurnComplete {
-                    usage: turn.usage.clone(),
-                    status: TurnOutcomeStatus::Failed,
-                    error: Some(message),
-                    tool_catalog: None,
-                    base_url: None,
-                })
-                .await;
-            return;
-        }
-
-        // Apply the host-resolved route budget only after admission succeeds.
+        // Apply the host-resolved route budget before building the request.
         // The model, limits, and compaction policy arrive in one operation so
         // no provider request can observe a partially updated route.
         self.active_route_limits = route_limits;
@@ -2504,29 +3274,7 @@ impl Engine {
         // is moved into `user_text_message_with_turn_metadata_for_route` below.
         let snapshot_prompt_post = content.clone();
 
-        // Check if we have the appropriate client
-        if let Some(provider) = provider
-            && let Err(message) = self.activate_runtime_route(provider, &model)
-        {
-            self.deepseek_client_error = Some(message.clone());
-            let _ = self
-                .tx_event
-                .send(Event::error(ErrorEnvelope::fatal_auth(message.clone())))
-                .await;
-            let _ = self
-                .tx_event
-                .send(Event::TurnComplete {
-                    usage: turn.usage.clone(),
-                    status: TurnOutcomeStatus::Failed,
-                    error: Some(message),
-                    tool_catalog: None,
-                    base_url: None,
-                })
-                .await;
-            return;
-        }
-
-        if self.deepseek_client.is_none() {
+        if self.model_client.is_none() {
             let message = self
                 .deepseek_client_error
                 .as_deref()
@@ -2541,12 +3289,21 @@ impl Engine {
                 .send(Event::TurnComplete {
                     usage: turn.usage.clone(),
                     status: TurnOutcomeStatus::Failed,
-                    error: Some(message),
+                    error: Some(message.clone()),
                     tool_catalog: None,
                     base_url: None,
                 })
                 .await;
-            return;
+            self.sync_unstarted_goal_for_terminal_projection(
+                goal_objective.as_deref(),
+                goal_token_budget,
+                goal_status,
+            );
+            let outcome = SendMessageOutcome::NotStarted {
+                error: Some(message),
+            };
+            self.reconcile_non_completed_goal_turn(&outcome).await;
+            return outcome;
         }
 
         self.session
@@ -2563,6 +3320,10 @@ impl Engine {
             reasoning_effort_auto,
             provenance,
         );
+        let base_content_blocks = user_msg.content.len();
+        let user_msg = self.with_slop_ledger_gate_for_initial_user_turn(user_msg, provenance);
+        turn.active_slop_gate_message =
+            (user_msg.content.len() > base_content_blocks).then(|| user_msg.clone());
         self.session.add_message(user_msg);
 
         let previous_goal_objective = self.config.goal_objective.clone();
@@ -2628,7 +3389,6 @@ impl Engine {
             )
             .await;
             Some(SubAgentForkContext {
-                system: self.session.system_prompt.clone(),
                 messages: self.messages_with_turn_metadata(),
                 structured_state_block: state.to_system_block(),
             })
@@ -2702,6 +3462,7 @@ impl Engine {
                     Some(self.tx_event.clone()),
                     Arc::clone(&self.subagent_manager),
                 )
+                .with_locale_tag(self.config.locale_tag.clone())
                 .with_role_models(self.subagent_role_models())
                 .with_api_config(self.api_config.clone())
                 .with_fleet_roster(self.config.fleet_roster.clone())
@@ -2771,18 +3532,26 @@ impl Engine {
             Vec::new()
         };
         let tools = tool_registry.as_ref().map(|registry| {
-            let capability = crate::model_profile::resolved_capability_profile(
+            let capability = crate::model_profile::resolved_capability_profile_for_route(
                 self.api_config.api_provider(),
                 &self.config.model,
+                self.active_route_capabilities,
+                self.active_route_limits.unwrap_or_default(),
             );
             let mut always_load = self.config.tools_always_load.clone();
             if self.config.features.enabled(Feature::Mcp) {
                 always_load.insert("start_mcp_server".to_string());
             }
+            let bypass = input_policy.auto_approve
+                || input_policy.approval_mode == crate::tui::approval::ApprovalMode::Bypass;
             let mut catalog = build_model_tool_catalog_with_surface(
                 registry.to_api_tools_with_cache(true),
                 mcp_tools,
-                input_policy.mode,
+                if bypass {
+                    AppMode::Yolo
+                } else {
+                    input_policy.mode
+                },
                 &always_load,
                 capability.tool_surface_budget,
             );
@@ -2795,6 +3564,10 @@ impl Engine {
                 &mut catalog,
                 self.config.allowed_tools.as_deref(),
                 self.config.disallowed_tools.as_deref(),
+            );
+            filter_tool_catalog_for_permission_posture(
+                &mut catalog,
+                input_policy.approval_mode_for_session(),
             );
             catalog
         });
@@ -2847,7 +3620,7 @@ impl Engine {
             .send(Event::TurnComplete {
                 usage: turn.usage,
                 status,
-                error,
+                error: error.clone(),
                 tool_catalog: tool_catalog_for_event,
                 base_url: base_url_for_event,
             })
@@ -2874,49 +3647,29 @@ impl Engine {
         }
 
         // ── Cross-turn goal continuation ───────────────────────────────────
-        // If the turn completed successfully and a goal is still Active (and
-        // under any optional budget), re-dispatch a synthetic continuation
-        // message back into the engine's own op channel. This makes `/goal` a
-        // persistent loop that runs until the model self-reports complete or
-        // blocked, the user pauses/clears, or an optional budget is exhausted.
-        // There is no continuation cap. A Failed or Interrupted turn does NOT
-        // continue — Esc cancels the loop by interrupting the turn.
-        if status == TurnOutcomeStatus::Completed
-            && let Some(continuation) = self.goal_continuation_if_active()
+        // When the interactive engine owns turn lifecycle, a successful turn
+        // with an active goal re-dispatches a synthetic continuation through
+        // its own op channel. RuntimeThreadManager engines instead yield here:
+        // their host must create the next durable claim before dispatching any
+        // further turn. A Failed or Interrupted turn never continues.
+        let outcome = SendMessageOutcome::Finished { status, error };
+        if !self.host_managed_turns()
+            && matches!(
+                &outcome,
+                SendMessageOutcome::Finished {
+                    status: TurnOutcomeStatus::Completed,
+                    ..
+                }
+            )
         {
-            // Re-dispatch with the same route/mode/approval settings as
-            // the prior turn. The non-Copy values were moved into
-            // `self.config` / `self.session` earlier in this function, so
-            // we clone them back out here.
-            let _ = self
-                .tx_op
-                .send(Op::SendMessage {
-                    content: continuation,
-                    mode,
-                    provider,
-                    model: self.session.model.clone(),
-                    route_limits: self.active_route_limits,
-                    compaction: Box::new(self.config.compaction.clone()),
-                    goal_objective: None,
-                    goal_token_budget: None,
-                    goal_status: GoalStatus::Active,
-                    reasoning_effort: self.session.reasoning_effort.clone(),
-                    reasoning_effort_auto,
-                    auto_model,
-                    allow_shell,
-                    trust_mode,
-                    auto_approve,
-                    approval_mode,
-                    translation_enabled,
-                    show_thinking,
-                    allowed_tools: self.config.allowed_tools.clone(),
-                    dynamic_tools: dynamic_tools.clone(),
-                    hook_executor: self.config.hook_executor.clone(),
-                    verbosity: self.config.verbosity.clone(),
-                    provenance: UserInputProvenance::Runtime,
-                })
-                .await;
+            // Queue a typed continuation instead of freezing an Active goal
+            // snapshot into a generic message. The operation re-reads the live
+            // state when consumed, after any already-queued goal controls.
+            self.schedule_goal_continuation(dynamic_tools);
+        } else {
+            self.reconcile_non_completed_goal_turn(&outcome).await;
         }
+        outcome
     }
 
     async fn handle_manual_compaction(&mut self) {
@@ -3135,7 +3888,40 @@ impl Engine {
         removed
     }
 
-    async fn recover_context_overflow(&mut self, client: &DeepSeekClient, reason: &str) -> bool {
+    /// Merge working-set pins with the mutable completion gate carried by the
+    /// current top-level user turn. The exact message identity matters: an
+    /// unchanged ledger can produce identical gate text on older turns, and
+    /// pinning every historical copy would defeat compaction.
+    fn compaction_pins_for_active_turn(
+        &self,
+        active_slop_gate_message: Option<&Message>,
+    ) -> Vec<usize> {
+        let mut pins = self
+            .session
+            .working_set
+            .pinned_message_indices(&self.session.messages, &self.session.workspace);
+
+        if let Some(active_message) = active_slop_gate_message
+            && let Some(index) = self
+                .session
+                .messages
+                .iter()
+                .rposition(|message| message == active_message)
+        {
+            pins.push(index);
+        }
+
+        pins.sort_unstable();
+        pins.dedup();
+        pins
+    }
+
+    async fn recover_context_overflow(
+        &mut self,
+        client: &dyn crate::core::model_client::ModelClient,
+        reason: &str,
+        active_slop_gate_message: Option<&Message>,
+    ) -> bool {
         let Some(target_budget) = context_input_budget_for_route(
             self.api_provider,
             &self.session.model,
@@ -3168,10 +3954,7 @@ impl Engine {
         // Previously this passed None/None, so a compaction routed here (which,
         // on large windows, is the path that actually fires) could summarize
         // away pinned errors, patches, and the files the user is editing.
-        let compaction_pins = self
-            .session
-            .working_set
-            .pinned_message_indices(&self.session.messages, &self.session.workspace);
+        let compaction_pins = self.compaction_pins_for_active_turn(active_slop_gate_message);
         let compaction_paths = self.session.working_set.top_paths(24);
 
         match compact_messages_safe(
@@ -3287,13 +4070,21 @@ impl Engine {
             authority.auto_approve,
         )
         .with_state_namespace(self.session.id.clone())
+        .with_route_context_window(crate::route_budget::route_context_window_tokens(
+            self.api_provider,
+            &self.session.model,
+            self.config.active_route_limits,
+        ))
+        .with_review_plan_changes(matches!(mode, AppMode::Plan))
         .with_features(self.config.features.clone())
         .with_shell_manager(self.shell_manager.clone())
+        .with_file_read_tracker(self.file_read_tracker.clone())
         .with_runtime_services(self.config.runtime_services.clone())
         .with_skills_config(
             self.config.skills_dir.clone(),
             self.config.skills_scan_codewhale_only,
         )
+        .with_plugin_registry(Arc::clone(&self.plugin_registry))
         .with_session_objects(crate::rlm::session::SessionObjectSnapshot::new(
             self.session.id.clone(),
             self.session.model.clone(),
@@ -3340,6 +4131,18 @@ impl Engine {
         ctx.search_provider = self.config.search_provider;
         ctx.search_api_key = self.config.search_api_key.clone();
         ctx.search_base_url = self.config.search_base_url.clone();
+        ctx.route_capabilities = self.active_route_capabilities;
+        if self
+            .active_route_capabilities
+            .server_side_web_search
+            .is_supported()
+        {
+            ctx.provider_native_search = self
+                .deepseek_client
+                .as_ref()
+                .cloned()
+                .and_then(crate::client::ProviderNativeSearchClient::new);
+        }
 
         let policy = authority.sandbox_policy(&self.session.workspace);
         let mut ctx = ctx.with_elevated_sandbox_policy(policy);
@@ -3351,17 +4154,120 @@ impl Engine {
         ctx
     }
 
+    /// Revalidate durable owners after a saved session is installed. Owner
+    /// stores apply restart recovery first; the graph consumes only their
+    /// monotonic snapshots and never infers liveness from prior UI state.
+    async fn reconcile_restored_work_bindings(&self) {
+        let Some(work) = self.config.runtime_services.work.as_ref() else {
+            return;
+        };
+        let session_id = self.session.id.as_str();
+        let candidates = work
+            .reconcilable_durable_bindings(Some(session_id))
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let checked_at = chrono::Utc::now().timestamp_millis();
+
+        let mut seen_tasks = HashSet::new();
+        if let Some(task_manager) = self.config.runtime_services.task_manager.as_ref() {
+            for task in task_manager.list_tasks(None).await {
+                let external = format!("task:{}", task.id);
+                if !candidates.contains(&external) {
+                    continue;
+                }
+                seen_tasks.insert(external.clone());
+                if let Err(err) = work.reconcile_operation(
+                    session_id,
+                    crate::work_graph::task_owner_snapshot(
+                        &task.id,
+                        task.status,
+                        task.lifecycle_seq,
+                        task.created_at,
+                        task.started_at,
+                        task.ended_at,
+                    ),
+                ) {
+                    tracing::warn!(task_id = %task.id, error = %err, "failed to reconcile restored task owner");
+                }
+            }
+        }
+        for external in candidates
+            .iter()
+            .filter(|external| external.starts_with("task:"))
+            .filter(|external| !seen_tasks.contains(*external))
+        {
+            if let Err(err) = work.reconcile_observation(
+                session_id,
+                external,
+                crate::work_graph::OperationObservation::OwnerMissing { checked_at },
+            ) {
+                tracing::warn!(%external, error = %err, "failed to mark missing task owner");
+            }
+        }
+
+        let worker_records = self.subagent_manager.read().await.list_worker_records();
+        let mut seen_workers = HashSet::new();
+        for record in worker_records {
+            let Some(snapshot) = agent_worker_owner_snapshot(&record) else {
+                continue;
+            };
+            if !candidates.contains(&snapshot.external) {
+                continue;
+            }
+            seen_workers.insert(snapshot.external.clone());
+            if let Err(err) = work.reconcile_operation(session_id, snapshot) {
+                tracing::warn!(worker_id = %record.spec.worker_id, error = %err, "failed to reconcile restored worker owner");
+            }
+        }
+        for external in candidates
+            .iter()
+            .filter(|external| external.starts_with("worker:"))
+            .filter(|external| !seen_workers.contains(*external))
+        {
+            if let Err(err) = work.reconcile_observation(
+                session_id,
+                external,
+                crate::work_graph::OperationObservation::OwnerMissing { checked_at },
+            ) {
+                tracing::warn!(%external, error = %err, "failed to mark missing worker owner");
+            }
+        }
+
+        if let Err(err) = crate::tools::workflow::reconcile_persisted_workflow_bindings(
+            work,
+            session_id,
+            &self.session.workspace,
+        ) {
+            tracing::warn!(error = %err, "failed to reconcile restored workflow owners");
+        }
+    }
+
     async fn ensure_mcp_pool(&mut self) -> Result<Arc<AsyncMutex<McpPool>>, ToolError> {
         if let Some(pool) = self.mcp_pool.as_ref() {
             return Ok(Arc::clone(pool));
         }
-        let mut pool = McpPool::from_config_path_with_workspace(
+        let mut pool = McpPool::from_config_path_with_workspace_and_plugins(
             &self.session.mcp_config_path,
             &self.session.workspace,
+            Arc::clone(&self.plugin_registry),
         )
         .unwrap_or_else(|e| {
-            tracing::debug!("No MCP config: {e}");
-            McpPool::new(McpConfig::default())
+            tracing::debug!(
+                "MCP config unavailable: {}",
+                crate::mcp::format_mcp_error_for_display(&e)
+            );
+            McpPool::empty_with_workspace_config_sources(
+                &self.session.mcp_config_path,
+                &self.session.workspace,
+                Arc::clone(&self.plugin_registry),
+            )
+            .unwrap_or_else(|fallback_error| {
+                tracing::debug!(
+                    "MCP reload source setup failed: {}",
+                    crate::mcp::format_mcp_error_for_display(&fallback_error)
+                );
+                McpPool::new(McpConfig::default())
+            })
         });
         if let Some(decider) = self.config.network_policy.as_ref() {
             pool = pool.with_network_policy(decider.clone());
@@ -3369,6 +4275,33 @@ impl Engine {
         let pool = Arc::new(AsyncMutex::new(pool));
         self.mcp_pool = Some(Arc::clone(&pool));
         Ok(pool)
+    }
+
+    async fn reload_mcp_pool(
+        &mut self,
+        config_path: PathBuf,
+    ) -> anyhow::Result<crate::mcp::McpManagerSnapshot> {
+        let pool = self
+            .ensure_mcp_pool()
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let mut pool = pool.lock().await;
+        let connection_errors = if config_path == self.session.mcp_config_path {
+            pool.reload_and_connect_all().await?
+        } else {
+            pool.switch_workspace_config_source_and_connect_all(
+                &config_path,
+                &self.session.workspace,
+                Arc::clone(&self.plugin_registry),
+            )
+            .await?
+        };
+        let errors = connection_errors
+            .into_iter()
+            .map(|(name, error)| (name, crate::mcp::format_mcp_error_for_display(&error)))
+            .collect::<HashMap<_, _>>();
+        self.session.mcp_config_path = config_path;
+        Ok(pool.manager_snapshot(&self.session.mcp_config_path, false, &errors))
     }
 
     async fn mcp_tools(&mut self) -> Vec<Tool> {
@@ -3532,21 +4465,11 @@ impl Engine {
                 show_thinking: self.config.show_thinking,
                 verbosity: self.config.verbosity.as_deref(),
                 skills_scan_codewhale_only: self.config.skills_scan_codewhale_only,
+                plugin_registry: Some(self.plugin_registry.as_ref()),
             },
         );
-        let mut stable_prompt =
+        let stable_prompt =
             merge_system_prompts(Some(&base), self.session.compaction_summary_prompt.clone());
-
-        // SlopLedger completion-gate: inject unresolved slop entries into the
-        // system prompt so the agent can autonomously review them before
-        // claiming the task is done (#2127).
-        let gate_block = self.slop_ledger_gate_block();
-        if let Some(ref block) = gate_block
-            && let Some(SystemPrompt::Text(prompt_text)) = &mut stable_prompt
-        {
-            prompt_text.push_str("\n\n");
-            prompt_text.push_str(block);
-        }
 
         let stable_hash = system_prompt_hash(stable_prompt.as_ref());
         if self.session.system_prompt_override {
@@ -3591,16 +4514,56 @@ impl Engine {
     /// intentionally accepts the cache-invalidation cost because the
     /// context-reduction benefit outweighs it.
     fn merge_compaction_summary(&mut self, summary_prompt: Option<SystemPrompt>) {
-        if summary_prompt.is_none() {
+        let Some(summary_prompt) = summary_prompt else {
             return;
-        }
-        self.session.compaction_summary_prompt = merge_system_prompts(
-            self.session.compaction_summary_prompt.as_ref(),
-            summary_prompt.clone(),
-        );
-        let merged = merge_system_prompts(self.session.system_prompt.as_ref(), summary_prompt);
+        };
+        let reanchor = self
+            .config
+            .runtime_services
+            .work
+            .as_ref()
+            .and_then(|work| work.active_operation_summary(Some(&self.session.id)))
+            .map(SystemPrompt::Text);
+        let summary_prompt =
+            merge_system_prompts(Some(&summary_prompt), reanchor).or(Some(summary_prompt));
+        let prior_compaction =
+            strip_active_operation_reanchor(self.session.compaction_summary_prompt.as_ref());
+        self.session.compaction_summary_prompt =
+            merge_system_prompts(prior_compaction.as_ref(), summary_prompt.clone());
+        let prior_system = strip_active_operation_reanchor(self.session.system_prompt.as_ref());
+        let merged = merge_system_prompts(prior_system.as_ref(), summary_prompt);
         self.session.last_system_prompt_hash = Some(system_prompt_hash(merged.as_ref()));
         self.session.system_prompt = merged;
+    }
+}
+
+fn strip_active_operation_reanchor(prompt: Option<&SystemPrompt>) -> Option<SystemPrompt> {
+    fn strip_text(mut text: String) -> Option<String> {
+        while let Some(start) = text.find(crate::work_graph::ACTIVE_OPERATION_SUMMARY_START) {
+            let tail = start + crate::work_graph::ACTIVE_OPERATION_SUMMARY_START.len();
+            let end = text[tail..]
+                .find(crate::work_graph::ACTIVE_OPERATION_SUMMARY_END)
+                .map_or(text.len(), |offset| {
+                    tail + offset + crate::work_graph::ACTIVE_OPERATION_SUMMARY_END.len()
+                });
+            text.replace_range(start..end, "");
+        }
+        let text = text.trim().to_string();
+        (!text.is_empty()).then_some(text)
+    }
+
+    match prompt.cloned()? {
+        SystemPrompt::Text(text) => strip_text(text).map(SystemPrompt::Text),
+        SystemPrompt::Blocks(blocks) => {
+            let blocks = blocks
+                .into_iter()
+                .filter_map(|mut block| {
+                    block.text = strip_text(block.text)?;
+                    Some(block)
+                })
+                .collect::<Vec<_>>();
+            (!blocks.is_empty()).then_some(SystemPrompt::Blocks(blocks))
+        }
     }
 }
 
@@ -3777,7 +4740,15 @@ pub(super) fn auto_review_plan_decision(
                 "Built-in safety gate requires approval: {}",
                 decision.reason
             );
-            if matches!(approval_mode, crate::tui::approval::ApprovalMode::Never) {
+            if matches!(
+                approval_mode,
+                crate::tui::approval::ApprovalMode::Never
+                    | crate::tui::approval::ApprovalMode::Bypass
+            ) {
+                // Never and Full Access are both non-interactive postures for
+                // approval holds. Full Access auto-runs ordinary calls, but a
+                // non-bypassable safety floor fails closed instead of opening
+                // a contradictory modal or being silently auto-approved.
                 AutoReviewPlanDecision::Block(reason)
             } else {
                 AutoReviewPlanDecision::ForcePrompt(reason)
@@ -3924,11 +4895,33 @@ pub fn spawn_engine(config: EngineConfig, api_config: &Config) -> EngineHandle {
     handle
 }
 
+/// Spawn a runtime-owned engine whose autonomous later turns resolve against
+/// the manager's atomic config snapshot. This does not mutate an active turn.
+pub(crate) fn spawn_engine_with_authoritative_route_config(
+    config: EngineConfig,
+    api_config: &Config,
+    authoritative_route_config: Arc<parking_lot::RwLock<Config>>,
+) -> EngineHandle {
+    let (mut engine, handle) = Engine::new(config, api_config);
+    engine.authoritative_route_config = Some(authoritative_route_config);
+
+    spawn_supervised(
+        "engine-event-loop",
+        std::panic::Location::caller(),
+        async move {
+            engine.run().await;
+        },
+    );
+
+    handle
+}
+
 #[cfg(test)]
 pub(crate) struct MockEngineHandle {
     pub handle: EngineHandle,
     pub rx_op: mpsc::Receiver<Op>,
     rx_approval: mpsc::Receiver<ApprovalDecision>,
+    rx_user_input: mpsc::Receiver<UserInputDecision>,
     pub rx_steer: mpsc::Receiver<String>,
     pub tx_event: mpsc::Sender<Event>,
     pub cancel_token: CancellationToken,
@@ -3960,6 +4953,29 @@ impl MockEngineHandle {
             }
         }
     }
+
+    pub(crate) async fn recv_user_input_submission(
+        &mut self,
+    ) -> Option<(String, UserInputResponse)> {
+        match self.rx_user_input.recv().await? {
+            UserInputDecision::Submitted { id, response } => Some((id, response)),
+            UserInputDecision::Cancelled { .. } => None,
+        }
+    }
+
+    pub(crate) async fn recv_user_input_cancellation(&mut self) -> Option<String> {
+        match self.rx_user_input.recv().await? {
+            UserInputDecision::Cancelled { id } => Some(id),
+            UserInputDecision::Submitted { .. } => None,
+        }
+    }
+
+    /// Close the engine event stream without moving fields out of the handle,
+    /// so failure-path tests can keep using the receiver helpers afterwards.
+    pub(crate) fn close_event_stream(&mut self) {
+        let (tx_event, _rx_event) = mpsc::channel(1);
+        self.tx_event = tx_event;
+    }
 }
 
 #[cfg(test)]
@@ -3967,7 +4983,7 @@ pub(crate) fn mock_engine_handle() -> MockEngineHandle {
     let (tx_op, rx_op) = mpsc::channel(32);
     let (tx_event, rx_event) = mpsc::channel(256);
     let (tx_approval, rx_approval) = mpsc::channel(64);
-    let (tx_user_input, _rx_user_input) = mpsc::channel(32);
+    let (tx_user_input, rx_user_input) = mpsc::channel(32);
     let (tx_steer, rx_steer) = mpsc::channel(64);
     let cancel_token = CancellationToken::new();
     let shared_cancel_token = Arc::new(StdMutex::new(cancel_token.clone()));
@@ -3982,12 +4998,14 @@ pub(crate) fn mock_engine_handle() -> MockEngineHandle {
         tx_user_input,
         tx_steer,
         shared_paused,
+        client_preflight_required: false,
     };
 
     MockEngineHandle {
         handle,
         rx_op,
         rx_approval,
+        rx_user_input,
         rx_steer,
         tx_event,
         cancel_token,
@@ -4015,10 +5033,13 @@ use context::{
 use context::{context_input_budget_for_provider, effective_max_output_tokens};
 mod dispatch;
 mod lsp_hooks;
+mod read_repeat_guard;
 mod streaming;
+mod stuck_guard;
 mod token_estimate_cache;
 mod tool_catalog;
 mod tool_execution;
+mod tool_preparation;
 mod tool_setup;
 mod turn_loop;
 pub(crate) use token_estimate_cache::TokenEstimateCache;
@@ -4042,18 +5063,29 @@ fn filter_tool_catalog_for_gates(
     });
 }
 
+/// Auto-Review is the one fully autonomous posture. Hiding the question tool
+/// keeps both the eager and deferred/tool-search surfaces aligned with the
+/// runtime question guard in `turn_loop`.
+fn filter_tool_catalog_for_permission_posture(
+    catalog: &mut Vec<Tool>,
+    approval_mode: crate::tui::approval::ApprovalMode,
+) {
+    if !super::authority::permission_posture_allows_questions(approval_mode) {
+        catalog.retain(|tool| tool.name != REQUEST_USER_INPUT_NAME);
+    }
+}
+
 use self::approval::{ApprovalDecision, ApprovalResult, UserInputDecision};
-#[cfg(test)]
-use self::dispatch::should_parallelize_tool_batch;
 use self::dispatch::{
     ParallelToolResult, ParallelToolResultEntry, ToolApprovalStamp, ToolExecGuard, ToolExecOutcome,
     ToolExecutionBatch, ToolExecutionPlan, caller_allowed_for_tool, caller_type_for_tool_use,
-    final_tool_input, format_tool_error, malformed_tool_arguments_error,
-    malformed_tool_arguments_input, mcp_tool_approval_description, mcp_tool_is_parallel_safe,
-    mcp_tool_is_read_only, parse_parallel_tool_calls, parse_tool_input,
-    plan_tool_execution_batches, should_force_update_plan_first, should_stop_after_plan_tool,
-    stamp_tool_result_approval,
+    final_tool_input, format_tool_error_with_schema, malformed_tool_arguments_error,
+    malformed_tool_arguments_input, mcp_tool_is_parallel_safe, parse_parallel_tool_calls,
+    parse_tool_input, plan_tool_execution_batches, should_force_update_plan_first,
+    should_stop_after_plan_tool, stamp_tool_result_approval,
 };
+#[cfg(test)]
+use self::dispatch::{format_tool_error, should_parallelize_tool_batch};
 #[cfg(test)]
 use self::lsp_hooks::edited_paths_for_tool;
 #[cfg(test)]
@@ -4080,6 +5112,7 @@ use self::tool_catalog::{
     preflight_requested_deferred_tool, should_default_defer_tool,
 };
 use self::tool_execution::emit_tool_audit;
+use self::tool_preparation::{prepare_tool_call, reprepare_tool_call_after_hook};
 use crate::tools::js_execution::execute_js_execution_tool;
 
 #[cfg(test)]

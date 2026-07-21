@@ -3,7 +3,9 @@
 use ratatui::style::Color;
 
 use super::detect::PaletteMode;
-use super::themes::{ThemeId, UiTheme};
+use super::themes::{
+    GRAYSCALE_UI_THEME, LIGHT_UI_THEME, SOLARIZED_LIGHT_UI_THEME, ThemeId, UiTheme,
+};
 use super::tokens::*;
 
 #[must_use]
@@ -37,12 +39,28 @@ fn adapt_fg_for_light_palette(color: Color) -> Color {
         LIGHT_TEXT_SOFT
     } else if color == BORDER_COLOR {
         LIGHT_BORDER
-    } else if color == TEXT_ACCENT || color == WHALE_INFO || color == ACCENT_TOOL_LIVE {
-        WHALE_ACCENT_PRIMARY
+    } else if color == TEXT_ACCENT || color == ACCENT_TOOL_LIVE {
+        LIGHT_LIVE
+    } else if color == WHALE_INFO || color == WHALE_ACTION || color == WHALE_ACCENT_PRIMARY {
+        LIGHT_ACTION
+    } else if color == MODE_AGENT {
+        LIGHT_UI_THEME.mode_agent
+    } else if color == WHALE_HUMAN {
+        LIGHT_HUMAN
+    } else if color == MODE_PLAN {
+        LIGHT_UI_THEME.mode_plan
     } else if color == TEXT_REASONING || color == ACCENT_REASONING_LIVE {
         Color::Rgb(146, 64, 14)
-    } else if color == ACCENT_TOOL_ISSUE {
-        Color::Rgb(159, 18, 57)
+    } else if color == ACCENT_TOOL_ISSUE || color == WHALE_ERROR || color == STATUS_ERROR {
+        LIGHT_DANGER
+    } else if color == MODE_YOLO {
+        LIGHT_UI_THEME.mode_yolo
+    } else if color == STATUS_WARNING {
+        LIGHT_WARNING
+    } else if color == STATUS_SUCCESS {
+        LIGHT_SUCCESS_FG
+    } else if color == MODE_OPERATE {
+        LIGHT_OPERATE
     } else if color == DIFF_ADDED {
         Color::Rgb(22, 101, 52)
     } else if color == USER_BODY {
@@ -94,14 +112,26 @@ fn adapt_fg_for_solarized_light_palette(color: Color) -> Color {
         SOLARIZED_TEXT_SOFT
     } else if color == BORDER_COLOR {
         SOLARIZED_BORDER
-    } else if color == TEXT_ACCENT || color == WHALE_INFO || color == ACCENT_TOOL_LIVE {
+    } else if color == TEXT_ACCENT || color == ACCENT_TOOL_LIVE {
+        SOLARIZED_CYAN
+    } else if color == WHALE_INFO || color == WHALE_ACTION || color == WHALE_ACCENT_PRIMARY {
         SOLARIZED_BLUE
-    } else if color == TEXT_REASONING || color == ACCENT_REASONING_LIVE {
+    } else if color == MODE_AGENT {
+        SOLARIZED_LIGHT_UI_THEME.mode_agent
+    } else if color == WHALE_HUMAN {
         SOLARIZED_ORANGE
-    } else if color == ACCENT_TOOL_ISSUE {
+    } else if color == MODE_PLAN {
+        SOLARIZED_LIGHT_UI_THEME.mode_plan
+    } else if color == STATUS_WARNING || color == TEXT_REASONING || color == ACCENT_REASONING_LIVE {
+        SOLARIZED_ORANGE
+    } else if color == ACCENT_TOOL_ISSUE || color == WHALE_ERROR || color == STATUS_ERROR {
         SOLARIZED_RED
-    } else if color == DIFF_ADDED || color == USER_BODY {
+    } else if color == MODE_YOLO {
+        SOLARIZED_LIGHT_UI_THEME.mode_yolo
+    } else if color == DIFF_ADDED || color == USER_BODY || color == STATUS_SUCCESS {
         SOLARIZED_GREEN
+    } else if color == MODE_OPERATE {
+        Color::Rgb(0x6C, 0x71, 0xC4)
     } else {
         color
     }
@@ -220,24 +250,34 @@ pub fn adapt_fg_for_theme(color: Color, theme: ThemeId, ui: &UiTheme) -> Color {
         ui.text_soft
     } else if color == BORDER_COLOR {
         ui.border
-    } else if color == TEXT_ACCENT || color == WHALE_INFO || color == ACCENT_TOOL_LIVE {
+    } else if color == TEXT_ACCENT || color == ACCENT_TOOL_LIVE {
         ui.status_working
+    } else if color == WHALE_INFO || color == WHALE_ACTION || color == WHALE_ACCENT_PRIMARY {
+        ui.accent_primary
+    } else if color == MODE_AGENT {
+        ui.mode_agent
+    } else if color == WHALE_HUMAN {
+        ui.accent_action
+    } else if color == MODE_PLAN {
+        ui.mode_plan
     } else if color == TEXT_REASONING || color == ACCENT_REASONING_LIVE {
         if theme == ThemeId::Matrix {
             Color::Rgb(0x00, 0x55, 0x00) // #005500
         } else {
             ui.mode_plan
         }
-    } else if color == ACCENT_TOOL_ISSUE {
+    } else if color == ACCENT_TOOL_ISSUE || color == STATUS_ERROR || color == WHALE_ERROR {
+        ui.error_fg
+    } else if color == MODE_YOLO {
         ui.mode_yolo
     } else if color == STATUS_WARNING {
         ui.warning
-    } else if color == STATUS_ERROR || color == WHALE_ERROR {
-        ui.error_fg
+    } else if color == STATUS_SUCCESS {
+        ui.success
+    } else if color == MODE_OPERATE {
+        ui.mode_operate
     } else if color == DIFF_ADDED || color == USER_BODY {
         theme_green(ui)
-    } else if color == WHALE_ACCENT_PRIMARY {
-        ui.mode_agent
     } else {
         color
     }
@@ -285,13 +325,29 @@ fn adapt_fg_for_grayscale_palette(color: Color) -> Color {
     if color == Color::Reset {
         return color;
     }
-    if color == TEXT_BODY
+    // Resolved grayscale mode slots are already final palette colors. Keep
+    // this branch ahead of the luma buckets so a direct `UiTheme` call site is
+    // idempotent instead of being adapted a second time.
+    if color == GRAYSCALE_UI_THEME.mode_agent
+        || color == GRAYSCALE_UI_THEME.mode_plan
+        || color == GRAYSCALE_UI_THEME.mode_operate
+        || color == GRAYSCALE_UI_THEME.mode_yolo
+    {
+        color
+    } else if color == MODE_AGENT {
+        GRAYSCALE_UI_THEME.mode_agent
+    } else if color == MODE_PLAN {
+        GRAYSCALE_UI_THEME.mode_plan
+    } else if color == MODE_OPERATE {
+        GRAYSCALE_UI_THEME.mode_operate
+    } else if color == MODE_YOLO {
+        GRAYSCALE_UI_THEME.mode_yolo
+    } else if color == TEXT_BODY
         || color == SELECTION_TEXT
         || color == LIGHT_TEXT_BODY
         || color == Color::White
         || color == WHALE_ERROR
         || color == STATUS_ERROR
-        || color == MODE_YOLO
     {
         GRAYSCALE_TEXT_BODY
     } else if color == TEXT_SOFT
@@ -300,10 +356,10 @@ fn adapt_fg_for_grayscale_palette(color: Color) -> Color {
         || color == TEXT_ACCENT
         || color == WHALE_INFO
         || color == WHALE_ACCENT_PRIMARY
+        || color == WHALE_HUMAN
         || color == ACCENT_TOOL_LIVE
         || color == STATUS_SUCCESS
         || color == STATUS_INFO
-        || color == MODE_AGENT
     {
         GRAYSCALE_TEXT_SOFT
     } else if color == TEXT_SECONDARY
@@ -312,7 +368,6 @@ fn adapt_fg_for_grayscale_palette(color: Color) -> Color {
         || color == TEXT_REASONING
         || color == ACCENT_REASONING_LIVE
         || color == STATUS_WARNING
-        || color == MODE_PLAN
         || color == USER_BODY
         || color == LIGHT_USER_BODY
         || color == DIFF_ADDED
@@ -439,6 +494,129 @@ pub enum ColorDepth {
     TrueColor,
 }
 
+/// Foreground roles that must remain distinct after the terminal reduces the
+/// palette. RGB proximity is deliberately irrelevant here: action and Operate,
+/// or a human ask and a warning, are different product states even when their
+/// source hues happen to share a nearest ANSI color.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SemanticForegroundRole {
+    Action,
+    Live,
+    Human,
+    Warning,
+    Danger,
+    Success,
+    ModeAgent,
+    ModePlan,
+    ModeOperate,
+    ModeYolo,
+}
+
+impl SemanticForegroundRole {
+    #[must_use]
+    const fn ansi16(self) -> Color {
+        match self {
+            Self::Action => Color::LightBlue,
+            Self::Live => Color::LightCyan,
+            Self::Human => Color::LightYellow,
+            Self::Warning => Color::Yellow,
+            Self::Danger => Color::LightRed,
+            Self::Success => Color::LightGreen,
+            Self::ModeAgent => Color::Blue,
+            Self::ModePlan => Color::Magenta,
+            Self::ModeOperate => Color::LightMagenta,
+            Self::ModeYolo => Color::Red,
+        }
+    }
+}
+
+fn raw_semantic_foreground_role(color: Color) -> Option<SemanticForegroundRole> {
+    if color == MODE_AGENT {
+        Some(SemanticForegroundRole::ModeAgent)
+    } else if color == MODE_PLAN {
+        Some(SemanticForegroundRole::ModePlan)
+    } else if color == MODE_OPERATE {
+        Some(SemanticForegroundRole::ModeOperate)
+    } else if color == MODE_YOLO {
+        Some(SemanticForegroundRole::ModeYolo)
+    } else if color == WHALE_ACTION
+        || color == WHALE_INFO
+        || color == STATUS_INFO
+        || color == WHALE_ACCENT_PRIMARY
+    {
+        Some(SemanticForegroundRole::Action)
+    } else if color == WHALE_LIVE || color == TEXT_ACCENT || color == ACCENT_TOOL_LIVE {
+        Some(SemanticForegroundRole::Live)
+    } else if color == WHALE_HUMAN {
+        Some(SemanticForegroundRole::Human)
+    } else if color == STATUS_WARNING {
+        Some(SemanticForegroundRole::Warning)
+    } else if color == WHALE_ERROR || color == STATUS_ERROR || color == ACCENT_TOOL_ISSUE {
+        Some(SemanticForegroundRole::Danger)
+    } else if color == STATUS_SUCCESS || color == USER_BODY || color == DIFF_ADDED {
+        Some(SemanticForegroundRole::Success)
+    } else {
+        None
+    }
+}
+
+fn theme_semantic_foreground_role(color: Color, ui: &UiTheme) -> Option<SemanticForegroundRole> {
+    // Mode slots come first. Shipped themes keep these source colors distinct
+    // from the general semantic lanes so direct `app.ui_theme.mode_*` call
+    // sites retain the same identity as raw `MODE_*` call sites.
+    if color == ui.mode_agent {
+        Some(SemanticForegroundRole::ModeAgent)
+    } else if color == ui.mode_plan {
+        Some(SemanticForegroundRole::ModePlan)
+    } else if color == ui.mode_operate {
+        Some(SemanticForegroundRole::ModeOperate)
+    } else if color == ui.mode_yolo {
+        Some(SemanticForegroundRole::ModeYolo)
+    } else if color == ui.accent_primary {
+        Some(SemanticForegroundRole::Action)
+    } else if color == ui.status_working
+        || color == ui.accent_secondary
+        || color == ui.tool_running
+        // `UiTheme::info` is the sky/worker lane used by ambient and live
+        // surfaces. Several shipped themes intentionally alias it to their
+        // working color, so it must not precede the live buckets.
+        || color == ui.info
+    {
+        Some(SemanticForegroundRole::Live)
+    } else if color == ui.accent_action {
+        Some(SemanticForegroundRole::Human)
+    } else if color == ui.warning || color == ui.status_warning {
+        Some(SemanticForegroundRole::Warning)
+    } else if color == ui.error_fg || color == ui.tool_failed || color == ui.diff_deleted_fg {
+        Some(SemanticForegroundRole::Danger)
+    } else if color == ui.success || color == ui.tool_success || color == ui.diff_added_fg {
+        Some(SemanticForegroundRole::Success)
+    } else {
+        None
+    }
+}
+
+/// Adapt a resolved foreground to terminal depth while retaining the semantic
+/// role carried by the original cell color. Truecolor and ANSI-256 preserve the
+/// resolved theme value; ANSI-16 uses a fixed, injective role matrix instead of
+/// an arbitrary nearest-color guess.
+#[must_use]
+pub(crate) fn adapt_fg_for_depth(
+    source: Color,
+    resolved: Color,
+    depth: ColorDepth,
+    ui: &UiTheme,
+) -> Color {
+    if depth == ColorDepth::Ansi16
+        && let Some(role) = raw_semantic_foreground_role(source)
+            .or_else(|| theme_semantic_foreground_role(source, ui))
+    {
+        role.ansi16()
+    } else {
+        adapt_color(resolved, depth)
+    }
+}
+
 impl ColorDepth {
     /// Detect the active terminal's color depth. Honors `COLORTERM`
     /// (truecolor / 24bit) first, then falls back to `TERM`. Defaults to
@@ -484,9 +662,10 @@ impl ColorDepth {
 
 /// Adapt a foreground color to the terminal's color depth.
 ///
-/// On TrueColor, `color` passes through. On Ansi256 we let ratatui's renderer
-/// down-convert (it does this already). On Ansi16 we strip RGB to a near
-/// named color so semantic intent survives even on legacy terminals.
+/// On TrueColor, `color` passes through. ANSI-256 uses the stable extended
+/// palette; ANSI-16 uses a generic nearest named color. Rendered semantic
+/// foregrounds must go through [`adapt_fg_for_depth`] so role identity is not
+/// inferred from RGB proximity.
 #[allow(dead_code)]
 #[must_use]
 pub fn adapt_color(color: Color, depth: ColorDepth) -> Color {

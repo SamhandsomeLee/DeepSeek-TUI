@@ -55,6 +55,7 @@ pub(super) const DEFAULT_ACTIVE_NATIVE_TOOLS: &[&str] = &[
     "grep_files",
     "list_dir",
     "read_file",
+    "remember",
     "run_tests",
     "run_verifiers",
     "task_create",
@@ -81,17 +82,17 @@ const CORE_ACTION_TOOL_FALLBACKS: &[CoreActionToolFallback] = &[
     CoreActionToolFallback {
         name: "write_file",
         description: "Create or overwrite files in the workspace.",
-        unavailable_reason: "Not present in the current model-visible catalog. File writes require Agent or Yolo mode and no command tool allow/deny gate blocking write_file.",
+        unavailable_reason: "Not present in the current model-visible catalog. File writes require Act mode and no command tool allow/deny gate blocking write_file.",
     },
     CoreActionToolFallback {
         name: "edit_file",
         description: "Edit existing files by replacing text.",
-        unavailable_reason: "Not present in the current model-visible catalog. File edits require Agent or Yolo mode and no command tool allow/deny gate blocking edit_file.",
+        unavailable_reason: "Not present in the current model-visible catalog. File edits require Act mode and no command tool allow/deny gate blocking edit_file.",
     },
     CoreActionToolFallback {
         name: "apply_patch",
         description: "Apply a patch to one or more workspace files.",
-        unavailable_reason: "Not present in the current model-visible catalog. Patches require Agent or Yolo mode, the apply_patch feature, and no command tool allow/deny gate blocking apply_patch.",
+        unavailable_reason: "Not present in the current model-visible catalog. Patches require Act mode, the apply_patch feature, and no command tool allow/deny gate blocking apply_patch.",
     },
 ];
 

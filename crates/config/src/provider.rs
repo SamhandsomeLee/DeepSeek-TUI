@@ -11,11 +11,12 @@ use super::{
     DEFAULT_DEEPSEEK_BASE_URL, DEFAULT_DEEPSEEK_MODEL, DEFAULT_FIREWORKS_BASE_URL,
     DEFAULT_FIREWORKS_MODEL, DEFAULT_HUGGINGFACE_BASE_URL, DEFAULT_HUGGINGFACE_MODEL,
     DEFAULT_LONGCAT_BASE_URL, DEFAULT_LONGCAT_MODEL, DEFAULT_META_BASE_URL, DEFAULT_META_MODEL,
-    DEFAULT_MINIMAX_BASE_URL, DEFAULT_MINIMAX_MODEL, DEFAULT_MOONSHOT_BASE_URL,
-    DEFAULT_MOONSHOT_MODEL, DEFAULT_NOVITA_BASE_URL, DEFAULT_NOVITA_MODEL,
-    DEFAULT_NVIDIA_NIM_BASE_URL, DEFAULT_NVIDIA_NIM_MODEL, DEFAULT_OLLAMA_BASE_URL,
-    DEFAULT_OLLAMA_MODEL, DEFAULT_OPENAI_BASE_URL, DEFAULT_OPENAI_CODEX_BASE_URL,
-    DEFAULT_OPENAI_CODEX_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_OPENMODEL_BASE_URL,
+    DEFAULT_MINIMAX_ANTHROPIC_BASE_URL, DEFAULT_MINIMAX_BASE_URL, DEFAULT_MINIMAX_MODEL,
+    DEFAULT_MOONSHOT_BASE_URL, DEFAULT_MOONSHOT_MODEL, DEFAULT_NOVITA_BASE_URL,
+    DEFAULT_NOVITA_MODEL, DEFAULT_NVIDIA_NIM_BASE_URL, DEFAULT_NVIDIA_NIM_MODEL,
+    DEFAULT_OLLAMA_BASE_URL, DEFAULT_OLLAMA_MODEL, DEFAULT_OPENAI_BASE_URL,
+    DEFAULT_OPENAI_CODEX_BASE_URL, DEFAULT_OPENAI_CODEX_MODEL, DEFAULT_OPENAI_MODEL,
+    DEFAULT_OPENCODE_GO_BASE_URL, DEFAULT_OPENCODE_GO_MODEL, DEFAULT_OPENMODEL_BASE_URL,
     DEFAULT_OPENMODEL_MODEL, DEFAULT_OPENROUTER_BASE_URL, DEFAULT_OPENROUTER_MODEL,
     DEFAULT_QIANFAN_BASE_URL, DEFAULT_QIANFAN_MODEL, DEFAULT_SAKANA_BASE_URL, DEFAULT_SAKANA_MODEL,
     DEFAULT_SGLANG_BASE_URL, DEFAULT_SGLANG_MODEL, DEFAULT_SILICONFLOW_BASE_URL,
@@ -38,6 +39,61 @@ pub enum WireFormat {
     /// Native Anthropic Messages API (`/v1/messages`).
     AnthropicMessages,
 }
+
+/// How a user obtains or supplies credentials for a built-in provider.
+///
+/// Keeping this typed prevents API-key onboarding from accidentally describing
+/// a local runtime, OAuth-only route, or user-defined endpoint as though it had
+/// a vendor key console.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialAcquisition {
+    /// A provider-issued API key or access token.
+    ApiKey,
+    /// Either a provider-issued API key or the provider's supported OAuth path.
+    ApiKeyOrOAuth,
+    /// A self-hosted route that is keyless by default but can be configured with auth.
+    LocalOptional,
+    /// An OAuth-only route; Codewhale does not collect an API key for it.
+    OAuth,
+    /// A user-defined route whose credential source belongs in configuration.
+    Configuration,
+}
+
+impl CredentialAcquisition {
+    /// Stable machine-readable label for diagnostics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ApiKey => "api_key",
+            Self::ApiKeyOrOAuth => "api_key_or_oauth",
+            Self::LocalOptional => "local_optional",
+            Self::OAuth => "oauth",
+            Self::Configuration => "configuration",
+        }
+    }
+}
+
+/// Canonical, non-secret help for configuring one provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CredentialHelp {
+    pub acquisition: CredentialAcquisition,
+    /// Stable provider-owned page for creating or locating credentials.
+    ///
+    /// `None` is deliberate for local, OAuth-only, and user-defined routes; UI
+    /// callers must show [`Self::guidance`] instead of guessing a URL.
+    pub credential_url: Option<&'static str>,
+    /// Provider-owned documentation when the repository already has a stable link.
+    pub docs_url: Option<&'static str>,
+    /// Concise fallback or qualification for non-key and mixed-auth routes.
+    pub guidance: &'static str,
+}
+
+/// Kimi Code's membership-plan key console.
+///
+/// This is intentionally distinct from Moonshot's direct API console.  The
+/// route-specific helper below owns the choice so a configured Kimi Code route
+/// is never described as a generic Moonshot route.
+pub const KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL: &str = "https://www.kimi.com/code/console";
 
 /// Static metadata for a built-in model provider.
 pub trait Provider: Send + Sync {
@@ -73,6 +129,290 @@ pub trait Provider: Send + Sync {
     fn wire(&self) -> WireFormat {
         WireFormat::ChatCompletions
     }
+
+    /// Credential acquisition metadata shared by onboarding, setup, diagnostics,
+    /// and provider-help surfaces.
+    fn credential_help(&self) -> CredentialHelp {
+        credential_help(self.kind())
+    }
+}
+
+/// Return the canonical credential-acquisition metadata for a provider kind.
+///
+/// URLs here are provider-owned links already documented in this repository.
+/// If no stable vendor credential page is known, the URL remains absent and the
+/// guidance explains the supported local, OAuth, or configuration path.
+/// This is provider-level fallback metadata: callers that know a concrete base
+/// URL must use [`credential_help_for_route`] so route-owned credentials do not
+/// inherit a default endpoint's console.
+#[must_use]
+pub const fn credential_help(kind: ProviderKind) -> CredentialHelp {
+    use CredentialAcquisition::{ApiKey, ApiKeyOrOAuth, Configuration, LocalOptional, OAuth};
+
+    match kind {
+        ProviderKind::Deepseek | ProviderKind::DeepseekAnthropic => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://platform.deepseek.com/api_keys"),
+            docs_url: Some("https://api-docs.deepseek.com/"),
+            guidance: "Create an API key in the DeepSeek platform console.",
+        },
+        ProviderKind::NvidiaNim => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://build.nvidia.com/settings/api-keys"),
+            docs_url: Some("https://build.nvidia.com/explore/discover"),
+            guidance: "Create an NVIDIA NIM key in the NVIDIA build console.",
+        },
+        ProviderKind::Openai => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://platform.openai.com/api-keys"),
+            docs_url: Some("https://platform.openai.com/docs/api-reference"),
+            guidance: "Create an OpenAI API key, or configure the credential for your compatible endpoint.",
+        },
+        ProviderKind::Atlascloud => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://atlascloud.ai/docs/en/api-keys"),
+            docs_url: Some("https://atlascloud.ai/docs/en/api-keys"),
+            guidance: "Follow Atlas Cloud's API Keys guide to create a credential.",
+        },
+        ProviderKind::WanjieArk => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://docs.wanjiedata.com/maas/maas-openapi-v1.html"),
+            docs_url: Some("https://docs.wanjiedata.com/maas/maas-openapi-v1.html"),
+            guidance: "Follow Wanjie MaaS's APIKEY guide to create a credential.",
+        },
+        ProviderKind::Volcengine => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://console.volcengine.com/ark/apiKey"),
+            docs_url: Some("https://www.volcengine.com/docs/82379/1541594"),
+            guidance: "Create a Volcengine Ark API key in the Ark console.",
+        },
+        ProviderKind::Openrouter => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://openrouter.ai/settings/keys"),
+            docs_url: Some("https://openrouter.ai/docs/api/reference/authentication"),
+            guidance: "Create an OpenRouter key from account settings.",
+        },
+        ProviderKind::XiaomiMimo => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://platform.xiaomimimo.com/token-plan"),
+            docs_url: Some("https://mimo.mi.com/docs/en-US/tokenplan/Token%20Plan/subscription"),
+            guidance: "Create a Xiaomi MiMo Token Plan or pay-as-you-go key and keep its matching base URL.",
+        },
+        ProviderKind::Novita => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://novita.ai/en/settings/key-management"),
+            docs_url: Some("https://novita.ai/docs/guides/quickstart"),
+            guidance: "Create a Novita key in account Key Management.",
+        },
+        ProviderKind::Fireworks => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://fireworks.ai/api-keys"),
+            docs_url: Some("https://docs.fireworks.ai/getting-started/quickstart"),
+            guidance: "Create a Fireworks API key before configuring the provider.",
+        },
+        ProviderKind::Siliconflow => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://cloud.siliconflow.com/account/ak"),
+            docs_url: Some("https://docs.siliconflow.com/en/userguide/quickstart"),
+            guidance: "Use the global SiliconFlow console for the global endpoint.",
+        },
+        ProviderKind::SiliconflowCN => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://cloud.siliconflow.cn/account/ak"),
+            docs_url: Some("https://docs.siliconflow.cn/en/userguide/quickstart"),
+            guidance: "Use the China SiliconFlow console for the China endpoint.",
+        },
+        ProviderKind::Arcee => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://docs.arcee.ai/other/create-your-first-api-key"),
+            docs_url: Some("https://docs.arcee.ai/other/create-your-first-api-key"),
+            guidance: "Follow Arcee's API key guide to create a credential.",
+        },
+        ProviderKind::Moonshot => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://platform.kimi.ai/console/api-keys"),
+            docs_url: Some("https://platform.kimi.ai/docs/overview"),
+            guidance: "For Moonshot's default direct API route, sign in to Kimi API Platform and create and copy an API key. A configured Kimi Code route uses a separate membership-plan console and never imports Kimi CLI credentials; first-class Kimi OAuth is not available.",
+        },
+        ProviderKind::Sglang => CredentialHelp {
+            acquisition: LocalOptional,
+            credential_url: None,
+            docs_url: Some("https://docs.sglang.ai/"),
+            guidance: "Self-hosted SGLang is keyless by default; configure a key only if your server requires one.",
+        },
+        ProviderKind::Vllm => CredentialHelp {
+            acquisition: LocalOptional,
+            credential_url: None,
+            docs_url: Some("https://docs.vllm.ai/en/stable/serving/openai_compatible_server/"),
+            guidance: "Self-hosted vLLM is keyless by default; configure a key only if your server requires one.",
+        },
+        ProviderKind::Ollama => CredentialHelp {
+            acquisition: LocalOptional,
+            credential_url: None,
+            docs_url: Some("https://docs.ollama.com/api"),
+            guidance: "Local Ollama is keyless by default; configure a key only if your server requires one.",
+        },
+        ProviderKind::Huggingface => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://huggingface.co/settings/tokens"),
+            docs_url: Some("https://huggingface.co/docs/hub/en/security-tokens"),
+            guidance: "Create a scoped Hugging Face access token.",
+        },
+        ProviderKind::Together => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://api.together.ai/settings/api-keys"),
+            docs_url: Some("https://docs.together.ai/docs/api-keys-authentication"),
+            guidance: "Create a Together API key from account settings.",
+        },
+        ProviderKind::Qianfan => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://console.bce.baidu.com/iam/#/iam/accesslist"),
+            docs_url: Some("https://cloud.baidu.com/doc/qianfan/index.html"),
+            guidance: "Create Baidu Qianfan credentials in the Baidu Cloud console.",
+        },
+        ProviderKind::OpenaiCodex => CredentialHelp {
+            acquisition: OAuth,
+            credential_url: None,
+            docs_url: Some("https://developers.openai.com/codex/"),
+            guidance: "Run `codex login`, then explicitly grant Codewhale read-only access to that exact Codex credential file; or use a process-scoped token environment variable.",
+        },
+        ProviderKind::Anthropic => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://console.anthropic.com/settings/keys"),
+            docs_url: Some("https://docs.anthropic.com/en/api/overview"),
+            guidance: "Create an Anthropic API key in the Anthropic Console.",
+        },
+        ProviderKind::Openmodel => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://console.openmodel.ai/"),
+            docs_url: Some("https://docs.openmodel.ai/en/docs/getting-started/authentication"),
+            guidance: "Create an API key in the OpenModel console, then follow the authentication guide.",
+        },
+        ProviderKind::Zai => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://z.ai/model-api"),
+            docs_url: Some("https://docs.z.ai/api-reference/introduction"),
+            guidance: "Create or manage a Z.ai API key from the Model API page.",
+        },
+        ProviderKind::Stepfun => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://platform.stepfun.ai/"),
+            docs_url: Some("https://platform.stepfun.ai/docs/en/quickstart/overview"),
+            guidance: "Open Account Management, then Interface Keys, in the StepFun console.",
+        },
+        ProviderKind::Minimax | ProviderKind::MinimaxAnthropic => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some(
+                "https://platform.minimax.io/user-center/basic-information/interface-key",
+            ),
+            docs_url: Some("https://platform.minimax.io/docs/api-reference/api-overview"),
+            guidance: "Create a MiniMax API key or subscription-plan key in the user center.",
+        },
+        ProviderKind::Deepinfra => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://deepinfra.com/dash/api_keys"),
+            docs_url: Some("https://docs.deepinfra.com/quickstart"),
+            guidance: "Create a DeepInfra API key from the dashboard.",
+        },
+        ProviderKind::Sakana => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://console.sakana.ai/api-keys"),
+            docs_url: Some("https://console.sakana.ai/get-started"),
+            guidance: "Create a Sakana AI key in the console and copy it when shown.",
+        },
+        ProviderKind::LongCat => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://longcat.chat/platform"),
+            docs_url: Some("https://longcat.chat/platform"),
+            guidance: "Sign up on the LongCat platform and create an API key.",
+        },
+        ProviderKind::OpencodeGo => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://opencode.ai/zen/"),
+            docs_url: Some("https://opencode.ai/docs/go/"),
+            guidance: "Create or copy an OpenCode Go subscription key from OpenCode Zen.",
+        },
+        ProviderKind::Meta => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://developer.meta.com/ai/"),
+            docs_url: Some("https://developer.meta.com/ai/resources/blog/build-with-muse-spark/"),
+            guidance: "Use the Meta developer portal to obtain Model API access and a key.",
+        },
+        ProviderKind::Xai => CredentialHelp {
+            acquisition: ApiKeyOrOAuth,
+            credential_url: Some("https://console.x.ai/"),
+            docs_url: None,
+            guidance: "Use an xAI Console API key or Codewhale's native device login. Reading an existing Grok CLI file requires explicit provider-scoped read-only consent.",
+        },
+        ProviderKind::Custom => CredentialHelp {
+            acquisition: Configuration,
+            credential_url: None,
+            docs_url: None,
+            guidance: "Set this custom provider's base_url and api_key_env or api_key in configuration; no canonical vendor credential page exists.",
+        },
+    }
+}
+
+fn is_exact_https_route(base_url: &str, expected_authority: &str, expected_path: &str) -> bool {
+    // URL schemes and host names are ASCII case-insensitive; paths are not.
+    // Do not lowercase the whole URL here: a differently-cased path is a
+    // neighboring route, not the official endpoint. Keep this intentionally
+    // dependency-free because provider metadata is used by low-level config
+    // callers that should not need URL parsing machinery just for this guard.
+    let trimmed = base_url.trim();
+    let normalized = trimmed.strip_suffix('/').unwrap_or(trimmed);
+    let Some((scheme, authority_and_path)) = normalized.split_once("://") else {
+        return false;
+    };
+    let Some((authority, path)) = authority_and_path.split_once('/') else {
+        return false;
+    };
+
+    scheme.eq_ignore_ascii_case("https")
+        && authority.eq_ignore_ascii_case(expected_authority)
+        && path == expected_path
+}
+
+/// Whether a configured route is exactly the official Kimi Code endpoint.
+///
+/// A trailing slash is insignificant, but neighboring Kimi-hosted paths must
+/// not inherit membership-plan credentials merely because they share a host.
+#[must_use]
+pub fn is_exact_kimi_code_route(kind: ProviderKind, base_url: &str) -> bool {
+    if kind != ProviderKind::Moonshot {
+        return false;
+    }
+
+    is_exact_https_route(base_url, "api.kimi.com", "coding/v1")
+}
+
+/// Whether a configured route is exactly Moonshot's direct API endpoint.
+///
+/// Direct K3 owns a different reasoning-control dialect from the Kimi Code
+/// membership endpoint. Keep this route guard exact so custom gateways and
+/// neighboring Moonshot paths do not inherit direct-K3 wire semantics.
+#[must_use]
+pub fn is_exact_moonshot_platform_route(kind: ProviderKind, base_url: &str) -> bool {
+    kind == ProviderKind::Moonshot && is_exact_https_route(base_url, "api.moonshot.ai", "v1")
+}
+
+/// Return credential help for one concrete provider route.
+///
+/// This protects non-UI callers such as diagnostics and command surfaces from
+/// presenting Moonshot's direct API console for a Kimi Code membership-plan
+/// endpoint. It performs no discovery, credential lookup, or network I/O.
+#[must_use]
+pub fn credential_help_for_route(kind: ProviderKind, base_url: &str) -> CredentialHelp {
+    if is_exact_kimi_code_route(kind, base_url) {
+        return CredentialHelp {
+            acquisition: CredentialAcquisition::ApiKey,
+            credential_url: Some(KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL),
+            docs_url: None,
+            guidance: "Create a Kimi Code membership-plan API key in the Kimi Code console. This route uses api.kimi.com/coding/v1; Codewhale does not import Kimi CLI credentials.",
+        };
+    }
+
+    credential_help(kind)
 }
 
 macro_rules! provider {
@@ -581,6 +921,51 @@ provider!(
     aliases: ["mini-max", "mini_max"]
 );
 
+/// MiniMax route that speaks the Anthropic Messages wire protocol.
+pub struct MinimaxAnthropic;
+
+impl Provider for MinimaxAnthropic {
+    fn id(&self) -> &'static str {
+        "minimax-anthropic"
+    }
+
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::MinimaxAnthropic
+    }
+
+    fn display_name(&self) -> &'static str {
+        "MiniMax (Anthropic-compatible)"
+    }
+
+    fn default_base_url(&self) -> &'static str {
+        DEFAULT_MINIMAX_ANTHROPIC_BASE_URL
+    }
+
+    fn default_model(&self) -> &'static str {
+        DEFAULT_MINIMAX_MODEL
+    }
+
+    fn env_vars(&self) -> &'static [&'static str] {
+        &["MINIMAX_API_KEY"]
+    }
+
+    fn provider_config_key(&self) -> &'static str {
+        "minimax_anthropic"
+    }
+
+    fn aliases(&self) -> &'static [&'static str] {
+        &[
+            "minimax_anthropic",
+            "mini-max-anthropic",
+            "mini_max_anthropic",
+        ]
+    }
+
+    fn wire(&self) -> WireFormat {
+        WireFormat::AnthropicMessages
+    }
+}
+
 provider!(
     Deepinfra,
     Deepinfra,
@@ -615,6 +1000,18 @@ provider!(
     ["LONGCAT_API_KEY"],
     "longcat",
     aliases: ["long-cat", "meituan-longcat", "meituan"]
+);
+
+provider!(
+    OpencodeGo,
+    OpencodeGo,
+    "opencode-go",
+    "OpenCode Go",
+    DEFAULT_OPENCODE_GO_BASE_URL,
+    DEFAULT_OPENCODE_GO_MODEL,
+    ["OPENCODE_GO_API_KEY"],
+    "opencode_go",
+    aliases: ["opencode_go", "opencodego"]
 );
 
 provider!(
@@ -728,14 +1125,16 @@ static OPENMODEL: Openmodel = Openmodel;
 static ZAI: Zai = Zai;
 static STEPFUN: Stepfun = Stepfun;
 static MINIMAX: Minimax = Minimax;
+static MINIMAX_ANTHROPIC: MinimaxAnthropic = MinimaxAnthropic;
 static DEEPINFRA: Deepinfra = Deepinfra;
 static SAKANA: Sakana = Sakana;
 static LONGCAT: LongCat = LongCat;
+static OPENCODE_GO: OpencodeGo = OpencodeGo;
 static META: Meta = Meta;
 static XAI: Xai = Xai;
 static CUSTOM: Custom = Custom;
 
-static PROVIDER_REGISTRY: [&dyn Provider; 33] = [
+static PROVIDER_REGISTRY: [&dyn Provider; 35] = [
     &DEEPSEEK,
     &DEEPSEEK_ANTHROPIC,
     &NVIDIA_NIM,
@@ -763,9 +1162,11 @@ static PROVIDER_REGISTRY: [&dyn Provider; 33] = [
     &ZAI,
     &STEPFUN,
     &MINIMAX,
+    &MINIMAX_ANTHROPIC,
     &DEEPINFRA,
     &SAKANA,
     &LONGCAT,
+    &OPENCODE_GO,
     &META,
     &XAI,
     &CUSTOM,
@@ -836,6 +1237,182 @@ pub fn provider_for_kind(kind: ProviderKind) -> &'static dyn Provider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_help_covers_every_provider_without_guessing_non_key_urls() {
+        for provider in all_providers() {
+            let help = provider.credential_help();
+            assert!(
+                !help.guidance.trim().is_empty(),
+                "{} credential guidance must not be empty",
+                provider.id()
+            );
+
+            match help.acquisition {
+                CredentialAcquisition::ApiKey | CredentialAcquisition::ApiKeyOrOAuth => {
+                    assert!(
+                        help.credential_url.is_some(),
+                        "{} needs a stable provider-owned credential link",
+                        provider.id()
+                    );
+                }
+                CredentialAcquisition::LocalOptional
+                | CredentialAcquisition::OAuth
+                | CredentialAcquisition::Configuration => assert!(
+                    help.credential_url.is_none(),
+                    "{} must explain its non-key route instead of inventing a credential link",
+                    provider.id()
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn kimi_credential_help_uses_the_durable_api_key_console_only() {
+        let help = provider_for_kind(ProviderKind::Moonshot).credential_help();
+
+        assert_eq!(help.acquisition, CredentialAcquisition::ApiKey);
+        assert_eq!(
+            help.credential_url,
+            Some("https://platform.kimi.ai/console/api-keys")
+        );
+        assert_eq!(
+            help.docs_url,
+            Some("https://platform.kimi.ai/docs/overview")
+        );
+        assert!(help.guidance.contains("create and copy an API key"));
+        assert!(help.guidance.contains("OAuth is not available"));
+    }
+
+    #[test]
+    fn kimi_code_route_credential_help_is_distinct_from_direct_moonshot() {
+        let direct = credential_help_for_route(ProviderKind::Moonshot, DEFAULT_MOONSHOT_BASE_URL);
+        let kimi_code =
+            credential_help_for_route(ProviderKind::Moonshot, "https://api.kimi.com/coding/v1/");
+
+        assert_eq!(
+            direct.credential_url,
+            Some("https://platform.kimi.ai/console/api-keys")
+        );
+        assert_eq!(
+            kimi_code.credential_url,
+            Some(KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL)
+        );
+        assert_eq!(kimi_code.docs_url, None);
+        assert!(kimi_code.guidance.contains("membership-plan API key"));
+        assert!(
+            kimi_code
+                .guidance
+                .contains("does not import Kimi CLI credentials")
+        );
+        assert!(!is_exact_kimi_code_route(
+            ProviderKind::Moonshot,
+            "https://api.kimi.com/coding/v1/preview"
+        ));
+
+        // Scheme and hostname casing are insignificant, but the endpoint
+        // path is a route identifier and must remain exact.
+        assert!(is_exact_kimi_code_route(
+            ProviderKind::Moonshot,
+            "HTTPS://API.KIMI.COM/coding/v1/"
+        ));
+        for neighboring_route in [
+            "https://api.kimi.com/CODING/v1",
+            "https://api.kimi.com/coding/V1",
+            "http://api.kimi.com/coding/v1",
+            "https://api.kimi.com:443/coding/v1",
+            "https://api.kimi.com/coding/v1?preview=1",
+            "https://api.kimi.com/coding/v1#fragment",
+            "https://api.kimi.com/coding/v1//",
+        ] {
+            assert!(
+                !is_exact_kimi_code_route(ProviderKind::Moonshot, neighboring_route),
+                "{neighboring_route} must not inherit Kimi Code membership semantics"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_moonshot_route_matching_is_exact() {
+        assert!(is_exact_moonshot_platform_route(
+            ProviderKind::Moonshot,
+            "HTTPS://API.MOONSHOT.AI/v1/"
+        ));
+        for neighboring_route in [
+            "https://api.moonshot.ai/V1",
+            "http://api.moonshot.ai/v1",
+            "https://api.moonshot.ai:443/v1",
+            "https://api.moonshot.ai/v1?preview=1",
+            "https://api.moonshot.ai/v1#fragment",
+            "https://api.moonshot.ai/v1//",
+            "https://api.moonshot.ai/v1/chat/completions",
+            "https://api.kimi.com/coding/v1",
+        ] {
+            assert!(
+                !is_exact_moonshot_platform_route(ProviderKind::Moonshot, neighboring_route),
+                "{neighboring_route} must not inherit direct Moonshot semantics"
+            );
+        }
+        assert!(!is_exact_moonshot_platform_route(
+            ProviderKind::Openai,
+            DEFAULT_MOONSHOT_BASE_URL
+        ));
+    }
+
+    #[test]
+    fn non_key_and_mixed_routes_are_typed_explicitly() {
+        for kind in [
+            ProviderKind::Sglang,
+            ProviderKind::Vllm,
+            ProviderKind::Ollama,
+        ] {
+            assert_eq!(
+                provider_for_kind(kind).credential_help().acquisition,
+                CredentialAcquisition::LocalOptional
+            );
+        }
+        assert_eq!(
+            provider_for_kind(ProviderKind::OpenaiCodex)
+                .credential_help()
+                .acquisition,
+            CredentialAcquisition::OAuth
+        );
+        assert_eq!(
+            provider_for_kind(ProviderKind::Xai)
+                .credential_help()
+                .acquisition,
+            CredentialAcquisition::ApiKeyOrOAuth
+        );
+        assert_eq!(
+            provider_for_kind(ProviderKind::Custom)
+                .credential_help()
+                .acquisition,
+            CredentialAcquisition::Configuration
+        );
+    }
+
+    #[test]
+    fn live_verified_console_replacements_do_not_regress_to_404_links() {
+        let openmodel = provider_for_kind(ProviderKind::Openmodel).credential_help();
+        assert_eq!(
+            openmodel.credential_url,
+            Some("https://console.openmodel.ai/")
+        );
+        assert_eq!(
+            openmodel.docs_url,
+            Some("https://docs.openmodel.ai/en/docs/getting-started/authentication")
+        );
+
+        let sakana = provider_for_kind(ProviderKind::Sakana).credential_help();
+        assert_eq!(
+            sakana.credential_url,
+            Some("https://console.sakana.ai/api-keys")
+        );
+        assert_eq!(
+            sakana.docs_url,
+            Some("https://console.sakana.ai/get-started")
+        );
+    }
 
     #[test]
     fn display_order_is_alphabetical_by_display_name() {

@@ -1,14 +1,15 @@
 import Link from "next/link";
 import { Seal } from "@/components/seal";
+import { FaqSearch } from "@/components/faq-search";
 
 export async function generateMetadata({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
   const isZh = locale === "zh";
   return {
-    title: isZh ? "常见问题 · CodeWhale" : "FAQ · CodeWhale",
+    title: isZh ? "常见问题 · Codewhale" : "FAQ · Codewhale",
     description: isZh
-      ? "CodeWhale 常见问题：安装、配置、提供商、模型、模式、安全与隐私。答案来自实际代码、文档和 GitHub 议题。"
-      : "CodeWhale frequently asked questions: install, config, providers, models, modes, security, and privacy. Answers sourced from real code, docs, and GitHub issues.",
+      ? "Codewhale 常见问题：安装、配置、提供商、模型、模式、安全与隐私。答案来自实际代码、文档和 GitHub 议题。"
+      : "Codewhale frequently asked questions: install, config, providers, models, modes, security, and privacy. Answers sourced from real code, docs, and GitHub issues.",
   };
 }
 
@@ -20,16 +21,16 @@ interface FaqItem {
 
 const faqEn: FaqItem[] = [
   {
-    q: "What is CodeWhale?",
+    q: "What is Codewhale?",
     a: (
       <>
-        CodeWhale is a terminal-native coding agent for open-source and open-weight models. It runs from the <code className="inline">codewhale</code> command, streams reasoning blocks, edits local workspaces with approval gates, and can auto-route each turn to the right model and thinking level. DeepSeek V4 is the first-class model path; OpenRouter, Hugging Face, self-hosted runtimes, and other OpenAI-compatible routes are additive.
+        Codewhale is a terminal-native coding agent that works across hosted and local models. It runs from the <code className="inline">codewhale</code> command, streams reasoning blocks, edits local workspaces with approval gates, and can route each turn to a configured model and thinking level. DeepSeek is the bundled default route, while OpenRouter, Anthropic, OpenAI-compatible services, and self-hosted runtimes use the same runtime and tools.
       </>
     ),
     sources: ["README.md", "docs/ARCHITECTURE.md"],
   },
   {
-    q: "How do I install CodeWhale?",
+    q: "How do I install Codewhale?",
     a: (
       <>
         <p className="mb-2">Four paths, same result:</p>
@@ -68,13 +69,13 @@ brew tap Hmbown/deepseek-tui && brew install deepseek-tui
     sources: ["README.md"],
   },
   {
-    q: "Is CodeWhale the same as DeepSeek TUI? What about the rename?",
+    q: "Is Codewhale the same as DeepSeek TUI? What about the rename?",
     a: (
       <>
-        Yes. CodeWhale is the new name for what was previously called DeepSeek TUI.
+        Yes. Codewhale is the new name for what was previously called DeepSeek TUI.
         The canonical command is now <code className="inline">codewhale</code>. Legacy <code className="inline">deepseek</code> and <code className="inline">deepseek-tui</code> commands remain as compatibility shims — they still work.
         Config lives at <code className="inline">~/.codewhale/</code>. Legacy <code className="inline">~/.deepseek/</code> config is still read as a compatibility fallback, and <code className="inline">DEEPSEEK_*</code> env vars continue to work.
-        DeepSeek is not deprecated. The rename reflects a mission idea put in this version: CodeWhale as an agentic terminal for open models across providers, not a narrowing away from DeepSeek.
+        DeepSeek is not deprecated. The rename reflects a mission idea put in this version: Codewhale as an agentic terminal for open models across providers, not a narrowing away from DeepSeek.
       </>
     ),
     sources: ["docs/REBRAND.md", "README.md"],
@@ -107,12 +108,12 @@ codewhale doctor         # full connectivity check`}
     sources: ["#907", "#1545", "docs/CONFIGURATION.md"],
   },
   {
-    q: "Which providers does CodeWhale support?",
+    q: "Which providers does Codewhale support?",
     a: (
       <>
-        <p className="mb-2">CodeWhale ships with these built-in providers:</p>
+        <p className="mb-2">Codewhale ships with these built-in providers:</p>
         <ul className="list-disc pl-5 space-y-1 text-sm text-ink-soft mb-3">
-          <li><strong>DeepSeek</strong> — first-class, native API. Reasoning streaming, cache metrics, thinking effort control.</li>
+          <li><strong>DeepSeek</strong> — bundled default with a native API route, reasoning streaming, cache metrics, and thinking effort control.</li>
           <li><strong>OpenRouter</strong> — unified API for DeepSeek models and other open-model routes.</li>
           <li><strong>OpenAI-compatible</strong>, <strong>NVIDIA NIM</strong>, <strong>AtlasCloud</strong>, <strong>Wanjie Ark</strong>, <strong>Volcengine Ark</strong>, <strong>Xiaomi MiMo</strong>, <strong>Novita</strong>, <strong>Fireworks</strong>, <strong>SiliconFlow</strong>, <strong>SiliconFlow CN</strong>, <strong>Arcee AI</strong>, <strong>Moonshot/Kimi</strong>, <strong>Hugging Face</strong>, <strong>DeepInfra</strong>, <strong>Together AI</strong>, <strong>Z.ai</strong>, <strong>StepFun</strong>, <strong>MiniMax</strong>, <strong>OpenAI Codex</strong>, <strong>Anthropic</strong>, <strong>SGLang</strong>, <strong>vLLM</strong>, <strong>Ollama</strong></li>
         </ul>
@@ -125,7 +126,7 @@ codewhale doctor         # full connectivity check`}
     sources: ["docs/CONFIGURATION.md", "#1978", "#1710"],
   },
   {
-    q: "How do I use OpenRouter with CodeWhale?",
+    q: "How do I use OpenRouter with Codewhale?",
     a: (
       <>
         <pre className="code-block mb-2">
@@ -156,7 +157,7 @@ default_text_model = "openrouter/deepseek/deepseek-v4-pro"`}
       <>
         Yes. Use the <code className="inline">vllm</code>, <code className="inline">sglang</code>, or <code className="inline">ollama</code> providers with your local endpoint.
         For OpenAI-compatible endpoints (llama.cpp server, text-generation-webui, Aphrodite, etc.), you can use the <code className="inline">openai</code> provider with a custom <code className="inline">base_url</code>.
-        CodeWhale also respects <code className="inline">DEEPSEEK_ALLOW_INSECURE_HTTP=true</code> for local HTTP endpoints.
+        Codewhale also respects <code className="inline">DEEPSEEK_ALLOW_INSECURE_HTTP=true</code> for local HTTP endpoints.
         Hugging Face Inference Providers are also available through the <code className="inline">huggingface</code> provider. Broader Hub discovery, model cards, datasets, and Jobs belong to Model Lab.
       </>
     ),
@@ -168,12 +169,12 @@ default_text_model = "openrouter/deepseek/deepseek-v4-pro"`}
       <>
         <ul className="list-disc pl-5 space-y-2 text-sm text-ink-soft">
           <li><strong>Plan</strong> — Read-only investigation. Can grep, read files, list directories, fetch URLs. Cannot write or execute shell.</li>
-          <li><strong>Act</strong> — Multi-step execution. Shell and side-effect tools require approval based on your approval_mode setting.</li>
-          <li><strong>Operate</strong> — Durable Fleet/Workflow orchestration for larger, staged jobs. It is still governed by the same approval posture.</li>
+          <li><strong>Act</strong> — Normal interactive coding. Tool availability and approval prompts follow the active configuration and permission posture.</li>
+          <li><strong>Operate</strong> — Direct tools follow the same permission, sandbox, shell, and safety rules as Act. Fleet workers are preferred for independent, parallel, background, or long-running work, but delegation is not mandatory. Workflow is optional for ordered phases and gates.</li>
         </ul>
         <p className="mt-2">
-          Press <kbd className="font-mono text-xs px-1.5 py-0.5 hairline-t hairline-b hairline-l hairline-r">Tab</kbd> to cycle modes.
-          Approval mode (suggest / auto / never) is orthogonal — you can be in Act mode with auto-approval, for example.
+          When the composer is idle, press <kbd className="font-mono text-xs px-1.5 py-0.5 hairline-t hairline-b hairline-l hairline-r">Tab</kbd> to cycle modes.
+          Press <kbd className="font-mono text-xs px-1.5 py-0.5 hairline-t hairline-b hairline-l hairline-r">Shift+Tab</kbd> to cycle the independent Ask / Auto-Review / Full Access permission posture; Plan remains read-only.
         </p>
       </>
     ),
@@ -184,13 +185,13 @@ default_text_model = "openrouter/deepseek/deepseek-v4-pro"`}
     a: (
       <>
         <p className="mb-2">
-          Use <code className="inline">codewhale --model auto</code> or <code className="inline">/model auto</code> to let CodeWhale decide how much model power each turn needs.
+          Use <code className="inline">codewhale --model auto</code> or <code className="inline">/model auto</code> to let Codewhale decide how much model power each turn needs.
         </p>
         <p className="mb-2">
           <strong>Fin</strong> is the fast non-thinking path (<code className="inline">deepseek-v4-flash</code> with thinking off) used for routing decisions, summaries, RLM children, context maintenance, and other coordination work. Before the real turn is sent, Fin makes a small routing call to pick the concrete model and thinking level.
         </p>
         <p>
-          Short/simple turns can stay on Flash with thinking off. Coding, debugging, release work, architecture, or security review can move up to Pro and/or higher thinking. Fin is local to CodeWhale — the upstream API never receives <code className="inline">model: "auto"</code>.
+          Short/simple turns can stay on Flash with thinking off. Coding, debugging, release work, architecture, or security review can move up to Pro and/or higher thinking. Fin is local to Codewhale — the upstream API never receives <code className="inline">model: "auto"</code>.
         </p>
       </>
     ),
@@ -203,20 +204,20 @@ default_text_model = "openrouter/deepseek/deepseek-v4-pro"`}
         <code className="inline">/goal</code> sets a goal for the current TUI session.
         App-server clients can also persist a thread-scoped goal through the
         <code className="inline">thread/goal/*</code> methods. It does not add another
-        app mode; the mode switcher remains Plan, Act, and Operate, while approval posture is selected independently.
+        app mode; the mode switcher remains Plan, Act, and Operate, while permission posture is selected independently.
         Track progress in <a href="https://github.com/Hmbown/CodeWhale/issues/891" className="body-link">#891</a>.
       </>
     ),
     sources: ["#891"],
   },
   {
-    q: "Is my code safe? What sandboxing does CodeWhale use?",
+    q: "Is my code safe? What sandboxing does Codewhale use?",
     a: (
       <>
-        CodeWhale runs entirely on your machine. No telemetry, no cloud processing of your code.
+        Codewhale runs entirely on your machine. No telemetry, no cloud processing of your code.
         Sandbox backends: <strong>seatbelt</strong> (macOS), <strong>landlock</strong> (Linux), restricted tokens (Windows).
         Workspace boundaries default to <code className="inline">--workspace</code>. <code className="inline">/trust</code> lifts them.
-        Approval mode is configurable per session. All credential/approval/elevation events are written to <code className="inline">~/.codewhale/audit.log</code>.
+        Permission posture is configurable per session. All credential/approval/elevation events are written to <code className="inline">~/.codewhale/audit.log</code>.
       </>
     ),
     sources: ["SECURITY.md", "docs/ARCHITECTURE.md"],
@@ -225,8 +226,8 @@ default_text_model = "openrouter/deepseek/deepseek-v4-pro"`}
     q: "How do MCP servers work?",
     a: (
       <>
-        CodeWhale is a bidirectional MCP client and server. Define servers in <code className="inline">~/.codewhale/mcp.json</code>.
-        Tools appear as <code className="inline">mcp_&lt;server&gt;_&lt;tool&gt;</code>. You can also expose CodeWhale as an MCP server with <code className="inline">codewhale mcp</code>.
+        Codewhale is a bidirectional MCP client and server. Define servers in <code className="inline">~/.codewhale/mcp.json</code>.
+        Tools appear as <code className="inline">mcp_&lt;server&gt;_&lt;tool&gt;</code>. You can also expose Codewhale as an MCP server with <code className="inline">codewhale mcp</code>.
         See the <Link href="/docs#mcp" className="body-link">docs page</Link> for configuration examples.
       </>
     ),
@@ -274,7 +275,7 @@ registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"`}
       <>
         <p className="mb-2">
           <strong>codewhale.net</strong> and <strong>www.codewhale.net</strong> are the
-          official CodeWhale sites, deployed on Cloudflare. The website source is open
+          official Codewhale sites, deployed on Cloudflare. The website source is open
           and lives under <code className="inline">web/</code> in the{" "}
           <code className="inline">Hmbown/CodeWhale</code> repository — anyone can
           self-deploy it as a mirror.
@@ -291,7 +292,7 @@ registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"`}
         </p>
         <p>
           Self-deployed website copies, mirror sites, and third-party packages are not
-          controlled by the CodeWhale project. Verify download sources and checksums.
+          controlled by the Codewhale project. Verify download sources and checksums.
         </p>
       </>
     ),
@@ -327,7 +328,7 @@ registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"`}
     q: "Why is token consumption so high? / Why is cache hit rate low?",
     a: (
       <>
-        CodeWhale sends substantial context (system prompt, project instructions, tool definitions) with each turn.
+        Codewhale sends substantial context (system prompt, project instructions, tool definitions) with each turn.
         DeepSeek's prefix cache is used aggressively — the system prompt is layered to maximize cache hits.
         If you see high token usage, check: are you using <code className="inline">deepseek-v4-pro</code> for simple queries better suited to Flash?
         Model auto-routing (Fin) can help pick the right model per turn.
@@ -337,7 +338,7 @@ registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"`}
     sources: ["#1177", "#1818", "#743"],
   },
   {
-    q: "How do I update CodeWhale?",
+    q: "How do I update Codewhale?",
     a: (
       <>
         <pre className="code-block mb-2">
@@ -365,16 +366,16 @@ brew update && brew upgrade deepseek-tui`}
 
 const faqZh: FaqItem[] = [
   {
-    q: "CodeWhale 是什么？",
+    q: "Codewhale 是什么？",
     a: (
       <>
-        CodeWhale 是一个面向开源模型的终端原生编程智能体。通过 <code className="inline">codewhale</code> 命令启动，流式输出推理块，在有审批门槛的情况下编辑本地工作区，并可为每个回合自动选择最合适的模型和推理深度。DeepSeek V4 是一级模型路径；OpenRouter、Hugging Face、自托管运行时和其他 OpenAI 兼容路由都是增量选择。
+        Codewhale 是一个可使用托管与本地模型的终端原生编程智能体。通过 <code className="inline">codewhale</code> 命令启动，流式输出推理块，在有审批门槛的情况下编辑本地工作区，并可为每个回合选择已配置的模型和推理深度。DeepSeek 是内置默认路由；OpenRouter、Anthropic、OpenAI 兼容服务与自托管运行时使用同一套运行时和工具。
       </>
     ),
     sources: ["README.md", "docs/ARCHITECTURE.md"],
   },
   {
-    q: "如何安装 CodeWhale？",
+    q: "如何安装 Codewhale？",
     a: (
       <>
         <p className="mb-2">四种方式，殊途同归：</p>
@@ -413,12 +414,12 @@ brew tap Hmbown/deepseek-tui && brew install deepseek-tui
     sources: ["README.md"],
   },
   {
-    q: "CodeWhale 和 DeepSeek TUI 是什么关系？改名是怎么回事？",
+    q: "Codewhale 和 DeepSeek TUI 是什么关系？改名是怎么回事？",
     a: (
       <>
-        CodeWhale 是 DeepSeek TUI 的新名称。当前的主命令是 <code className="inline">codewhale</code>。旧的 <code className="inline">deepseek</code> 和 <code className="inline">deepseek-tui</code> 命令作为兼容垫片继续有效。
+        Codewhale 是 DeepSeek TUI 的新名称。当前的主命令是 <code className="inline">codewhale</code>。旧的 <code className="inline">deepseek</code> 和 <code className="inline">deepseek-tui</code> 命令作为兼容垫片继续有效。
         配置存放在 <code className="inline">~/.codewhale/</code>。旧版 <code className="inline">~/.deepseek/</code> 配置仍会作为兼容回退读取，<code className="inline">DEEPSEEK_*</code> 环境变量继续有效。
-        DeepSeek 并未被弃用。改名是为了体现 CodeWhale 更广泛的使命——成为面向所有提供商的开放模型智能体终端，而非弱化 DeepSeek 的地位。
+        DeepSeek 并未被弃用。改名是为了体现 Codewhale 更广泛的使命——成为面向所有提供商的开放模型智能体终端，而非弱化 DeepSeek 的地位。
       </>
     ),
     sources: ["docs/REBRAND.md", "README.md"],
@@ -451,12 +452,12 @@ codewhale doctor         # 完整连接检查`}
     sources: ["#907", "#1545", "docs/CONFIGURATION.md"],
   },
   {
-    q: "CodeWhale 支持哪些提供商？",
+    q: "Codewhale 支持哪些提供商？",
     a: (
       <>
-        <p className="mb-2">CodeWhale 内建以下提供商：</p>
+        <p className="mb-2">Codewhale 内建以下提供商：</p>
         <ul className="list-disc pl-5 space-y-1 text-sm text-ink-soft mb-3">
-          <li><strong>DeepSeek</strong> — 一级支持，原生 API。推理流、缓存指标、思考力度控制。</li>
+          <li><strong>DeepSeek</strong> — 内置默认原生 API 路由，支持推理流、缓存指标和思考力度控制。</li>
           <li><strong>OpenRouter</strong> — 统一 API，可访问 DeepSeek 和其他开放模型路由。</li>
           <li><strong>OpenAI 兼容</strong>、<strong>NVIDIA NIM</strong>、<strong>AtlasCloud</strong>、<strong>Wanjie Ark</strong>、<strong>Volcengine Ark</strong>、<strong>Xiaomi MiMo</strong>、<strong>Novita</strong>、<strong>Fireworks</strong>、<strong>SiliconFlow</strong>、<strong>SiliconFlow CN</strong>、<strong>Arcee AI</strong>、<strong>Moonshot/Kimi</strong>、<strong>Hugging Face</strong>、<strong>DeepInfra</strong>、<strong>Together AI</strong>、<strong>Z.ai</strong>、<strong>StepFun</strong>、<strong>MiniMax</strong>、<strong>OpenAI Codex</strong>、<strong>Anthropic</strong>、<strong>SGLang</strong>、<strong>vLLM</strong>、<strong>Ollama</strong></li>
         </ul>
@@ -500,7 +501,7 @@ default_text_model = "openrouter/deepseek/deepseek-v4-pro"`}
       <>
         可以。使用 <code className="inline">vllm</code>、<code className="inline">sglang</code> 或 <code className="inline">ollama</code> 提供商连接本地端点。
         对于 OpenAI 兼容端点（llama.cpp server、text-generation-webui 等），可以使用 <code className="inline">openai</code> 提供商并设置自定义 <code className="inline">base_url</code>。
-        CodeWhale 也支持 <code className="inline">DEEPSEEK_ALLOW_INSECURE_HTTP=true</code> 用于本地 HTTP 端点。
+        Codewhale 也支持 <code className="inline">DEEPSEEK_ALLOW_INSECURE_HTTP=true</code> 用于本地 HTTP 端点。
         Hugging Face Inference Providers 也可以通过 <code className="inline">huggingface</code> provider 使用。更完整的 Hub 发现、模型卡片、数据集和 Jobs 属于 Model Lab。
       </>
     ),
@@ -512,12 +513,12 @@ default_text_model = "openrouter/deepseek/deepseek-v4-pro"`}
       <>
         <ul className="list-disc pl-5 space-y-2 text-sm text-ink-soft">
           <li><strong>Plan（计划）</strong> — 只读调查。可以 grep、读文件、列目录、抓取 URL。不能写入或执行 Shell。</li>
-          <li><strong>Act（执行）</strong> — 多步执行。Shell 和有副作用的工具根据 approval_mode 设置审批。</li>
-          <li><strong>Operate（编排）</strong> — 面向较大、分阶段任务的持久 Fleet/Workflow 编排，仍受同一审批模式约束。</li>
+          <li><strong>Act（执行）</strong> — 常规交互式编码。工具是否可用以及何时请求批准，取决于当前配置和权限姿态。</li>
+          <li><strong>Operate（编排）</strong> — 直接工具遵循与 Act 相同的权限、沙箱、Shell 和安全规则。独立、并行、后台或长时间工作会优先交给 Fleet worker，但不强制委派；只有需要有序阶段和门禁时才需要 Workflow。</li>
         </ul>
         <p className="mt-2">
-          按 <kbd className="font-mono text-xs px-1.5 py-0.5 hairline-t hairline-b hairline-l hairline-r">Tab</kbd> 切换模式。
-          审批模式（建议 / 自动 / 拒绝）是独立的——例如你可以在 Act 模式下使用自动审批。
+          输入区空闲时，按 <kbd className="font-mono text-xs px-1.5 py-0.5 hairline-t hairline-b hairline-l hairline-r">Tab</kbd> 切换模式。
+          按 <kbd className="font-mono text-xs px-1.5 py-0.5 hairline-t hairline-b hairline-l hairline-r">Shift+Tab</kbd> 循环独立的 Ask / Auto-Review / Full Access 权限姿态；Plan 始终只读。
         </p>
       </>
     ),
@@ -528,13 +529,13 @@ default_text_model = "openrouter/deepseek/deepseek-v4-pro"`}
     a: (
       <>
         <p className="mb-2">
-          使用 <code className="inline">codewhale --model auto</code> 或 <code className="inline">/model auto</code> 让 CodeWhale 为每个回合自动选择最合适的模型和推理深度。
+          使用 <code className="inline">codewhale --model auto</code> 或 <code className="inline">/model auto</code> 让 Codewhale 为每个回合自动选择最合适的模型和推理深度。
         </p>
         <p className="mb-2">
           <strong>Fin</strong> 是快速非推理路径（<code className="inline">deepseek-v4-flash</code>，推理关闭），用于路由决策、摘要、RLM 子任务、上下文维护等协调工作。在真实请求发送前，Fin 会做一个小的路由调用来选择具体的模型和推理级别。
         </p>
         <p>
-          简短简单的请求可以留在 Flash + 推理关闭的状态。编码、调试、发布工作、架构设计或安全审查则会提升到 Pro 和/或更高的推理级别。Fin 是 CodeWhale 本地逻辑——上游 API 永远不会收到 <code className="inline">model: "auto"</code>。
+          简短简单的请求可以留在 Flash + 推理关闭的状态。编码、调试、发布工作、架构设计或安全审查则会提升到 Pro 和/或更高的推理级别。Fin 是 Codewhale 本地逻辑——上游 API 永远不会收到 <code className="inline">model: "auto"</code>。
         </p>
       </>
     ),
@@ -546,20 +547,20 @@ default_text_model = "openrouter/deepseek/deepseek-v4-pro"`}
       <>
         <code className="inline">/goal</code> 为当前 TUI 会话设置目标，支持 <code className="inline">pause</code>、<code className="inline">resume</code>、<code className="inline">complete</code>、<code className="inline">blocked</code> 和 <code className="inline">clear</code> 控制。
         App-server 客户端也可以通过 <code className="inline">thread/goal/*</code> 方法持久化线程范围的目标，支持 <code className="inline">set</code>、<code className="inline">get</code> 和 <code className="inline">clear</code>。
-        它不会新增一个应用模式；模式切换器仍然是 Plan、Act 和 Operate，审批姿态独立选择。
+        它不会新增一个应用模式；模式切换器仍然是 Plan、Act 和 Operate，权限姿态独立选择。
         跟踪进展：<a href="https://github.com/Hmbown/CodeWhale/issues/891" className="body-link">#891</a>。
       </>
     ),
     sources: ["#891"],
   },
   {
-    q: "我的代码安全吗？CodeWhale 使用什么沙箱机制？",
+    q: "我的代码安全吗？Codewhale 使用什么沙箱机制？",
     a: (
       <>
-        CodeWhale 完全在你的机器上运行。无遥测，不会将你的代码上传到云端处理。
+        Codewhale 完全在你的机器上运行。无遥测，不会将你的代码上传到云端处理。
         沙箱后端：<strong>seatbelt</strong>（macOS）、<strong>landlock</strong>（Linux）、受限令牌（Windows）。
         工作区边界默认为 <code className="inline">--workspace</code>。<code className="inline">/trust</code> 可解除边界。
-        审批模式可按会话配置。所有凭证/审批/提权事件写入 <code className="inline">~/.codewhale/audit.log</code>。
+        权限姿态可按会话配置。所有凭证/审批/提权事件写入 <code className="inline">~/.codewhale/audit.log</code>。
       </>
     ),
     sources: ["SECURITY.md", "docs/ARCHITECTURE.md"],
@@ -568,8 +569,8 @@ default_text_model = "openrouter/deepseek/deepseek-v4-pro"`}
     q: "MCP 服务器如何工作？",
     a: (
       <>
-        CodeWhale 是双向 MCP 客户端和服务器。在 <code className="inline">~/.codewhale/mcp.json</code> 中定义服务器。
-        工具以 <code className="inline">mcp_&lt;server&gt;_&lt;tool&gt;</code> 形式呈现。你也可以通过 <code className="inline">codewhale mcp</code> 将 CodeWhale 暴露为 MCP 服务器。
+        Codewhale 是双向 MCP 客户端和服务器。在 <code className="inline">~/.codewhale/mcp.json</code> 中定义服务器。
+        工具以 <code className="inline">mcp_&lt;server&gt;_&lt;tool&gt;</code> 形式呈现。你也可以通过 <code className="inline">codewhale mcp</code> 将 Codewhale 暴露为 MCP 服务器。
         查看 <Link href="/zh/docs#mcp" className="body-link">文档页面</Link> 了解配置示例。
       </>
     ),
@@ -617,7 +618,7 @@ registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"`}
       <>
         <p className="mb-2">
           <strong>codewhale.net</strong> 和 <strong>www.codewhale.net</strong> 是
-          CodeWhale 的官方站点，部署在 Cloudflare 上。网站源码存放于{" "}
+          Codewhale 的官方站点，部署在 Cloudflare 上。网站源码存放于{" "}
           <code className="inline">Hmbown/CodeWhale</code> 仓库的{" "}
           <code className="inline">web/</code> 目录下，任何人都可自行部署为镜像。
         </p>
@@ -632,7 +633,7 @@ registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"`}
           Cargo 用户可使用 TUNA 镜像在国内加速下载。
         </p>
         <p>
-          自行部署的网站副本、镜像站和第三方包不受 CodeWhale 项目控制。
+          自行部署的网站副本、镜像站和第三方包不受 Codewhale 项目控制。
           请验证下载来源和校验和。
         </p>
       </>
@@ -669,7 +670,7 @@ registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"`}
     q: "为什么 token 消耗这么大？/ 缓存命中率为什么低？",
     a: (
       <>
-        CodeWhale 每次请求都会发送大量上下文（系统提示、项目说明、工具定义）。
+        Codewhale 每次请求都会发送大量上下文（系统提示、项目说明、工具定义）。
         DeepSeek 的前缀缓存被积极使用——系统提示按最稳定的层级排列以最大化缓存命中。
         如果你发现 token 使用量很高，请检查：是否在简单查询中使用了 <code className="inline">deepseek-v4-pro</code>（更适合用 Flash）？
         模型自动路由（Fin）可以帮助为每个回合选择合适的模型。
@@ -679,7 +680,7 @@ registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"`}
     sources: ["#1177", "#1818", "#743"],
   },
   {
-    q: "如何更新 CodeWhale？",
+    q: "如何更新 Codewhale？",
     a: (
       <>
         <pre className="code-block mb-2">
@@ -732,34 +733,7 @@ export default async function FaqPage({ params }: { params: Promise<{ locale: st
       </section>
 
       <section className="mx-auto max-w-[1400px] px-6 pb-20">
-        <div className="space-y-0 hairline-t hairline-b">
-          {items.map((item, i) => (
-            <details key={i} className="group hairline-b last:border-b-0">
-              <summary className="px-0 py-5 cursor-pointer flex items-start gap-4 hover:text-indigo transition-colors">
-                <span className="font-mono text-indigo tabular text-sm pt-0.5 shrink-0">
-                  {String(i + 1).padStart(2, "0")}
-                </span>
-                <span className="font-display text-lg leading-snug flex-1">{item.q}</span>
-                <span className="font-mono text-ink-mute text-sm group-open:rotate-45 transition-transform shrink-0">+</span>
-              </summary>
-              <div className="pb-5 pl-10 pr-4">
-                <div className={`text-ink-soft leading-relaxed ${isZh ? "leading-[1.9] tracking-wide" : ""}`}>
-                  {item.a}
-                </div>
-                {item.sources && item.sources.length > 0 && (
-                  <div className="mt-3 flex items-center gap-2 flex-wrap">
-                    <span className="font-mono text-[0.66rem] text-ink-mute uppercase tracking-wider">
-                      {isZh ? "来源" : "Sources"}:
-                    </span>
-                    {item.sources.map((s) => (
-                      <span key={s} className="font-mono text-[0.7rem] text-indigo">{s}</span>
-                    ))}
-                  </div>
-                )}
-              </div>
-            </details>
-          ))}
-        </div>
+        <FaqSearch items={items} locale={locale} />
 
         <div className="mt-12 text-center">
           <p className="text-ink-soft text-sm mb-4">

@@ -10,12 +10,14 @@ visual motion and density for screen-reader and low-motion users.
 | Toggle | Default | Effect |
 | --- | --- | --- |
 | `NO_ANIMATIONS=1` env var | unset | At startup, forces `low_motion = true` and `fancy_animations = false`. Overrides whatever's saved in `settings.toml`. |
-| `low_motion` setting | `false` | Uses calmer streaming pacing and a lower redraw cadence so cursor/status motion is less aggressive. The footer water strip is controlled separately by `fancy_animations`. |
-| `fancy_animations` setting | `true` | Footer water-spout strip and pulsing sub-agent counter. Set to `false` to keep live-turn chrome still. |
-| `status_indicator` setting | `whale` | Header status chip. Set to `dots` for the compact dot cycle or `off` to hide it. |
-| `calm_mode` setting | `false` | Collapses tool-output details by default and trims status messages. Useful for screen readers that announce every redraw. |
+| `CODEWHALE_ASCII_SAFE=1` env var | unset | Replaces decorative Unicode and box-drawing marks with narrow ASCII at the terminal backend. Labels, focus, state, and controls remain available. |
+| `low_motion` setting | `false` | Freezes decorative and state animation without changing model text delivery. The footer water strip is controlled separately by `fancy_animations`. |
+| `fancy_animations` setting | `true` | Enables expressive live-state chrome. Set to `false` to keep live-turn chrome still. |
+| `ocean_treatment` setting | `ombre` | Chooses the background appearance: `ombre` paints the state-reactive water column; `flat` uses the plain theme surface. Both keep the same state marks and idle ambient life; appearance is independent of motion settings. |
+| `status_indicator` setting | `cw` | Static typographic header mark. Set to `whale` or `dots` for the legacy animations, or `off` to hide it. |
+| `calm_mode` setting | `true` | Collapses tool-output details by default and trims status messages. Useful for screen readers that announce every redraw. |
 | `show_thinking` setting | `true` | Set to `false` to hide model `reasoning_content` blocks entirely. |
-| `show_tool_details` setting | `true` | Set to `false` to render tool calls as one-liners without expanded payloads. |
+| `show_tool_details` setting | `false` | Set to `true` to expand tool calls inline; details remain available on demand either way. |
 
 ## Standard env-var surface
 
@@ -24,6 +26,9 @@ Set these in your shell profile so they apply to every session:
 ```bash
 # Force low-motion + no fancy animations.
 export NO_ANIMATIONS=1
+
+# Force the terminal-safe ASCII rendering tier.
+export CODEWHALE_ASCII_SAFE=1
 
 # Optional: respect the wider terminal-color convention.
 export NO_COLOR=1            # honored by the underlying ratatui backend
@@ -59,8 +64,8 @@ version renders cleanly.
 
 ## Notes for screen-reader users
 
-* `low_motion` slows the idle redraw loop to ~120ms per frame so
-  the cursor isn't constantly repositioned. Combined with
+* `low_motion` slows the idle redraw loop to ~120ms per frame and freezes state
+  markers without synthesizing or throttling model text. Combined with
   `calm_mode`, the redraw rate stays low enough that VoiceOver /
   Orca announcements track linearly with model output instead of
   re-reading the whole screen on each tick.

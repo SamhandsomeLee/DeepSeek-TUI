@@ -14,6 +14,55 @@ use std::{
 
 use super::*;
 
+const TOOL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Emits delayed, best-effort liveness pulses for one running tool.
+///
+/// Keep the ticker in its own task instead of embedding `tokio::time::Interval`
+/// in the already-large engine turn future. Besides keeping the turn future
+/// compact, this leaves pre-execution MCP discovery and approval scheduling
+/// untouched. Dropping the guard cancels and aborts the ticker synchronously.
+struct ToolHeartbeatGuard {
+    cancel: tokio_util::sync::CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ToolHeartbeatGuard {
+    fn start(tx_event: mpsc::Sender<Event>, interval: Duration) -> Self {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Tokio intervals tick immediately once. Consume that tick so fast
+            // tools do not produce a pulse and the first heartbeat is delayed.
+            ticker.tick().await;
+
+            loop {
+                tokio::select! {
+                    biased;
+
+                    () = task_cancel.cancelled() => break,
+                    _ = ticker.tick() => {
+                        match tx_event.try_send(Event::ToolCallHeartbeat) {
+                            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                        }
+                    }
+                }
+            }
+        });
+        Self { cancel, task }
+    }
+}
+
+impl Drop for ToolHeartbeatGuard {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.task.abort();
+    }
+}
+
 /// RAII guard that pauses the TUI's terminal-state ownership for the duration
 /// of an interactive tool, then restores it on drop.
 ///
@@ -126,7 +175,9 @@ impl Drop for InteractiveTerminalGuard {
 }
 
 pub(super) fn emit_tool_audit(event: serde_json::Value) {
-    let Some(path) = std::env::var_os("DEEPSEEK_TOOL_AUDIT_LOG") else {
+    let Some(path) = std::env::var_os("CODEWHALE_TOOL_AUDIT_LOG")
+        .or_else(|| std::env::var_os("DEEPSEEK_TOOL_AUDIT_LOG"))
+    else {
         return;
     };
     emit_tool_audit_to_path(&PathBuf::from(path), event);
@@ -310,6 +361,9 @@ impl Engine {
         mcp_pool: Option<Arc<AsyncMutex<McpPool>>>,
         context_override: Option<crate::tools::ToolContext>,
     ) -> Result<ToolResult, ToolError> {
+        // This guard starts before lock acquisition, so contention as well as
+        // registry/MCP/interpreter execution remains visibly live.
+        let _heartbeat = ToolHeartbeatGuard::start(tx_event.clone(), TOOL_HEARTBEAT_INTERVAL);
         let started_at = std::time::Instant::now();
         let dispatch = if McpPool::is_mcp_tool(&tool_name) {
             "mcp"
@@ -391,6 +445,7 @@ impl Engine {
                     ToolError::PathEscape { .. } => "path_escape",
                     ToolError::ExecutionFailed { .. } => "execution_failed",
                     ToolError::Timeout { .. } => "timeout",
+                    ToolError::Cancelled { .. } => "cancelled",
                     ToolError::NotAvailable { .. } => "not_available",
                     ToolError::PermissionDenied { .. } => "permission_denied",
                 };
@@ -414,6 +469,73 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::time::Duration;
+
+    const TEST_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(10);
+
+    #[tokio::test]
+    async fn tool_heartbeat_emits_for_slow_tool() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let guard = ToolHeartbeatGuard::start(tx, TEST_HEARTBEAT_INTERVAL);
+
+        let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("heartbeat before slow tool completes")
+            .expect("event channel stays open");
+
+        assert!(matches!(event, Event::ToolCallHeartbeat));
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn tool_heartbeat_is_delayed_for_fast_tool() {
+        let (tx, mut rx) = mpsc::channel(4);
+
+        let guard = ToolHeartbeatGuard::start(tx, TEST_HEARTBEAT_INTERVAL);
+        drop(guard);
+        tokio::time::sleep(TEST_HEARTBEAT_INTERVAL * 2).await;
+
+        assert!(rx.try_recv().is_err(), "fast tool emitted a heartbeat");
+    }
+
+    #[tokio::test]
+    async fn tool_heartbeat_stops_after_tool_completes() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let guard = ToolHeartbeatGuard::start(tx, TEST_HEARTBEAT_INTERVAL);
+
+        let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("heartbeat before slow tool completes")
+            .expect("event channel stays open");
+        assert!(matches!(event, Event::ToolCallHeartbeat));
+
+        drop(guard);
+        tokio::task::yield_now().await;
+        while rx.try_recv().is_ok() {}
+        tokio::time::sleep(TEST_HEARTBEAT_INTERVAL * 2).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "heartbeat continued after tool completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_event_channel_never_blocks_tool_heartbeat() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(Event::status("filler")).expect("fill channel");
+
+        let result = tokio::time::timeout(Duration::from_secs(1), async {
+            let guard = ToolHeartbeatGuard::start(tx, TEST_HEARTBEAT_INTERVAL);
+            tokio::time::sleep(TEST_HEARTBEAT_INTERVAL * 3).await;
+            drop(guard);
+            "done"
+        })
+        .await
+        .expect("full event channel must not block tool completion");
+
+        assert_eq!(result, "done");
+        assert!(matches!(rx.recv().await, Some(Event::Status { .. })));
+        assert!(rx.try_recv().is_err(), "heartbeat displaced queued event");
+    }
 
     #[tokio::test]
     async fn terminal_guard_queues_resume_when_event_channel_is_full() {

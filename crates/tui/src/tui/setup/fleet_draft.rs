@@ -16,8 +16,8 @@
 //!   parse, escalation rejection, sanitization, bounding — before anyone
 //!   previews it. Failure of any kind degrades to the manual authoring flow;
 //!   it never blocks the wizard.
-//! - **Drafting is not ratifying.** The caller shows the exact rendered TOML
-//!   and still requires the explicit ratify keypress before anything is
+//! - **Drafting is not saving.** The caller shows the exact rendered TOML
+//!   and still requires the explicit save keypress before anything is
 //!   written; the on-disk bytes are rendered from the validated struct, never
 //!   from model output.
 
@@ -157,7 +157,7 @@ pub(crate) fn workspace_fingerprint(workspace: &Path) -> String {
 /// pin the guardrails.
 fn profile_drafting_system_prompt() -> String {
     concat!(
-        "You are helping a CodeWhale user draft a fleet agent profile: a small, ",
+        "You are helping a Codewhale user draft a fleet agent profile: a small, ",
         "durable description of one worker role their agent fleet can spawn.\n\n",
         "Return ONLY one JSON object — no markdown fences, no commentary — with these ",
         "fields (include \"model\" only when a specific target model is given below; ",
@@ -255,7 +255,7 @@ fn profile_draft_response_text(content: &[ContentBlock]) -> String {
 
 /// Ask `client` to draft a fleet profile for the wizard's answers. Returns
 /// the sanitized, bounded draft, or a short human-facing reason on any
-/// failure. The caller owns timeout, preview, and the ratify gate.
+/// failure. The caller owns timeout, preview, and the save gate.
 pub(crate) async fn draft_fleet_profile_with_model<C: LlmClient>(
     client: &C,
     request_model: &str,

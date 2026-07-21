@@ -15,10 +15,10 @@ use crate::provider_lake::{all_catalog_models_for_provider, models_for_provider}
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ModelAuthSource {
     Config,
-    Command,
     Env,
     OAuthCli,
-    Secret,
+    ImportedToken,
+    NoAuth,
     KeylessLocal,
 }
 
@@ -33,6 +33,7 @@ pub(crate) struct ModelRouteCandidate {
     pub(crate) thinking_supported: bool,
     pub(crate) cache_telemetry_supported: bool,
     pub(crate) auth_source: ModelAuthSource,
+    pub(crate) readiness: crate::provider_readiness::ResolvedProviderReadiness,
     pub(crate) default_for_provider: bool,
     pub(crate) tags: Vec<&'static str>,
 }
@@ -48,6 +49,16 @@ pub(crate) struct ModelInventory {
 
 impl ModelInventory {
     pub(crate) fn from_config(config: &Config) -> Self {
+        Self::from_config_with_health(
+            config,
+            &crate::provider_readiness::ProviderReadinessSnapshot::default(),
+        )
+    }
+
+    pub(crate) fn from_config_with_health(
+        config: &Config,
+        health: &crate::provider_readiness::ProviderReadinessSnapshot,
+    ) -> Self {
         let active_provider = config.api_provider();
         let mut candidates = Vec::new();
 
@@ -55,7 +66,6 @@ impl ModelInventory {
             let Some(auth_source) = auth_source_for_provider(config, provider) else {
                 continue;
             };
-
             let default_model = provider_default_model(config, provider);
             let mut models = Vec::<String>::new();
             if let Some(model) = configured_model_for_provider(config, provider) {
@@ -75,7 +85,26 @@ impl ModelInventory {
             }
 
             for model in models {
-                let capability = provider_capability(provider, &model);
+                let readiness =
+                    crate::provider_readiness::resolve_for_model(config, provider, &model, health);
+                let mut capability = provider_capability(provider, &model);
+                if let Ok(route) =
+                    crate::route_runtime::resolve_runtime_route(config, provider, Some(&model))
+                {
+                    if let Some(context_window) = route.candidate.limits().context_tokens {
+                        capability.context_window = context_window.min(u64::from(u32::MAX)) as u32;
+                    }
+                    // Do not promote bare `k3` into the global capability
+                    // catalog. Its thinking trace contract belongs only to
+                    // Kimi Code's exact membership-plan route.
+                    if crate::config::is_exact_kimi_code_k3_route(
+                        provider,
+                        &route.candidate.endpoint().base_url,
+                        route.candidate.wire_model_id().as_str(),
+                    ) {
+                        capability.thinking_supported = true;
+                    }
+                }
                 let mut tags = Vec::new();
                 if capability.context_window >= 1_000_000 {
                     tags.push("long_context");
@@ -89,21 +118,29 @@ impl ModelInventory {
                 ) {
                     tags.push("local");
                 }
-                if model.eq_ignore_ascii_case(&default_model) {
+                // Unready routes stay visible (annotated) so an operator can
+                // override explicitly, but they are never a silent default.
+                let default_for_provider =
+                    readiness.can_attempt() && model.eq_ignore_ascii_case(&default_model);
+                if default_for_provider {
                     tags.push("default");
+                }
+                if !readiness.can_attempt() {
+                    tags.push("unready");
                 }
 
                 candidates.push(ModelRouteCandidate {
                     provider,
                     provider_name: provider.as_str(),
                     provider_display_name: provider.display_name(),
-                    default_for_provider: model.eq_ignore_ascii_case(&default_model),
+                    default_for_provider,
                     model,
                     context_window: capability.context_window,
                     max_output: capability.max_output,
                     thinking_supported: capability.thinking_supported,
                     cache_telemetry_supported: capability.cache_telemetry_supported,
                     auth_source: auth_source.clone(),
+                    readiness: readiness.clone(),
                     tags,
                 });
             }
@@ -135,15 +172,63 @@ impl ModelInventory {
                 candidate.provider == self.active_provider && candidate.default_for_provider
             })
             .or_else(|| {
+                self.candidates.iter().find(|candidate| {
+                    candidate.provider == self.active_provider && candidate.readiness.can_attempt()
+                })
+            })
+            .or_else(|| {
                 self.candidates
                     .iter()
-                    .find(|candidate| candidate.provider == self.active_provider)
+                    .find(|candidate| candidate.readiness.can_attempt())
             })
-            .or_else(|| self.candidates.first())
     }
 
     pub(crate) fn router_context_json(&self) -> String {
-        serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
+        #[derive(Serialize)]
+        struct RouterInventoryContext<'a> {
+            active_provider: ApiProvider,
+            candidates: Vec<RouterCandidateContext<'a>>,
+        }
+
+        #[derive(Serialize)]
+        struct RouterCandidateContext<'a> {
+            provider: ApiProvider,
+            provider_name: &'a str,
+            provider_display_name: &'a str,
+            model: &'a str,
+            context_window: u32,
+            max_output: u32,
+            thinking_supported: bool,
+            cache_telemetry_supported: bool,
+            default_for_provider: bool,
+            tags: &'a [&'static str],
+        }
+
+        // The classifier needs route capabilities, not credentials, endpoint
+        // configuration, or provider error text. Filter to runnable candidates
+        // and project only non-secret routing facts before serializing.
+        let candidates = self
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.readiness.can_attempt())
+            .map(|candidate| RouterCandidateContext {
+                provider: candidate.provider,
+                provider_name: candidate.provider_name,
+                provider_display_name: candidate.provider_display_name,
+                model: &candidate.model,
+                context_window: candidate.context_window,
+                max_output: candidate.max_output,
+                thinking_supported: candidate.thinking_supported,
+                cache_telemetry_supported: candidate.cache_telemetry_supported,
+                default_for_provider: candidate.default_for_provider,
+                tags: &candidate.tags,
+            })
+            .collect();
+        serde_json::to_string(&RouterInventoryContext {
+            active_provider: self.active_provider,
+            candidates,
+        })
+        .unwrap_or_else(|_| "{}".to_string())
     }
 }
 
@@ -176,6 +261,13 @@ fn provider_default_model(config: &Config, provider: ApiProvider) -> String {
             return model;
         }
     }
+    if provider == ApiProvider::Moonshot
+        && config
+            .provider_config_for(provider)
+            .is_some_and(crate::config::provider_config_uses_kimi_imported_token)
+    {
+        return crate::config::DEFAULT_KIMI_CODE_MODEL.to_string();
+    }
     all_catalog_models_for_provider(provider)
         .first()
         .map(|model| model.as_str())
@@ -189,40 +281,71 @@ fn provider_default_model(config: &Config, provider: ApiProvider) -> String {
 }
 
 fn auth_source_for_provider(config: &Config, provider: ApiProvider) -> Option<ModelAuthSource> {
-    if matches!(
-        provider,
-        ApiProvider::Ollama | ApiProvider::Sglang | ApiProvider::Vllm
-    ) {
-        return Some(ModelAuthSource::KeylessLocal);
+    let credential_state =
+        crate::provider_readiness::credential_state_for_provider(config, provider);
+    match credential_state {
+        crate::provider_readiness::CredentialState::NoAuth => {
+            return Some(ModelAuthSource::NoAuth);
+        }
+        crate::provider_readiness::CredentialState::Local => {
+            return Some(ModelAuthSource::KeylessLocal);
+        }
+        crate::provider_readiness::CredentialState::ImportedToken => {
+            return Some(ModelAuthSource::ImportedToken);
+        }
+        crate::provider_readiness::CredentialState::MissingKey
+        | crate::provider_readiness::CredentialState::MissingLogin
+        | crate::provider_readiness::CredentialState::ExternalConsent
+        | crate::provider_readiness::CredentialState::Legacy => return None,
+        crate::provider_readiness::CredentialState::Saved => {}
     }
-    if env_has_key_for(provider) {
-        return Some(ModelAuthSource::Env);
+
+    if provider == ApiProvider::Custom {
+        let configured = config.provider_config_for(provider)?;
+        if configured
+            .api_key_env
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .is_some_and(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
+        {
+            return Some(ModelAuthSource::Env);
+        }
+        return (configured
+            .api_key
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            || crate::config::explicit_cli_api_key_override().is_some())
+        .then_some(ModelAuthSource::Config);
     }
-    if let Some(auth) = config
-        .provider_config_for(provider)
-        .and_then(|entry| entry.auth.as_ref())
-    {
-        return match auth.source {
-            codewhale_config::AuthSourceKind::Command => Some(ModelAuthSource::Command),
-            codewhale_config::AuthSourceKind::Secret => Some(ModelAuthSource::Secret),
-        };
-    }
-    if provider_uses_oauth_cli(config, provider) && has_api_key_for(config, provider) {
+    if provider_uses_oauth_cli(config, provider) {
         return Some(ModelAuthSource::OAuthCli);
     }
-    has_api_key_for(config, provider).then_some(ModelAuthSource::Config)
+    if config
+        .provider_config_for(provider)
+        .and_then(|entry| entry.api_key_env.as_deref())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .is_some_and(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
+    {
+        return Some(ModelAuthSource::Env);
+    }
+    if !config.should_skip_secret_store_for_provider(provider) && env_has_key_for(provider) {
+        return Some(ModelAuthSource::Env);
+    }
+    Some(ModelAuthSource::Config)
 }
 
 fn provider_uses_oauth_cli(config: &Config, provider: ApiProvider) -> bool {
+    if config.provider_uses_custom_endpoint(provider) {
+        return false;
+    }
     match provider {
         ApiProvider::OpenaiCodex => true,
-        ApiProvider::Moonshot => config
+        ApiProvider::Xai => config
             .provider_config_for(provider)
             .and_then(|entry| entry.auth_mode.as_deref())
-            .is_some_and(|mode| {
-                let mode = mode.trim().to_ascii_lowercase().replace('-', "_");
-                matches!(mode.as_str(), "kimi" | "kimi_oauth" | "kimi_cli" | "oauth")
-            }),
+            .is_some_and(crate::xai_oauth::auth_mode_uses_xai_oauth),
         _ => false,
     }
 }
@@ -294,16 +417,135 @@ mod tests {
     }
 
     #[test]
-    fn inventory_reports_command_auth_without_secret_value() {
+    fn inventory_never_admits_kimi_cli_oauth_import() {
         let _env_lock = crate::test_support::lock_test_env();
+        let temp = tempfile::tempdir().expect("Kimi import fixture root");
+        let kimi_home = temp.path().join("kimi-code");
+        std::fs::create_dir_all(kimi_home.join("credentials")).expect("Kimi credential directory");
+        let expires_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs_f64()
+            + 3600.0;
+        let credential_path = kimi_home.join("credentials/kimi-code.json");
+        let credential_raw = serde_json::json!({
+            "access_token": "unexpired-user-owned-token",
+            "refresh_token": "must-not-be-used",
+            "expires_at": expires_at,
+        })
+        .to_string();
+        std::fs::write(&credential_path, &credential_raw).expect("write Kimi import fixture");
+        let _kimi_home = crate::test_support::EnvVarGuard::set(
+            "KIMI_CODE_HOME",
+            kimi_home.to_str().expect("utf8 path"),
+        );
+        let config = Config {
+            provider: Some("moonshot".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                moonshot: crate::config::ProviderConfig {
+                    auth_mode: Some("kimi_oauth".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let inventory = ModelInventory::from_config(&config);
+        assert!(
+            inventory
+                .candidates
+                .iter()
+                .all(|candidate| candidate.provider != ApiProvider::Moonshot),
+            "unsupported Kimi CLI OAuth must not enter the routing inventory"
+        );
+        assert_eq!(
+            std::fs::read_to_string(credential_path).expect("Kimi file remains untouched"),
+            credential_raw
+        );
+    }
+
+    #[test]
+    fn inventory_uses_kimi_code_k3_route_context_not_generic_fallback() {
+        let config = Config {
+            provider: Some("moonshot".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                moonshot: crate::config::ProviderConfig {
+                    api_key: Some("test-kimi-key".to_string()),
+                    base_url: Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string()),
+                    model: Some(crate::config::KIMI_CODE_K3_MODEL.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let inventory = ModelInventory::from_config(&config);
+        let candidate = inventory
+            .candidate(ApiProvider::Moonshot, crate::config::KIMI_CODE_K3_MODEL)
+            .expect("configured Kimi Code K3 route");
+
+        assert_eq!(candidate.context_window, 262_144);
+        assert!(candidate.thinking_supported);
+        assert!(candidate.tags.contains(&"thinking"));
+        assert!(!candidate.tags.contains(&"long_context"));
+    }
+
+    #[test]
+    fn inventory_includes_custom_api_key_env_route() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let _custom_key = crate::test_support::EnvVarGuard::set("ACME_CUSTOM_KEY", "custom-key");
+        let config = Config {
+            provider: Some("acme".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                custom: std::collections::HashMap::from([(
+                    "acme".to_string(),
+                    crate::config::ProviderConfig {
+                        kind: Some("openai-compatible".to_string()),
+                        base_url: Some("https://api.acme.test/v1".to_string()),
+                        model: Some("acme-coder".to_string()),
+                        api_key_env: Some("ACME_CUSTOM_KEY".to_string()),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let inventory = ModelInventory::from_config(&config);
+        assert!(
+            inventory
+                .candidates
+                .iter()
+                .any(|candidate| candidate.provider == ApiProvider::Custom
+                    && candidate.model == "acme-coder"
+                    && candidate.auth_source == ModelAuthSource::Env)
+        );
+    }
+
+    #[test]
+    fn inventory_ignores_unresolved_command_and_secret_auth_metadata() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let temp = tempfile::tempdir().expect("isolated credential home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", temp.path());
+        let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
         let _deepseek = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
         let _openai = crate::test_support::EnvVarGuard::remove("OPENAI_API_KEY");
+        let _xai = crate::test_support::EnvVarGuard::remove("XAI_API_KEY");
         let mut providers = crate::config::ProvidersConfig::default();
         providers.openai.auth = Some(codewhale_config::ProviderAuthSourceToml {
             source: codewhale_config::AuthSourceKind::Command,
             command: vec!["secret-tool".to_string(), "lookup".to_string()],
             timeout_ms: Some(2000),
             secret_id: None,
+        });
+        providers.xai.auth = Some(codewhale_config::ProviderAuthSourceToml {
+            source: codewhale_config::AuthSourceKind::Secret,
+            command: Vec::new(),
+            timeout_ms: None,
+            secret_id: Some("codewhale/xai".to_string()),
         });
         let config = Config {
             provider: Some("openai".to_string()),
@@ -312,16 +554,123 @@ mod tests {
         };
 
         let inventory = ModelInventory::from_config(&config);
+        assert!(inventory.candidates.iter().all(|candidate| !matches!(
+            candidate.provider,
+            ApiProvider::Openai | ApiProvider::Xai
+        )));
+    }
+
+    #[test]
+    fn inventory_marks_explicit_no_auth_separately_from_keyless_local() {
+        let mut providers = crate::config::ProvidersConfig::default();
+        providers.vllm.auth_mode = Some("none".to_string());
+        providers.vllm.model = Some("local-model".to_string());
+        let config = Config {
+            provider: Some("vllm".to_string()),
+            providers: Some(providers),
+            ..Default::default()
+        };
+
+        let inventory = ModelInventory::from_config(&config);
         let candidate = inventory
             .candidates
             .iter()
-            .find(|candidate| candidate.provider == ApiProvider::Openai)
-            .expect("openai candidate");
+            .find(|candidate| {
+                candidate.provider == ApiProvider::Vllm && candidate.model == "local-model"
+            })
+            .expect("vLLM no-auth candidate");
 
-        assert_eq!(candidate.auth_source, ModelAuthSource::Command);
+        assert_eq!(candidate.auth_source, ModelAuthSource::NoAuth);
+        assert_eq!(
+            candidate.readiness,
+            crate::provider_readiness::ResolvedProviderReadiness::NoAuthUnchecked
+        );
+    }
+
+    #[test]
+    fn unready_candidates_are_never_provider_defaults() {
+        use crate::provider_readiness::ResolvedProviderReadiness;
+
+        let candidate = ModelRouteCandidate {
+            provider: ApiProvider::Openai,
+            provider_name: "openai",
+            provider_display_name: "OpenAI",
+            model: "gpt-5.5".to_string(),
+            context_window: 128_000,
+            max_output: 16_384,
+            thinking_supported: true,
+            cache_telemetry_supported: false,
+            auth_source: ModelAuthSource::Config,
+            readiness: ResolvedProviderReadiness::MissingLogin,
+            default_for_provider: false,
+            tags: vec!["unready"],
+        };
+        assert!(!candidate.readiness.can_attempt());
+        assert!(!candidate.default_for_provider);
+        assert!(candidate.tags.contains(&"unready"));
+    }
+
+    #[test]
+    fn active_default_never_falls_back_to_unready_candidate() {
+        let inventory = ModelInventory {
+            active_provider: ApiProvider::Openai,
+            router_provider: ApiProvider::Deepseek,
+            router_model: "deepseek-v4-flash",
+            router_available: false,
+            candidates: vec![ModelRouteCandidate {
+                provider: ApiProvider::Openai,
+                provider_name: "openai",
+                provider_display_name: "OpenAI",
+                model: "unsupported-model".to_string(),
+                context_window: 1,
+                max_output: 1,
+                thinking_supported: false,
+                cache_telemetry_supported: false,
+                auth_source: ModelAuthSource::Config,
+                readiness: crate::provider_readiness::ResolvedProviderReadiness::InvalidRoute,
+                default_for_provider: false,
+                tags: vec!["unready"],
+            }],
+        };
+
+        assert!(inventory.active_default().is_none());
+    }
+
+    #[test]
+    fn router_context_is_runnable_and_redacts_auth_and_failure_details() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let _deepseek = crate::test_support::EnvVarGuard::set("DEEPSEEK_API_KEY", "ds-key");
+        let mut inventory = ModelInventory::from_config(&Config::default());
+        let candidate = inventory
+            .candidates
+            .iter_mut()
+            .find(|candidate| candidate.provider == ApiProvider::Deepseek)
+            .expect("DeepSeek inventory candidate");
+        candidate.readiness =
+            crate::provider_readiness::ResolvedProviderReadiness::SavedLastCheckFailed {
+                category: crate::error_taxonomy::ErrorCategory::Authentication,
+                message: "Bearer super-secret-router-token".to_string(),
+            };
+        inventory.candidates.push(ModelRouteCandidate {
+            provider: ApiProvider::Openai,
+            provider_name: "openai",
+            provider_display_name: "OpenAI",
+            model: "unsupported-model".to_string(),
+            context_window: 1,
+            max_output: 1,
+            thinking_supported: false,
+            cache_telemetry_supported: false,
+            auth_source: ModelAuthSource::Config,
+            readiness: crate::provider_readiness::ResolvedProviderReadiness::InvalidRoute,
+            default_for_provider: false,
+            tags: vec!["unready"],
+        });
+
         let json = inventory.router_context_json();
-        assert!(json.contains(r#""auth_source":"command""#));
-        assert!(!json.contains("secret-tool"));
-        assert!(!json.contains("lookup"));
+
+        assert!(json.contains("deepseek-v4"));
+        assert!(!json.contains("super-secret-router-token"));
+        assert!(!json.contains("auth_source"));
+        assert!(!json.contains("unsupported-model"));
     }
 }

@@ -21,14 +21,24 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Padding, Paragraph, Widget, Wrap},
+    widgets::{Paragraph, Widget, Wrap},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::palette;
 use crate::tui::views::{
     ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, render_modal_footer,
+    render_panel_scroll_rail, render_underwater_surface,
 };
+
+#[derive(Debug, Clone)]
+struct PagerDestructiveAction {
+    key: char,
+    label: String,
+    confirm_label: String,
+    event: ViewEvent,
+    armed: bool,
+}
 
 pub struct PagerView {
     title: String,
@@ -48,6 +58,13 @@ pub struct PagerView {
     /// Turn Inspector pager (#4108) so `e` copies a pasteable turn handoff;
     /// `None` for every other pager, where `e` stays inert.
     export_markdown: Option<String>,
+    /// Optional source-faithful clipboard payload. Display wrapping is a view
+    /// concern and may insert line breaks or normalize whitespace; Turn
+    /// Inspector copy must retain the assembled text exactly (#4482).
+    copy_text: Option<String>,
+    /// Optional inspector-owned destructive action. It requires two presses
+    /// (or key then Enter); Esc disarms before it closes the pager.
+    destructive_action: Option<PagerDestructiveAction>,
 }
 
 impl PagerView {
@@ -65,6 +82,8 @@ impl PagerView {
             pending_g: false,
             last_visible_height: Cell::new(0),
             export_markdown: None,
+            copy_text: None,
+            destructive_action: None,
         }
     }
 
@@ -76,14 +95,38 @@ impl PagerView {
         self
     }
 
+    /// Preserve a source-faithful payload for `c` / `y` while the rendered
+    /// pager remains free to wrap content to its viewport.
+    pub fn with_copy_text(mut self, text: impl Into<String>) -> Self {
+        self.copy_text = Some(text.into());
+        self
+    }
+
+    /// Attach a two-step destructive action to this pager. Work Graph
+    /// inspectors use this to keep Stop inside the detail surface while
+    /// reusing the existing command/agent cancellation events.
+    pub fn with_destructive_action(
+        mut self,
+        key: char,
+        label: impl Into<String>,
+        confirm_label: impl Into<String>,
+        event: ViewEvent,
+    ) -> Self {
+        self.destructive_action = Some(PagerDestructiveAction {
+            key,
+            label: label.into(),
+            confirm_label: confirm_label.into(),
+            event,
+            armed: false,
+        });
+        self
+    }
+
     pub fn from_text(title: impl Into<String>, text: &str, width: u16) -> Self {
         let mut lines = Vec::new();
         for raw in text.lines() {
             for wrapped in wrap_text(raw, width.max(1) as usize) {
                 lines.push(Line::from(Span::raw(wrapped)));
-            }
-            if raw.is_empty() {
-                lines.push(Line::from(""));
             }
         }
         Self::new(title, lines)
@@ -105,14 +148,15 @@ impl PagerView {
         self.scroll = max_scroll;
     }
 
-    /// Plain-text body of the pager joined with `\n`, suitable for sending
-    /// to the system clipboard via `ViewEvent::CopyToClipboard`. Reflects the
-    /// content the user sees, including any width-based wrapping that
-    /// `from_text` introduced — copying the visible text is the expected
-    /// affordance when the user can't reach terminal-native selection inside
-    /// the modal (#1354).
+    /// Plain-text rendered body of the pager joined with `\n`. This reflects
+    /// width-based display wrapping. Clipboard events use this by default;
+    /// pagers with a source-faithful override use that payload instead.
     pub fn body_text(&self) -> String {
         self.plain_lines.join("\n")
+    }
+
+    fn clipboard_text(&self) -> String {
+        self.copy_text.clone().unwrap_or_else(|| self.body_text())
     }
 
     /// The pager's title bar text. Used by tests to assert the raw-detail
@@ -253,6 +297,24 @@ impl ModalView for PagerView {
             }
         }
 
+        if let Some(action) = self.destructive_action.as_mut() {
+            if key.code == KeyCode::Esc && action.armed {
+                action.armed = false;
+                self.pending_g = false;
+                return ViewAction::None;
+            }
+            let matching_key =
+                matches!(key.code, KeyCode::Char(ch) if ch.eq_ignore_ascii_case(&action.key));
+            if matching_key || (key.code == KeyCode::Enter && action.armed) {
+                self.pending_g = false;
+                if action.armed {
+                    return ViewAction::EmitAndClose(action.event.clone());
+                }
+                action.armed = true;
+                return ViewAction::None;
+            }
+        }
+
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let max_scroll = self.max_scroll();
@@ -368,7 +430,7 @@ impl ModalView for PagerView {
             KeyCode::Char('c') | KeyCode::Char('y') => {
                 self.pending_g = false;
                 ViewAction::Emit(ViewEvent::CopyToClipboard {
-                    text: self.body_text(),
+                    text: self.clipboard_text(),
                     label: "Pager content".to_string(),
                 })
             }
@@ -404,25 +466,7 @@ impl ModalView for PagerView {
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let popup_width = area.width.saturating_sub(2).max(1);
-        let popup_height = area.height.saturating_sub(2).max(1);
-        let popup_area = Rect {
-            x: 1,
-            y: 1,
-            width: popup_width,
-            height: popup_height,
-        };
-
-        Clear.render(popup_area, buf);
-
-        let block = Block::default()
-            .title(self.title.clone())
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(palette::BORDER_COLOR))
-            .style(Style::default().bg(palette::WHALE_BG))
-            .padding(Padding::uniform(1));
-        let inner = block.inner(popup_area);
-        block.render(popup_area, buf);
+        let inner = render_underwater_surface(area, buf, self.title.clone());
 
         // The wrapping action footer is anchored to the bottom of the inner
         // area; the body fills the rows above it.
@@ -437,6 +481,15 @@ impl ModalView for PagerView {
         ];
         if self.export_markdown.is_some() {
             hints.push(ActionHint::new("e", "copy handoff"));
+        }
+        if let Some(action) = self.destructive_action.as_ref() {
+            let key = action.key.to_string();
+            let label = if action.armed {
+                action.confirm_label.clone()
+            } else {
+                action.label.clone()
+            };
+            hints.push(ActionHint::new(key, label));
         }
         let content = render_modal_footer(inner, buf, &hints);
 
@@ -517,6 +570,8 @@ impl ModalView for PagerView {
             )));
         }
 
+        let content =
+            render_panel_scroll_rail(content, buf, self.lines.len(), scroll, visible_height, true);
         let paragraph = Paragraph::new(visible_lines).wrap(Wrap { trim: false });
         paragraph.render(content, buf);
     }
@@ -615,6 +670,38 @@ mod tests {
 
     fn ctrl(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn destructive_action_requires_two_steps_and_escape_only_disarms() {
+        let mut pager = make_pager(2).with_destructive_action(
+            's',
+            "stop",
+            "confirm stop · Esc cancels",
+            ViewEvent::SidebarAgentCancel {
+                agent_id: "agent_1".to_string(),
+            },
+        );
+
+        assert!(matches!(
+            pager.handle_key(key(KeyCode::Char('s'))),
+            ViewAction::None
+        ));
+        assert!(matches!(
+            pager.handle_key(key(KeyCode::Esc)),
+            ViewAction::None
+        ));
+        assert!(matches!(
+            pager.handle_key(key(KeyCode::Esc)),
+            ViewAction::Close
+        ));
+
+        let _ = pager.handle_key(key(KeyCode::Char('s')));
+        assert!(matches!(
+            pager.handle_key(key(KeyCode::Enter)),
+            ViewAction::EmitAndClose(ViewEvent::SidebarAgentCancel { agent_id })
+                if agent_id == "agent_1"
+        ));
     }
 
     /// Drive a render once so `last_visible_height` is populated and paging
@@ -844,6 +931,26 @@ mod tests {
             }
             other => panic!("expected CopyToClipboard emit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn copy_override_preserves_indentation_tabs_and_blank_lines() {
+        let source = "Result:\n    indented\n\twith-tab\n\nnext";
+        let mut pager = PagerView::from_text("T", source, 12).with_copy_text(source);
+
+        let action = pager.handle_key(key(KeyCode::Char('c')));
+        match action {
+            ViewAction::Emit(ViewEvent::CopyToClipboard { text, .. }) => {
+                assert_eq!(text, source);
+            }
+            other => panic!("expected CopyToClipboard emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_text_keeps_one_display_row_per_blank_source_line() {
+        let pager = PagerView::from_text("T", "first\n\nthird", 80);
+        assert_eq!(pager.body_text(), "first\n\nthird");
     }
 
     #[test]

@@ -21,6 +21,7 @@ use ratatui::widgets::{Paragraph, Widget};
 use serde_json::{Value, json};
 use unicode_width::UnicodeWidthStr;
 
+use crate::localization::{Locale, MessageId, tr};
 use crate::palette;
 use crate::tui::ui_text::truncate_line_to_width;
 use crate::tui::widgets::Renderable;
@@ -78,6 +79,7 @@ impl WorkflowPanelLifecycle {
 pub enum WorkflowRowStatus {
     Pending,
     Running,
+    Waiting,
     Succeeded,
     Failed,
     Cancelled,
@@ -90,6 +92,7 @@ impl WorkflowRowStatus {
         match self {
             Self::Pending => "pending",
             Self::Running => "running",
+            Self::Waiting => "waiting",
             Self::Succeeded => "done",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
@@ -97,9 +100,20 @@ impl WorkflowRowStatus {
         }
     }
 
+    /// Localized display variant of [`Self::label`]. `label()` stays
+    /// English because it doubles as the machine-readable `status` token in
+    /// [`WorkflowPanel::to_run_json`]; this method is for rendered rows only.
+    #[must_use]
+    pub fn display_label(self, locale: Locale) -> std::borrow::Cow<'static, str> {
+        match self {
+            Self::Waiting => tr(locale, MessageId::WorkflowStatusWaiting),
+            other => std::borrow::Cow::Borrowed(other.label()),
+        }
+    }
+
     #[must_use]
     pub fn is_running(self) -> bool {
-        matches!(self, Self::Pending | Self::Running)
+        matches!(self, Self::Pending | Self::Running | Self::Waiting)
     }
 
     #[must_use]
@@ -116,6 +130,7 @@ impl WorkflowRowStatus {
         match self {
             Self::Pending => palette::TEXT_MUTED,
             Self::Running => palette::STATUS_WARNING,
+            Self::Waiting => palette::STATUS_ERROR,
             Self::Succeeded => palette::STATUS_SUCCESS,
             Self::Failed | Self::SchemaFailed => palette::STATUS_ERROR,
             Self::Cancelled => palette::TEXT_MUTED,
@@ -129,6 +144,7 @@ impl WorkflowRowStatus {
             "cancelled" | "canceled" => Self::Cancelled,
             "budget_exceeded" => Self::Failed,
             "running" => Self::Running,
+            "waiting" | "blocked" | "needs_user" => Self::Waiting,
             "pending" => Self::Pending,
             other if other.contains("schema") => Self::SchemaFailed,
             _ => Self::Failed,
@@ -187,7 +203,9 @@ impl WorkflowPanelPhase {
         for row in &self.rows {
             match row.status {
                 WorkflowRowStatus::Succeeded => done += 1,
-                WorkflowRowStatus::Running | WorkflowRowStatus::Pending => running += 1,
+                WorkflowRowStatus::Running
+                | WorkflowRowStatus::Pending
+                | WorkflowRowStatus::Waiting => running += 1,
                 WorkflowRowStatus::Failed | WorkflowRowStatus::SchemaFailed => failed += 1,
                 WorkflowRowStatus::Cancelled => cancelled += 1,
             }
@@ -374,16 +392,15 @@ pub struct WorkflowPanel {
     pub started_at_ms: u64,
     pub completed_at_ms: Option<u64>,
     pub error: Option<String>,
-    pub cancel_requested: bool,
     /// Optional final result / verification summary for the history card.
     pub result_summary: Option<String>,
     /// Source script path or other durable artifact pointer.
     pub source_path: Option<PathBuf>,
     /// Spillover / full-output path when the tool result was large.
     pub spillover_path: Option<PathBuf>,
-    /// Set when the operator requested cancel from the panel (mouse/key).
-    /// Consumed by the host to drive `/workflow cancel`.
-    cancel_emit: Option<String>,
+    /// UI locale for rendered copy. Defaults to English; hosts with app
+    /// access set it after construction (#4057 wave 2).
+    pub locale: Locale,
 }
 
 /// Extra fields the history card can show that are not part of the live panel
@@ -414,11 +431,10 @@ impl WorkflowPanel {
             started_at_ms: at_ms,
             completed_at_ms: None,
             error: None,
-            cancel_requested: false,
             result_summary: None,
             source_path: None,
             spillover_path: None,
-            cancel_emit: None,
+            locale: Locale::En,
         }
     }
 
@@ -785,9 +801,10 @@ impl WorkflowPanel {
             .take(8)
             .map(|row| {
                 format!(
-                    "{label} ({status})",
+                    "{mark} {label} ({status})",
+                    mark = role_mark(row.profile.as_deref()),
                     label = short_label(&row.label, 16),
-                    status = row.status.label()
+                    status = row.status.display_label(self.locale)
                 )
             })
             .collect();
@@ -805,6 +822,50 @@ impl WorkflowPanel {
             lines.push(Line::from(Span::styled(
                 truncate_line_to_width(&format!("children: {body}"), content_width),
                 Style::default().fg(palette::TEXT_TOOL_OUTPUT),
+            )));
+        }
+
+        // The history variant uses the same real-data lane vocabulary as the
+        // live panel. Durations are proportional within the run; gates remain
+        // a separate named line because runtime events do not yet timestamp
+        // them precisely enough to place them on a synthetic timeline.
+        let rows = self.phases.iter().flat_map(|phase| phase.rows.iter());
+        let max_elapsed = rows
+            .clone()
+            .map(|row| row_elapsed_ms(row, now_ms()))
+            .max()
+            .unwrap_or(0);
+        for row in rows.take(8) {
+            lines.push(Line::from(Span::styled(
+                truncate_line_to_width(
+                    &format!(
+                        "lane {mark} {label:<14} {track} {elapsed} {status}",
+                        mark = role_mark(row.profile.as_deref()),
+                        label = short_label(&row.label, 14),
+                        track = lane_track(row, max_elapsed, 16, now_ms()),
+                        elapsed = format_elapsed(row_elapsed_ms(row, now_ms())),
+                        status = row.status.display_label(self.locale),
+                    ),
+                    content_width,
+                ),
+                Style::default().fg(row.status.color()),
+            )));
+        }
+
+        if self.lifecycle.is_terminal() {
+            let (done, total) = self.done_total();
+            let (failed, cancelled) = self.failure_cancel_counts();
+            lines.push(Line::from(Span::styled(
+                truncate_line_to_width(
+                    &tr(self.locale, MessageId::WorkflowDebrief)
+                        .replace("{done}", &done.to_string())
+                        .replace("{total}", &total.to_string())
+                        .replace("{failed}", &failed.to_string())
+                        .replace("{cancelled}", &cancelled.to_string())
+                        .replace("{elapsed}", &self.elapsed_label()),
+                    content_width,
+                ),
+                Style::default().fg(palette::TEXT_MUTED),
             )));
         }
 
@@ -845,11 +906,11 @@ impl WorkflowPanel {
                 Style::default().fg(palette::TEXT_MUTED),
             )));
         } else if self.lifecycle.is_terminal() {
+            let details = crate::tui::shell_key_routing::tool_details_chord();
+            let transcript_hint = tr(self.locale, MessageId::WorkflowTranscriptDetails)
+                .replace("{details}", details.as_ref());
             lines.push(Line::from(Span::styled(
-                truncate_line_to_width(
-                    "transcript: full run JSON available via tool details (v)",
-                    content_width,
-                ),
+                truncate_line_to_width(&transcript_hint, content_width),
                 Style::default().fg(palette::TEXT_MUTED),
             )));
         }
@@ -984,6 +1045,7 @@ impl WorkflowPanel {
                 at_ms,
             } => {
                 // New run replaces preserved completed state.
+                let locale = self.locale;
                 *self = Self::new(
                     run_id,
                     workflow_goal
@@ -991,6 +1053,7 @@ impl WorkflowPanel {
                         .unwrap_or_else(|| "workflow".to_string()),
                     at_ms,
                 );
+                self.locale = locale;
                 self.budget_total = token_budget;
                 self.budget_remaining = token_budget;
                 self.source_path = source_path;
@@ -1180,24 +1243,6 @@ impl WorkflowPanel {
             .unwrap_or(self.phases.len() - 1);
     }
 
-    /// Request cancel from the panel. Returns the run id when a cancel should
-    /// be dispatched to the workflow tool. Running children stay running until
-    /// the host interrupt/cancel path finalizes them (or a terminal event
-    /// arrives).
-    pub fn request_cancel(&mut self) -> Option<String> {
-        if !self.lifecycle.is_running() || self.cancel_requested {
-            return None;
-        }
-        self.cancel_requested = true;
-        self.cancel_emit = Some(self.run_id.clone());
-        self.cancel_emit.clone()
-    }
-
-    /// Take a pending cancel emit (run_id) once.
-    pub fn take_cancel_emit(&mut self) -> Option<String> {
-        self.cancel_emit.take()
-    }
-
     /// Interrupt finalizes every still-running child as cancelled and marks
     /// the run cancelled. Preserves the panel until the next workflow starts.
     pub fn finalize_interrupt(&mut self) {
@@ -1210,27 +1255,6 @@ impl WorkflowPanel {
         self.completed_at_ms = Some(at);
         if self.error.is_none() {
             self.error = Some("interrupted".to_string());
-        }
-    }
-
-    /// Handle a key while the panel has keyboard focus.
-    /// Returns true when the key was consumed.
-    pub fn handle_key(&mut self, ch: char) -> bool {
-        if !self.keyboard_focus {
-            return false;
-        }
-        match ch {
-            't' | 'T' | ' ' => self.toggle_expanded(),
-            'c' | 'C' | 'x' | 'X' => self.request_cancel().is_some(),
-            'n' | 'N' | 'j' | 'J' => {
-                self.select_next_phase();
-                true
-            }
-            'p' | 'P' | 'k' | 'K' => {
-                self.select_prev_phase();
-                true
-            }
-            _ => false,
         }
     }
 
@@ -1285,11 +1309,7 @@ impl WorkflowPanel {
             _ => String::new(),
         };
         let cancel_hint = if self.lifecycle.is_running() {
-            if self.cancel_requested {
-                " · cancelling…"
-            } else {
-                " · [c] cancel"
-            }
+            " · [c] cancel"
         } else {
             ""
         };
@@ -1304,6 +1324,17 @@ impl WorkflowPanel {
             label = self.label,
         );
         truncate_line_to_width(&raw, width.max(1))
+    }
+
+    /// Return the display-column span of the cancel hint in the exact header
+    /// string that `render_lines` paints, after truncation.
+    #[must_use]
+    pub fn cancel_hint_span(&self, width: u16) -> Option<(u16, u16)> {
+        let header = self.header_text(usize::from(width));
+        let start = header.find("[c] cancel")?;
+        let start = unicode_width::UnicodeWidthStr::width(&header[..start]);
+        let end = start + unicode_width::UnicodeWidthStr::width("[c] cancel");
+        Some((start as u16, end as u16))
     }
 
     #[must_use]
@@ -1388,7 +1419,7 @@ impl WorkflowPanel {
         if self.keyboard_focus {
             lines.push(Line::from(Span::styled(
                 truncate_line_to_width(
-                    "[t] toggle  [c] cancel  [j/k] phase  click header to toggle",
+                    "[enter] toggle  [del] cancel  [up/down] phase  [esc] chat",
                     content_width,
                 ),
                 Style::default()
@@ -1401,10 +1432,7 @@ impl WorkflowPanel {
     }
 
     fn render_row_line(&self, row: &WorkflowPanelRow, width: usize, now_ms: u64) -> Line<'static> {
-        let elapsed_ms = row
-            .completed_at_ms
-            .unwrap_or(now_ms)
-            .saturating_sub(row.started_at_ms);
+        let elapsed_ms = row_elapsed_ms(row, now_ms);
         let elapsed = format_elapsed(elapsed_ms);
         let role = row.profile.as_deref().unwrap_or("-");
         let model = match (row.model.as_deref(), row.strength.as_deref()) {
@@ -1421,9 +1449,11 @@ impl WorkflowPanel {
             .map(|e| format!(" !{}", short_label(e, 24)))
             .unwrap_or_default();
         let text = format!(
-            "  {status:<9} {label} · {role} · {model} · {worktree} · {elapsed}{schema}",
-            status = row.status.label(),
+            "  {mark} {status:<9} {label} · {role} · {model} · {worktree} · {lane} · {elapsed}{schema}",
+            mark = role_mark(row.profile.as_deref()),
+            status = row.status.display_label(self.locale),
             label = short_label(&row.label, 18),
+            lane = lane_track(row, elapsed_ms.max(1), 10, now_ms),
         );
         Line::from(Span::styled(
             truncate_line_to_width(&text, width),
@@ -1541,6 +1571,60 @@ fn short_label(text: &str, max: usize) -> String {
     truncate_line_to_width(trimmed, max)
 }
 
+/// Terminal-safe role grammar from the underwater design contract. Labels
+/// remain authoritative; the marks make siblings scan as the same work kind.
+fn role_mark(profile: Option<&str>) -> &'static str {
+    let role = profile.unwrap_or_default().trim().to_ascii_lowercase();
+    if role.contains("operator") {
+        "@"
+    } else if role.contains("manager") || role.contains("lead") || role.contains("coordinator") {
+        "/\\"
+    } else if role.contains("scout") || role.contains("research") || role.contains("explor") {
+        "<>"
+    } else if role.contains("build") || role.contains("implement") || role.contains("engineer") {
+        "[]"
+    } else if role.contains("verif") || role.contains("test") || role.contains("qa") {
+        "()"
+    } else if role.contains("review") || role.contains("critic") {
+        "**"
+    } else {
+        "--"
+    }
+}
+
+fn row_elapsed_ms(row: &WorkflowPanelRow, now_ms: u64) -> u64 {
+    row.completed_at_ms
+        .unwrap_or(now_ms)
+        .saturating_sub(row.started_at_ms)
+}
+
+fn lane_track(row: &WorkflowPanelRow, max_elapsed_ms: u64, width: usize, now_ms: u64) -> String {
+    let width = width.max(4);
+    let elapsed = row_elapsed_ms(row, now_ms);
+    let filled = if max_elapsed_ms == 0 {
+        1
+    } else {
+        ((elapsed as u128 * width as u128) / max_elapsed_ms as u128).clamp(1, width as u128)
+            as usize
+    };
+    let end = match row.status {
+        WorkflowRowStatus::Succeeded => "OK",
+        WorkflowRowStatus::Failed | WorkflowRowStatus::SchemaFailed => "!!",
+        WorkflowRowStatus::Cancelled => "XX",
+        WorkflowRowStatus::Waiting => "? ",
+        WorkflowRowStatus::Pending => ". ",
+        WorkflowRowStatus::Running => "> ",
+    };
+    let body_width = width.saturating_sub(2);
+    let active = filled.saturating_sub(2).min(body_width);
+    format!(
+        "{}{}{}",
+        "=".repeat(active),
+        end,
+        "-".repeat(body_width.saturating_sub(active))
+    )
+}
+
 /// Format an elapsed duration for panel headers and history cards. Shared with
 /// direct sub-agent cards so both surfaces use the same vocabulary.
 #[must_use]
@@ -1616,6 +1700,78 @@ mod tests {
             at_ms: 1_200,
         });
         panel
+    }
+
+    #[test]
+    fn cancel_hint_span_matches_rendered_header_and_truncation() {
+        let panel = started_panel();
+        let header = panel.header_text(120);
+        let (start, end) = panel.cancel_hint_span(120).expect("running cancel hint");
+        let marker = header.find("[c] cancel").expect("rendered cancel hint");
+        assert_eq!(UnicodeWidthStr::width(&header[..marker]), start as usize);
+        assert_eq!(end - start, UnicodeWidthStr::width("[c] cancel") as u16);
+
+        assert!(panel.cancel_hint_span(8).is_none());
+    }
+
+    /// #4208: every decorative glyph the run map emits — expand marks, role
+    /// marks, lane glyphs, gates, status marks across running, waiting,
+    /// failed, cancelled, and completed members — must narrow to an
+    /// ASCII-safe alternative.
+    #[test]
+    fn workflow_panel_glyphs_all_have_ascii_alternatives() {
+        let mut panel = started_panel();
+        for (task_id, status) in [
+            ("t1", WorkflowRowStatus::Succeeded),
+            ("t2", WorkflowRowStatus::Failed),
+            ("t3", WorkflowRowStatus::Cancelled),
+            ("t4", WorkflowRowStatus::Waiting),
+        ] {
+            if task_id != "t1" {
+                panel.apply_event(WorkflowPanelEvent::TaskStarted {
+                    task_id: task_id.to_string(),
+                    label: Some(format!("lane {task_id}")),
+                    profile: Some("implementer".to_string()),
+                    model: None,
+                    strength: None,
+                    resolved_model: None,
+                    worktree: false,
+                    workspace: None,
+                    at_ms: 1_400,
+                });
+            }
+            panel.apply_event(WorkflowPanelEvent::TaskCompleted {
+                task_id: task_id.to_string(),
+                status,
+                at_ms: 2_500,
+            });
+        }
+        panel.apply_event(WorkflowPanelEvent::GateUpdated {
+            gate_id: "gate-1".to_string(),
+            role: Some("verifier".to_string()),
+            gate: Some("tests-green".to_string()),
+            state: "blocked".to_string(),
+            blocked_role: Some("implementer".to_string()),
+            blocked_reason: Some("waiting on tests".to_string()),
+            at_ms: 2_600,
+        });
+
+        let mut glyphs: Vec<char> = panel.header_text(120).chars().collect();
+        for line in panel.render_lines(100) {
+            for span in &line.spans {
+                glyphs.extend(span.content.chars());
+            }
+        }
+        for ch in glyphs.into_iter().filter(|ch| !ch.is_ascii()) {
+            let mut cell = ratatui::buffer::Cell::default();
+            cell.set_symbol(&ch.to_string());
+            crate::tui::color_compat::adapt_cell_symbol_for_ascii(&mut cell);
+            assert!(
+                cell.symbol().is_ascii(),
+                "workflow glyph {ch:?} (U+{:04X}) lacks an ASCII-safe alternative",
+                ch as u32
+            );
+        }
     }
 
     #[test]
@@ -1805,28 +1961,13 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_and_mouse_toggle_and_cancel() {
+    fn panel_toggle_is_independent_of_text_input_routing() {
         let mut panel = started_panel();
         assert!(panel.expanded);
         assert!(panel.toggle_expanded());
         assert!(!panel.expanded);
         assert!(panel.toggle_expanded());
         assert!(panel.expanded);
-
-        // Without focus, keys ignored
-        assert!(!panel.handle_key('t'));
-
-        panel.keyboard_focus = true;
-        assert!(panel.handle_key('t'));
-        assert!(!panel.expanded);
-
-        let run_id = panel.request_cancel().expect("cancel");
-        assert_eq!(run_id, "workflow_abc");
-        assert!(panel.cancel_requested);
-        // Second cancel is a no-op
-        assert!(panel.request_cancel().is_none());
-        assert_eq!(panel.take_cancel_emit().as_deref(), Some("workflow_abc"));
-        assert!(panel.take_cancel_emit().is_none());
     }
 
     #[test]
@@ -2117,6 +2258,11 @@ mod tests {
         assert!(joined.contains("children:"), "{joined}");
         assert!(joined.contains("result:"), "{joined}");
         assert!(joined.contains("found 3 call sites"), "{joined}");
+        assert!(
+            joined.contains(crate::tui::shell_key_routing::tool_details_chord().as_ref()),
+            "history details hint must use the platform chord: {joined}"
+        );
+        assert!(!joined.contains("details (v)"), "{joined}");
     }
 
     #[test]
@@ -2492,14 +2638,8 @@ mod tests {
             at_ms: 1_500,
         });
 
-        // Operator hits panel cancel.
-        let run_id = panel.request_cancel().expect("cancel while running");
-        assert_eq!(run_id, "wf_a4");
-        assert!(panel.cancel_requested);
-        assert!(panel.request_cancel().is_none(), "second cancel is no-op");
-        assert_eq!(panel.take_cancel_emit().as_deref(), Some("wf_a4"));
-
-        // Host interrupt finalizes remaining runners.
+        // A confirmed host interrupt finalizes remaining runners. The widget
+        // itself never claims cancellation before that runtime event.
         panel.finalize_interrupt();
         assert_eq!(panel.lifecycle, WorkflowPanelLifecycle::Cancelled);
 

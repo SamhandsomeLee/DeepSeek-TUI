@@ -109,6 +109,11 @@ impl GoalState {
             Some(objective) => {
                 let changed = self.objective.as_deref() != Some(objective);
                 let status_changed = self.status != Some(status);
+                let resumed = !changed
+                    && status == GoalStatus::Active
+                    && self
+                        .status
+                        .is_some_and(|previous| previous != GoalStatus::Active);
                 if changed {
                     self.objective = Some(objective.to_string());
                     self.token_budget = token_budget;
@@ -121,6 +126,12 @@ impl GoalState {
                     self.completion_verification = None;
                 } else if self.token_budget != token_budget {
                     self.token_budget = token_budget;
+                }
+
+                if resumed {
+                    self.evidence = None;
+                    self.blocker = None;
+                    self.completion_verification = None;
                 }
 
                 if changed || status_changed || self.status.is_none() {
@@ -136,7 +147,16 @@ impl GoalState {
         }
     }
 
-    pub fn create(&mut self, objective: String, token_budget: Option<u32>) {
+    pub fn create(
+        &mut self,
+        objective: String,
+        token_budget: Option<u32>,
+    ) -> Result<(), &'static str> {
+        if self.objective.is_some() && self.status != Some(GoalStatus::Complete) {
+            return Err(
+                "An unfinished goal already exists. Complete or clear it before creating another.",
+            );
+        }
         self.objective = Some(objective);
         self.token_budget = token_budget;
         self.status = Some(GoalStatus::Active);
@@ -148,6 +168,7 @@ impl GoalState {
         self.evidence = None;
         self.blocker = None;
         self.completion_verification = None;
+        Ok(())
     }
 
     pub fn record_usage(&mut self, token_delta: u64, time_delta_seconds: u64) {
@@ -361,6 +382,15 @@ fn json_result(snapshot: &GoalSnapshot) -> Result<ToolResult, ToolError> {
     ToolResult::json(snapshot).map_err(|err| ToolError::execution_failed(err.to_string()))
 }
 
+fn require_root_goal_mutation(context: &ToolContext) -> Result<(), ToolError> {
+    if context.owner_agent_id.is_some() {
+        return Err(ToolError::invalid_input(
+            "Goal lifecycle mutation is root-agent only; sub-agents may inspect the parent goal with get_goal.",
+        ));
+    }
+    Ok(())
+}
+
 pub struct CreateGoalTool {
     goal_state: SharedGoalState,
 }
@@ -379,7 +409,7 @@ impl ToolSpec for CreateGoalTool {
     }
 
     fn description(&self) -> &'static str {
-        "Create the current runtime goal. Use this only when the user explicitly asks to pursue a persistent objective."
+        "Create the current runtime goal. Use this only when the user explicitly asks to pursue a persistent objective and no unfinished goal exists; complete or clear an unfinished goal before creating another."
     }
 
     fn input_schema(&self) -> Value {
@@ -409,7 +439,8 @@ impl ToolSpec for CreateGoalTool {
         ApprovalRequirement::Auto
     }
 
-    async fn execute(&self, input: Value, _context: &ToolContext) -> Result<ToolResult, ToolError> {
+    async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+        require_root_goal_mutation(context)?;
         let objective = required_str(&input, "objective")?.trim().to_string();
         if objective.is_empty() {
             return Err(ToolError::invalid_input("objective cannot be empty"));
@@ -417,7 +448,9 @@ impl ToolSpec for CreateGoalTool {
         let token_budget = parse_token_budget(&input)?;
         let snapshot = {
             let mut state = lock_goal_state(&self.goal_state)?;
-            state.create(objective, token_budget);
+            state
+                .create(objective, token_budget)
+                .map_err(ToolError::invalid_input)?;
             state.snapshot()
         };
         json_result(&snapshot)
@@ -496,7 +529,7 @@ impl ToolSpec for UpdateGoalTool {
     }
 
     fn description(&self) -> &'static str {
-        "Update the runtime goal completion gate. Only mark complete when the objective has verified evidence; mark blocked only after a real blocker prevents progress."
+        "Update the runtime goal completion gate. Only mark complete when the objective has verified evidence; mark blocked whenever progress requires user input, including after asking a question whose answer is needed."
     }
 
     fn input_schema(&self) -> Value {
@@ -506,7 +539,7 @@ impl ToolSpec for UpdateGoalTool {
                 "status": {
                     "type": "string",
                     "enum": ["complete", "blocked"],
-                    "description": "Use complete only when the goal is fully satisfied; blocked when meaningful progress cannot continue. Pause, resume, and budget-limit states are controlled by the user or system."
+                    "description": "Use complete only when the goal is fully satisfied; blocked when meaningful progress cannot continue without external action or user input. Pause, resume, and budget-limit states are controlled by the user or system."
                 },
                 "evidence": {
                     "type": "string",
@@ -555,7 +588,8 @@ impl ToolSpec for UpdateGoalTool {
         ApprovalRequirement::Auto
     }
 
-    async fn execute(&self, input: Value, _context: &ToolContext) -> Result<ToolResult, ToolError> {
+    async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+        require_root_goal_mutation(context)?;
         let status = required_str(&input, "status")?.trim().to_ascii_lowercase();
         let snapshot = {
             let mut state = lock_goal_state(&self.goal_state)?;
@@ -667,6 +701,160 @@ mod tests {
         );
         assert!(completed.content.contains("focused tests passed"));
         assert!(!state.lock().expect("goal lock").is_active());
+    }
+
+    #[test]
+    fn unfinished_goal_replacement_fails_closed_without_mutating_state() {
+        for status in [GoalStatus::Active, GoalStatus::Paused, GoalStatus::Blocked] {
+            let mut state = GoalState::default();
+            state.sync_from_host_status(
+                Some("preserve the current objective"),
+                Some(1_200),
+                status,
+            );
+            state.record_usage(300, 12);
+            state.record_continuation();
+            let before = state.snapshot();
+
+            let error = state
+                .create("replace it silently".to_string(), Some(99))
+                .expect_err("unfinished goal replacement must fail");
+
+            assert!(
+                error.contains("unfinished goal"),
+                "status {status:?}: {error}"
+            );
+            assert_eq!(
+                state.snapshot(),
+                before,
+                "status {status:?} must preserve the entire goal snapshot"
+            );
+        }
+    }
+
+    #[test]
+    fn same_objective_goal_host_resume_clears_terminal_payloads_and_preserves_progress() {
+        let mut blocked = GoalState::default();
+        blocked
+            .create("resume the release goal".to_string(), Some(4_000))
+            .expect("create blocked fixture");
+        blocked.record_usage(750, 44);
+        blocked.record_continuation();
+        blocked
+            .mark_blocked("provider failed".to_string())
+            .expect("block goal");
+
+        blocked.sync_from_host_status(
+            Some("resume the release goal"),
+            Some(4_000),
+            GoalStatus::Active,
+        );
+
+        let resumed = blocked.snapshot();
+        assert_eq!(resumed.status, "active");
+        assert_eq!(resumed.tokens_used, 750);
+        assert_eq!(resumed.time_used_seconds, 44);
+        assert_eq!(resumed.continuation_count, 1);
+        assert_eq!(resumed.evidence, None);
+        assert_eq!(resumed.blocker, None);
+        assert_eq!(resumed.completion_verification, None);
+        let prompt = render_continuation_prompt(&resumed, resumed.continuation_count);
+        assert!(prompt.contains("\"blocker\": null"), "{prompt}");
+
+        let mut completed = GoalState::default();
+        completed
+            .create("resume verified work".to_string(), None)
+            .expect("create completed fixture");
+        completed
+            .mark_complete(
+                "focused tests passed".to_string(),
+                GoalCompletionVerification {
+                    status: "passed".to_string(),
+                    check: "cargo test".to_string(),
+                    summary: "goal tests passed".to_string(),
+                },
+            )
+            .expect("complete goal");
+
+        completed.sync_from_host_status(Some("resume verified work"), None, GoalStatus::Active);
+        let resumed = completed.snapshot();
+        assert_eq!(resumed.status, "active");
+        assert_eq!(resumed.evidence, None);
+        assert_eq!(resumed.blocker, None);
+        assert_eq!(resumed.completion_verification, None);
+    }
+
+    #[test]
+    fn completed_goal_can_be_replaced_with_fresh_accounting() {
+        let mut state = GoalState::default();
+        state
+            .create("finish the first objective".to_string(), Some(1_200))
+            .expect("create first goal");
+        state.record_usage(300, 12);
+        state.record_continuation();
+        state
+            .mark_complete(
+                "focused tests passed".to_string(),
+                GoalCompletionVerification {
+                    status: "passed".to_string(),
+                    check: "cargo test".to_string(),
+                    summary: "goal tests passed".to_string(),
+                },
+            )
+            .expect("complete first goal");
+
+        state
+            .create("start the next objective".to_string(), Some(2_400))
+            .expect("completed goal may be replaced");
+
+        let snapshot = state.snapshot();
+        assert_eq!(
+            snapshot.objective.as_deref(),
+            Some("start the next objective")
+        );
+        assert_eq!(snapshot.status, "active");
+        assert_eq!(snapshot.token_budget, Some(2_400));
+        assert_eq!(snapshot.tokens_used, 0);
+        assert_eq!(snapshot.time_used_seconds, 0);
+        assert_eq!(snapshot.continuation_count, 0);
+        assert_eq!(snapshot.evidence, None);
+        assert_eq!(snapshot.blocker, None);
+        assert_eq!(snapshot.completion_verification, None);
+    }
+
+    #[tokio::test]
+    async fn subagent_context_cannot_mutate_parent_goal() {
+        let state = new_shared_goal_state_from_host_status(
+            Some("keep root lifecycle authority".to_string()),
+            Some(1_200),
+            GoalStatus::Active,
+        );
+        let before = state.lock().expect("goal lock").snapshot();
+        let child_context = ToolContext::new(".").with_owner_agent("agent_child", "child verifier");
+
+        let create_error = CreateGoalTool::new(state.clone())
+            .execute(
+                json!({"objective": "replace the parent goal"}),
+                &child_context,
+            )
+            .await
+            .expect_err("child create_goal must fail");
+        assert!(create_error.to_string().contains("root-agent only"));
+
+        let update_error = UpdateGoalTool::new(state.clone())
+            .execute(
+                json!({"status": "blocked", "blocker": "child decided to stop"}),
+                &child_context,
+            )
+            .await
+            .expect_err("child update_goal must fail");
+        assert!(update_error.to_string().contains("root-agent only"));
+
+        assert_eq!(
+            state.lock().expect("goal lock").snapshot(),
+            before,
+            "rejected child mutations must leave the parent goal unchanged"
+        );
     }
 
     #[tokio::test]
@@ -881,5 +1069,12 @@ mod tests {
         assert!(prompt.contains("Goal Continuation"));
         assert!(prompt.contains("finish issue 2199"));
         assert!(prompt.contains("Continuation pass #2"));
+        assert!(prompt.contains("waiting for user response"));
+    }
+
+    #[test]
+    fn update_goal_contract_treats_required_user_input_as_blocking() {
+        let update = UpdateGoalTool::new(new_shared_goal_state());
+        assert!(update.description().contains("requires user input"));
     }
 }

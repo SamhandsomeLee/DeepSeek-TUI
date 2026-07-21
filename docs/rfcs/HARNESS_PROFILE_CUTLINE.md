@@ -1,6 +1,11 @@
 # Harness Profile Cutline
 
-This note defines the v0.9.0 order for HarnessProfile work. The automatic
+**Status (2026-07-12): Current cutline.** The schema/resolver lane is
+implemented (`crates/config/src/harness.rs`: `HarnessPostureKind`,
+`HarnessProfile`, seed profiles); the status/UX display and runtime use remain
+deferred, and automatic profile evolution stays future work.
+
+This note defines the next-major order for HarnessProfile work. The automatic
 Harness Creator must not run before the profile schema, resolver, seed
 profiles, and user-visible status surfaces are explicit and tested.
 
@@ -71,7 +76,7 @@ and pure resolver checks, the acceptance matrix should record evidence for:
 - a generic/HF/local model resolving to a lean or standard profile;
 - the TUI or runtime status surface showing provider, model, profile, and repo
   constitution separately;
-- no automatic profile mutation during normal Agent or WhaleFlow runs.
+- no automatic profile mutation during normal Agent or Workflow runs.
 
 For v0.9.0, pure resolver tests may satisfy the profile-selection evidence, but
 status display and runtime use remain deferred until separate PRs wire those

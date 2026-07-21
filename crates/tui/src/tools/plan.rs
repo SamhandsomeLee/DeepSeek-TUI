@@ -580,7 +580,7 @@ impl ToolSpec for UpdatePlanTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
         let empty_plan = Vec::new();
         let plan_items = match input.get("plan") {
@@ -625,18 +625,57 @@ impl ToolSpec for UpdatePlanTool {
             plan: plan_args,
         };
 
-        let mut state = self.plan_state.lock().await;
-
-        state.update(args);
-
-        let snapshot = state.snapshot();
+        let mut next_state = PlanState::default();
+        next_state.update(args);
+        let desired = next_state.snapshot();
+        let proposed_for_review = context.review_plan_changes;
+        let snapshot = if let Some(work) = context.runtime.work.as_ref()
+            && work.matches_plan(&self.plan_state)
+        {
+            if proposed_for_review {
+                work.propose_plan_update(&context.state_namespace, self.name(), &desired)
+                    .await
+                    .map_err(ToolError::execution_failed)?
+            } else {
+                work.apply_plan_update(&context.state_namespace, self.name(), &desired)
+                    .await
+                    .map_err(ToolError::execution_failed)?
+            }
+        } else if proposed_for_review {
+            return Err(ToolError::execution_failed(
+                "Plan review requires the active Work Graph runtime".to_string(),
+            ));
+        } else {
+            let mut state = self.plan_state.lock().await;
+            state.update(UpdatePlanArgs {
+                title: desired.title.clone(),
+                objective: desired.objective.clone(),
+                context_summary: desired.context_summary.clone(),
+                explanation: desired.explanation.clone(),
+                sources_used: desired.sources_used.clone(),
+                critical_files: desired.critical_files.clone(),
+                constraints: desired.constraints.clone(),
+                recommended_approach: desired.recommended_approach.clone(),
+                verification_plan: desired.verification_plan.clone(),
+                risks_and_unknowns: desired.risks_and_unknowns.clone(),
+                handoff_packet: desired.handoff_packet.clone(),
+                plan: desired.items.clone(),
+            });
+            state.snapshot()
+        };
+        let state = PlanState::from_snapshot(&snapshot);
         let (pending, in_progress, completed) = state.counts();
         let progress = state.progress_percent();
 
         let result = serde_json::to_string_pretty(&snapshot).unwrap_or_else(|_| "{}".to_string());
 
+        let outcome = if proposed_for_review {
+            "Plan proposed for review"
+        } else {
+            "Plan updated"
+        };
         Ok(ToolResult::success(format!(
-            "Plan updated: {pending} pending, {in_progress} in progress, {completed} completed ({progress}% done)\n{result}"
+            "{outcome}: {pending} pending, {in_progress} in progress, {completed} completed ({progress}% done)\n{result}"
         )))
     }
 }
@@ -680,6 +719,75 @@ mod tests {
         assert!(
             !description.contains("phase-level"),
             "Strategy must not reuse Workflow Phase vocabulary: {description}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_plan_routes_through_attached_work_graph() {
+        let plan = new_shared_plan_state();
+        let todos = crate::tools::todo::new_shared_todo_list();
+        let work = crate::work_graph::new_shared_work_runtime(todos, plan.clone());
+        let tool = UpdatePlanTool::new(plan);
+        let mut context = ToolContext::new(std::env::temp_dir());
+        context.runtime.work = Some(work.clone());
+
+        tool.execute(
+            json!({
+                "objective": "Prove the real tool path",
+                "plan": [{"step": "Update graph", "status": "in_progress"}]
+            }),
+            &context,
+        )
+        .await
+        .expect("update_plan succeeds");
+
+        let state = work
+            .capture(Some(&context.state_namespace))
+            .expect("capture")
+            .expect("graph state");
+        assert_eq!(
+            state.plan.objective.as_deref(),
+            Some("Prove the real tool path")
+        );
+        assert_eq!(state.graph.compat.plan_order.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn plan_mode_update_returns_reviewable_proposal_without_publishing_it() {
+        let plan = new_shared_plan_state();
+        let todos = crate::tools::todo::new_shared_todo_list();
+        let work = crate::work_graph::new_shared_work_runtime(todos, plan.clone());
+        let tool = UpdatePlanTool::new(plan.clone());
+        let mut context = ToolContext::new(std::env::temp_dir());
+        context.runtime.work = Some(work.clone());
+        context.review_plan_changes = true;
+
+        let result = tool
+            .execute(
+                json!({
+                    "objective": "Review before mutation",
+                    "plan": [{"step": "Inspect the diff", "status": "in_progress"}]
+                }),
+                &context,
+            )
+            .await
+            .expect("Plan-mode proposal succeeds");
+
+        assert!(result.content.starts_with("Plan proposed for review:"));
+        assert!(plan.lock().await.snapshot().is_empty());
+        let captured = work
+            .capture(Some(&context.state_namespace))
+            .expect("capture proposal")
+            .expect("proposal graph");
+        assert!(captured.plan.is_empty());
+        assert_eq!(captured.graph.proposals.len(), 1);
+        assert_eq!(
+            work.plan_for_review(Some(&context.state_namespace))
+                .expect("review preview")
+                .expect("pending plan")
+                .objective
+                .as_deref(),
+            Some("Review before mutation")
         );
     }
 

@@ -1010,6 +1010,29 @@ impl JsonRpcError {
 mod tests {
     use super::*;
 
+    struct EchoMcpClient;
+
+    impl McpManagedClient for EchoMcpClient {
+        fn list_tools(&self) -> Result<Vec<McpToolDescriptor>> {
+            Ok(vec![])
+        }
+
+        fn call_tool(&self, tool_name: &str, arguments: Value) -> Result<Value> {
+            if tool_name == "error" {
+                bail!("intentional error for testing");
+            }
+            Ok(arguments)
+        }
+
+        fn list_resources(&self) -> Result<Vec<McpResourceDescriptor>> {
+            Ok(vec![])
+        }
+
+        fn read_resource(&self, _uri: &str) -> Result<Value> {
+            bail!("not supported")
+        }
+    }
+
     // ── InMemoryMcpClient ──────────────────────────────────────────────
 
     #[test]
@@ -1174,6 +1197,31 @@ mod tests {
         );
         let result = manager.call_tool("s1", "t", json!({})).unwrap();
         assert_eq!(result["v"], 42);
+    }
+
+    #[test]
+    fn manager_call_tool_passes_arguments_to_client() {
+        let mut manager = McpManager::default();
+        manager.register_server(
+            make_server_config("s1"),
+            ToolFilter::default(),
+            Box::new(EchoMcpClient),
+        );
+        let args = json!({"hello": "world", "num": 100});
+        let result = manager.call_tool("s1", "echo", args.clone()).unwrap();
+        assert_eq!(result, args);
+    }
+
+    #[test]
+    fn manager_call_tool_propagates_client_error() {
+        let mut manager = McpManager::default();
+        manager.register_server(
+            make_server_config("s1"),
+            ToolFilter::default(),
+            Box::new(EchoMcpClient),
+        );
+        let err = manager.call_tool("s1", "error", json!({})).unwrap_err();
+        assert!(err.to_string().contains("intentional error for testing"));
     }
 
     #[test]

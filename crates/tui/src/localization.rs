@@ -14,6 +14,7 @@ pub enum Locale {
     PtBr,
     Es419,
     Vi,
+    Ko,
 }
 
 impl Locale {
@@ -26,6 +27,7 @@ impl Locale {
             Self::PtBr => "pt-BR",
             Self::Es419 => "es-419",
             Self::Vi => "vi",
+            Self::Ko => "ko",
         }
     }
 
@@ -38,6 +40,7 @@ impl Locale {
             Self::PtBr => "Brazilian Portuguese (Português do Brasil)",
             Self::Es419 => "Latin American Spanish (Español latinoamericano)",
             Self::Vi => "Vietnamese (Tiếng Việt)",
+            Self::Ko => "Korean (한국어)",
         }
     }
 
@@ -52,6 +55,7 @@ impl Locale {
             Self::PtBr,
             Self::Es419,
             Self::Vi,
+            Self::Ko,
         ]
     }
 
@@ -67,6 +71,7 @@ impl Locale {
             Self::PtBr,
             Self::Es419,
             Self::Vi,
+            Self::Ko,
         ]
     }
 
@@ -80,6 +85,7 @@ impl Locale {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageId {
     ComposerPlaceholder,
+    ComposerDispatchFailedRestored,
     HistorySearchPlaceholder,
     HistorySearchTitle,
     HistoryHintMove,
@@ -175,6 +181,10 @@ pub enum MessageId {
     ConfigDefaultValue,
     ConfigDefaultReasoning,
     ConfigUnavailable,
+    ModelPickerAutoNetworkHint,
+    ModelPickerAutoLocalHint,
+    ModelPickerAutoLastRoute,
+    AutoRouteSelectedToast,
     HelpTitle,
     HelpSubtitle,
     HelpFilterPlaceholder,
@@ -223,6 +233,16 @@ pub enum MessageId {
     CmdMcpDescription,
     CmdMemoryDescription,
     CmdPluginDescription,
+    CmdPluginBundleUsage,
+    CmdPluginBundleNoneFound,
+    CmdPluginBundleListHeader,
+    CmdPluginLegacyListHeader,
+    CmdPluginBundleNotFound,
+    CmdPluginBundleReloaded,
+    CmdPluginBundleDetail,
+    CmdPluginBundleDiagnosticsHeader,
+    CmdPluginBundleMutationSuccess,
+    CmdPluginActionFailed,
     CmdPluginNoneFound,
     CmdPluginNotFound,
     CmdPluginListHeader,
@@ -307,6 +327,7 @@ pub enum MessageId {
     CmdTokensReport,
     FooterAgentSingular,
     FooterAgentsPlural,
+    HeaderAgentsChip,
     FooterPressCtrlCAgain,
     FooterWorking,
     FooterBalancePrefix,
@@ -328,7 +349,10 @@ pub enum MessageId {
     KbMoveCursor,
     KbJumpLineStartEnd,
     KbDeleteChar,
+    KbSelectText,
+    KbSelectAllDraft,
     KbClearDraft,
+    KbRestoreClearedDraft,
     KbStashDraft,
     KbSearchHistory,
     KbInsertNewline,
@@ -345,6 +369,7 @@ pub enum MessageId {
     KbSelectedDetails,
     KbToolDetailsPager,
     KbThinkingPager,
+    KbExternalEditor,
     KbLiveTranscript,
     KbBacktrackMessage,
     KbCompleteCycleModes,
@@ -354,8 +379,10 @@ pub enum MessageId {
     KbAltJumpPlanAgentYolo,
     KbFocusSidebar,
     KbSessionPicker,
+    KbTerminalPaste,
     KbPasteAttach,
     KbCopySelection,
+    ClipboardSshPasteHint,
     KbContextMenu,
     KbAttachPath,
     KbHelpOverlay,
@@ -368,9 +395,16 @@ pub enum MessageId {
     ClearConversation,
     ClearConversationBusy,
     ModelChanged,
+    LinksProjectTitle,
+    LinksDocumentation,
+    LinksCommunity,
+    LinksGitHub,
+    LinksManagedApp,
+    LinksManagedAppNote,
     LinksTitle,
     LinksDashboard,
     LinksDocs,
+    LinksKimiCodeRouteNote,
     LinksTip,
     SubagentsFetching,
     HelpUnknownCommand,
@@ -411,6 +445,7 @@ pub enum MessageId {
     OnboardWelcomeStepLanguage,
     OnboardWelcomeStepApiKey,
     OnboardWelcomeStepTrust,
+    OnboardWelcomeStepMentalModels,
     OnboardWelcomeStepTips,
     OnboardWelcomeDefaults,
     OnboardWelcomeEnter,
@@ -428,6 +463,9 @@ pub enum MessageId {
     OnboardApiKeyLocalHint,
     OnboardApiKeySavedHint,
     OnboardApiKeyFormatHint,
+    KimiCodePlanApiKeyHint,
+    KimiCodePlanRouteHint,
+    KimiCodePlanNoImportHint,
     OnboardApiKeyPlaceholder,
     OnboardApiKeyLabel,
     OnboardApiKeyFooter,
@@ -440,12 +478,27 @@ pub enum MessageId {
     OnboardTrustFooterPrefix,
     OnboardTrustFooterMiddle,
     OnboardTrustFooterSuffix,
+    // Onboarding screens — product mental model primer.
+    OnboardMentalTitle,
+    OnboardMentalModesLabel,
+    OnboardMentalPlanHint,
+    OnboardMentalActHint,
+    OnboardMentalOperateHint,
+    OnboardMentalPermissionLabel,
+    OnboardMentalCurrentLabel,
+    OnboardMentalConstitution,
+    OnboardMentalCycleMode,
+    OnboardMentalCyclePermission,
+    OnboardMentalContinue,
+    OnboardMentalBack,
     // Onboarding screens — final tips screen.
     OnboardTipsTitle,
     OnboardTipsLine1,
     OnboardTipsLine2,
     OnboardTipsLine3,
     OnboardTipsLine4,
+    OnboardTipsDoctorPrefix,
+    OnboardTipsDoctorSuffix,
     OnboardTipsFooterEnter,
     OnboardTipsFooterAction,
     // Constitution-first setup wizard.
@@ -678,10 +731,14 @@ pub enum MessageId {
     ApprovalOptionAbortTurn,
     ApprovalBlockTitle,
     ApprovalControlsHint,
+    ApprovalTruncationHint,
+    ApprovalFullAccessPolicyBlocked,
+    AutoReviewQuestionSkipped,
     ApprovalChooseHint,
     ApprovalChooseAction,
     ApprovalIntentLabel,
     ApprovalMoreLines,
+    ApprovalAutoDeniedSession,
     // Sandbox elevation dialog.
     ElevationTitleSandboxDenied,
     ElevationTitleRequired,
@@ -779,6 +836,10 @@ pub enum MessageId {
     // Notifications (turn/agent completion).
     NotificationTurnComplete,
     NotificationSubagentComplete,
+    NotificationSubagentFailed,
+    NotificationSubagentInterrupted,
+    NotificationSubagentCancelled,
+    NotificationSubagentBudgetExhausted,
     // Footer chips.
     FooterWorkedChip,
     // Fleet setup wizard.
@@ -864,11 +925,240 @@ pub enum MessageId {
     SetupGuidedEvidenceReleaseReceipts,
     // Setup wizard — guided answer notes.
     SetupGuidedNotes,
+    // Underwater launch screen (pre-session menu + worktree flow).
+    LaunchMenuNewSession,
+    LaunchMenuNewWorktree,
+    LaunchMenuResumeSession,
+    LaunchMenuChangelog,
+    LaunchMenuQuit,
+    LaunchMenuUnavailable,
+    LaunchMenuSavedCount,
+    LaunchWorktreePrompt,
+    LaunchWorktreeNeedsGit,
+    LaunchWorktreeNameLabel,
+    LaunchHintMove,
+    LaunchHintOpen,
+    LaunchTipFlags,
+    LaunchSavedSessionSingular,
+    LaunchSavedSessionsPlural,
+    LaunchCreatingWorktree,
+    LaunchWorktreeFailed,
+    LaunchNoSavedSessions,
+    // Underwater shell phase words (footer status band).
+    PhaseIdle,
+    PhaseDraft,
+    PhaseWorking,
+    /// Metered verification pass (tests/checks) — distinct from `working`
+    /// so checking reads differently from searching (ocean state model).
+    PhaseVerifying,
+    PhaseWaitingOnYou,
+    PhaseDone,
+    PhaseFailed,
+    PhaseFinishing,
+    // Underwater header chips: mode and permission words.
+    ChipModeAct,
+    ChipModePlan,
+    ChipModeOperate,
+    ChipPermissionReadOnly,
+    ChipPermissionAsk,
+    ChipPermissionAuto,
+    ChipPermissionFullAccess,
+    ChipPermissionNever,
+    // Underwater footer right-hand hint words (keys stay literal in code).
+    FooterHintKeys,
+    FooterHintOutput,
+    FooterHintContext,
+    // Underwater post-launch empty state.
+    EmptyStateNoGit,
+    EmptyStateMcpLabel,
+    EmptyStateFleetLabel,
+    EmptyStateFleetSetupLabel,
+    EmptyStateHelpHint,
+    // Session picker surface.
+    SessionsSurfaceTitle,
+    SessionsPaneTitle,
+    SessionsHistoryPaneTitle,
+    SessionsActionResume,
+    SessionsActionSearch,
+    SessionsActionSort,
+    SessionsActionRename,
+    SessionsActionAllWorkspaces,
+    SessionsActionDelete,
+    SessionsActionClose,
+    SessionsScopeSortHeader,
+    SessionsEmptyTitle,
+    SessionsEmptyHint,
+    SessionsShowingAllWorkspaces,
+    SessionsScopedToWorkspace,
+    SessionsNewTitlePrompt,
+    SessionsDeletePrompt,
+    SessionsConfirmDelete,
+    SessionsNewSessionTitle,
+    SessionsOpenedHistory,
+    SessionsSortStatus,
+    SessionsSortRecent,
+    SessionsSortName,
+    SessionsSortSize,
+    SessionsSearchPrompt,
+    SessionsDeleteFailed,
+    SessionsDeleted,
+    SessionsNoSelection,
+    SessionsTitleLength,
+    SessionsOpenFailed,
+    SessionsLoadFailed,
+    SessionsRenameFailed,
+    SessionsRenamed,
+    SessionsNoResults,
+    SessionsDirectoryFailed,
+    SessionsPreviewFailed,
+    SessionsDeleteCancelled,
+    SessionsRenameCancelled,
+    SessionsShowingRange,
+    SessionsMessageCountCompact,
+    SessionsForkCompact,
+    SessionsUnknownMode,
+    SessionsPreviewTitle,
+    SessionsPreviewUpdated,
+    SessionsPreviewMessagesModel,
+    SessionsPreviewMode,
+    SessionsToolCall,
+    SessionsToolError,
+    SessionsToolResult,
+    SessionsServerTool,
+    SessionsImage,
+    SessionsTimeJustNow,
+    SessionsTimeMinutesAgo,
+    SessionsTimeHoursAgo,
+    SessionsTimeDaysAgo,
+    // Compact context inspector (Alt+C surface).
+    CtxInspRowSystemPrompt,
+    CtxInspRowMessages,
+    CtxInspRowFree,
+    CtxInspFreeTokensDetail,
+    CtxInspDrillTitle,
+    CtxInspSurfaceTitle,
+    CtxInspActionSelect,
+    CtxInspActionDrillDown,
+    CtxInspActionClose,
+    CtxInspUsedTokens,
+    CtxInspAutoCompactAt,
+    CtxInspRowTokens,
+    // Model picker route surface.
+    RouteSurfaceTitle,
+    RouteBrowseCatalog,
+    RouteActionType,
+    RouteActionSearchAnyModel,
+    RoutePanelHeader,
+    RouteProviderLabel,
+    RouteModelFirstAtomic,
+    PickerActionMove,
+    PickerActionSwitch,
+    PickerActionApply,
+    PickerActionCancel,
+    PickerActionClear,
+    PickerActionClearSearch,
+    PickerActionBrowseAll,
+    PickerActionCustom,
+    PickerActionJump,
+    PickerActionEditKey,
+    PickerActionModels,
+    PickerActionUnavailable,
+    PickerActionSetKey,
+    PickerActionConfigured,
+    RouteNoModels,
+    RouteNoModelMatch,
+    ProviderNoMatchesTitle,
+    ProviderNoMatchesHint,
+    ProviderNoConfiguredTitle,
+    ProviderNoConfiguredHint,
+    ProviderNoCatalogModels,
+    // Provider picker — informed external-credential consent.
+    ProviderExternalActionRevoke,
+    ProviderExternalActionChoices,
+    ProviderExternalActionReuseGrok,
+    ProviderExternalHintCodexReview,
+    ProviderExternalHintXaiReview,
+    ProviderExternalHintXaiApiKey,
+    ProviderExternalDetailScope,
+    ProviderExternalDormant,
+    ProviderExternalOwnerPath,
+    ProviderExternalPinnedPathWarning,
+    ProviderExternalSemanticsRevoke,
+    ProviderExternalRevoke,
+    ProviderExternalChoiceTitle,
+    ProviderExternalActionChoose,
+    ProviderExternalChoiceIntro,
+    ProviderExternalDisabledLabel,
+    ProviderExternalDisabledDetail,
+    ProviderExternalReadOnlyLabel,
+    ProviderExternalReadOnlyDetail,
+    ProviderExternalReadOnlySemantics,
+    ProviderExternalManagedLabel,
+    ProviderExternalManagedDetail,
+    ProviderExternalConfirmTitle,
+    ProviderExternalActionGrant,
+    ProviderExternalOwnerLabel,
+    ProviderExternalExactPathLabel,
+    ProviderExternalSemanticsLabel,
+    ProviderExternalRejectUnsafe,
+    ProviderExternalRevokeLabel,
+    ProviderExternalGrantedToast,
+    ProviderExternalSaveFailedToast,
+    ProviderExternalRevokedToast,
+    ProviderExternalRevokeFailedToast,
+    // Theme picker surface.
+    ThemeSurfaceTitle,
+    ThemeTreatmentOmbreUnavailable,
+    ThemeTreatmentFlatActive,
+    ThemeTreatmentOmbreActive,
+    // Fleet roster room.
+    FleetRosterHeaderLabel,
+    FleetRosterTabRoster,
+    FleetRosterTabSetup,
+    FleetRosterWorkers,
+    FleetRosterMembersCount,
+    FleetRosterOperatorFirst,
+    FleetRosterOperatorRow,
+    FleetReadyNotice,
+    /// Sticky error when Fleet profile save cannot prove collision safety.
+    FleetProfileIdentityVerifyFailed,
+    /// Sticky error when the drafted profile id collides with another file.
+    FleetProfileIdConflict,
+    /// Sticky error when the drafted profile pins an unconfigured provider.
+    FleetProfileProviderUnconfigured,
+    // Workflow panel.
+    WorkflowStatusWaiting,
+    WorkflowDebrief,
+    WorkflowTranscriptDetails,
+    // Sidebar work strip.
+    SidebarTasksLabel,
+    SidebarTodoLabel,
+    SidebarStopControl,
+    SidebarDestructiveArmed,
+    WorkSurfaceTodoProgress,
+    WorkSurfaceStopConfirmHint,
+    // Composer slash menu.
+    ComposerSlashMenuHint,
+    // Approval modal — repository law band.
+    ApprovalRepoLawBadge,
+    ApprovalRepoLawTitle,
+    ApprovalRepoLawWarning,
+    ApprovalRepoLawRuleLabel,
+    // Fuzzy file picker (@ attach overlay).
+    FilePickerMatchSingular,
+    FilePickerMatchesPlural,
+    // Quiet action-triggered product guidance.
+    BehavioralTipPlanning,
+    BehavioralTipBackgroundReceipt,
+    BehavioralTipClearedInput,
+    BehavioralTipMcpValidation,
+    BehavioralTipRepeatedCommand,
 }
 
 #[allow(dead_code)]
 pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::ComposerPlaceholder,
+    MessageId::ComposerDispatchFailedRestored,
     MessageId::HistorySearchPlaceholder,
     MessageId::HistorySearchTitle,
     MessageId::HistoryHintMove,
@@ -962,6 +1252,10 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::ConfigDefaultValue,
     MessageId::ConfigDefaultReasoning,
     MessageId::ConfigUnavailable,
+    MessageId::ModelPickerAutoNetworkHint,
+    MessageId::ModelPickerAutoLocalHint,
+    MessageId::ModelPickerAutoLastRoute,
+    MessageId::AutoRouteSelectedToast,
     MessageId::HelpTitle,
     MessageId::HelpSubtitle,
     MessageId::HelpFilterPlaceholder,
@@ -990,6 +1284,9 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::CmdExitDescription,
     MessageId::CmdExportDescription,
     MessageId::CmdFeedbackDescription,
+    MessageId::CmdForkDescription,
+    MessageId::CmdGoalDescription,
+    MessageId::CmdThemeDescription,
     MessageId::CmdHfDescription,
     MessageId::CmdHelpDescription,
     MessageId::CmdProfileDescription,
@@ -1003,6 +1300,16 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::CmdLogoutDescription,
     MessageId::CmdMcpDescription,
     MessageId::CmdPluginDescription,
+    MessageId::CmdPluginBundleUsage,
+    MessageId::CmdPluginBundleNoneFound,
+    MessageId::CmdPluginBundleListHeader,
+    MessageId::CmdPluginLegacyListHeader,
+    MessageId::CmdPluginBundleNotFound,
+    MessageId::CmdPluginBundleReloaded,
+    MessageId::CmdPluginBundleDetail,
+    MessageId::CmdPluginBundleDiagnosticsHeader,
+    MessageId::CmdPluginBundleMutationSuccess,
+    MessageId::CmdPluginActionFailed,
     MessageId::CmdPluginNoneFound,
     MessageId::CmdPluginNotFound,
     MessageId::CmdPluginListHeader,
@@ -1091,6 +1398,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::CmdTokensReport,
     MessageId::FooterAgentSingular,
     MessageId::FooterAgentsPlural,
+    MessageId::HeaderAgentsChip,
     MessageId::FooterPressCtrlCAgain,
     MessageId::FooterWorking,
     MessageId::FooterBalancePrefix,
@@ -1112,7 +1420,10 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::KbMoveCursor,
     MessageId::KbJumpLineStartEnd,
     MessageId::KbDeleteChar,
+    MessageId::KbSelectText,
+    MessageId::KbSelectAllDraft,
     MessageId::KbClearDraft,
+    MessageId::KbRestoreClearedDraft,
     MessageId::KbStashDraft,
     MessageId::KbSearchHistory,
     MessageId::KbInsertNewline,
@@ -1129,6 +1440,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::KbSelectedDetails,
     MessageId::KbToolDetailsPager,
     MessageId::KbThinkingPager,
+    MessageId::KbExternalEditor,
     MessageId::KbLiveTranscript,
     MessageId::KbBacktrackMessage,
     MessageId::KbCompleteCycleModes,
@@ -1138,8 +1450,10 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::KbAltJumpPlanAgentYolo,
     MessageId::KbFocusSidebar,
     MessageId::KbSessionPicker,
+    MessageId::KbTerminalPaste,
     MessageId::KbPasteAttach,
     MessageId::KbCopySelection,
+    MessageId::ClipboardSshPasteHint,
     MessageId::KbContextMenu,
     MessageId::KbAttachPath,
     MessageId::KbHelpOverlay,
@@ -1152,9 +1466,16 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::ClearConversation,
     MessageId::ClearConversationBusy,
     MessageId::ModelChanged,
+    MessageId::LinksProjectTitle,
+    MessageId::LinksDocumentation,
+    MessageId::LinksCommunity,
+    MessageId::LinksGitHub,
+    MessageId::LinksManagedApp,
+    MessageId::LinksManagedAppNote,
     MessageId::LinksTitle,
     MessageId::LinksDashboard,
     MessageId::LinksDocs,
+    MessageId::LinksKimiCodeRouteNote,
     MessageId::LinksTip,
     MessageId::SubagentsFetching,
     MessageId::HelpUnknownCommand,
@@ -1194,6 +1515,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::OnboardWelcomeStepLanguage,
     MessageId::OnboardWelcomeStepApiKey,
     MessageId::OnboardWelcomeStepTrust,
+    MessageId::OnboardWelcomeStepMentalModels,
     MessageId::OnboardWelcomeStepTips,
     MessageId::OnboardWelcomeDefaults,
     MessageId::OnboardWelcomeEnter,
@@ -1210,6 +1532,9 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::OnboardApiKeyLocalHint,
     MessageId::OnboardApiKeySavedHint,
     MessageId::OnboardApiKeyFormatHint,
+    MessageId::KimiCodePlanApiKeyHint,
+    MessageId::KimiCodePlanRouteHint,
+    MessageId::KimiCodePlanNoImportHint,
     MessageId::OnboardApiKeyPlaceholder,
     MessageId::OnboardApiKeyLabel,
     MessageId::OnboardApiKeyFooter,
@@ -1221,11 +1546,25 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::OnboardTrustFooterPrefix,
     MessageId::OnboardTrustFooterMiddle,
     MessageId::OnboardTrustFooterSuffix,
+    MessageId::OnboardMentalTitle,
+    MessageId::OnboardMentalModesLabel,
+    MessageId::OnboardMentalPlanHint,
+    MessageId::OnboardMentalActHint,
+    MessageId::OnboardMentalOperateHint,
+    MessageId::OnboardMentalPermissionLabel,
+    MessageId::OnboardMentalCurrentLabel,
+    MessageId::OnboardMentalConstitution,
+    MessageId::OnboardMentalCycleMode,
+    MessageId::OnboardMentalCyclePermission,
+    MessageId::OnboardMentalContinue,
+    MessageId::OnboardMentalBack,
     MessageId::OnboardTipsTitle,
     MessageId::OnboardTipsLine1,
     MessageId::OnboardTipsLine2,
     MessageId::OnboardTipsLine3,
     MessageId::OnboardTipsLine4,
+    MessageId::OnboardTipsDoctorPrefix,
+    MessageId::OnboardTipsDoctorSuffix,
     MessageId::OnboardTipsFooterEnter,
     MessageId::OnboardTipsFooterAction,
     MessageId::SetupWizardTitle,
@@ -1452,10 +1791,14 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::ApprovalOptionAbortTurn,
     MessageId::ApprovalBlockTitle,
     MessageId::ApprovalControlsHint,
+    MessageId::ApprovalTruncationHint,
+    MessageId::ApprovalFullAccessPolicyBlocked,
+    MessageId::AutoReviewQuestionSkipped,
     MessageId::ApprovalChooseHint,
     MessageId::ApprovalChooseAction,
     MessageId::ApprovalIntentLabel,
     MessageId::ApprovalMoreLines,
+    MessageId::ApprovalAutoDeniedSession,
     MessageId::ElevationTitleSandboxDenied,
     MessageId::ElevationTitleRequired,
     MessageId::ElevationFieldTool,
@@ -1548,6 +1891,10 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::VoiceTranscribed,
     MessageId::NotificationTurnComplete,
     MessageId::NotificationSubagentComplete,
+    MessageId::NotificationSubagentFailed,
+    MessageId::NotificationSubagentInterrupted,
+    MessageId::NotificationSubagentCancelled,
+    MessageId::NotificationSubagentBudgetExhausted,
     MessageId::FooterWorkedChip,
     MessageId::FleetDraftTitle,
     MessageId::FleetDraftHeader,
@@ -1618,6 +1965,212 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::SetupGuidedEvidenceTestsAndReceipts,
     MessageId::SetupGuidedEvidenceReleaseReceipts,
     MessageId::SetupGuidedNotes,
+    MessageId::LaunchMenuNewSession,
+    MessageId::LaunchMenuNewWorktree,
+    MessageId::LaunchMenuResumeSession,
+    MessageId::LaunchMenuChangelog,
+    MessageId::LaunchMenuQuit,
+    MessageId::LaunchMenuUnavailable,
+    MessageId::LaunchMenuSavedCount,
+    MessageId::LaunchWorktreePrompt,
+    MessageId::LaunchWorktreeNeedsGit,
+    MessageId::LaunchWorktreeNameLabel,
+    MessageId::LaunchHintMove,
+    MessageId::LaunchHintOpen,
+    MessageId::LaunchTipFlags,
+    MessageId::LaunchSavedSessionSingular,
+    MessageId::LaunchSavedSessionsPlural,
+    MessageId::LaunchCreatingWorktree,
+    MessageId::LaunchWorktreeFailed,
+    MessageId::LaunchNoSavedSessions,
+    MessageId::PhaseIdle,
+    MessageId::PhaseDraft,
+    MessageId::PhaseWorking,
+    MessageId::PhaseVerifying,
+    MessageId::PhaseWaitingOnYou,
+    MessageId::PhaseDone,
+    MessageId::PhaseFailed,
+    MessageId::PhaseFinishing,
+    MessageId::ChipModeAct,
+    MessageId::ChipModePlan,
+    MessageId::ChipModeOperate,
+    MessageId::ChipPermissionReadOnly,
+    MessageId::ChipPermissionAsk,
+    MessageId::ChipPermissionAuto,
+    MessageId::ChipPermissionFullAccess,
+    MessageId::ChipPermissionNever,
+    MessageId::FooterHintKeys,
+    MessageId::FooterHintOutput,
+    MessageId::FooterHintContext,
+    MessageId::EmptyStateNoGit,
+    MessageId::EmptyStateMcpLabel,
+    MessageId::EmptyStateFleetLabel,
+    MessageId::EmptyStateFleetSetupLabel,
+    MessageId::EmptyStateHelpHint,
+    MessageId::SessionsSurfaceTitle,
+    MessageId::SessionsPaneTitle,
+    MessageId::SessionsHistoryPaneTitle,
+    MessageId::SessionsActionResume,
+    MessageId::SessionsActionSearch,
+    MessageId::SessionsActionSort,
+    MessageId::SessionsActionRename,
+    MessageId::SessionsActionAllWorkspaces,
+    MessageId::SessionsActionDelete,
+    MessageId::SessionsActionClose,
+    MessageId::SessionsScopeSortHeader,
+    MessageId::SessionsEmptyTitle,
+    MessageId::SessionsEmptyHint,
+    MessageId::SessionsShowingAllWorkspaces,
+    MessageId::SessionsScopedToWorkspace,
+    MessageId::SessionsNewTitlePrompt,
+    MessageId::SessionsDeletePrompt,
+    MessageId::SessionsConfirmDelete,
+    MessageId::SessionsNewSessionTitle,
+    MessageId::SessionsOpenedHistory,
+    MessageId::SessionsSortStatus,
+    MessageId::SessionsSortRecent,
+    MessageId::SessionsSortName,
+    MessageId::SessionsSortSize,
+    MessageId::SessionsSearchPrompt,
+    MessageId::SessionsDeleteFailed,
+    MessageId::SessionsDeleted,
+    MessageId::SessionsNoSelection,
+    MessageId::SessionsTitleLength,
+    MessageId::SessionsOpenFailed,
+    MessageId::SessionsLoadFailed,
+    MessageId::SessionsRenameFailed,
+    MessageId::SessionsRenamed,
+    MessageId::SessionsNoResults,
+    MessageId::SessionsDirectoryFailed,
+    MessageId::SessionsPreviewFailed,
+    MessageId::SessionsDeleteCancelled,
+    MessageId::SessionsRenameCancelled,
+    MessageId::SessionsShowingRange,
+    MessageId::SessionsMessageCountCompact,
+    MessageId::SessionsForkCompact,
+    MessageId::SessionsUnknownMode,
+    MessageId::SessionsPreviewTitle,
+    MessageId::SessionsPreviewUpdated,
+    MessageId::SessionsPreviewMessagesModel,
+    MessageId::SessionsPreviewMode,
+    MessageId::SessionsToolCall,
+    MessageId::SessionsToolError,
+    MessageId::SessionsToolResult,
+    MessageId::SessionsServerTool,
+    MessageId::SessionsImage,
+    MessageId::SessionsTimeJustNow,
+    MessageId::SessionsTimeMinutesAgo,
+    MessageId::SessionsTimeHoursAgo,
+    MessageId::SessionsTimeDaysAgo,
+    MessageId::CtxInspRowSystemPrompt,
+    MessageId::CtxInspRowMessages,
+    MessageId::CtxInspRowFree,
+    MessageId::CtxInspFreeTokensDetail,
+    MessageId::CtxInspDrillTitle,
+    MessageId::CtxInspSurfaceTitle,
+    MessageId::CtxInspActionSelect,
+    MessageId::CtxInspActionDrillDown,
+    MessageId::CtxInspActionClose,
+    MessageId::CtxInspUsedTokens,
+    MessageId::CtxInspAutoCompactAt,
+    MessageId::CtxInspRowTokens,
+    MessageId::RouteSurfaceTitle,
+    MessageId::RouteBrowseCatalog,
+    MessageId::RouteActionType,
+    MessageId::RouteActionSearchAnyModel,
+    MessageId::RoutePanelHeader,
+    MessageId::RouteProviderLabel,
+    MessageId::RouteModelFirstAtomic,
+    MessageId::PickerActionMove,
+    MessageId::PickerActionSwitch,
+    MessageId::PickerActionApply,
+    MessageId::PickerActionCancel,
+    MessageId::PickerActionClear,
+    MessageId::PickerActionClearSearch,
+    MessageId::PickerActionBrowseAll,
+    MessageId::PickerActionCustom,
+    MessageId::PickerActionJump,
+    MessageId::PickerActionEditKey,
+    MessageId::PickerActionModels,
+    MessageId::PickerActionUnavailable,
+    MessageId::PickerActionSetKey,
+    MessageId::PickerActionConfigured,
+    MessageId::RouteNoModels,
+    MessageId::RouteNoModelMatch,
+    MessageId::ProviderNoMatchesTitle,
+    MessageId::ProviderNoMatchesHint,
+    MessageId::ProviderNoConfiguredTitle,
+    MessageId::ProviderNoConfiguredHint,
+    MessageId::ProviderNoCatalogModels,
+    MessageId::ProviderExternalActionRevoke,
+    MessageId::ProviderExternalActionChoices,
+    MessageId::ProviderExternalActionReuseGrok,
+    MessageId::ProviderExternalHintCodexReview,
+    MessageId::ProviderExternalHintXaiReview,
+    MessageId::ProviderExternalHintXaiApiKey,
+    MessageId::ProviderExternalDetailScope,
+    MessageId::ProviderExternalDormant,
+    MessageId::ProviderExternalOwnerPath,
+    MessageId::ProviderExternalPinnedPathWarning,
+    MessageId::ProviderExternalSemanticsRevoke,
+    MessageId::ProviderExternalRevoke,
+    MessageId::ProviderExternalChoiceTitle,
+    MessageId::ProviderExternalActionChoose,
+    MessageId::ProviderExternalChoiceIntro,
+    MessageId::ProviderExternalDisabledLabel,
+    MessageId::ProviderExternalDisabledDetail,
+    MessageId::ProviderExternalReadOnlyLabel,
+    MessageId::ProviderExternalReadOnlyDetail,
+    MessageId::ProviderExternalReadOnlySemantics,
+    MessageId::ProviderExternalManagedLabel,
+    MessageId::ProviderExternalManagedDetail,
+    MessageId::ProviderExternalConfirmTitle,
+    MessageId::ProviderExternalActionGrant,
+    MessageId::ProviderExternalOwnerLabel,
+    MessageId::ProviderExternalExactPathLabel,
+    MessageId::ProviderExternalSemanticsLabel,
+    MessageId::ProviderExternalRejectUnsafe,
+    MessageId::ProviderExternalRevokeLabel,
+    MessageId::ProviderExternalGrantedToast,
+    MessageId::ProviderExternalSaveFailedToast,
+    MessageId::ProviderExternalRevokedToast,
+    MessageId::ProviderExternalRevokeFailedToast,
+    MessageId::ThemeSurfaceTitle,
+    MessageId::ThemeTreatmentOmbreUnavailable,
+    MessageId::ThemeTreatmentFlatActive,
+    MessageId::ThemeTreatmentOmbreActive,
+    MessageId::FleetRosterHeaderLabel,
+    MessageId::FleetRosterTabRoster,
+    MessageId::FleetRosterTabSetup,
+    MessageId::FleetRosterWorkers,
+    MessageId::FleetRosterMembersCount,
+    MessageId::FleetRosterOperatorFirst,
+    MessageId::FleetRosterOperatorRow,
+    MessageId::FleetReadyNotice,
+    MessageId::FleetProfileIdentityVerifyFailed,
+    MessageId::FleetProfileIdConflict,
+    MessageId::FleetProfileProviderUnconfigured,
+    MessageId::WorkflowStatusWaiting,
+    MessageId::WorkflowDebrief,
+    MessageId::WorkflowTranscriptDetails,
+    MessageId::SidebarTasksLabel,
+    MessageId::SidebarTodoLabel,
+    MessageId::SidebarStopControl,
+    MessageId::SidebarDestructiveArmed,
+    MessageId::WorkSurfaceTodoProgress,
+    MessageId::WorkSurfaceStopConfirmHint,
+    MessageId::ComposerSlashMenuHint,
+    MessageId::ApprovalRepoLawBadge,
+    MessageId::ApprovalRepoLawTitle,
+    MessageId::ApprovalRepoLawWarning,
+    MessageId::ApprovalRepoLawRuleLabel,
+    MessageId::FilePickerMatchSingular,
+    MessageId::FilePickerMatchesPlural,
+    MessageId::BehavioralTipPlanning,
+    MessageId::BehavioralTipBackgroundReceipt,
+    MessageId::BehavioralTipClearedInput,
+    MessageId::BehavioralTipMcpValidation,
+    MessageId::BehavioralTipRepeatedCommand,
 ];
 
 pub fn tr(locale: Locale, id: MessageId) -> Cow<'static, str> {
@@ -1633,6 +2186,7 @@ pub fn thinking_translation_placeholder(locale: Locale) -> &'static str {
         Locale::PtBr => "Pensando; traduzindo ao concluir...",
         Locale::Es419 => "Pensando; traduciendo al finalizar...",
         Locale::Vi => "Đang suy nghĩ; sẽ dịch sau khi hoàn thành...",
+        Locale::Ko => "생각하는 중입니다. 완료되면 번역합니다...",
     }
 }
 
@@ -1645,6 +2199,7 @@ pub fn thinking_translation_in_progress(locale: Locale) -> &'static str {
         Locale::PtBr => "Traduzindo o conteúdo de raciocínio...",
         Locale::Es419 => "Traduciendo el contenido de razonamiento...",
         Locale::Vi => "Đang dịch nội dung suy nghĩ...",
+        Locale::Ko => "생각 내용을 번역하는 중...",
     }
 }
 
@@ -1657,6 +2212,7 @@ pub fn thinking_translation_complete(locale: Locale) -> &'static str {
         Locale::PtBr => "Tradução do raciocínio concluída",
         Locale::Es419 => "Traducción del razonamiento completada",
         Locale::Vi => "Đã dịch xong nội dung suy nghĩ",
+        Locale::Ko => "생각 내용 번역 완료",
     }
 }
 
@@ -1669,6 +2225,7 @@ pub fn thinking_translation_failed(locale: Locale) -> &'static str {
         Locale::PtBr => "Falha ao traduzir o raciocínio",
         Locale::Es419 => "Falló la traducción del razonamiento",
         Locale::Vi => "Dịch nội dung suy nghĩ thất bại",
+        Locale::Ko => "생각 내용 번역 실패",
     }
 }
 
@@ -1681,6 +2238,7 @@ pub fn hidden_translation_failed(locale: Locale) -> &'static str {
         Locale::PtBr => "A tradução falhou; o texto original está oculto.",
         Locale::Es419 => "La traducción falló; el texto original está oculto.",
         Locale::Vi => "Dịch thất bại; văn bản gốc đã bị ẩn.",
+        Locale::Ko => "번역에 실패했습니다. 원문은 숨겨져 있습니다.",
     }
 }
 
@@ -1690,6 +2248,19 @@ pub fn normalize_configured_locale(input: &str) -> Option<&'static str> {
         return Some("auto");
     }
     parse_locale(&normalized).map(Locale::tag)
+}
+
+/// Human-facing list of accepted `locale` setting values, derived from the
+/// shipped packs so config hints and error messages cannot go stale as new
+/// locales land. `separator` is `", "` for prose and `" | "` for hints.
+#[must_use]
+pub fn configured_locale_values(separator: &str) -> String {
+    let mut out = String::from("auto");
+    for locale in Locale::shipped() {
+        out.push_str(separator);
+        out.push_str(locale.tag());
+    }
+    out
 }
 
 pub fn resolve_locale(setting: &str) -> Locale {
@@ -1784,6 +2355,9 @@ fn parse_locale(value: &str) -> Option<Locale> {
     if value.starts_with("vi") {
         return Some(Locale::Vi);
     }
+    if value.starts_with("ko") {
+        return Some(Locale::Ko);
+    }
     None
 }
 
@@ -1847,6 +2421,7 @@ mod tests {
             Locale::PtBr => include_str!("../locales/pt-BR.json"),
             Locale::Es419 => include_str!("../locales/es-419.json"),
             Locale::Vi => include_str!("../locales/vi.json"),
+            Locale::Ko => include_str!("../locales/ko.json"),
         }
     }
 
@@ -1856,6 +2431,83 @@ mod tests {
             assert!(
                 missing_message_ids(*locale).is_empty(),
                 "{} is missing messages",
+                locale.tag()
+            );
+        }
+    }
+
+    #[test]
+    fn work_stop_confirmation_is_explicitly_localized() {
+        for locale in Locale::shipped_complete() {
+            if *locale == Locale::En {
+                continue;
+            }
+            assert_ne!(tr(*locale, MessageId::SidebarStopControl), "stop");
+            assert_ne!(
+                tr(*locale, MessageId::WorkSurfaceStopConfirmHint),
+                "confirm stop · Esc cancels"
+            );
+        }
+    }
+
+    fn raw_locale_keys(locale: Locale) -> std::collections::BTreeSet<String> {
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(locale_json_source(
+            locale,
+        ))
+        .unwrap_or_else(|err| panic!("{} locale json should parse: {err}", locale.tag()))
+        .keys()
+        .cloned()
+        .collect()
+    }
+
+    /// `missing_message_ids` is blind to keys that exist in en but not in a
+    /// "complete" pack — the English fallback returns the English string, so
+    /// nothing looks missing. Keep the enum, en.json, and ALL_MESSAGE_IDS in
+    /// exact sync so every other parity gate actually sees every message.
+    #[test]
+    fn message_id_list_english_pack_stay_in_exact_sync() {
+        let en = raw_locale_keys(Locale::En);
+        let ids: std::collections::BTreeSet<String> =
+            ALL_MESSAGE_IDS.iter().map(|id| format!("{id:?}")).collect();
+        assert_eq!(
+            ids.len(),
+            ALL_MESSAGE_IDS.len(),
+            "ALL_MESSAGE_IDS contains duplicates"
+        );
+        let unlisted: Vec<_> = en.difference(&ids).collect();
+        assert!(
+            unlisted.is_empty(),
+            "en.json keys absent from ALL_MESSAGE_IDS — every parity test is blind to them: {unlisted:?}"
+        );
+        let untranslatable: Vec<_> = ids.difference(&en).collect();
+        assert!(
+            untranslatable.is_empty(),
+            "ALL_MESSAGE_IDS entries without an en.json string: {untranslatable:?}"
+        );
+    }
+
+    /// Raw key-set parity for every pack that claims completeness, in both
+    /// directions. This is the test that fails when a new en key ships
+    /// without translations instead of silently falling back to English.
+    #[test]
+    fn shipped_complete_packs_have_raw_key_parity_with_english() {
+        let en = raw_locale_keys(Locale::En);
+        for locale in Locale::shipped_complete() {
+            if *locale == Locale::En {
+                continue;
+            }
+            let pack = raw_locale_keys(*locale);
+            let missing: Vec<_> = en.difference(&pack).collect();
+            assert!(
+                missing.is_empty(),
+                "{} claims completeness but lacks {} key(s); the English fallback hides these at runtime: {missing:?}",
+                locale.tag(),
+                missing.len()
+            );
+            let extra: Vec<_> = pack.difference(&en).collect();
+            assert!(
+                extra.is_empty(),
+                "{} defines key(s) en.json lacks: {extra:?}",
                 locale.tag()
             );
         }
@@ -1902,6 +2554,86 @@ mod tests {
                 assert!(
                     messages.contains_key(key),
                     "{} should define {key} explicitly",
+                    locale.tag()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zh_hans_constitution_copy_uses_functional_terms() {
+        let messages = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+            locale_json_source(Locale::ZhHans),
+        )
+        .expect("zh-Hans locale json");
+
+        for (key, value) in &messages {
+            let Some(value) = value.as_str() else {
+                continue;
+            };
+            for literal_metaphor in ["宪法", "教义", "自由原则", "仓库法则"] {
+                assert!(
+                    !value.contains(literal_metaphor),
+                    "zh-Hans {key} should use functional terminology instead of {literal_metaphor}: {value}"
+                );
+            }
+        }
+
+        let setup_intro = tr(Locale::ZhHans, MessageId::SetupStepConstitutionWhy);
+        assert!(setup_intro.contains("Codewhale"));
+        assert!(setup_intro.contains("协作准则"));
+        assert!(!setup_intro.contains("代码"));
+        let welcome = tr(Locale::ZhHans, MessageId::OnboardWelcomeLead);
+        assert!(welcome.contains("Codewhale"));
+        assert!(!welcome.contains("代码"));
+        assert!(tr(Locale::ZhHans, MessageId::OnboardTipsLine2).contains("/constitution"));
+        assert!(
+            tr(
+                Locale::ZhHans,
+                MessageId::SetupConstitutionFileLoadedUnselected
+            )
+            .contains("constitution.json")
+        );
+    }
+
+    #[test]
+    fn route_and_provider_picker_strings_are_translated_in_complete_locales() {
+        // High-visibility model/provider empty states and footers must not
+        // leak English through the fallback chain in complete packs.
+        let ids = [
+            MessageId::PickerActionMove,
+            MessageId::PickerActionSwitch,
+            MessageId::PickerActionApply,
+            MessageId::PickerActionCancel,
+            MessageId::PickerActionClear,
+            MessageId::PickerActionClearSearch,
+            MessageId::PickerActionBrowseAll,
+            MessageId::PickerActionCustom,
+            MessageId::PickerActionJump,
+            MessageId::PickerActionEditKey,
+            MessageId::PickerActionModels,
+            MessageId::PickerActionConfigured,
+            MessageId::RouteNoModels,
+            MessageId::RouteNoModelMatch,
+            MessageId::ProviderNoMatchesTitle,
+            MessageId::ProviderNoMatchesHint,
+            MessageId::ProviderNoConfiguredTitle,
+            MessageId::ProviderNoConfiguredHint,
+            MessageId::ProviderNoCatalogModels,
+            MessageId::SessionsOpenedHistory,
+            MessageId::SessionsTimeJustNow,
+        ];
+        for locale in Locale::shipped_complete() {
+            if *locale == Locale::En {
+                continue;
+            }
+            for id in ids {
+                let localized = tr(*locale, id);
+                assert!(!localized.is_empty(), "{} empty for {id:?}", locale.tag());
+                assert_ne!(
+                    localized,
+                    tr(Locale::En, id),
+                    "{} should translate {id:?}",
                     locale.tag()
                 );
             }

@@ -1,14 +1,15 @@
 //! Fleet roster — the persistent, inspectable party of named agent roles.
 //!
-//! The roster merges three layers into one config-backed lineup shared by
+//! The roster merges four layers into one config-backed lineup shared by
 //! model-spawned sub-agents and fleet dispatch (#fleet-roster cutover
 //! (v0.8.67)):
 //!
 //! - built-in members (the default party, always available),
 //! - `[fleet.profiles]` entries from config.toml,
+//! - personal `$CODEWHALE_HOME/agents/*.toml` profile files,
 //! - workspace `.codewhale/agents/*.toml` profile files.
 //!
-//! Precedence is Workspace > Config > BuiltIn, merged by id. Loading never
+//! Precedence is Workspace > Personal > Config > BuiltIn, merged by id. Loading never
 //! fails the session: an unreadable workspace profile dir degrades to the
 //! built-in + config layers with a log line.
 
@@ -24,15 +25,19 @@ use codewhale_config::{
     FleetRole, FleetSlot,
 };
 
-use super::profile::{AgentProfile, load_workspace_agent_profiles};
+use super::profile::{
+    AgentProfile, load_agent_profiles_from_dir_tolerant, load_workspace_agent_profiles_tolerant,
+    personal_agent_profile_dir,
+};
 
 /// Which layer a roster member came from. Higher layers override lower ones
-/// by id (Workspace > Config > BuiltIn).
+/// by id (Workspace > Personal > Config > BuiltIn).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProfileOrigin {
     BuiltIn,
     Config,
+    Personal,
     Workspace,
 }
 
@@ -41,6 +46,7 @@ impl std::fmt::Display for ProfileOrigin {
         f.write_str(match self {
             Self::BuiltIn => "built-in",
             Self::Config => "config",
+            Self::Personal => "personal",
             Self::Workspace => "project",
         })
     }
@@ -65,12 +71,21 @@ impl FleetRoster {
 
     /// Load and merge the full roster for a workspace.
     ///
-    /// Config members come from `[fleet.profiles]` (id = map key). Workspace
-    /// members come from `.codewhale/agents/*.toml`; a load failure there is
-    /// logged and skipped so a broken profile file cannot take down the
-    /// session — the roster degrades to built-ins + config.
+    /// Config members come from `[fleet.profiles]` (id = map key). Personal
+    /// members come from `$CODEWHALE_HOME/agents/*.toml`, and workspace members
+    /// come from `.codewhale/agents/*.toml`. A load failure is logged and
+    /// skipped so one broken profile layer cannot take down the session.
     #[must_use]
     pub fn load(fleet_config: &FleetConfigToml, workspace: &Path) -> Self {
+        let personal_dir = personal_agent_profile_dir().ok();
+        Self::load_with_personal_dir(fleet_config, workspace, personal_dir.as_deref())
+    }
+
+    fn load_with_personal_dir(
+        fleet_config: &FleetConfigToml,
+        workspace: &Path,
+        personal_dir: Option<&Path>,
+    ) -> Self {
         let mut built_ins = Self::built_in_members();
         let mut extras: Vec<AgentProfile> = Vec::new();
 
@@ -86,8 +101,32 @@ impl FleetRoster {
             merge_member(&mut built_ins, &mut extras, member);
         }
 
-        match load_workspace_agent_profiles(workspace) {
-            Ok(profiles) => {
+        if let Some(personal_dir) = personal_dir {
+            match load_agent_profiles_from_dir_tolerant(personal_dir, ProfileOrigin::Personal) {
+                Ok((profiles, issues)) => {
+                    for issue in issues {
+                        tracing::warn!(
+                            "fleet roster: skipping invalid personal agent profile: {issue}"
+                        );
+                    }
+                    for member in profiles {
+                        merge_member(&mut built_ins, &mut extras, member);
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!("fleet roster: skipping personal agent profiles: {err:#}");
+                }
+            }
+        }
+
+        match load_workspace_agent_profiles_tolerant(workspace) {
+            Ok((profiles, issues)) => {
+                for issue in issues {
+                    tracing::warn!(
+                        workspace = %workspace.display(),
+                        "fleet roster: skipping invalid workspace agent profile: {issue}"
+                    );
+                }
                 for member in profiles {
                     merge_member(&mut built_ins, &mut extras, member);
                 }
@@ -138,8 +177,8 @@ impl FleetRoster {
             (
                 "scout",
                 FleetSlot::Scout,
-                FleetLoadout::Fast,
-                "Fast read-only reconnaissance: find files, map code, gather evidence.",
+                FleetLoadout::Inherit,
+                "Read-only reconnaissance: find files, map code, gather evidence.",
                 None,
             ),
             (
@@ -168,7 +207,7 @@ impl FleetRoster {
             (
                 "synthesizer",
                 FleetSlot::Summarizer,
-                FleetLoadout::Fast,
+                FleetLoadout::Inherit,
                 "Read-only synthesis: merge findings into one coherent report.",
                 None,
             ),
@@ -338,9 +377,9 @@ mod tests {
         }
         assert_eq!(members[0].profile.slot, FleetSlot::Manager);
         assert_eq!(members[1].profile.slot, FleetSlot::Operator);
-        assert_eq!(members[2].profile.loadout, FleetLoadout::Fast);
+        assert_eq!(members[2].profile.loadout, FleetLoadout::Inherit);
         assert_eq!(members[6].profile.slot, FleetSlot::Summarizer);
-        assert_eq!(members[6].profile.loadout, FleetLoadout::Fast);
+        assert_eq!(members[6].profile.loadout, FleetLoadout::Inherit);
     }
 
     #[test]
@@ -410,6 +449,43 @@ mod tests {
     }
 
     #[test]
+    fn personal_member_applies_across_projects_but_project_still_wins() {
+        let tmp = TempDir::new().unwrap();
+        let personal_dir = tmp.path().join("personal-agents");
+        std::fs::create_dir_all(&personal_dir).unwrap();
+        std::fs::write(
+            personal_dir.join("reviewer.toml"),
+            "id = \"reviewer\"\nrole_hint = \"reviewer\"\nmodel = \"deepseek-v4-flash\"\n",
+        )
+        .unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let personal = FleetRoster::load_with_personal_dir(
+            &FleetConfigToml::default(),
+            &workspace,
+            Some(&personal_dir),
+        );
+        let reviewer = personal.get("reviewer").unwrap();
+        assert_eq!(reviewer.origin, ProfileOrigin::Personal);
+        assert_eq!(reviewer.profile.model.as_deref(), Some("deepseek-v4-flash"));
+
+        write_workspace_profile(
+            &workspace,
+            "reviewer.toml",
+            "id = \"reviewer\"\nrole_hint = \"reviewer\"\nmodel = \"glm-5.2\"\n",
+        );
+        let project = FleetRoster::load_with_personal_dir(
+            &FleetConfigToml::default(),
+            &workspace,
+            Some(&personal_dir),
+        );
+        let reviewer = project.get("reviewer").unwrap();
+        assert_eq!(reviewer.origin, ProfileOrigin::Workspace);
+        assert_eq!(reviewer.profile.model.as_deref(), Some("glm-5.2"));
+    }
+
+    #[test]
     fn broken_workspace_dir_degrades_to_built_ins_and_config() {
         let tmp = TempDir::new().unwrap();
         // A malformed provider token is still a load failure (#4093 / #3965):
@@ -436,7 +512,39 @@ mod tests {
     }
 
     #[test]
+    fn invalid_legacy_profile_does_not_hide_valid_scout_neighbor() {
+        let tmp = TempDir::new().unwrap();
+        write_workspace_profile(
+            tmp.path(),
+            "reviewer.toml",
+            "id = \"reviewer\"\nmodel_class_hint = \"heavy\"\n",
+        );
+        write_workspace_profile(
+            tmp.path(),
+            "scout.toml",
+            "id = \"scout\"\nrole_hint = \"scout\"\nprovider = \"deepseek\"\nmodel = \"deepseek-v4-flash\"\n",
+        );
+
+        let roster = FleetRoster::load(&FleetConfigToml::default(), tmp.path());
+
+        let scout = roster.get("scout").expect("valid scout remains visible");
+        assert_eq!(scout.origin, ProfileOrigin::Workspace);
+        assert_eq!(scout.profile.provider.as_deref(), Some("deepseek"));
+        assert_eq!(scout.profile.model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(
+            roster.get("reviewer").unwrap().origin,
+            ProfileOrigin::BuiltIn,
+            "invalid legacy override must fall back to the safe built-in"
+        );
+    }
+
+    #[test]
     fn model_overrides_use_lowercased_ids_and_only_explicit_models() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let home = TempDir::new().unwrap();
+        let _codewhale_home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        // Isolate personal `$CODEWHALE_HOME/agents` so ambient developer
+        // profiles cannot pin built-ins like manager during unit tests.
         let tmp = TempDir::new().unwrap();
         let config = config_with_profiles(BTreeMap::from([
             (
@@ -468,6 +576,7 @@ mod tests {
     fn origin_labels_are_stable() {
         assert_eq!(ProfileOrigin::BuiltIn.to_string(), "built-in");
         assert_eq!(ProfileOrigin::Config.to_string(), "config");
+        assert_eq!(ProfileOrigin::Personal.to_string(), "personal");
         assert_eq!(ProfileOrigin::Workspace.to_string(), "project");
     }
 }

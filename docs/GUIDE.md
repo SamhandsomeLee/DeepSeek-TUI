@@ -1,20 +1,20 @@
-# CodeWhale User Guide
+# Codewhale User Guide
 
-This guide is for your first hour with CodeWhale. It explains the main
+This guide is for your first hour with Codewhale. It explains the main
 workflow, the important safety controls, and where to go next when you need a
 complete reference.
 
-CodeWhale has deeper reference documents for installation, configuration,
+Codewhale has deeper reference documents for installation, configuration,
 providers, modes, keybindings, tools, and operations. Use this page as a guided
 walkthrough, then follow the "Next" links when you need every option.
 
-## 1. Welcome to CodeWhale
+## 1. Welcome to Codewhale
 
-CodeWhale is a terminal coding agent. You run it from a workspace, give it a
+Codewhale is a terminal coding agent. You run it from a workspace, give it a
 task, and it can use structured tools to inspect files, run commands, edit
 code, and report back with evidence.
 
-The important difference from a normal chat model is that CodeWhale is built
+The important difference from a normal chat model is that Codewhale is built
 around a harness:
 
 - It keeps the active workspace and session visible.
@@ -23,7 +23,7 @@ around a harness:
 - It can preserve sessions, fork conversations, and continue later.
 - It can run sub-agents for focused background work.
 
-You can use CodeWhale for small questions:
+You can use Codewhale for small questions:
 
 ```text
 Explain the authentication flow in this repository.
@@ -36,7 +36,7 @@ Find the failing validation path, propose a fix, and wait for my approval
 before editing files.
 ```
 
-For a new repository, start conservatively. Ask CodeWhale to explore and plan
+For a new repository, start conservatively. Ask Codewhale to explore and plan
 before asking it to change files. That gives you a reviewable path and makes it
 easier to catch wrong assumptions early.
 
@@ -45,7 +45,7 @@ runtime model.
 
 ## 2. First Launch
 
-Install CodeWhale with the path that fits your machine. Each supported install
+Install Codewhale with the path that fits your machine. Each supported install
 path provides both the `codewhale` dispatcher and the `codewhale-tui` runtime.
 
 ```bash
@@ -75,15 +75,15 @@ docker run --rm -it \
   ghcr.io/hmbown/codewhale:latest
 ```
 
-Launch CodeWhale from the repository or directory you want it to work in:
+Launch Codewhale from the repository or directory you want it to work in:
 
 ```bash
 codewhale
 ```
 
-On first launch, CodeWhale starts with a short constitution-first setup path:
+On first launch, Codewhale starts with a short constitution-first setup path:
 choose language, review provider/model readiness, review runtime posture, then
-create or confirm your CodeWhale constitution. The bundled/default
+create or confirm your Codewhale constitution. The bundled/default
 constitution is valid, and you can revisit the setup hub later with `/setup`.
 
 DeepSeek is the default provider. If you want to configure its key before or
@@ -100,7 +100,7 @@ export DEEPSEEK_API_KEY="your-key"
 codewhale
 ```
 
-New CodeWhale config is stored under `~/.codewhale/config.toml`. Legacy
+New Codewhale config is stored under `~/.codewhale/config.toml`. Legacy
 `~/.deepseek/config.toml` files are still supported for users migrating from
 the old name.
 
@@ -119,6 +119,15 @@ codewhale doctor --json
 
 If the doctor command reports that a rejected key came from the environment,
 remove or replace that environment variable before testing saved config again.
+
+Both `doctor` and `doctor --json` also include a session-recovery diagnostic
+that compares legacy session filenames against the current store and reports
+one of `isolated`, `no_legacy_sessions`, `migration_pending`,
+`migration_incomplete`, `migration_complete`, or `scan_failed`; it never reads
+session contents. Use `migration_pending` or `migration_incomplete` as your
+cue to finish moving sessions from `~/.deepseek` to `~/.codewhale`, the same
+legacy-path migration described above. Setting an explicit `CODEWHALE_HOME`
+suppresses this ambient inspection.
 
 Next: [INSTALL.md](INSTALL.md) covers platform-specific install paths,
 [CONFIGURATION.md](CONFIGURATION.md) covers config resolution, and
@@ -167,11 +176,11 @@ Investigate why `codewhale doctor` reports the wrong provider. Do not edit
 files yet. Return the likely cause, evidence, and a proposed patch plan.
 ```
 
-CodeWhale works best when you let investigation and implementation happen in
+Codewhale works best when you let investigation and implementation happen in
 separate steps for unfamiliar code. For small, well-understood changes, a
 single implementation request is fine.
 
-Next: [MODES.md](MODES.md) explains when to use Plan, Agent, and YOLO.
+Next: [MODES.md](MODES.md) explains when to use Plan, Act, and Operate.
 
 ## 4. Understanding the Interface
 
@@ -195,7 +204,7 @@ control both selection and order. Supported keys currently include `mode`,
 and `tokens`. Omit `status_items` to keep the built-in default order; set it to
 `[]` to hide configurable chips.
 
-The transcript is the audit trail. When CodeWhale reads files, runs commands,
+The transcript is the audit trail. When Codewhale reads files, runs commands,
 or edits code, the action appears there. If a command fails, use the visible
 failure output as part of your next instruction instead of starting over.
 
@@ -214,13 +223,13 @@ Next: [KEYBINDINGS.md](KEYBINDINGS.md) is the complete shortcut reference.
 
 ## 5. Modes
 
-CodeWhale has three visible TUI modes:
+Codewhale has three visible TUI modes:
 
 | Mode | Use it for | Default posture |
 | --- | --- | --- |
 | Plan | Exploration, design, and review before changes | Read-only investigation |
-| Agent | Normal multi-step coding work | Tool use with approval gates |
-| YOLO | Trusted repos where you want automatic execution | Auto-approval and trust |
+| Act | Normal multi-step coding work | Tool use with approval gates |
+| Operate | Direct work plus parallel or background coordination | Tools follow the active posture; delegate when useful |
 
 Switch modes from the TUI with the mode picker:
 
@@ -232,8 +241,8 @@ Or switch directly:
 
 ```text
 /mode plan
-/mode agent
-/mode yolo
+/mode act
+/mode operate
 ```
 
 Plan mode is the safest place to start in an unfamiliar repository. It is for
@@ -244,12 +253,17 @@ approach, verification plan, risks, and handoff notes. Empty sections are
 visible when the agent uses the rich artifact shape, so you can ask for a
 revision instead of accepting an under-specified plan.
 
-Agent mode is the default for most contribution work. It lets CodeWhale read,
+Act mode is the default for most contribution work. It lets Codewhale read,
 run checks, and edit files while keeping risky actions behind approval gates.
 
-YOLO mode is for trusted workspaces where you intentionally want the model to
-act without stopping for approvals. Do not use it in a repository you do not
-trust.
+Operate keeps that direct tool surface and its approval, sandbox, shell,
+ask-rule, and repository protections. Its difference is orchestration emphasis:
+Codewhale prefers Fleet workers for independent, parallel, background, or
+long-running work, while small or tightly coupled work can remain in the parent.
+
+For trusted workspaces where you intentionally want actions to proceed without
+approval prompts, select the Full Access permission posture with `Shift+Tab`.
+Do not use Full Access in a repository you do not trust.
 
 Modes are separate from model routing. `Tab` cycles visible modes when the
 composer is idle, while `/model auto` controls model and thinking selection for
@@ -264,7 +278,7 @@ reference.
 ## 6. Slash Commands
 
 Slash commands are typed into the composer. They are useful when you want to
-change CodeWhale state directly instead of asking the model in natural
+change Codewhale state directly instead of asking the model in natural
 language.
 
 Common commands for first-time users:
@@ -281,6 +295,7 @@ Common commands for first-time users:
 | `/review` | Ask for a structured review workflow |
 | `/memory` | Inspect or manage memory when enabled |
 | `/mcp` | Configure or inspect MCP server integration |
+| `/plugin` | Review and manage disabled-by-default local plugin bundles |
 
 Toolbox commands stay searchable when you type them directly: `/models`
 fetches live endpoint IDs, `/modeldb` opens the bundled model reference, and
@@ -295,9 +310,23 @@ Soft-auto multi-agent work: [AUTOMATIC_WORKFLOWS.md](AUTOMATIC_WORKFLOWS.md).
 Next for durable multi-worker work: [FLEET_WORKFLOW_TUTORIAL.md](FLEET_WORKFLOW_TUTORIAL.md)
 walks through Fleet task specs, monitoring, and Workflow authoring.
 
-Use `/model auto` when you want CodeWhale to choose the model and thinking
-level per turn. Use a fixed model when you need repeatable comparisons or a
-strict cost profile.
+Use `/model auto` when you want Codewhale to choose the model and thinking
+level per turn. When the DeepSeek routing model is available, Auto may select
+any runnable provider/model pair in the redacted inventory. That classification
+sends the latest request (capped at 4,000 characters) plus a bounded summary of
+up to six recent context rows (900 characters each) to
+`DeepSeek / deepseek-v4-flash`. Credentials, endpoints, and provider error text
+are not included in the inventory. Without that router, Auto uses a local,
+provider-aware heuristic and sends no routing request. If a classifier attempt
+fails validation or errors, Auto falls back to that heuristic while retaining
+the attempted classifier data path in the turn receipt.
+
+The `/model` picker states which data path is available and shows the last
+resolved route. `Ctrl+O` opens the Turn Inspector, whose model-route section
+records the concrete provider/model, strong/fast pair, selected tier, selection
+scope, route reason, and whether the classifier received routing context. Use a
+fixed model when you need repeatable comparisons, a strict provider boundary,
+or no classification request.
 
 Use `/compact` when a session gets long and the model starts carrying too much
 history. Compaction trades raw transcript detail for a concise working summary.
@@ -308,10 +337,12 @@ source of truth while you are inside a session.
 
 Next: [CONFIGURATION.md](CONFIGURATION.md) covers runtime settings and
 [MCP.md](MCP.md) covers Model Context Protocol integration.
+[PLUGIN_BUNDLES.md](PLUGIN_BUNDLES.md) covers the disabled-by-default bundle
+inventory, capability review, and namespaced Skill/MCP activation boundary.
 
 ## 7. Working with Tools
 
-CodeWhale tools are structured actions. Instead of only producing prose, the
+Codewhale tools are structured actions. Instead of only producing prose, the
 model can call tools to inspect and change the workspace.
 
 Examples of tool-backed work include:
@@ -324,10 +355,10 @@ Examples of tool-backed work include:
 
 Tool use is governed by mode, approvals, and sandbox policy. The exact behavior
 depends on the current mode and config, but the basic rule is simple: start in
-Plan for read-only exploration, use Agent for normal changes, and reserve YOLO
-for trusted automation.
+Plan for read-only exploration, use Act for normal changes, and reserve Full
+Access for trusted automation.
 
-The workspace boundary matters. CodeWhale is expected to work in the directory
+The workspace boundary matters. Codewhale is expected to work in the directory
 you launched it from or the workspace you configured. Be explicit when a task
 should stay inside a repo:
 
@@ -394,7 +425,7 @@ output contracts.
 ## 9. Skills
 
 Skills are reusable instruction packs. A skill is usually a `SKILL.md` file
-that teaches CodeWhale how to perform a recurring workflow, use a tool family,
+that teaches Codewhale how to perform a recurring workflow, use a tool family,
 or follow a project convention.
 
 Use skills when a task has a repeatable process:
@@ -450,7 +481,7 @@ start a fresh session in the same workspace and summarize what you need.
 
 When reporting an issue, include:
 
-- CodeWhale version.
+- Codewhale version.
 - Install method.
 - Operating system and terminal.
 - Provider and model.
@@ -465,19 +496,19 @@ recovery steps.
 
 ## FAQ
 
-### Is CodeWhale only for DeepSeek?
+### Is Codewhale only for DeepSeek?
 
-DeepSeek is the default and first-class route, but CodeWhale also supports
+DeepSeek is the default and first-class route, but Codewhale also supports
 other hosted and local OpenAI-compatible providers. Use `/provider` or
 `codewhale --provider <id>` to choose a provider. Keep the provider registry
 open when configuring a non-default route.
 
 ### Which mode should I use first?
 
-Use Plan for unfamiliar code, Agent for normal implementation, and YOLO only
-for trusted repositories where automatic execution is acceptable.
+Use Plan for unfamiliar code, Act for normal implementation, and Full Access
+only for trusted repositories where automatic execution is acceptable.
 
-### Why does CodeWhale ask before running commands?
+### Why does Codewhale ask before running commands?
 
 Approvals are part of the safety model. Shell commands, paid tools, writes, and
 actions outside the expected workspace can have side effects. Approval prompts
@@ -498,7 +529,7 @@ If macOS says `python3` is missing, install Python from
 brew install python
 ```
 
-Inside CodeWhale, ask the agent to inspect the file and run it with
+Inside Codewhale, ask the agent to inspect the file and run it with
 `python3 your_file.py`. If the script needs packages, install them in a virtual
 environment first:
 
@@ -511,19 +542,19 @@ python3 your_file.py
 
 ### Where is my config stored?
 
-New CodeWhale config uses `~/.codewhale/config.toml`. Legacy
+New Codewhale config uses `~/.codewhale/config.toml`. Legacy
 `~/.deepseek/config.toml` remains supported for compatibility. Project overlays
 can also affect behavior when a workspace config exists.
 
 ### How do I keep costs predictable?
 
 Use `/model auto` for routing, choose a fixed model when you need a strict
-profile, and compact long sessions. For larger tasks, ask CodeWhale to plan
+profile, and compact long sessions. For larger tasks, ask Codewhale to plan
 before implementing so you do not spend tokens on the wrong path.
 
 ### How do I continue previous work?
 
-CodeWhale saves sessions. Use the session picker or resume/continue CLI paths
+Codewhale saves sessions. Use the session picker or resume/continue CLI paths
 documented in the README and modes guide. For a risky experiment, fork the
 session before changing direction.
 
@@ -545,7 +576,7 @@ Use repository files for durable project rules and prompts for turn-specific
 intent. If a workflow repeats across projects, consider turning it into a
 skill.
 
-### Can CodeWhale edit files outside the current repository?
+### Can Codewhale edit files outside the current repository?
 
 That depends on workspace boundaries, sandbox settings, trust mode, and
 approval policy. For contribution work, keep instructions scoped to the current

@@ -86,11 +86,6 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
         section: KeybindingSection::Navigation,
     },
     KeybindingEntry {
-        chord: "Ctrl+↑ / Ctrl+↓",
-        description_id: crate::localization::MessageId::KbNavigateHistory,
-        section: KeybindingSection::Navigation,
-    },
-    KeybindingEntry {
         chord: "Alt+↑ / Alt+↓",
         description_id: crate::localization::MessageId::KbScrollTranscriptAlt,
         section: KeybindingSection::Navigation,
@@ -111,12 +106,12 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
         section: KeybindingSection::Navigation,
     },
     KeybindingEntry {
-        chord: "g / G",
+        chord: "Alt+G / Alt+Shift+G",
         description_id: crate::localization::MessageId::KbJumpTopBottomEmpty,
         section: KeybindingSection::Navigation,
     },
     KeybindingEntry {
-        chord: "[ / ]",
+        chord: "Alt+[ / Alt+]",
         description_id: crate::localization::MessageId::KbJumpToolBlocks,
         section: KeybindingSection::Navigation,
     },
@@ -142,12 +137,29 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
         section: KeybindingSection::Editing,
     },
     KeybindingEntry {
+        chord: "Shift+←/→ / Shift+Home/End",
+        description_id: crate::localization::MessageId::KbSelectText,
+        section: KeybindingSection::Editing,
+    },
+    KeybindingEntry {
+        // Ctrl+A keeps its readline meaning (start of input); select-all is
+        // the shifted chord, plus native Cmd+A on terminals that forward Cmd.
+        chord: "Ctrl+Shift+A / Cmd+A",
+        description_id: crate::localization::MessageId::KbSelectAllDraft,
+        section: KeybindingSection::Editing,
+    },
+    KeybindingEntry {
         chord: "Ctrl+U",
         description_id: crate::localization::MessageId::KbClearDraft,
         section: KeybindingSection::Editing,
     },
     KeybindingEntry {
-        chord: "Ctrl+S",
+        chord: "Ctrl+Z",
+        description_id: crate::localization::MessageId::KbRestoreClearedDraft,
+        section: KeybindingSection::Editing,
+    },
+    KeybindingEntry {
+        chord: "Ctrl+G / Ctrl+S",
         description_id: crate::localization::MessageId::KbStashDraft,
         section: KeybindingSection::Editing,
     },
@@ -203,17 +215,20 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
-        chord: "Alt+C",
+        // `/context` is the guaranteed path; Alt+C is an unadvertised
+        // handler until proven in real terminals (TUI-DOG-003).
+        chord: "/context",
         description_id: crate::localization::MessageId::KbCompactInspector,
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
-        chord: "l",
+        chord: "Alt+L",
         description_id: crate::localization::MessageId::KbLastMessagePager,
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
-        chord: "v",
+        // Bare `v` always types `v`; details is Alt+V only (⌥V on macOS).
+        chord: "Alt+V",
         description_id: crate::localization::MessageId::KbSelectedDetails,
         section: KeybindingSection::Submission,
     },
@@ -223,7 +238,14 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
-        chord: "Ctrl+Shift+T",
+        chord: "Ctrl+Shift+O / F4",
+        description_id: crate::localization::MessageId::KbExternalEditor,
+        section: KeybindingSection::Editing,
+    },
+    KeybindingEntry {
+        // `/transcript` is the reliable fallback when a terminal cannot
+        // distinguish Ctrl+Shift+T from Ctrl+T.
+        chord: "/transcript / Ctrl+Shift+T",
         description_id: crate::localization::MessageId::KbLiveTranscript,
         section: KeybindingSection::Submission,
     },
@@ -271,12 +293,22 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
     },
     // --- Clipboard ---
     KeybindingEntry {
+        // Keep both terminal-client families visible: the TUI may be running
+        // on Linux while the user's SSH terminal is on macOS (or vice versa).
+        chord: "Cmd+V / Ctrl+Shift+V",
+        description_id: crate::localization::MessageId::KbTerminalPaste,
+        section: KeybindingSection::Clipboard,
+    },
+    KeybindingEntry {
         chord: "Ctrl+V",
         description_id: crate::localization::MessageId::KbPasteAttach,
         section: KeybindingSection::Clipboard,
     },
     KeybindingEntry {
-        chord: "Ctrl+Shift+C",
+        // Terminal-native copy chords are normally consumed by the local
+        // terminal and never become Codewhale key events. Ctrl+C is the
+        // reliable in-app copy path when a Codewhale selection is active.
+        chord: "Ctrl+C (selection)",
         description_id: crate::localization::MessageId::KbCopySelection,
         section: KeybindingSection::Clipboard,
     },
@@ -292,18 +324,10 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
     },
     // --- Help ---
     KeybindingEntry {
-        chord: "?",
+        // F1 is primary (with /help); Ctrl+/ is the secondary fallback.
+        // Alt+? stays an unadvertised handler (TUI-DOG-003).
+        chord: "F1 / Ctrl+/",
         description_id: crate::localization::MessageId::KbHelpOverlay,
-        section: KeybindingSection::Help,
-    },
-    KeybindingEntry {
-        chord: "F1",
-        description_id: crate::localization::MessageId::KbToggleHelp,
-        section: KeybindingSection::Help,
-    },
-    KeybindingEntry {
-        chord: "Ctrl+/",
-        description_id: crate::localization::MessageId::KbToggleHelp,
         section: KeybindingSection::Help,
     },
 ];
@@ -335,15 +359,114 @@ mod tests {
     }
 
     #[test]
-    fn help_section_documents_question_mark() {
-        // The whole point of #93 is that `?` opens this overlay; if the entry
-        // ever disappears the user-facing discoverability promise breaks.
+    fn help_advertises_f1_and_ctrl_slash_never_alt_question() {
+        // TUI-DOG-003: Alt+? is not advertised anywhere; F1 (with /help) is
+        // primary and Ctrl+/ is the secondary fallback.
+        assert!(
+            KEYBINDINGS.iter().any(|entry| {
+                entry.section == KeybindingSection::Help
+                    && entry.chord.contains("F1")
+                    && entry.chord.contains("Ctrl+/")
+            }),
+            "help must document F1 with the Ctrl+/ fallback"
+        );
         assert!(
             KEYBINDINGS
                 .iter()
-                .any(|entry| entry.chord.contains('?') && entry.section == KeybindingSection::Help),
-            "`?` must remain documented as the help-toggle chord"
+                .all(|entry| !entry.chord.contains("Alt+?")),
+            "Alt+? must not be advertised in the help catalog"
         );
+    }
+
+    #[test]
+    fn clipboard_help_distinguishes_terminal_text_graphical_image_and_in_app_copy() {
+        let terminal_paste = KEYBINDINGS
+            .iter()
+            .find(|entry| entry.description_id == crate::localization::MessageId::KbTerminalPaste)
+            .expect("terminal paste binding should be documented");
+        let graphical_paste = KEYBINDINGS
+            .iter()
+            .find(|entry| entry.description_id == crate::localization::MessageId::KbPasteAttach)
+            .expect("graphical paste binding should be documented");
+        let copy = KEYBINDINGS
+            .iter()
+            .find(|entry| entry.description_id == crate::localization::MessageId::KbCopySelection)
+            .expect("copy binding should be documented");
+
+        assert!(terminal_paste.chord.contains("Cmd+V"));
+        assert!(terminal_paste.chord.contains("Ctrl+Shift+V"));
+        assert_eq!(graphical_paste.chord, "Ctrl+V");
+        let terminal_description = crate::localization::tr(
+            crate::localization::Locale::En,
+            crate::localization::MessageId::KbTerminalPaste,
+        );
+        let graphical_description = crate::localization::tr(
+            crate::localization::Locale::En,
+            crate::localization::MessageId::KbPasteAttach,
+        );
+        assert!(!terminal_description.to_ascii_lowercase().contains("image"));
+        assert!(graphical_description.to_ascii_lowercase().contains("image"));
+        assert_eq!(copy.chord, "Ctrl+C (selection)");
+        assert!(!copy.chord.contains("Cmd+C"));
+        assert!(!copy.chord.contains("Ctrl+Shift+C"));
+    }
+
+    #[test]
+    fn transcript_navigation_catalog_does_not_advertise_bare_typing_keys() {
+        for stale in [
+            "g / G",
+            "[ / ]",
+            "l",
+            "?",
+            "Ctrl+↑ / Ctrl+↓",
+            "v",
+            "v / Alt+V",
+        ] {
+            assert!(
+                KEYBINDINGS.iter().all(|entry| entry.chord != stale),
+                "stale handler-free chord remains documented: {stale}"
+            );
+        }
+        for wired in ["Alt+G / Alt+Shift+G", "Alt+[ / Alt+]", "Alt+L", "Alt+V"] {
+            assert!(
+                KEYBINDINGS.iter().any(|entry| entry.chord == wired),
+                "wired transcript shortcut missing from help: {wired}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_transcript_documents_command_before_shaky_chord() {
+        let transcript = KEYBINDINGS
+            .iter()
+            .find(|entry| entry.description_id == crate::localization::MessageId::KbLiveTranscript)
+            .expect("live transcript entry should be documented");
+
+        assert_eq!(transcript.chord, "/transcript / Ctrl+Shift+T");
+    }
+
+    #[test]
+    fn shell_binding_source_matches_help_catalog_chords() {
+        use crate::tui::shell_key_routing::{ShellBindingId, binding};
+        assert_eq!(binding(ShellBindingId::ToolDetails).catalog_chord, "Alt+V");
+        assert_eq!(
+            binding(ShellBindingId::ContextInspector).catalog_chord,
+            "/context"
+        );
+        assert_eq!(binding(ShellBindingId::Help).catalog_chord, "F1 / Ctrl+/");
+        for id in [
+            ShellBindingId::ToolDetails,
+            ShellBindingId::ContextInspector,
+            ShellBindingId::Help,
+        ] {
+            let chord = binding(id).catalog_chord;
+            assert!(
+                KEYBINDINGS
+                    .iter()
+                    .any(|entry| entry.chord == chord || entry.chord.contains(chord)),
+                "shell binding {id:?} chord missing from help catalog: {chord}"
+            );
+        }
     }
 
     #[test]
@@ -365,6 +488,15 @@ mod tests {
             crate::localization::tr(crate::localization::Locale::En, ctrl_o.description_id,),
             "Open Turn Inspector"
         );
+
+        let editor = KEYBINDINGS
+            .iter()
+            .find(|entry| entry.chord == "Ctrl+Shift+O / F4")
+            .expect("external-editor keybinding should be documented");
+        assert_eq!(
+            crate::localization::tr(crate::localization::Locale::En, editor.description_id,),
+            "Open composer draft in external editor"
+        );
     }
 
     #[test]
@@ -381,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_details_help_documents_bare_v_without_alt_v() {
+    fn tool_details_documents_alt_v_only_never_bare_v() {
         let selected_details = KEYBINDINGS
             .iter()
             .filter(|entry| {
@@ -390,13 +522,13 @@ mod tests {
             .map(|entry| entry.chord)
             .collect::<Vec<_>>();
 
-        assert_eq!(selected_details, vec!["v"]);
-        let legacy_modified_details_chord = ["Alt", "V"].join("+");
+        // TUI-DOG-002: bare `v` always types `v`; details is Alt+V only.
+        assert_eq!(selected_details, vec!["Alt+V"]);
         assert!(
             KEYBINDINGS
                 .iter()
-                .all(|entry| entry.chord != legacy_modified_details_chord),
-            "help should advertise the bare v details shortcut"
+                .all(|entry| entry.chord != "v" && !entry.chord.starts_with("v /")),
+            "bare `v` must not be advertised — composer typing owns it"
         );
     }
 

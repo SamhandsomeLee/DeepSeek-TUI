@@ -1,15 +1,30 @@
 //! Compact session context inspector.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fmt::Write;
+
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::{Paragraph, Widget},
+};
 
 use crate::compaction::estimate_input_tokens_conservative;
 use crate::localization::{Locale, MessageId, tr};
 use crate::models::SystemPrompt;
+use crate::palette;
 use crate::session_manager::SessionContextReference;
 use crate::tui::app::{App, ToolDetailRecord};
 use crate::tui::file_mention::ContextReferenceSource;
+use crate::tui::views::{
+    ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, render_modal_footer,
+    render_underwater_surface,
+};
 use crate::utils::estimate_message_chars;
 
 /// Marker used by per-turn working-set metadata. Replicated here so the
@@ -24,6 +39,27 @@ const MAX_TOOL_ROWS: usize = 8;
 
 const SYSTEM_LAYER_MARKERS: &[(&str, &str, PromptLayerKind)] = &[
     (
+        "Bundled constitution",
+        "## Codewhale",
+        PromptLayerKind::Static,
+    ),
+    ("Language policy", "## Language", PromptLayerKind::Static),
+    (
+        "Output formatting",
+        "## Output Formatting",
+        PromptLayerKind::Static,
+    ),
+    (
+        "User-global constitution",
+        "<codewhale_user_constitution",
+        PromptLayerKind::Static,
+    ),
+    (
+        "Repository constitution",
+        "<codewhale_repo_constitution",
+        PromptLayerKind::Static,
+    ),
+    (
         "Project context",
         "<project_instructions",
         PromptLayerKind::Static,
@@ -36,8 +72,8 @@ const SYSTEM_LAYER_MARKERS: &[(&str, &str, PromptLayerKind)] = &[
     ("Environment", "## Environment", PromptLayerKind::Static),
     ("Skills", "## Skills", PromptLayerKind::Static),
     (
-        "Context management",
-        "## Context Management",
+        "Core execution",
+        "## Core Execution",
         PromptLayerKind::Static,
     ),
     ("Compact template", "## Compact", PromptLayerKind::Static),
@@ -76,6 +112,15 @@ impl PromptLayerKind {
             Self::Static => tr(locale, MessageId::CtxInspCacheFriendly),
             Self::Dynamic => tr(locale, MessageId::CtxInspChangesByTurn),
         }
+    }
+}
+
+/// Localize well-known layer labels that already have inspector MessageIds.
+/// Other layer names stay as English product identifiers.
+fn layer_display_name(name: &'static str, locale: Locale) -> Cow<'static, str> {
+    match name {
+        "Volatile working set" => tr(locale, MessageId::CtxInspVolatileWorkingSet),
+        other => Cow::Borrowed(other),
     }
 }
 
@@ -255,6 +300,23 @@ fn push_system_prompt_structure(out: &mut String, app: &App, locale: Locale) {
                 "  {total_lbl}: {} {blocks_unit}, ~{total_est} {tokens_unit}",
                 blocks.len()
             );
+            let layers = blocks
+                .iter()
+                .flat_map(|block| split_text_prompt_layers(&block.text))
+                .filter(|layer| !layer.body.is_empty())
+                .collect::<Vec<_>>();
+            if layers.iter().any(|layer| layer.name != "System prompt") {
+                let _ = writeln!(out, "  {text_prompt_lbl}:");
+                for layer in layers {
+                    let tokens = text_tokens(layer.body);
+                    let kind_lbl = layer.kind.label(locale);
+                    let layer_name = layer_display_name(layer.name, locale);
+                    let _ = writeln!(
+                        out,
+                        "  - {layer_name}: ~{tokens} {tokens_unit} [{kind_lbl}]",
+                    );
+                }
+            }
         }
         Some(SystemPrompt::Text(text)) => {
             let layers = split_text_prompt_layers(text);
@@ -271,10 +333,10 @@ fn push_system_prompt_structure(out: &mut String, app: &App, locale: Locale) {
                 for layer in layers {
                     let tokens = text_tokens(layer.body);
                     let kind_lbl = layer.kind.label(locale);
+                    let layer_name = layer_display_name(layer.name, locale);
                     let _ = writeln!(
                         out,
-                        "  - {}: ~{tokens} {tokens_unit} [{kind_lbl}]",
-                        layer.name,
+                        "  - {layer_name}: ~{tokens} {tokens_unit} [{kind_lbl}]",
                     );
                 }
             } else {
@@ -420,7 +482,17 @@ fn push_tools(out: &mut String, app: &App, locale: Locale) {
     if rendered == 0 {
         let _ = writeln!(out, "- {}", tr(locale, MessageId::CtxInspNoToolActivity));
     } else {
-        let _ = writeln!(out, "- {}", tr(locale, MessageId::CtxInspVHint));
+        let details = crate::tui::shell_key_routing::display_chord(
+            crate::tui::shell_key_routing::binding(
+                crate::tui::shell_key_routing::ShellBindingId::ToolDetails,
+            )
+            .footer_chord,
+        );
+        let _ = writeln!(
+            out,
+            "- {}",
+            tr(locale, MessageId::CtxInspVHint).replace("{details}", details.as_ref())
+        );
     }
 }
 
@@ -444,6 +516,261 @@ fn short_tool_id(id: &str) -> String {
         id.to_string()
     } else {
         format!("{}...", &id[..8])
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ContextBucket {
+    label: String,
+    tokens: usize,
+    percent: f64,
+    detail: String,
+}
+
+/// Live context surface. The host refreshes its snapshot immediately before
+/// every render, so opening it never freezes the underlying session facts.
+pub(crate) struct ContextInspectorView {
+    used: usize,
+    max: u32,
+    percent: f64,
+    model: String,
+    workspace: String,
+    threshold: f64,
+    rows: Vec<ContextBucket>,
+    selected: usize,
+    hitboxes: RefCell<Vec<(u16, usize)>>,
+    locale: Locale,
+}
+
+impl ContextInspectorView {
+    #[must_use]
+    pub(crate) fn new(app: &App) -> Self {
+        let mut view = Self {
+            used: 0,
+            max: 0,
+            percent: 0.0,
+            model: String::new(),
+            workspace: String::new(),
+            threshold: 0.0,
+            rows: Vec::new(),
+            selected: 0,
+            hitboxes: RefCell::new(Vec::new()),
+            locale: app.ui_locale,
+        };
+        view.refresh_from_app(app);
+        view
+    }
+
+    pub(crate) fn refresh_from_app(&mut self, app: &App) {
+        let (used, max, percent) = context_usage(app);
+        let system_tokens = estimate_input_tokens_conservative(&[], app.system_prompt.as_ref());
+        let message_tokens = used.saturating_sub(system_tokens);
+        let free_tokens = usize::try_from(max)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(used);
+        let full_detail = build_context_inspector_text(app, app.ui_locale);
+        self.used = used;
+        self.max = max;
+        self.percent = percent;
+        self.model = app.model_display_label();
+        self.workspace = crate::utils::display_path(&app.workspace);
+        self.threshold = app.auto_compact_threshold_percent;
+        self.locale = app.ui_locale;
+        let max_f = f64::from(max.max(1));
+        self.rows = vec![
+            ContextBucket {
+                label: tr(self.locale, MessageId::CtxInspRowSystemPrompt).into_owned(),
+                tokens: system_tokens,
+                percent: (system_tokens as f64 / max_f) * 100.0,
+                detail: full_detail.clone(),
+            },
+            ContextBucket {
+                label: tr(self.locale, MessageId::CtxInspRowMessages).into_owned(),
+                tokens: message_tokens,
+                percent: (message_tokens as f64 / max_f) * 100.0,
+                detail: full_detail,
+            },
+            ContextBucket {
+                label: tr(self.locale, MessageId::CtxInspRowFree).into_owned(),
+                tokens: free_tokens,
+                percent: (free_tokens as f64 / max_f) * 100.0,
+                detail: tr(self.locale, MessageId::CtxInspFreeTokensDetail)
+                    .replace("{free}", &free_tokens.to_string())
+                    .replace("{threshold}", &format!("{:.0}", self.threshold)),
+            },
+        ];
+        self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.rows.is_empty() {
+            return;
+        }
+        self.selected = if delta.is_negative() {
+            self.selected.saturating_sub(delta.unsigned_abs())
+        } else {
+            (self.selected + delta as usize).min(self.rows.len() - 1)
+        };
+    }
+
+    fn open_selected(&self) -> ViewAction {
+        let Some(row) = self.rows.get(self.selected) else {
+            return ViewAction::None;
+        };
+        ViewAction::Emit(ViewEvent::OpenTextPager {
+            title: tr(self.locale, MessageId::CtxInspDrillTitle).replace("{row}", &row.label),
+            content: row.detail.clone(),
+        })
+    }
+}
+
+impl ModalView for ContextInspectorView {
+    fn kind(&self) -> ModalKind {
+        ModalKind::ContextInspector
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => ViewAction::Close,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_selection(-1);
+                ViewAction::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_selection(1);
+                ViewAction::None
+            }
+            KeyCode::Enter => self.open_selected(),
+            _ => ViewAction::None,
+        }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.move_selection(-1);
+                ViewAction::None
+            }
+            MouseEventKind::ScrollDown => {
+                self.move_selection(1);
+                ViewAction::None
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let hit = self
+                    .hitboxes
+                    .borrow()
+                    .iter()
+                    .find_map(|(y, idx)| (*y == mouse.row).then_some(*idx));
+                let Some(idx) = hit else {
+                    return ViewAction::None;
+                };
+                if idx == self.selected {
+                    self.open_selected()
+                } else {
+                    self.selected = idx;
+                    ViewAction::None
+                }
+            }
+            _ => ViewAction::None,
+        }
+    }
+
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        let inner =
+            render_underwater_surface(area, buf, tr(self.locale, MessageId::CtxInspSurfaceTitle));
+        let content = render_modal_footer(
+            inner,
+            buf,
+            &[
+                ActionHint::new("↑/↓", tr(self.locale, MessageId::CtxInspActionSelect)),
+                ActionHint::new("Enter", tr(self.locale, MessageId::CtxInspActionDrillDown)),
+                ActionHint::new("Esc", tr(self.locale, MessageId::CtxInspActionClose)),
+            ],
+        );
+        let width = usize::from(content.width);
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled(
+                    tr(self.locale, MessageId::CtxInspUsedTokens)
+                        .replace("{used}", &self.used.to_string())
+                        .replace("{max}", &self.max.to_string()),
+                    Style::default()
+                        .fg(palette::WHALE_INFO)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" · {:.1}% · {}", self.percent, self.model),
+                    Style::default().fg(palette::TEXT_MUTED),
+                ),
+            ]),
+            Line::from(Span::styled(
+                crate::tui::ui_text::semantic_truncate(&self.workspace, width),
+                Style::default().fg(palette::TEXT_DIM),
+            )),
+            Line::from(""),
+        ];
+
+        if content.height >= 11 && content.width >= 24 {
+            let cells = usize::from(content.width.saturating_sub(2)).min(60);
+            let system_cells = ((self.rows[0].percent / 100.0) * cells as f64).round() as usize;
+            let message_cells = ((self.rows[1].percent / 100.0) * cells as f64).round() as usize;
+            let system_cells = system_cells.min(cells);
+            let message_cells = message_cells.min(cells.saturating_sub(system_cells));
+            let free_cells = cells.saturating_sub(system_cells + message_cells);
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "#".repeat(system_cells),
+                    Style::default().fg(palette::WHALE_INFO),
+                ),
+                Span::styled(
+                    "=".repeat(message_cells),
+                    Style::default().fg(palette::TEXT_PRIMARY),
+                ),
+                Span::styled(
+                    ".".repeat(free_cells),
+                    Style::default().fg(palette::TEXT_DIM),
+                ),
+            ]));
+            lines.push(Line::from(Span::styled(
+                tr(self.locale, MessageId::CtxInspAutoCompactAt)
+                    .replace("{threshold}", &format!("{:.0}", self.threshold)),
+                Style::default().fg(palette::TEXT_HINT),
+            )));
+            lines.push(Line::from(""));
+        }
+
+        self.hitboxes.borrow_mut().clear();
+        for (idx, row) in self.rows.iter().enumerate() {
+            let selected = idx == self.selected;
+            let marker = crate::tui::glyphs::selection_marker(selected);
+            let style = if selected {
+                Style::default()
+                    .fg(palette::SELECTION_TEXT)
+                    .bg(palette::SELECTION_BG)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(palette::TEXT_PRIMARY)
+            };
+            let value = tr(self.locale, MessageId::CtxInspRowTokens)
+                .replace("{tokens}", &row.tokens.to_string())
+                .replace("{percent}", &format!("{:.1}", row.percent));
+            let label_width = width.saturating_sub(value.len() + 5);
+            let label = crate::tui::ui_text::semantic_truncate(&row.label, label_width);
+            let gap = width.saturating_sub(label.len() + value.len() + 3);
+            let y = content
+                .y
+                .saturating_add(u16::try_from(lines.len()).unwrap_or(u16::MAX));
+            self.hitboxes.borrow_mut().push((y, idx));
+            lines.push(Line::from(Span::styled(
+                format!("{marker} {label}{}{value}", " ".repeat(gap)),
+                style,
+            )));
+        }
+        Paragraph::new(lines).render(content, buf);
     }
 }
 
@@ -645,18 +972,22 @@ mod tests {
     fn inspector_text_prompt_shows_layer_map() {
         let mut app = test_app();
         app.system_prompt = Some(SystemPrompt::Text(
-            "You are CodeWhale.\n\n<project_instructions source=\"AGENTS.md\">\nRules\n</project_instructions>\n\n## Project Context Pack\n{}\n\n## Environment\n- lang: en\n\n## Skills\n- rust\n\n## Context Management\nKeep compact\n\n## Compact\nTemplate\n\n## Repo Working Set\nsrc/".to_string(),
+            "## Codewhale\nBundled base law.\n\n## Language\nUse English.\n\n## Output Formatting\nBe clear.\n\n<codewhale_user_constitution>\nUser law\n</codewhale_user_constitution>\n\n<codewhale_repo_constitution>\nRepo law\n</codewhale_repo_constitution>\n\n<project_instructions source=\"AGENTS.md\">\nRules\n</project_instructions>\n\n## Project Context Pack\n{}\n\n## Environment\n- lang: en\n\n## Skills\n- rust\n\n## Core Execution\nInspect, edit, verify.\n\n## Compact\nTemplate\n\n## Repo Working Set\nsrc/".to_string(),
         ));
 
         let text = build_context_inspector_text(&app, Locale::En);
         assert!(text.contains("System Prompt Structure"));
         assert!(text.contains("Text prompt layers"));
-        assert!(text.contains("Global system prefix"));
+        assert!(text.contains("Bundled constitution"));
+        assert!(text.contains("Language policy"));
+        assert!(text.contains("Output formatting"));
+        assert!(text.contains("User-global constitution"));
+        assert!(text.contains("Repository constitution"));
         assert!(text.contains("Project context"));
         assert!(text.contains("Project context pack"));
         assert!(text.contains("Environment"));
         assert!(text.contains("Skills"));
-        assert!(text.contains("Context management"));
+        assert!(text.contains("Core execution"));
         assert!(text.contains("Compact template"));
         assert!(text.contains("Volatile working set"));
         assert!(text.contains("changes by session/turn"));

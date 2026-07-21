@@ -7,14 +7,14 @@ release_base="${CODEWHALE_RELEASE_BASE_URL:-${DEEPSEEK_TUI_RELEASE_BASE_URL:-}}"
 
 usage() {
   cat <<'USAGE'
-CodeWhale installer for macOS and Linux.
+Codewhale installer for macOS and Linux.
 
 Usage:
   curl -fsSL https://codewhale.net/install.sh | sh
 
 Environment:
   CODEWHALE_INSTALL_DIR    Install directory. Default: $HOME/.local/bin
-  CODEWHALE_VERSION        Release tag to install, for example v0.8.64. Default: latest
+  CODEWHALE_VERSION        Release tag to install, for example v0.9.0. Default: latest
   CODEWHALE_RELEASE_BASE_URL
                            Custom release asset base URL ending in /download
   CODEWHALE_SKIP_GLIBC_CHECK=1
@@ -22,7 +22,7 @@ Environment:
 
 Examples:
   curl -fsSL https://codewhale.net/install.sh | CODEWHALE_INSTALL_DIR=/usr/local/bin sh
-  curl -fsSL https://codewhale.net/install.sh | CODEWHALE_VERSION=v0.8.64 sh
+  curl -fsSL https://codewhale.net/install.sh | CODEWHALE_VERSION=v0.9.0 sh
 USAGE
 }
 
@@ -147,7 +147,7 @@ check_glibc() {
   host="$(glibc_version || true)"
   if [ -z "$host" ] || ! version_at_least "$host" "$required"; then
     cat >&2 <<EOF
-codewhale install: prebuilt CodeWhale $target assets require glibc $required or newer.
+codewhale install: prebuilt Codewhale $target assets require glibc $required or newer.
 This system reports glibc ${host:-unavailable}.
 
 Linux x64 uses a static musl build. Linux arm64 release assets are GNU libc
@@ -195,7 +195,7 @@ manifest_asset="codewhale-artifacts-sha256.txt"
 tmpdir="$(mktemp -d 2>/dev/null || mktemp -d -t codewhale-install)"
 trap 'rm -rf "$tmpdir"' EXIT INT TERM
 
-say "Installing CodeWhale for $target"
+say "Installing Codewhale for $target"
 say "Release assets: $release_base"
 say "Install dir: $install_dir"
 

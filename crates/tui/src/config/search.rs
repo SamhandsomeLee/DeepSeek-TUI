@@ -7,7 +7,10 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Search provider enumeration — selects which backend `web_search` uses.
+/// Search provider enumeration — selects the first backend `web_search` uses.
+/// API-backed providers may visibly degrade through the default DuckDuckGo →
+/// Bing chain after runtime failure or an empty result. Configuration and
+/// network-policy errors fail closed without crossing providers.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchProvider {
@@ -21,8 +24,8 @@ pub enum SearchProvider {
     Tavily,
     /// Bocha AI Search API (<https://bochaai.com>). Requires api_key.
     Bocha,
-    /// Metaso AI Search API (<https://metaso.cn>). Uses built-in default key
-    /// or `METASO_API_KEY` env var; configurable via `[search] api_key`.
+    /// Metaso AI Search API (<https://metaso.cn>). Requires `[search] api_key`
+    /// or the `METASO_API_KEY` env var.
     #[serde(alias = "metaso")]
     Metaso,
     /// SearXNG JSON search API. Requires a trusted/self-hosted `base_url`.
@@ -127,7 +130,7 @@ pub struct SearchConfig {
     #[serde(default)]
     pub base_url: Option<String>,
     /// API key for Tavily, Bocha, Metaso, Baidu, or Volcengine. Not required for Bing, DuckDuckGo, or SearXNG.
-    /// Metaso also falls back to `METASO_API_KEY` env var, then a built-in default.
+    /// Metaso also falls back to the `METASO_API_KEY` env var.
     /// Baidu also falls back to `BAIDU_SEARCH_API_KEY` env var.
     /// Volcengine also falls back to `VOLCENGINE_API_KEY` / `VOLCENGINE_ARK_API_KEY` / `ARK_API_KEY` env vars.
     #[serde(default)]

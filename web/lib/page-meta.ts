@@ -3,11 +3,10 @@ import type { Metadata } from "next";
 /** Canonical origin for the production site (no trailing slash). */
 export const SITE_URL = "https://codewhale.net";
 
-export const SITE_NAME = "CodeWhale";
+export const SITE_NAME = "Codewhale";
 
 /** The one-line product identity, used as the default OG image alt text. */
-export const IDENTITY_PHRASE =
-  "The calm, provider-honest terminal coding agent for any model — open models first.";
+export const IDENTITY_PHRASE = "One runtime. Every model. Your machine.";
 
 /** Shared OG card rendered by app/opengraph-image.tsx (1200×630 PNG). */
 const OG_IMAGE = {
@@ -38,7 +37,7 @@ const OG_IMAGE = {
  *   return buildPageMetadata({
  *     path: "/install",
  *     locale,
- *     title: isZh ? "安装 · CodeWhale" : "Install · CodeWhale",
+ *     title: isZh ? "安装 · Codewhale" : "Install · Codewhale",
  *     description: isZh ? "…" : "…",
  *   });
  * }

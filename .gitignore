@@ -58,6 +58,11 @@ test.txt
 TODO*.md
 todo*.md
 AGENTS.md
+# …except the deliberate, maintained agent-guidance files:
+!/AGENTS.md
+!crates/tui/AGENTS.md
+!crates/tui/locales/AGENTS.md
+!web/AGENTS.md
 NEXT_SESSION.md
 AI_HANDOFF.md
 result.json
