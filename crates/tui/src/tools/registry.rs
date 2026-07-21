@@ -717,22 +717,26 @@ impl ToolRegistryBuilder {
             GithubCloseIssueTool, GithubClosePrTool, GithubCommentTool, GithubIssueContextTool,
             GithubPrContextTool,
         };
-        use super::tasks::{
-            PrAttemptListTool, PrAttemptPreflightTool, PrAttemptReadTool, PrAttemptRecordTool,
-            TaskCancelTool, TaskCreateTool, TaskGateRunTool, TaskListTool, TaskReadTool,
-        };
+        use super::tasks::TasksTool;
 
-        self.with_tool(Arc::new(TaskCreateTool))
-            .with_tool(Arc::new(TaskListTool))
-            .with_tool(Arc::new(TaskReadTool))
-            .with_tool(Arc::new(TaskCancelTool))
-            .with_tool(Arc::new(TaskGateRunTool))
+        self.with_tool(Arc::new(TasksTool::new("tasks")))
+            .with_tool(Arc::new(TasksTool::alias("task_create", "create")))
+            .with_tool(Arc::new(TasksTool::alias("task_list", "list")))
+            .with_tool(Arc::new(TasksTool::alias("task_read", "read")))
+            .with_tool(Arc::new(TasksTool::alias("task_cancel", "cancel")))
+            .with_tool(Arc::new(TasksTool::alias("task_gate_run", "gate_run")))
+            .with_tool(Arc::new(TasksTool::alias(
+                "pr_attempt_record",
+                "pr_attempt_record",
+            )))
+            .with_tool(Arc::new(TasksTool::alias("pr_attempt_list", "pr_attempt_list")))
+            .with_tool(Arc::new(TasksTool::alias("pr_attempt_read", "pr_attempt_read")))
+            .with_tool(Arc::new(TasksTool::alias(
+                "pr_attempt_preflight",
+                "pr_attempt_preflight",
+            )))
             .with_tool(Arc::new(GithubIssueContextTool))
             .with_tool(Arc::new(GithubPrContextTool))
-            .with_tool(Arc::new(PrAttemptRecordTool))
-            .with_tool(Arc::new(PrAttemptListTool))
-            .with_tool(Arc::new(PrAttemptReadTool))
-            .with_tool(Arc::new(PrAttemptPreflightTool))
             .with_tool(Arc::new(AutomationTool::new("automation")))
             .with_tool(Arc::new(AutomationTool::alias(
                 "automation_create",
@@ -778,14 +782,15 @@ impl ToolRegistryBuilder {
     pub fn with_runtime_read_only_task_tools(self) -> Self {
         use super::automation::AutomationTool;
         use super::github::{GithubIssueContextTool, GithubPrContextTool};
-        use super::tasks::{PrAttemptListTool, PrAttemptReadTool, TaskListTool, TaskReadTool};
+        use super::tasks::TasksTool;
 
-        self.with_tool(Arc::new(TaskListTool))
-            .with_tool(Arc::new(TaskReadTool))
+        self.with_tool(Arc::new(TasksTool::read_only("tasks")))
+            .with_tool(Arc::new(TasksTool::alias("task_list", "list")))
+            .with_tool(Arc::new(TasksTool::alias("task_read", "read")))
+            .with_tool(Arc::new(TasksTool::alias("pr_attempt_list", "pr_attempt_list")))
+            .with_tool(Arc::new(TasksTool::alias("pr_attempt_read", "pr_attempt_read")))
             .with_tool(Arc::new(GithubIssueContextTool))
             .with_tool(Arc::new(GithubPrContextTool))
-            .with_tool(Arc::new(PrAttemptListTool))
-            .with_tool(Arc::new(PrAttemptReadTool))
             .with_tool(Arc::new(AutomationTool::read_only("automation")))
             .with_tool(Arc::new(AutomationTool::alias("automation_list", "list")))
             .with_tool(Arc::new(AutomationTool::alias("automation_read", "read")))
