@@ -206,6 +206,49 @@ impl WorkshopVariables {
     }
 }
 
+// ── Adaptive evidence routing (#4619) ─────────────────────────────────────────
+
+/// Routing policy for tool results: how much of the output stays inline in the
+/// conversation vs. being stored as an external artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceRouting {
+    /// Full result stays inline in the conversation context.
+    Inline,
+    /// A bounded observation (head/tail/summary) stays inline; the exact bytes
+    /// are stored as an artifact recoverable via handle.
+    Hybrid,
+    /// Only a handle/reference stays inline; the full result is artifact-only.
+    HandleOnly,
+}
+
+impl EvidenceRouting {
+    /// Determine routing from estimated token count and threshold.
+    #[must_use]
+    pub fn from_token_estimate(estimated_tokens: usize, threshold: usize) -> Self {
+        if estimated_tokens <= threshold / 4 {
+            Self::Inline
+        } else if estimated_tokens <= threshold {
+            Self::Hybrid
+        } else {
+            Self::HandleOnly
+        }
+    }
+}
+
+/// Immutable metadata for a stored evidence artifact (#4619).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceArtifact {
+    pub digest: String,
+    pub size_bytes: u64,
+    pub content_type: String,
+    pub tool_name: String,
+    pub call_id: String,
+    pub origin_session: String,
+    pub generation: u32,
+    pub redacted: bool,
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
