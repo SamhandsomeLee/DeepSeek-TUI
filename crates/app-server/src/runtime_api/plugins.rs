@@ -29,6 +29,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use codewhale_plugins::host_services::{
+    HostServiceWireState, PersonVia, PluginApprover, PluginCohort, ReviewApproval, ReviewPeer,
+    cohort_of, host_service_wire_state, offered,
+};
 use codewhale_plugins::marketplace::document::{
     CatalogInstallResolution, load_catalog_document, resolve_candidate_install,
 };
@@ -36,12 +40,113 @@ use codewhale_plugins::marketplace::store::MarketplaceStore;
 use codewhale_plugins::mutation::{
     PluginMutationContext, PluginMutationOutcome, PluginMutationRequest,
 };
-use codewhale_plugins::types::{LoadedPlugin, PluginDiagnostic, PluginDiagnosticLevel};
+use codewhale_plugins::types::{
+    LoadedPlugin, PluginDiagnostic, PluginDiagnosticLevel, PluginReviewEntry,
+};
 
 use super::{ApiError, RuntimeApiState};
 
 const PLUGIN_UI_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const PLUGIN_UI_SLOT: &str = "customize.plugins.detail";
+const PLUGIN_UI_SEATS: [&str; 6] = [
+    PLUGIN_UI_SLOT,
+    "conversation.composer.dock",
+    "conversation.chat.node",
+    "workpane.panel",
+    "sidebar.section",
+    "command.row",
+];
+const DSH_BOOTSTRAP_ENTRY: &str = "__codewhale_dsh_bootstrap.js";
+const DSH_FRAME_MODULES: [&str; 4] = [
+    "react",
+    "react-dom",
+    "react-dom/client",
+    "react/jsx-runtime",
+];
+const DSH_ROUTE_METHODS: [&str; 5] = ["GET", "POST", "PUT", "PATCH", "DELETE"];
+
+enum DshSeat {
+    Seat(&'static str),
+    Unsupported(&'static str),
+}
+
+const DSH_SEAT_TABLE: [(&str, DshSeat); 33] = [
+    ("plugins.bundle.config", DshSeat::Seat(PLUGIN_UI_SLOT)),
+    ("plugins.row.config", DshSeat::Seat(PLUGIN_UI_SLOT)),
+    ("plugins.tab", DshSeat::Seat(PLUGIN_UI_SLOT)),
+    ("plugins.detail.section", DshSeat::Seat(PLUGIN_UI_SLOT)),
+    ("plugins.item", DshSeat::Seat(PLUGIN_UI_SLOT)),
+    ("plugins.detail.actions", DshSeat::Seat(PLUGIN_UI_SLOT)),
+    ("plugins.detail.badge", DshSeat::Seat(PLUGIN_UI_SLOT)),
+    ("settings.section", DshSeat::Seat(PLUGIN_UI_SLOT)),
+    ("settings.plugin.item", DshSeat::Seat(PLUGIN_UI_SLOT)),
+    ("settings.general.item", DshSeat::Seat(PLUGIN_UI_SLOT)),
+    ("settings.plugins.tab", DshSeat::Seat(PLUGIN_UI_SLOT)),
+    (
+        "conversation.chat.node",
+        DshSeat::Seat("conversation.chat.node"),
+    ),
+    (
+        "conversation.chat.turnTail",
+        DshSeat::Seat("conversation.chat.node"),
+    ),
+    (
+        "conversation.chat.assistant-actions",
+        DshSeat::Seat("conversation.chat.node"),
+    ),
+    (
+        "conversation.chat.text-interaction",
+        DshSeat::Seat("conversation.chat.node"),
+    ),
+    (
+        "conversation.user.text.node",
+        DshSeat::Seat("conversation.chat.node"),
+    ),
+    (
+        "tool.call.toolview",
+        DshSeat::Seat("conversation.chat.node"),
+    ),
+    ("conversation.view", DshSeat::Seat("conversation.chat.node")),
+    (
+        "conversation.input.dock",
+        DshSeat::Seat("conversation.composer.dock"),
+    ),
+    (
+        "conversation.input.overlay",
+        DshSeat::Seat("conversation.composer.dock"),
+    ),
+    (
+        "conversation.input.right",
+        DshSeat::Seat("conversation.composer.dock"),
+    ),
+    (
+        "conversation.composer.dock",
+        DshSeat::Seat("conversation.composer.dock"),
+    ),
+    ("sidebar.right.pane.tab", DshSeat::Seat("workpane.panel")),
+    ("main.conversation", DshSeat::Seat("workpane.panel")),
+    ("main.page-menu", DshSeat::Seat("workpane.panel")),
+    ("sidebar.panellist", DshSeat::Seat("sidebar.section")),
+    ("sidebar.workspaces", DshSeat::Seat("sidebar.section")),
+    ("sidebar.footer.action", DshSeat::Seat("sidebar.section")),
+    (
+        "sidebar.session.row.leading",
+        DshSeat::Seat("sidebar.section"),
+    ),
+    (
+        "sidebar.workspaces.session.row.action",
+        DshSeat::Seat("sidebar.section"),
+    ),
+    (
+        "conversation.session.header.actions",
+        DshSeat::Unsupported("no ADE seat yet"),
+    ),
+    (
+        "conversation.session.header.utilities",
+        DshSeat::Unsupported("no ADE seat yet"),
+    ),
+    ("contextMenu.icon", DshSeat::Unsupported("no ADE seat yet")),
+];
 
 // ---------------------------------------------------------------------------
 // Response shapes
@@ -89,12 +194,25 @@ pub(super) struct PluginSummaryEntry {
     pub(super) enabled: bool,
     pub(super) trust_status: &'static str,
     pub(super) active: bool,
+    pub(super) approved_by: Option<PluginApprover>,
+    pub(super) enabled_by: Option<PluginApprover>,
+    pub(super) cohort: PluginCohort,
+    pub(super) outside_reach: bool,
+    pub(super) host_services: Vec<PluginHostServiceEntry>,
     pub(super) compatibility: &'static str,
     pub(super) inventory: PluginInventorySummary,
     pub(super) content_hash: String,
     pub(super) capability_hash: String,
     pub(super) state_generation: u64,
     pub(super) diagnostics: Vec<PluginDiagnosticEntry>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct PluginHostServiceEntry {
+    pub(super) service: &'static str,
+    pub(super) state: HostServiceWireState,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) withheld_by: Vec<ReviewPeer>,
 }
 
 #[derive(Debug, Serialize)]
@@ -143,6 +261,8 @@ pub(super) struct PluginReviewPayload {
     pub(super) commands: Vec<String>,
     pub(super) agents: Vec<String>,
     pub(super) hooks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) host_services: Option<codewhale_plugins::host_services::HostServiceReview>,
 }
 
 #[derive(Debug, Serialize)]
@@ -153,6 +273,8 @@ pub(super) struct PluginDetailResponse {
     pub(super) license: Option<String>,
     pub(super) keywords: Vec<String>,
     pub(super) staged: bool,
+    pub(super) reviewed_at: Option<String>,
+    pub(super) review_history: Vec<PluginReviewEntry>,
     pub(super) review: PluginReviewPayload,
 }
 
@@ -177,13 +299,25 @@ pub(super) struct PluginActionResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub(super) struct PluginUiBridge {
+    pub(super) kind: &'static str,
+    pub(super) dsh_version: String,
+    pub(super) compatibility_digest: String,
+}
+
+#[derive(Debug, Serialize)]
 pub(super) struct PluginUiSlotResponse {
     pub(super) slot: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) dsh_slot: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) bridge: Option<PluginUiBridge>,
     pub(super) base: String,
     pub(super) entry: String,
     pub(super) revision: String,
 }
 
+#[derive(Debug)]
 enum UiFileError {
     Missing,
     TooLarge,
@@ -209,6 +343,7 @@ pub(super) struct InstallPluginRequest {
 #[derive(Debug, Deserialize)]
 pub(super) struct PluginUiQuery {
     pub(super) slot: Option<String>,
+    pub(super) dsh_slot: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,6 +368,8 @@ pub(super) struct TrustPluginRequest {
     /// Review token from `GET /v1/apps/plugins/{selector}`. Required: trust
     /// is an explicit confirmation bound to both SHA-256 receipts.
     pub(super) token: String,
+    #[serde(default)]
+    pub(super) host_services_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -288,7 +425,53 @@ fn inventory_summary(plugin: &LoadedPlugin) -> PluginInventorySummary {
     }
 }
 
-fn plugin_summary(plugin: &LoadedPlugin) -> PluginSummaryEntry {
+fn summary_host_services(
+    plugin: &LoadedPlugin,
+    registry: Option<&codewhale_plugins::PluginRegistry>,
+) -> Vec<PluginHostServiceEntry> {
+    if let Some(review) = registry.and_then(|reg| match plugin.approved_by.as_ref() {
+        Some(approver) => reg.host_service_review_for(plugin.id.as_str(), approver),
+        None => reg.host_service_review(plugin.id.as_str()),
+    }) {
+        return review
+            .lines
+            .into_iter()
+            .map(|line| {
+                let state = host_service_wire_state(&plugin.host_services, &line);
+                let withheld_by = if state == HostServiceWireState::CanUse {
+                    line.withheld_by
+                } else {
+                    Vec::new()
+                };
+                PluginHostServiceEntry {
+                    service: line.service.name(),
+                    state,
+                    withheld_by,
+                }
+            })
+            .collect();
+    }
+    plugin
+        .inventory
+        .host_services
+        .iter()
+        .copied()
+        .map(|service| PluginHostServiceEntry {
+            service: service.name(),
+            state: if offered(service) && plugin.host_services.contains(&service) {
+                HostServiceWireState::CanUse
+            } else {
+                HostServiceWireState::NotOffered
+            },
+            withheld_by: Vec::new(),
+        })
+        .collect()
+}
+
+fn plugin_summary(
+    plugin: &LoadedPlugin,
+    registry: Option<&codewhale_plugins::PluginRegistry>,
+) -> PluginSummaryEntry {
     PluginSummaryEntry {
         id: plugin.id.as_str().to_string(),
         name: plugin.name().to_string(),
@@ -311,6 +494,11 @@ fn plugin_summary(plugin: &LoadedPlugin) -> PluginSummaryEntry {
         enabled: plugin.enabled,
         trust_status: plugin.trust_status.as_str(),
         active: plugin.active(),
+        approved_by: plugin.approved_by.clone(),
+        enabled_by: plugin.enabled_by.clone(),
+        cohort: cohort_of(plugin.approved_by.as_ref()),
+        outside_reach: plugin.outside_reach,
+        host_services: summary_host_services(plugin, registry),
         compatibility: plugin.compatibility().as_str(),
         inventory: inventory_summary(plugin),
         content_hash: plugin.content_hash.clone(),
@@ -342,13 +530,20 @@ fn mcp_server_review(
     }
 }
 
-fn file_stem(path: &std::path::Path) -> String {
-    path.file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string())
+async fn component_names(
+    paths: &[std::path::PathBuf],
+    extension: Option<&str>,
+    lowercase: bool,
+) -> Vec<String> {
+    codewhale_plugins::runtime::component_file_names(paths, extension, lowercase, 512)
+        .await
+        .0
 }
 
-fn review_payload(plugin: &LoadedPlugin) -> PluginReviewPayload {
+async fn review_payload(
+    plugin: &LoadedPlugin,
+    registry: Option<&codewhale_plugins::PluginRegistry>,
+) -> PluginReviewPayload {
     let mut mcp_servers: Vec<_> = plugin
         .manifest
         .mcp_servers
@@ -361,27 +556,9 @@ fn review_payload(plugin: &LoadedPlugin) -> PluginReviewPayload {
         })
         .unwrap_or_default();
     mcp_servers.sort_by(|a, b| a.name.cmp(&b.name));
-    let mut commands: Vec<_> = plugin
-        .components
-        .commands
-        .iter()
-        .map(|p| file_stem(p))
-        .collect();
-    commands.sort();
-    let mut agents: Vec<_> = plugin
-        .components
-        .agents
-        .iter()
-        .map(|p| file_stem(p))
-        .collect();
-    agents.sort();
-    let mut hooks: Vec<_> = plugin
-        .components
-        .hooks
-        .iter()
-        .map(|p| file_stem(p))
-        .collect();
-    hooks.sort();
+    let commands = component_names(&plugin.components.commands, Some("md"), true).await;
+    let agents = component_names(&plugin.components.agents, Some("toml"), false).await;
+    let hooks = component_names(&plugin.components.hooks, None, false).await;
     let mut skills: Vec<_> = plugin
         .skill_snapshots
         .iter()
@@ -391,6 +568,12 @@ fn review_payload(plugin: &LoadedPlugin) -> PluginReviewPayload {
         })
         .collect();
     skills.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let host_services = registry
+        .and_then(|reg| {
+            reg.host_service_review_for(plugin.name(), &PluginApprover::person(PersonVia::App))
+        })
+        .filter(|review| !review.lines.is_empty());
 
     PluginReviewPayload {
         token: plugin.review_token(),
@@ -404,17 +587,23 @@ fn review_payload(plugin: &LoadedPlugin) -> PluginReviewPayload {
         commands,
         agents,
         hooks,
+        host_services,
     }
 }
 
-fn plugin_detail(plugin: &LoadedPlugin) -> PluginDetailResponse {
+async fn plugin_detail(
+    plugin: &LoadedPlugin,
+    registry: Option<&codewhale_plugins::PluginRegistry>,
+) -> PluginDetailResponse {
     PluginDetailResponse {
-        summary: plugin_summary(plugin),
+        summary: plugin_summary(plugin, registry),
         repository: plugin.manifest.plugin.repository.clone(),
         license: plugin.manifest.plugin.license.clone(),
         keywords: plugin.manifest.plugin.keywords.clone(),
         staged: plugin.staged_root.is_some(),
-        review: review_payload(plugin),
+        reviewed_at: plugin.reviewed_at.clone(),
+        review_history: plugin.review_history.clone(),
+        review: review_payload(plugin, registry).await,
     }
 }
 
@@ -497,6 +686,16 @@ fn ui_content_type(path: &FsPath) -> &'static str {
     }
 }
 
+fn is_dsh_static_ui_asset(path: &FsPath) -> bool {
+    matches!(
+        path.extension()
+            .and_then(std::ffi::OsStr::to_str)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("css" | "svg" | "png" | "jpg" | "jpeg" | "webp" | "woff" | "woff2" | "ttf")
+    )
+}
+
 fn ui_asset_response(bytes: Vec<u8>, content_type: &'static str) -> Response {
     let mut response = Response::new(Body::from(bytes));
     let headers = response.headers_mut();
@@ -506,6 +705,12 @@ fn ui_asset_response(bytes: Vec<u8>, content_type: &'static str) -> Response {
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
+    if content_type == "image/svg+xml" {
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'; sandbox"),
+        );
+    }
     response
 }
 
@@ -519,6 +724,19 @@ struct PluginUiGrant {
     ui_prefix: PathBuf,
     file_hashes: Arc<BTreeMap<PathBuf, String>>,
     expires: std::time::Instant,
+    dsh: Option<Arc<DshServed>>,
+}
+
+struct DshClosure {
+    package: String,
+    entry: String,
+    files: BTreeMap<String, String>,
+    imports: BTreeMap<String, BTreeMap<String, Option<String>>>,
+    host_provided: Vec<String>,
+}
+
+struct DshServed {
+    closure: DshClosure,
 }
 
 #[derive(Default)]
@@ -548,6 +766,12 @@ impl PluginUiGrants {
         }
     }
 
+    fn revoke_selector(&self, selector: &str) {
+        self.entries
+            .lock()
+            .retain(|_, value| value.selector != selector);
+    }
+
     fn get(&self, revision: &str) -> Option<PluginUiGrant> {
         let mut entries = self.entries.lock();
         let now = std::time::Instant::now();
@@ -561,7 +785,8 @@ fn ui_file_refusal(plugin: &LoadedPlugin, display: &str, error: UiFileError) -> 
         UiFileError::Missing => ApiError::not_found(format!(
             "plugin '{}' has no staged file '{display}'",
             plugin.name()
-        )),
+        ))
+        .with_code("plugin_ui_file_not_reviewed"),
         UiFileError::TooLarge => ApiError::payload_too_large(format!(
             "plugin '{}' file '{display}' exceeds the 8 MiB plugin UI limit",
             plugin.name()
@@ -656,6 +881,15 @@ fn admit_ui_grant(state: &RuntimeApiState, grant: &PluginUiGrant) -> Result<(), 
     Ok(())
 }
 
+fn valid_dsh_slot_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    key.len() <= 128
+        && chars
+            .next()
+            .is_some_and(|first| first.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
 fn ui_stale_revision() -> ApiError {
     ApiError {
         status: StatusCode::PRECONDITION_FAILED,
@@ -664,10 +898,307 @@ fn ui_stale_revision() -> ApiError {
     }
 }
 
+struct PreparedPluginUi {
+    entry: String,
+    dsh_slot: Option<String>,
+    bridge: Option<PluginUiBridge>,
+    grant: PluginUiGrant,
+}
+
+fn seat_not_admitted(plugin: &LoadedPlugin, seat: &str, dsh_slot: Option<&str>) -> ApiError {
+    let key = dsh_slot
+        .map(|key| format!(" key '{key}'"))
+        .unwrap_or_default();
+    ApiError::not_found(format!(
+        "plugin '{}' has no admitted client for seat '{seat}'{key}",
+        plugin.name()
+    ))
+    .with_code("plugin_ui_seat_not_admitted")
+}
+
+fn ui_unsupported(message: impl Into<String>) -> ApiError {
+    ApiError::bad_request(message).with_code("plugin_ui_unsupported")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn dsh_client_closure(conversion: &Value) -> Option<DshClosure> {
+    let closure = conversion
+        .get("client_closures")?
+        .as_array()?
+        .iter()
+        .find(|closure| closure.get("root").and_then(Value::as_str) == Some(""))?;
+    let files = closure
+        .get("files")?
+        .as_object()?
+        .iter()
+        .map(|(path, hash)| Some((path.clone(), hash.as_str()?.to_string())))
+        .collect::<Option<BTreeMap<_, _>>>()?;
+    let entry = closure.get("entry")?.as_str()?.to_string();
+    if !files.contains_key(&entry) {
+        return None;
+    }
+    let imports: BTreeMap<String, BTreeMap<String, Option<String>>> =
+        serde_json::from_value(closure.get("imports")?.clone()).ok()?;
+    for (from, edges) in &imports {
+        if !files.contains_key(from)
+            || edges
+                .values()
+                .flatten()
+                .any(|target| !files.contains_key(target))
+        {
+            return None;
+        }
+    }
+    Some(DshClosure {
+        package: closure
+            .get("package")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        entry,
+        files,
+        imports,
+        host_provided: closure
+            .get("host_provided")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
+}
+
+fn verify_dsh_closure(
+    grant: &PluginUiGrant,
+    closure: &DshClosure,
+) -> Result<Vec<(String, Vec<u8>)>, UiFileError> {
+    let mut verified = Vec::with_capacity(closure.files.len());
+    for (path, expected) in &closure.files {
+        let relative = ui_relative_path(path)
+            .map_err(|reason| UiFileError::Invalid(format!("closure file '{path}': {reason}")))?;
+        let bytes = verified_ui_file(grant, &relative)?;
+        if sha256_hex(&bytes) != *expected {
+            return Err(UiFileError::Invalid(format!(
+                "closure file '{path}' no longer matches its reviewed hash"
+            )));
+        }
+        verified.push((path.clone(), bytes));
+    }
+    Ok(verified)
+}
+
+fn has_esm_syntax(text: &str) -> bool {
+    text.contains("import.meta")
+        || text.lines().any(|line| {
+            let line = line.trim_start();
+            [
+                "import ", "import{", "import\"", "import'", "export ", "export{", "export*",
+            ]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+        })
+}
+
+fn dsh_closure_unsupported(closure: &DshClosure, verified: &[(String, Vec<u8>)]) -> Option<String> {
+    let missing: Vec<&str> = closure
+        .host_provided
+        .iter()
+        .map(String::as_str)
+        .filter(|module| !DSH_FRAME_MODULES.contains(module))
+        .take(5)
+        .collect();
+    if !missing.is_empty() {
+        return Some(format!(
+            "this DSH client requires modules the plugin frame does not provide yet: {}",
+            missing.join(", ")
+        ));
+    }
+    for (path, bytes) in verified {
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            return Some(format!("closure file '{path}' is not UTF-8 text"));
+        };
+        if path.ends_with(".json") {
+            if serde_json::from_str::<Value>(text).is_err() {
+                return Some(format!("closure file '{path}' is not valid JSON"));
+            }
+        } else if has_esm_syntax(text) {
+            return Some(format!(
+                "closure file '{path}' uses ES module syntax; only CommonJS closures are served"
+            ));
+        }
+    }
+    None
+}
+
+fn quoted_in(text: &str, key: &str) -> bool {
+    ['"', '\'', '`']
+        .iter()
+        .any(|quote| text.contains(&format!("{quote}{key}{quote}")))
+}
+
+fn declared_dsh_keys(verified: &[(String, Vec<u8>)]) -> Vec<&'static (&'static str, DshSeat)> {
+    let texts: Vec<String> = verified
+        .iter()
+        .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned())
+        .collect();
+    DSH_SEAT_TABLE
+        .iter()
+        .filter(|(key, _)| texts.iter().any(|text| quoted_in(text, key)))
+        .collect()
+}
+
+fn admit_dsh_seat(
+    plugin: &LoadedPlugin,
+    seat: &str,
+    requested: Option<&str>,
+    declared: &[&'static (&'static str, DshSeat)],
+) -> Result<String, ApiError> {
+    if let Some(key) = requested {
+        let Some((_, mapped)) = declared.iter().find(|(name, _)| *name == key) else {
+            return Err(seat_not_admitted(plugin, seat, requested));
+        };
+        return match mapped {
+            DshSeat::Unsupported(reason) => Err(ApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                message: format!(
+                    "plugin '{}' declares '{key}', which has no Codewhale seat: {reason}",
+                    plugin.name()
+                ),
+                code: Some("plugin_ui_seat_unsupported"),
+            }),
+            DshSeat::Seat(mapped_seat) if *mapped_seat == seat => Ok(key.to_string()),
+            DshSeat::Seat(_) => Err(seat_not_admitted(plugin, seat, requested)),
+        };
+    }
+    let mut on_seat = declared.iter().filter_map(|(name, mapped)| match mapped {
+        DshSeat::Seat(mapped_seat) if *mapped_seat == seat => Some(*name),
+        _ => None,
+    });
+    match (on_seat.next(), on_seat.next()) {
+        (None, _) => Err(seat_not_admitted(plugin, seat, None)),
+        (Some(key), None) => Ok(key.to_string()),
+        (Some(_), Some(_)) => Err(ApiError::bad_request(format!(
+            "plugin '{}' admits more than one client key on seat '{seat}'; pass dsh_slot",
+            plugin.name()
+        ))
+        .with_code("plugin_ui_dsh_slot_required")),
+    }
+}
+
+fn dsh_bridge() -> Result<PluginUiBridge, ApiError> {
+    let receipt: Value = serde_json::from_slice(codewhale_plugins::activation::DSH_COMPATIBILITY)
+        .map_err(|_| {
+        ApiError::internal("the pinned DSH compatibility receipt is unreadable")
+    })?;
+    let version = receipt
+        .get("target_dsh_version")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::internal("the pinned DSH compatibility receipt has no version"))?;
+    Ok(PluginUiBridge {
+        kind: "dsh-client",
+        dsh_version: version.to_string(),
+        compatibility_digest: sha256_hex(codewhale_plugins::activation::DSH_COMPATIBILITY),
+    })
+}
+
+const DSH_BOOTSTRAP_HEAD: &str = r#""use strict";
+(function () {
+  var files = {
+"#;
+
+const DSH_BOOTSTRAP_TAIL: &str = r#"  var cache = Object.create(null);
+  var hostRequire = null;
+  function load(path) {
+    if (Object.prototype.hasOwnProperty.call(cache, path)) return cache[path].exports;
+    var module = { exports: {} };
+    cache[path] = module;
+    files[path].call(module.exports, module, module.exports, makeRequire(path));
+    return module.exports;
+  }
+  function makeRequire(from) {
+    return function (id) {
+      var edges = imports[from];
+      if (typeof id !== "string" || !edges || !Object.prototype.hasOwnProperty.call(edges, id)) {
+        throw new Error("the plugin client requires an undeclared module: " + id);
+      }
+      var resolved = edges[id];
+      if (resolved !== null) return load(resolved);
+      if (hosts.indexOf(id) < 0) throw new Error("the plugin client requires an undeclared host service: " + id);
+      return hostRequire(id);
+    };
+  }
+  window.__ModuleLoader__.load({
+    id: PLUGIN_ID,
+    factory: function (require) {
+      hostRequire = require;
+      return load(ENTRY);
+    }
+  });
+})();
+"#;
+
+fn dsh_bootstrap(
+    selector: &str,
+    closure: &DshClosure,
+    verified: &[(String, Vec<u8>)],
+) -> Result<Vec<u8>, UiFileError> {
+    let quote = |text: &str| {
+        serde_json::to_string(text).map_err(|error| UiFileError::Internal(error.to_string()))
+    };
+    let mut out = String::from(DSH_BOOTSTRAP_HEAD);
+    for (path, bytes) in verified {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| UiFileError::Invalid(format!("closure file '{path}' is not UTF-8")))?;
+        out.push_str("    ");
+        out.push_str(&quote(path)?);
+        out.push_str(": function (module, exports, require) {\n");
+        if path.ends_with(".json") {
+            out.push_str("module.exports = JSON.parse(");
+            out.push_str(&quote(text)?);
+            out.push_str(");");
+        } else {
+            out.push_str(text);
+        }
+        out.push_str("\n},\n");
+    }
+    out.push_str("  };\n");
+    out.push_str(&format!(
+        "  var PLUGIN_ID = {};\n  var ENTRY = {};\n",
+        quote(if closure.package.is_empty() {
+            selector
+        } else {
+            &closure.package
+        })?,
+        quote(&closure.entry)?
+    ));
+    let imports = serde_json::to_string(&closure.imports)
+        .map_err(|error| UiFileError::Internal(error.to_string()))?;
+    let hosts = serde_json::to_string(&closure.host_provided)
+        .map_err(|error| UiFileError::Internal(error.to_string()))?;
+    out.push_str(&format!(
+        "  var imports = JSON.parse({});\n  var hosts = JSON.parse({});\n",
+        quote(&imports)?,
+        quote(&hosts)?
+    ));
+    out.push_str(DSH_BOOTSTRAP_TAIL);
+    Ok(out.into_bytes())
+}
+
 fn prepare_plugin_ui(
     state: &RuntimeApiState,
     selector: &str,
-) -> Result<(String, PluginUiGrant), ApiError> {
+    seat: &str,
+    dsh_slot: Option<&str>,
+) -> Result<PreparedPluginUi, ApiError> {
     let registry = registry_for_state(state);
     let plugin = registry
         .get(selector)
@@ -718,6 +1249,7 @@ fn prepare_plugin_ui(
         ui_prefix: PathBuf::new(),
         file_hashes: Arc::new(validated.file_hashes),
         expires: std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        dsh: None,
     };
     let mut found = None;
     for candidate in ["package.json", "source/package.json"] {
@@ -745,6 +1277,7 @@ fn prepare_plugin_ui(
         return Err(ApiError::not_found(format!("plugin '{}' declares no dsh.client UI in {}; add dsh.client and exports[\"./client\"] to expose client assets", plugin.name(), ui_relative_display(&manifest_path))).with_code("plugin_ui_not_declared"));
     }
     let conversion_path = FsPath::new("CONVERSION.json");
+    let mut closure = None;
     if grant.file_hashes.contains_key(conversion_path) {
         let bytes = verified_ui_file(&grant, conversion_path)
             .map_err(|error| ui_file_refusal(&plugin, "CONVERSION.json", error))?;
@@ -759,16 +1292,39 @@ fn prepare_plugin_ui(
                 .and_then(Value::as_str)
                 == Some("dsh")
         {
-            return Err(ApiError::bad_request(
-                "this DSH client UI was not converted and is not supported by Codewhale yet",
-            )
-            .with_code("plugin_ui_unsupported"));
+            closure = Some(dsh_client_closure(&conversion).ok_or_else(|| {
+                ui_unsupported(
+                    "this DSH client UI was not converted and is not supported by Codewhale yet",
+                )
+            })?);
         }
     }
     grant.ui_prefix = manifest_path
         .parent()
         .unwrap_or(FsPath::new(""))
         .to_path_buf();
+    if let Some(closure) = closure {
+        let verified = verify_dsh_closure(&grant, &closure)
+            .map_err(|error| ui_file_refusal(&plugin, "client closure", error))?;
+        if let Some(reason) = dsh_closure_unsupported(&closure, &verified) {
+            return Err(ui_unsupported(format!(
+                "plugin '{}': {reason}",
+                plugin.name()
+            )));
+        }
+        let key = admit_dsh_seat(&plugin, seat, dsh_slot, &declared_dsh_keys(&verified))?;
+        grant.dsh = Some(Arc::new(DshServed { closure }));
+        admit_ui_grant(state, &grant)?;
+        return Ok(PreparedPluginUi {
+            entry: DSH_BOOTSTRAP_ENTRY.to_string(),
+            dsh_slot: Some(key),
+            bridge: Some(dsh_bridge()?),
+            grant,
+        });
+    }
+    if seat != PLUGIN_UI_SLOT || dsh_slot.is_some() {
+        return Err(seat_not_admitted(&plugin, seat, dsh_slot));
+    }
     let raw = ui_client_entry(&manifest).unwrap_or_else(|| "client.js".into());
     let relative = ui_relative_path(&raw).map_err(|reason| {
         ApiError::bad_request(format!(
@@ -779,7 +1335,12 @@ fn prepare_plugin_ui(
     verified_ui_file(&grant, &grant.ui_prefix.join(&relative))
         .map_err(|error| ui_file_refusal(&plugin, &ui_relative_display(&relative), error))?;
     admit_ui_grant(state, &grant)?;
-    Ok((ui_relative_display(&relative), grant))
+    Ok(PreparedPluginUi {
+        entry: ui_relative_display(&relative),
+        dsh_slot: None,
+        bridge: None,
+        grant,
+    })
 }
 
 fn plugin_ui_base(
@@ -909,6 +1470,8 @@ async fn run_plugin_mutation(
         PluginMutationOutcome::Uninstalled => "uninstalled",
     };
 
+    state.plugin_ui_grants.revoke_selector(&receipt.name);
+
     // Mutations can change merged plugin MCP servers. Advance the existing
     // shared generation so each captured workspace pool reloads on next use.
     state
@@ -916,9 +1479,10 @@ async fn run_plugin_mutation(
         .mcp_generation
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-    let plugin = registry_for_state(state)
+    let registry = registry_for_state(state);
+    let plugin = registry
         .get(receipt.name.as_str())
-        .map(plugin_summary);
+        .map(|plugin| plugin_summary(plugin, Some(&registry)));
     let note = match receipt.outcome {
         PluginMutationOutcome::Installed => Some(
             "Installed disabled and untrusted. Open this plugin's detail \
@@ -950,7 +1514,7 @@ async fn run_registry_mutation(
     mutation: RegistryMutation<'_>,
 ) -> Result<PluginActionResponse, ApiError> {
     let registry = registry_for_state(state);
-    if let RegistryMutation::Trust { token } = &mutation {
+    if let RegistryMutation::Trust { token, .. } = &mutation {
         let Some(plugin) = registry.get(selector) else {
             return Err(ApiError::not_found(format!(
                 "plugin '{selector}' not found"
@@ -974,8 +1538,19 @@ async fn run_registry_mutation(
 
     let mut registry = (*registry).clone();
     let result = match mutation {
-        RegistryMutation::Trust { .. } => registry.trust(selector),
-        RegistryMutation::Enable => registry.enable(selector),
+        RegistryMutation::Trust {
+            host_services_token,
+            ..
+        } => registry.trust_reviewed(
+            selector,
+            ReviewApproval {
+                approved_by: PluginApprover::person(PersonVia::App),
+                host_services: host_services_token.map(str::to_owned),
+            },
+        ),
+        RegistryMutation::Enable => {
+            registry.enable_by(selector, PluginApprover::person(PersonVia::App))
+        }
         RegistryMutation::Restage => registry.restage(selector),
         RegistryMutation::Disable => registry.disable(selector),
         RegistryMutation::Revoke => registry.revoke_trust(selector),
@@ -983,6 +1558,8 @@ async fn run_registry_mutation(
     result.map_err(|error| {
         ApiError::conflict(format!("{action} failed for '{selector}': {error}"))
     })?;
+
+    state.plugin_ui_grants.revoke_selector(selector);
 
     state
         .workspace_scopes
@@ -1022,7 +1599,10 @@ async fn run_registry_mutation(
 }
 
 enum RegistryMutation<'a> {
-    Trust { token: &'a str },
+    Trust {
+        token: &'a str,
+        host_services_token: Option<&'a str>,
+    },
     Enable,
     Restage,
     Disable,
@@ -1125,7 +1705,7 @@ fn marketplace_candidate_entry(
             reason: None,
         },
         CatalogInstallResolution::AlreadyPresent { plugin, reason } => {
-            existing_plugin = Some(plugin_summary(plugin));
+            existing_plugin = Some(plugin_summary(plugin, Some(registry)));
             MarketplaceInstallPlanEntry {
                 installable: false,
                 spec: None,
@@ -1233,7 +1813,11 @@ pub(super) async fn list_plugins(
     let registry = registry_for_state(&state);
     Ok(Json(PluginsResponse {
         workspace: state.workspace.display().to_string(),
-        plugins: registry.list().iter().map(|p| plugin_summary(p)).collect(),
+        plugins: registry
+            .list()
+            .iter()
+            .map(|p| plugin_summary(p, Some(&registry)))
+            .collect(),
         registry_diagnostics: registry
             .diagnostics()
             .iter()
@@ -1248,7 +1832,12 @@ pub(super) async fn get_plugin(
     State(state): State<RuntimeApiState>,
     Path(selector): Path<String>,
 ) -> Result<Json<PluginDetailResponse>, ApiError> {
-    Ok(Json(plugin_detail(&find_plugin(&state, &selector)?)))
+    let registry = registry_for_state(&state);
+    let plugin = registry
+        .get(&selector)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found(format!("plugin '{selector}' not found")))?;
+    Ok(Json(plugin_detail(&plugin, Some(&registry)).await))
 }
 
 pub(super) async fn get_plugin_ui(
@@ -1265,43 +1854,60 @@ pub(super) async fn get_plugin_ui(
         ));
     }
     let slot = query.slot.ok_or_else(|| {
-        ApiError::bad_request(
-            "the 'slot' query parameter is required; supported slot: 'customize.plugins.detail'",
-        )
+        ApiError::bad_request(format!(
+            "the 'slot' query parameter is required; seats: {}",
+            PLUGIN_UI_SEATS.join(", ")
+        ))
+        .with_code("plugin_ui_seat_unknown")
     })?;
-    if slot.as_str() != PLUGIN_UI_SLOT {
+    if !PLUGIN_UI_SEATS.contains(&slot.as_str()) {
         return Err(ApiError::bad_request(format!(
-            "slot '{slot}' is not supported; supported slot: 'customize.plugins.detail'"
-        )));
+            "slot '{slot}' is not a plugin UI seat; seats: {}",
+            PLUGIN_UI_SEATS.join(", ")
+        ))
+        .with_code("plugin_ui_seat_unknown"));
+    }
+    if let Some(key) = &query.dsh_slot
+        && !valid_dsh_slot_key(key)
+    {
+        return Err(ApiError::bad_request(
+            "dsh_slot must be 1 to 128 characters of letters, digits, '.', '_' or '-', starting with a letter or digit",
+        )
+        .with_code("plugin_ui_dsh_slot_invalid"));
     }
     let state_for_prepare = state.clone();
     let selector_for_prepare = selector.clone();
-    let (entry, grant) = tokio::task::spawn_blocking(move || {
-        prepare_plugin_ui(&state_for_prepare, &selector_for_prepare)
+    let seat = slot.clone();
+    let requested_key = query.dsh_slot.clone();
+    let policy = codewhale_plugins::activation::extension_host_policy_enabled();
+    let prepared = tokio::task::spawn_blocking(move || {
+        let _scope = codewhale_plugins::activation::PolicyScope::propagate(policy);
+        prepare_plugin_ui(
+            &state_for_prepare,
+            &selector_for_prepare,
+            &seat,
+            requested_key.as_deref(),
+        )
     })
     .await
     .map_err(|_| ApiError::internal("plugin UI preparation failed"))??;
     let base = plugin_ui_base(&state, &selector, &headers, &uri)?;
-    let revision = state.plugin_ui_grants.insert(grant);
+    let revision = state.plugin_ui_grants.insert(prepared.grant);
     Ok(Json(PluginUiSlotResponse {
         slot,
+        dsh_slot: prepared.dsh_slot,
+        bridge: prepared.bridge,
         base,
-        entry,
+        entry: prepared.entry,
         revision,
     }))
 }
 
-pub(super) async fn get_plugin_ui_asset(
-    State(state): State<RuntimeApiState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Path((selector, path)): Path<(String, String)>,
-    headers: HeaderMap,
-) -> Result<Response, ApiError> {
-    if !peer.ip().is_loopback() {
-        return Err(ApiError::forbidden(
-            "plugin UI assets are available only from loopback",
-        ));
-    }
+fn grant_for_request(
+    state: &RuntimeApiState,
+    selector: &str,
+    headers: &HeaderMap,
+) -> Result<(PluginUiGrant, String), ApiError> {
     let mut values = headers.get_all(header::IF_MATCH).iter();
     let first = values.next().ok_or_else(|| ApiError {
         status: StatusCode::PRECONDITION_REQUIRED,
@@ -1319,25 +1925,113 @@ pub(super) async fn get_plugin_ui_asset(
     if grant.selector != selector || grant.authority.workspace != state.workspace {
         return Err(ui_stale_revision());
     }
+    Ok((grant, revision))
+}
+
+pub(super) async fn plugin_route_bridge(
+    State(state): State<RuntimeApiState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path((selector, path)): Path<(String, String)>,
+    method: axum::http::Method,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    if !peer.ip().is_loopback() {
+        return Err(ApiError::forbidden(
+            "plugin routes are available only from loopback",
+        ));
+    }
+    let (grant, revision) = grant_for_request(&state, &selector, &headers)?;
+    let state_for_route = state.clone();
+    let policy = codewhale_plugins::activation::extension_host_policy_enabled();
+    tokio::task::spawn_blocking(move || {
+        let _scope = codewhale_plugins::activation::PolicyScope::propagate(policy);
+        codewhale_plugins::registry::verify_plugin_authority(&grant.authority)
+            .map_err(|_| ui_stale_revision())?;
+        admit_ui_grant(&state_for_route, &grant)?;
+        if state_for_route.plugin_ui_grants.get(&revision).is_none() {
+            return Err(ui_stale_revision());
+        }
+        if grant.dsh.is_none() {
+            return Err(ApiError::forbidden(
+                "this plugin UI grant has no DSH client and no plugin routes",
+            )
+            .with_code("plugin_route_not_admitted"));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| ApiError::internal("plugin route check failed"))??;
+    ui_relative_path(&path).map_err(|reason| {
+        ApiError::bad_request(format!("plugin route path '{path}' is invalid: {reason}"))
+    })?;
+    if !DSH_ROUTE_METHODS.contains(&method.as_str()) {
+        return Err(ApiError {
+            status: StatusCode::METHOD_NOT_ALLOWED,
+            message: format!("plugin routes do not accept {method}"),
+            code: None,
+        });
+    }
+    Err(ApiError::not_implemented(
+        "this Engine has no plugin web server to forward the route to yet",
+    )
+    .with_code("plugin_route_not_served"))
+}
+
+pub(super) async fn get_plugin_ui_asset(
+    State(state): State<RuntimeApiState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path((selector, path)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    if !peer.ip().is_loopback() {
+        return Err(ApiError::forbidden(
+            "plugin UI assets are available only from loopback",
+        ));
+    }
+    let (grant, revision) = grant_for_request(&state, &selector, &headers)?;
     let relative = ui_relative_path(&path).map_err(|reason| {
         ApiError::bad_request(format!("plugin UI path '{path}' is invalid: {reason}"))
     })?;
     let content_type = ui_content_type(&relative);
+    let is_dsh_bootstrap = grant.dsh.is_some() && relative == FsPath::new(DSH_BOOTSTRAP_ENTRY);
+    if grant.dsh.is_some() && !is_dsh_bootstrap && !is_dsh_static_ui_asset(&relative) {
+        return Err(
+            ApiError::not_found("plugin UI file is not in the reviewed client closure")
+                .with_code("plugin_ui_file_not_reviewed"),
+        );
+    }
     let state_for_asset = state.clone();
+    let policy = codewhale_plugins::activation::extension_host_policy_enabled();
     let bytes = tokio::task::spawn_blocking(move || {
+        let _scope = codewhale_plugins::activation::PolicyScope::propagate(policy);
         codewhale_plugins::registry::verify_plugin_authority(&grant.authority)
             .map_err(|_| ui_stale_revision())?;
-        let bytes = verified_ui_file(&grant, &grant.ui_prefix.join(&relative)).map_err(
-            |error| match error {
+        let bytes = if is_dsh_bootstrap {
+            let dsh = grant
+                .dsh
+                .as_ref()
+                .expect("is_dsh_bootstrap requires a DSH grant");
+            let verified =
+                verify_dsh_closure(&grant, &dsh.closure).map_err(|_| ui_stale_revision())?;
+            dsh_bootstrap(&grant.selector, &dsh.closure, &verified)
+                .map_err(|_| ui_stale_revision())?
+        } else {
+            let bundle_path = if grant.dsh.is_some() {
+                relative.clone()
+            } else {
+                grant.ui_prefix.join(&relative)
+            };
+            verified_ui_file(&grant, &bundle_path).map_err(|error| match error {
                 UiFileError::Missing => {
                     ApiError::not_found("plugin UI file is not in the reviewed bundle")
+                        .with_code("plugin_ui_file_not_reviewed")
                 }
                 UiFileError::TooLarge => {
                     ApiError::payload_too_large("plugin UI file exceeds the 8 MiB limit")
                 }
                 _ => ui_stale_revision(),
-            },
-        )?;
+            })?
+        };
         admit_ui_grant(&state_for_asset, &grant)?;
         if state_for_asset.plugin_ui_grants.get(&revision).is_none() {
             return Err(ui_stale_revision());
@@ -1386,11 +2080,21 @@ pub(super) async fn preview_dsh_plugin_api(
     } else {
         state.workspace.join(requested)
     };
+    let network = {
+        let config = state.config.read();
+        config
+            .network
+            .clone()
+            .map(codewhale_net::network_policy::NetworkPolicy::from)
+            .unwrap_or_default()
+    };
+    let policy = codewhale_plugins::activation::extension_host_policy_enabled();
     let preview = tokio::task::spawn_blocking(move || {
+        let _scope = codewhale_plugins::activation::PolicyScope::propagate(policy);
         let canonical = path
             .canonicalize()
             .map_err(|_| format!("DSH package not found at {}", path.display()))?;
-        codewhale_plugins::install::preview_dsh(&canonical)
+        codewhale_plugins::install::preview_dsh_with_network(&canonical, &network)
             .map(|(conversion, content_hash)| (canonical, conversion, content_hash))
             .map_err(|error| format!("{error:#}"))
     })
@@ -1449,7 +2153,10 @@ pub(super) async fn trust_plugin_api(
         run_registry_mutation(
             &state,
             &selector,
-            RegistryMutation::Trust { token: &req.token },
+            RegistryMutation::Trust {
+                token: &req.token,
+                host_services_token: req.host_services_token.as_deref(),
+            },
         )
         .await?,
     ))
@@ -1498,20 +2205,34 @@ pub(super) async fn revoke_plugin_api(
 // Handlers — marketplaces
 // ---------------------------------------------------------------------------
 
+async fn with_marketplace_store<T: Send + 'static>(
+    state: &RuntimeApiState,
+    work: impl FnOnce(RuntimeApiState, MarketplaceStore) -> Result<T, ApiError> + Send + 'static,
+) -> Result<T, ApiError> {
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        let store = open_marketplace_store(&state)?;
+        work(state, store)
+    })
+    .await
+    .map_err(|_| ApiError::internal("marketplace store task failed"))?
+}
+
 /// `GET /v1/apps/marketplaces`
 pub(super) async fn list_marketplaces(
     State(state): State<RuntimeApiState>,
 ) -> Result<Json<MarketplacesResponse>, ApiError> {
-    let store = open_marketplace_store(&state)?;
-    let marketplace_state = load_marketplace_state(&store)?;
-    let registry = registry_for_state(&state);
-    Ok(Json(MarketplacesResponse {
-        marketplaces: marketplace_state
+    let marketplaces = with_marketplace_store(&state, |state, store| {
+        let marketplace_state = load_marketplace_state(&store)?;
+        let registry = registry_for_state(&state);
+        Ok(marketplace_state
             .catalogs()
             .iter()
             .map(|(name, entry)| marketplace_catalog_entry(name, entry, &registry))
-            .collect(),
-    }))
+            .collect())
+    })
+    .await?;
+    Ok(Json(MarketplacesResponse { marketplaces }))
 }
 
 /// `GET /v1/apps/marketplaces/{name}`
@@ -1519,16 +2240,19 @@ pub(super) async fn get_marketplace(
     State(state): State<RuntimeApiState>,
     Path(name): Path<String>,
 ) -> Result<Json<MarketplaceCatalogEntry>, ApiError> {
-    let store = open_marketplace_store(&state)?;
-    let marketplace_state = load_marketplace_state(&store)?;
-    let entry = marketplace_state
-        .get(&name)
-        .ok_or_else(|| ApiError::not_found(format!("marketplace '{name}' not found")))?;
-    Ok(Json(marketplace_catalog_entry(
-        &name,
-        entry,
-        &registry_for_state(&state),
-    )))
+    let entry = with_marketplace_store(&state, move |state, store| {
+        let marketplace_state = load_marketplace_state(&store)?;
+        let entry = marketplace_state
+            .get(&name)
+            .ok_or_else(|| ApiError::not_found(format!("marketplace '{name}' not found")))?;
+        Ok(marketplace_catalog_entry(
+            &name,
+            entry,
+            &registry_for_state(&state),
+        ))
+    })
+    .await?;
+    Ok(Json(entry))
 }
 
 /// `POST /v1/apps/marketplaces`
@@ -1536,21 +2260,23 @@ pub(super) async fn add_marketplace(
     State(state): State<RuntimeApiState>,
     Json(req): Json<AddMarketplaceRequest>,
 ) -> Result<(StatusCode, Json<MarketplaceActionResponse>), ApiError> {
-    let store = open_marketplace_store(&state)?;
-    let loaded = load_catalog_document(&req.name, &state.workspace, &req.path)
-        .map_err(ApiError::bad_request)?;
-    store
-        .add(&loaded.entry.catalog.id.clone(), loaded.entry)
-        .map_err(ApiError::conflict)?;
-    Ok((
-        StatusCode::CREATED,
-        Json(MarketplaceActionResponse {
+    let response = with_marketplace_store(&state, move |state, store| {
+        let loaded = load_catalog_document(&req.name, &state.workspace, &req.path)
+            .map_err(ApiError::bad_request)?;
+        let candidate_count = loaded.candidate_count;
+        let warning_count = loaded.warning_count;
+        store
+            .add(&loaded.entry.catalog.id.clone(), loaded.entry)
+            .map_err(ApiError::conflict)?;
+        Ok(MarketplaceActionResponse {
             name: req.name,
             action: "added",
-            candidate_count: Some(loaded.candidate_count),
-            warning_count: Some(loaded.warning_count),
-        }),
-    ))
+            candidate_count: Some(candidate_count),
+            warning_count: Some(warning_count),
+        })
+    })
+    .await?;
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 /// `DELETE /v1/apps/marketplaces/{name}`
@@ -1558,10 +2284,13 @@ pub(super) async fn remove_marketplace(
     State(state): State<RuntimeApiState>,
     Path(name): Path<String>,
 ) -> Result<Json<MarketplaceActionResponse>, ApiError> {
-    let store = open_marketplace_store(&state)?;
-    let removed = store
-        .remove(&name)
-        .map_err(|error| ApiError::internal(format!("remove marketplace: {error}")))?;
+    let target = name.clone();
+    let removed = with_marketplace_store(&state, move |_, store| {
+        store
+            .remove(&target)
+            .map_err(|error| ApiError::internal(format!("remove marketplace: {error}")))
+    })
+    .await?;
     if !removed {
         return Err(ApiError::not_found(format!(
             "marketplace '{name}' not found"
@@ -1585,48 +2314,53 @@ pub(super) async fn install_marketplace_candidate_api(
     Path(name): Path<String>,
     Json(req): Json<InstallMarketplaceCandidateRequest>,
 ) -> Result<(StatusCode, Json<PluginMutationResponse>), ApiError> {
-    let store = open_marketplace_store(&state)?;
-    let marketplace_state = load_marketplace_state(&store)?;
-    let entry = marketplace_state
-        .get(&name)
-        .ok_or_else(|| ApiError::not_found(format!("marketplace '{name}' not found")))?;
-    let candidate = entry
-        .catalog
-        .candidate_by_name(&req.candidate)
-        .ok_or_else(|| {
-            ApiError::not_found(format!(
-                "candidate '{}' not found in marketplace '{name}'",
+    let spec = with_marketplace_store(&state, move |state, store| {
+        let marketplace_state = load_marketplace_state(&store)?;
+        let entry = marketplace_state
+            .get(&name)
+            .ok_or_else(|| ApiError::not_found(format!("marketplace '{name}' not found")))?;
+        let candidate = entry
+            .catalog
+            .candidate_by_name(&req.candidate)
+            .ok_or_else(|| {
+                ApiError::not_found(format!(
+                    "candidate '{}' not found in marketplace '{name}'",
+                    req.candidate
+                ))
+            })?;
+        let registry = registry_for_state(&state);
+        match resolve_candidate_install(entry, candidate, &registry) {
+            CatalogInstallResolution::Supported { spec, .. } => Ok(spec),
+            CatalogInstallResolution::AlreadyPresent { reason, .. } => {
+                Err(ApiError::conflict(reason))
+            }
+            CatalogInstallResolution::Unsupported { reason } => Err(ApiError::conflict(format!(
+                "candidate '{}' cannot be installed by Codewhale: {reason}",
                 req.candidate
-            ))
-        })?;
-    let registry = registry_for_state(&state);
-    match resolve_candidate_install(entry, candidate, &registry) {
-        CatalogInstallResolution::Supported { spec, .. } => {
-            let response = run_plugin_mutation(
-                &state,
-                PluginMutationRequest::Install {
-                    source: codewhale_plugins::install::PluginInstallSource::parse(&spec).map_err(
-                        |error| {
-                            ApiError::internal(format!(
-                                "resolved install spec '{spec}' no longer parses: {error:#}"
-                            ))
-                        },
-                    )?,
-                },
-            )
-            .await?;
-            Ok((StatusCode::CREATED, Json(response)))
+            ))),
+            CatalogInstallResolution::HasErrors { diagnostics } => {
+                Err(ApiError::conflict(format!(
+                    "candidate '{}' has parse errors and cannot be installed: {diagnostics}",
+                    req.candidate
+                )))
+            }
         }
-        CatalogInstallResolution::AlreadyPresent { reason, .. } => Err(ApiError::conflict(reason)),
-        CatalogInstallResolution::Unsupported { reason } => Err(ApiError::conflict(format!(
-            "candidate '{}' cannot be installed by Codewhale: {reason}",
-            req.candidate
-        ))),
-        CatalogInstallResolution::HasErrors { diagnostics } => Err(ApiError::conflict(format!(
-            "candidate '{}' has parse errors and cannot be installed: {diagnostics}",
-            req.candidate
-        ))),
-    }
+    })
+    .await?;
+    let response = run_plugin_mutation(
+        &state,
+        PluginMutationRequest::Install {
+            source: codewhale_plugins::install::PluginInstallSource::parse(&spec).map_err(
+                |error| {
+                    ApiError::internal(format!(
+                        "resolved install spec '{spec}' no longer parses: {error:#}"
+                    ))
+                },
+            )?,
+        },
+    )
+    .await?;
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1662,7 +2396,7 @@ pub(super) struct CatalogRowEnvelope {
     pub(super) row: CatalogRow,
 }
 
-const CATALOG_BUILTIN_KEYS: &[&str] = &["subagents", "web_search", "shell_tool"];
+const CATALOG_BUILTIN_KEYS: &[&str] = &["subagents", "web_search", "shell_tool", "plugin_creator"];
 const AGENT_LOOP_ID: &str = "agent_loop";
 
 fn catalog_title(key: &str) -> String {
@@ -1670,6 +2404,7 @@ fn catalog_title(key: &str) -> String {
         "subagents" => "Subagent".to_string(),
         "web_search" => "Web search".to_string(),
         "shell_tool" => "Shell".to_string(),
+        "plugin_creator" => "Plugin creator".to_string(),
         other => super::humanize_schema_key(other),
     }
 }
@@ -1679,6 +2414,7 @@ fn catalog_description(key: &str) -> Option<String> {
         "subagents" => "Delegate bounded tasks to focused child agents with isolated context.",
         "web_search" => "Search and fetch live web pages while answering.",
         "shell_tool" => "Run commands in your workspace terminal with approval controls.",
+        "plugin_creator" => "Enable the built-in plugin_manager tool and Creator mode host module.",
         "apply_patch" => "Apply structured multi-file patches as one reviewed change.",
         "mcp" => "Connect Model Context Protocol servers and their tools.",
         "exec_policy" => "Check shell commands against your exec policy before they run.",
@@ -1726,12 +2462,18 @@ fn subagents_settings(config: &codewhale_runtime::config::Config) -> (Value, Val
 fn catalog_feature_row(
     config: &codewhale_runtime::config::Config,
     spec: &codewhale_runtime::features::FeatureSpec,
+    creator_reason: Option<&str>,
 ) -> CatalogRow {
     let (settings_schema, settings) = if spec.key == "subagents" {
         let (schema, settings) = subagents_settings(config);
         (Some(schema), Some(settings))
     } else {
         (None, None)
+    };
+    let (available, unavailable_reason) = if spec.key == "plugin_creator" {
+        (creator_reason.is_none(), creator_reason.map(str::to_string))
+    } else {
+        (true, None)
     };
     CatalogRow {
         id: spec.key.to_string(),
@@ -1740,8 +2482,8 @@ fn catalog_feature_row(
         icon: Some(spec.key.to_string()),
         experimental: spec.stage == codewhale_runtime::features::Stage::Experimental,
         enabled: config.features().enabled(spec.id),
-        available: true,
-        unavailable_reason: None,
+        available,
+        unavailable_reason,
         settings_schema,
         settings,
         restart_required: spec.key == "extension_host",
@@ -1771,12 +2513,15 @@ fn agent_loop_row() -> CatalogRow {
     }
 }
 
-fn build_catalog(config: &codewhale_runtime::config::Config) -> CatalogResponse {
+fn build_catalog(
+    config: &codewhale_runtime::config::Config,
+    creator_reason: Option<&str>,
+) -> CatalogResponse {
     let mut builtin = Vec::new();
     let mut experimental = Vec::new();
     let mut more = Vec::new();
     for spec in codewhale_runtime::features::FEATURES {
-        let row = catalog_feature_row(config, spec);
+        let row = catalog_feature_row(config, spec, creator_reason);
         if CATALOG_BUILTIN_KEYS.contains(&spec.key) {
             builtin.push(row);
         } else if spec.stage == codewhale_runtime::features::Stage::Experimental {
@@ -1799,8 +2544,12 @@ fn build_catalog(config: &codewhale_runtime::config::Config) -> CatalogResponse 
     }
 }
 
-fn find_catalog_row(config: &codewhale_runtime::config::Config, id: &str) -> Option<CatalogRow> {
-    let catalog = build_catalog(config);
+fn find_catalog_row(
+    config: &codewhale_runtime::config::Config,
+    creator_reason: Option<&str>,
+    id: &str,
+) -> Option<CatalogRow> {
+    let catalog = build_catalog(config, creator_reason);
     catalog
         .builtin
         .into_iter()
@@ -1809,12 +2558,29 @@ fn find_catalog_row(config: &codewhale_runtime::config::Config, id: &str) -> Opt
         .find(|row| row.id == id)
 }
 
+async fn catalog_creator_reason_for(state: &RuntimeApiState, id: Option<&str>) -> Option<String> {
+    if matches!(id, Some(other) if other != "plugin_creator") {
+        return None;
+    }
+    let plugin_creator_enabled = state
+        .config
+        .read()
+        .features()
+        .enabled(codewhale_runtime::features::Feature::PluginCreator);
+    codewhale_engine::conversation_modes::creator_unavailable_reason(
+        state.runtime_threads.extension_host_options(),
+        plugin_creator_enabled,
+    )
+    .await
+}
+
 /// `GET /v1/apps/plugins/catalog`
 pub(super) async fn list_plugin_catalog(
     State(state): State<RuntimeApiState>,
 ) -> Result<Json<CatalogResponse>, ApiError> {
+    let creator_reason = catalog_creator_reason_for(&state, None).await;
     let config = state.config.read();
-    Ok(Json(build_catalog(&config)))
+    Ok(Json(build_catalog(&config, creator_reason.as_deref())))
 }
 
 async fn reload_after_catalog_write(state: RuntimeApiState) -> Result<(), ApiError> {
@@ -1869,8 +2635,9 @@ async fn set_catalog_enabled(
     )
     .map_err(|e| ApiError::internal(format!("Failed to persist setting: {e}")))?;
     reload_after_catalog_write(state.clone()).await?;
+    let creator_reason = catalog_creator_reason_for(&state, Some(&id)).await;
     let config = state.config.read();
-    let row = find_catalog_row(&config, &id).ok_or_else(|| {
+    let row = find_catalog_row(&config, creator_reason.as_deref(), &id).ok_or_else(|| {
         ApiError::internal(format!("catalog plugin '{id}' vanished after reload"))
     })?;
     Ok(Json(CatalogRowEnvelope { row }))
@@ -1903,9 +2670,10 @@ pub(super) async fn put_catalog_settings(
     Path(id): Path<String>,
     Json(req): Json<CatalogSettingsRequest>,
 ) -> Result<Json<CatalogRowEnvelope>, ApiError> {
+    let creator_reason = catalog_creator_reason_for(&state, Some(&id)).await;
     {
         let config = state.config.read();
-        if find_catalog_row(&config, &id).is_none() {
+        if find_catalog_row(&config, creator_reason.as_deref(), &id).is_none() {
             return Err(ApiError::not_found(format!(
                 "catalog plugin '{id}' not found"
             )));
@@ -1946,8 +2714,9 @@ pub(super) async fn put_catalog_settings(
         .map_err(|e| ApiError::internal(format!("Failed to persist setting: {e}")))?;
         reload_after_catalog_write(state.clone()).await?;
     }
+    let creator_reason = catalog_creator_reason_for(&state, Some(&id)).await;
     let config = state.config.read();
-    let row = find_catalog_row(&config, &id).ok_or_else(|| {
+    let row = find_catalog_row(&config, creator_reason.as_deref(), &id).ok_or_else(|| {
         ApiError::internal(format!("catalog plugin '{id}' vanished after reload"))
     })?;
     Ok(Json(CatalogRowEnvelope { row }))
@@ -1955,7 +2724,102 @@ pub(super) async fn put_catalog_settings(
 
 #[cfg(test)]
 mod review_tests {
-    use super::mcp_server_review;
+    use super::{dsh_bootstrap, dsh_client_closure, mcp_server_review};
+
+    #[test]
+    fn dsh_bootstrap_root_entry_closure_resolves_relative_requires_in_node() {
+        let closure = dsh_client_closure(&serde_json::json!({
+            "client_closures": [{
+                "root": "",
+                "entry": "client.js",
+                "files": { "client.js": "h1", "util.js": "h2" },
+                "imports": { "client.js": { "./util": "util.js" } }
+            }]
+        }))
+        .expect("authored closure");
+        let verified = vec![
+            (
+                "client.js".to_string(),
+                b"var util = require(\"./util\");\nexports.apply = function apply() { return [util.v]; };\n".to_vec(),
+            ),
+            ("util.js".to_string(), b"exports.v = 1;\n".to_vec()),
+        ];
+        let bootstrap = dsh_bootstrap("rootentry", &closure, &verified)
+            .unwrap_or_else(|_| panic!("dsh_bootstrap failed"));
+        let source = String::from_utf8(bootstrap).unwrap();
+        assert!(source.contains("\"client.js\""));
+        if let Some(out) = crate::runtime_api::tests::bootstrap_loads_in_node(&source) {
+            let out: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(out["apply"], "function");
+            assert_eq!(out["out"][0], 1);
+        }
+    }
+
+    #[test]
+    fn dsh_bootstrap_uses_only_admitted_edges_for_cycles_json_packages_and_hosts() {
+        for prefix in ["", "lib/"] {
+            let entry = format!("{prefix}client.js");
+            let helper = format!("{prefix}helper.cjs");
+            let verified = vec![
+                (
+                    entry.clone(),
+                    br#"exports.ready = 7;
+var helper = require('./helper');
+var data = require('./data.json');
+var packageValue = require('mapped');
+exports.apply = function () {
+  var denied = 0;
+  for (var id of ['./unlisted', 'unknown-service', './helper.cjs']) {
+    try { require(id); } catch (_) { denied++; }
+  }
+  return [helper.ready, data.value, packageValue.value, require('react').id, denied];
+};"#
+                    .to_vec(),
+                ),
+                (
+                    helper.clone(),
+                    b"exports.ready = require('./client').ready;".to_vec(),
+                ),
+                ("data.json".into(), br#"{"value":2}"#.to_vec()),
+                (
+                    "node_modules/mapped/selected.cjs".into(),
+                    b"exports.value = 3;".to_vec(),
+                ),
+                (
+                    "unlisted.js".into(),
+                    b"throw new Error('must not execute');".to_vec(),
+                ),
+            ];
+            let files: std::collections::BTreeMap<_, _> = verified
+                .iter()
+                .map(|(path, _)| (path.clone(), "hash"))
+                .collect();
+            let conversion = serde_json::json!({"client_closures": [{
+                "root": "", "entry": entry, "files": files, "host_provided": ["react"],
+                "imports": {
+                    (entry.clone()): {"./helper": helper, "./data.json": "data.json", "mapped": "node_modules/mapped/selected.cjs", "react": null},
+                    (helper.clone()): {"./client": entry}
+                }
+            }]});
+            let closure = dsh_client_closure(&conversion).unwrap();
+            let source =
+                String::from_utf8(dsh_bootstrap("mapped", &closure, &verified).unwrap()).unwrap();
+            let out = crate::runtime_api::tests::bootstrap_loads_in_node(&source)
+                .expect("node required for module map regression");
+            let out: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(out["out"], serde_json::json!([7, 2, 3, "react", 3]));
+            let mut missing = conversion.clone();
+            missing["client_closures"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("imports");
+            assert!(dsh_client_closure(&missing).is_none());
+            let mut outside = conversion;
+            outside["client_closures"][0]["imports"][&entry]["./helper"] =
+                serde_json::json!("outside.js");
+            assert!(dsh_client_closure(&outside).is_none());
+        }
+    }
 
     #[test]
     fn plugin_mcp_review_omits_url_credentials_without_changing_the_bundle() {

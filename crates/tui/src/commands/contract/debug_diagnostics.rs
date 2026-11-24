@@ -107,6 +107,7 @@ impl CommandDebugDiagnosticsContext for DebugDiagnosticsAdapter<'_> {
                     output_audio_tokens: None,
 
                     request_usages: Vec::new(),
+                    safety_tokens: None,
                 });
                 DebugCacheTurn {
                     provider: rec.provider.map(|provider| provider.as_str().to_string()),
@@ -381,6 +382,8 @@ pub(crate) fn observe_cache_for_app(
         stream: Some(true),
         temperature: None,
         top_p: None,
+        safety_check: None,
+        title: None,
     };
     let inspection = inspect_prompt_for_request(&request);
     let key = CacheWarmupKey::from_inspection(
@@ -429,7 +432,7 @@ impl CostComponents {
     }
 }
 
-fn cost_projection(app: &App) -> DebugCostProjection {
+pub(super) fn cost_projection(app: &App) -> DebugCostProjection {
     let currency = app.cost_display_currency(app.cost_currency);
     let total = app.displayed_session_cost_for_currency(app.cost_currency);
     let components = CostComponents::compute(app);

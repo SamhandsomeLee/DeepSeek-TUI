@@ -4,6 +4,7 @@ import { ConnectionBanner } from "@/components/connection-banner";
 import { EmptyState, ErrorState } from "@/components/surface-state";
 import { WhalePose } from "@/components/whale-pose";
 import { getAgentEnv, listDrafts, validateSession, type AgentDraft } from "@/lib/community-agent";
+import { MAINTAINER_TOKEN_UNAVAILABLE, maintainerTokenUsable } from "@/lib/maintainer-token";
 import { AdminClient } from "./admin-client";
 
 export const dynamic = "force-dynamic";
@@ -18,10 +19,6 @@ export const metadata: Metadata = {
 };
 
 const TYPE_LABELS: Record<string, { en: string; zh: string }> = {
-  triage: { en: "Issue Triage", zh: "议题分类" },
-  "pr-review": { en: "PR Review", zh: "PR 审阅" },
-  stale: { en: "Stale Nudge", zh: "过期提醒" },
-  dupes: { en: "Duplicate", zh: "重复检测" },
   digest: { en: "Weekly Digest", zh: "每周摘要" },
   linkcheck: { en: "Broken Link", zh: "失效链接" },
   "semantic-drift": { en: "Content Drift", zh: "内容漂移" },
@@ -81,7 +78,8 @@ export default async function AdminPage({
 
   const env = await getAgentEnv();
 
-  if (!env.MAINTAINER_TOKEN) {
+  if (!maintainerTokenUsable(env.MAINTAINER_TOKEN)) {
+    if (env.MAINTAINER_TOKEN) console.warn(MAINTAINER_TOKEN_UNAVAILABLE);
     return (
       <div className="route-state">
         <ConnectionBanner locale={locale} />
@@ -92,8 +90,8 @@ export default async function AdminPage({
           titleAs="h1"
           body={
             isZh
-              ? "MAINTAINER_TOKEN 未设置。请在部署前配置此环境变量。"
-              : "MAINTAINER_TOKEN is not set. Configure this secret before deployment."
+              ? "此页面当前不可用。"
+              : "This page is not available right now."
           }
         />
       </div>
@@ -102,7 +100,7 @@ export default async function AdminPage({
 
   const cookieStore = await cookies();
   const sid = cookieStore.get("mt_sid")?.value;
-  const authed = await validateSession(env.CURATED_KV, sid);
+  const authed = await validateSession(env.CURATED_KV, sid, env.MAINTAINER_TOKEN);
 
   if (!authed) {
     return <LoginForm locale={locale} error={err === "1"} />;
@@ -148,8 +146,8 @@ export default async function AdminPage({
           title={isZh ? "暂无草稿" : "No drafts yet"}
           body={
             isZh
-              ? "草稿将在 cron 运行后出现。可在 cloudflare.config.ts 中配置触发时间。"
-              : "Drafts will appear here after cron runs. Configure triggers in cloudflare.config.ts."
+              ? "有新草稿时会显示在这里。"
+              : "New drafts appear here when there are any."
           }
         />
       )}

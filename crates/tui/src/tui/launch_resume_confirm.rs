@@ -12,13 +12,15 @@ use crossterm::event::{
 };
 use ratatui::layout::Rect;
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Padding, Paragraph, Widget, Wrap};
+use ratatui::widgets::{Paragraph, Widget, Wrap};
 
-use crate::tui::views::{
-    ModalKind, ModalView, ViewAction, ViewEvent, centered_modal_area, render_modal_surface,
-};
+use crate::tui::views::rounded::render_rounded_modal;
+use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent, centered_modal_area};
 use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_palette as palette;
+
+const MIN_HEIGHT: u16 = 7;
+pub(crate) const MIN_CANVAS_HEIGHT: u16 = MIN_HEIGHT + 2;
 
 pub struct LaunchResumeConfirmView {
     session_id: String,
@@ -61,15 +63,19 @@ impl ModalView for LaunchResumeConfirmView {
 
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
         // Resuming replaces the whole session, so only a plain press answers:
-        // a release/repeat, or a Ctrl/Alt/Super chord that happens to end in
-        // Enter or `y`, is not a confirmation (U01-05). Shift stays allowed
-        // for `Y`.
+        // a release/repeat, or a Ctrl/Alt/Super/Meta/Hyper chord that happens
+        // to end in Enter or `y`, is not a confirmation (U01-05). Shift stays
+        // allowed for `Y`.
         if key.kind != KeyEventKind::Press {
             return ViewAction::None;
         }
-        let chord = key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+        let chord = key.modifiers.intersects(
+            KeyModifiers::CONTROL
+                | KeyModifiers::ALT
+                | KeyModifiers::SUPER
+                | KeyModifiers::META
+                | KeyModifiers::HYPER,
+        );
         match key.code {
             KeyCode::Enter if !chord => {
                 if self.selected == 0 {
@@ -123,7 +129,7 @@ impl ModalView for LaunchResumeConfirmView {
     }
 
     fn occupied_region(&self, area: Rect) -> Rect {
-        centered_modal_area(area, 64, 11, 32, 7)
+        centered_modal_area(area, 64, 11, 32, MIN_HEIGHT)
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
@@ -133,22 +139,15 @@ impl ModalView for LaunchResumeConfirmView {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         let popup = self.occupied_region(area);
         self.last_area.set(Some(popup));
-        render_modal_surface(area, popup, buf);
+        let inner = render_rounded_modal(
+            area,
+            popup,
+            buf,
+            tr(self.locale, MessageId::LaunchResumeConfirmTitle),
+            None,
+            true,
+        );
 
-        let block = Block::default()
-            .title(Line::from(Span::styled(
-                tr(self.locale, MessageId::LaunchResumeConfirmTitle).to_string(),
-                Style::default().fg(palette::TEXT_PRIMARY).bold(),
-            )))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(palette::BORDER_COLOR))
-            .style(Style::default().bg(palette::WHALE_BG))
-            .padding(Padding::uniform(1));
-        let inner = block.inner(popup);
-        block.render(popup, buf);
-
-        // Reserve the consequence and controls first. A long session title
-        // is one clipped line, never a paragraph that can bury the warning.
         let body_height = inner.height.saturating_sub(1);
         let warning = Paragraph::new(tr(self.locale, MessageId::LaunchResumeConfirmBody))
             .style(Style::default().fg(palette::TEXT_SOFT))
@@ -181,8 +180,6 @@ impl ModalView for LaunchResumeConfirmView {
         }
         warning.render(Rect::new(inner.x, y, inner.width, warning_height), buf);
 
-        // These are real controls, sharing the same measured rectangles for
-        // paint and pointer input. Keep both reachable in compact terminals.
         let button_width = inner.width.saturating_sub(1) / 2;
         let y = inner.bottom().saturating_sub(1);
         let buttons = [
@@ -275,14 +272,34 @@ mod tests {
 
         // U01-05: a chord that ends in Enter or `y`, and a key release, are
         // not a confirmation.
+        let dispatched = |code, modifiers| {
+            KeyEvent::new(
+                code,
+                crate::tui::composer_ui::normalize_macos_modifiers(modifiers),
+            )
+        };
         for key in [
             KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
             KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT),
             KeyEvent::new(KeyCode::Char('y'), KeyModifiers::SUPER),
+            dispatched(KeyCode::Char('y'), KeyModifiers::SUPER),
+            dispatched(KeyCode::Enter, KeyModifiers::META),
+            dispatched(KeyCode::Char('y'), KeyModifiers::META),
+            dispatched(KeyCode::Enter, KeyModifiers::HYPER),
+            dispatched(
+                KeyCode::Char('Y'),
+                KeyModifiers::HYPER | KeyModifiers::SHIFT,
+            ),
+            dispatched(KeyCode::Char('y'), KeyModifiers::META | KeyModifiers::SHIFT),
             KeyEvent::new_with_kind(
                 KeyCode::Enter,
                 KeyModifiers::NONE,
                 crossterm::event::KeyEventKind::Release,
+            ),
+            KeyEvent::new_with_kind(
+                KeyCode::Char('y'),
+                KeyModifiers::NONE,
+                crossterm::event::KeyEventKind::Repeat,
             ),
         ] {
             let mut confirm = view();
@@ -291,6 +308,73 @@ mod tests {
                 "{key:?} must not resume"
             );
         }
+
+        for key in [
+            dispatched(KeyCode::Enter, KeyModifiers::NONE),
+            dispatched(KeyCode::Char('y'), KeyModifiers::NONE),
+            dispatched(KeyCode::Char('Y'), KeyModifiers::SHIFT),
+        ] {
+            let mut confirm = view();
+            assert!(
+                matches!(
+                    confirm.handle_key(key),
+                    ViewAction::EmitAndClose(ViewEvent::LaunchResumeConfirmed { .. })
+                ),
+                "{key:?} must still confirm"
+            );
+        }
+
+        for modifiers in [
+            KeyModifiers::META,
+            KeyModifiers::HYPER,
+            KeyModifiers::CONTROL,
+        ] {
+            let mut confirm = view();
+            assert!(
+                matches!(
+                    confirm.handle_key(dispatched(KeyCode::Esc, modifiers)),
+                    ViewAction::Close
+                ),
+                "{modifiers:?}+Esc must still back out"
+            );
+        }
+    }
+
+    #[test]
+    fn the_popup_stays_above_the_composer_on_a_short_terminal() {
+        let area = Rect::new(0, 0, 60, 20);
+        let composer_top = 14;
+        let mut stack = crate::tui::views::ViewStack::new();
+        stack.push(view());
+        assert_eq!(
+            stack.top_occupied_region(area).map(|popup| popup.bottom()),
+            Some(15),
+            "centered in the whole frame, the popup's border lands on the composer's"
+        );
+        stack.set_composer_top(Some(composer_top));
+        let popup = stack.top_occupied_region(area).expect("a popup is open");
+        assert!(popup.bottom() <= composer_top, "{popup:?}");
+        let mut buf = Buffer::empty(area);
+        stack.render(area, &mut buf);
+        for y in composer_top..area.height {
+            let row: String = (0..area.width).map(|x| buf[(x, y)].symbol()).collect();
+            assert!(row.trim().is_empty(), "row {y} is the composer's: {row:?}");
+        }
+        let painted: String = (0..composer_top)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .map(|at| buf[at].symbol())
+            .collect();
+        assert!(
+            painted.contains("12 msgs") && painted.contains("Esc"),
+            "{painted}"
+        );
+
+        stack.set_composer_top(Some(MIN_CANVAS_HEIGHT - 1));
+        assert_eq!(
+            stack.top_occupied_region(area).map(|popup| popup.bottom()),
+            Some(15),
+            "too little room above the composer keeps the popup readable over it"
+        );
     }
 
     #[test]

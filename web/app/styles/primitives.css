@@ -588,15 +588,23 @@ a.dir-row:hover .dir-action { color: var(--text); }
 .code .code-copy:focus-visible { box-shadow: var(--glow-focus); }
 .code .code-copy:hover { background: var(--hover); color: var(--text); }
 .code-copy[data-copied="true"] { color: var(--live); }
-@media (max-width: 30rem) {
-  .code pre.code-block { padding-right: 3rem; }
-  .code .code-copy-label {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip-path: inset(50%);
-    white-space: nowrap;
+@media (max-width: 35rem) {
+  .code pre.code-block {
+    padding-right: var(--space-4);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .code pre.code-block-single {
+    padding-left: calc(var(--space-4) + 2ch);
+    text-indent: -2ch;
+  }
+  .code .code-seg-pipe { display: block; text-indent: 0; }
+  .code .code-copy {
+    position: static;
+    transform: none;
+    box-shadow: none;
+    display: flex;
+    margin: var(--space-2) 0 0 auto;
   }
 }
 
@@ -658,6 +666,14 @@ a.dir-row:hover .dir-action { color: var(--text); }
 }
 .figure-frame img { display: block; width: 100%; height: auto; }
 .figure-caption { color: var(--muted); font-size: var(--text-caption); line-height: 1.5; }
+
+/* ---------- desktop shot ---------- */
+.desktop-shot { display: block; }
+.desktop-shot picture { display: block; }
+.desktop-shot img { display: block; width: 100%; height: auto; }
+.desktop-shot-dark { display: none !important; }
+:root[data-theme="dark"] .desktop-shot-light { display: none !important; }
+:root[data-theme="dark"] .desktop-shot-dark { display: block !important; }
 
 /* ---------- callout ---------- */
 .callout {
@@ -787,23 +803,6 @@ h1.state-title { font-size: var(--text-display); }
 .data-table tbody th { font-weight: 500; }
 .data-table td { color: var(--muted); }
 .data-table code { font-family: var(--font-mono); font-size: var(--text-mono); color: var(--text); overflow-wrap: anywhere; }
-.data-table-sort {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-1);
-  margin: -0.25rem -0.375rem;
-  padding: 0.25rem 0.375rem;
-  color: inherit;
-  font: inherit;
-  border-radius: var(--radius-control);
-  cursor: pointer;
-}
-.data-table-sort:hover { background: var(--hover); color: var(--text); }
-.data-table-sort svg { width: 0.875rem; height: 0.875rem; transition: transform var(--dur-state) var(--ease-out); }
-.data-table-sort[data-dir="asc"] svg { transform: rotate(180deg); }
-.data-table-sort[data-dir="none"] svg { opacity: 0.45; }
-th[aria-sort="ascending"] .data-table-sort,
-th[aria-sort="descending"] .data-table-sort { color: var(--text); }
 
 /* ---------- fields ---------- */
 .field { display: grid; gap: var(--space-2); }
@@ -946,21 +945,6 @@ pre.gs-step-commands { margin-top: var(--space-1); font-size: var(--text-caption
 .session-media-caption { display: grid; gap: var(--space-2); padding: var(--space-4) var(--space-5); color: var(--muted); font-size: var(--text-ui); line-height: 1.6; }
 .session-media-caption strong { color: var(--text); font-size: var(--text-body); }
 .session-media-caption a { color: var(--accent); font-size: var(--text-caption); }
-
-/* ---------- the horizon ---------- */
-/* One calm, empty horizon per page: a straight line where the sky meets the
-   sea. Nothing stands on it but the whale. The sea below is the stage. */
-.horizon {
-  position: relative;
-  height: 1px;
-  background: var(--horizon-light);
-}
-
-.sea { background: var(--sea), var(--ocean-abyss); }
-
-@media (forced-colors: active) {
-  .horizon { background: CanvasText; }
-}
 
 /* ---------- search field ---------- */
 .search-field { position: relative; }

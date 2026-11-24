@@ -59,6 +59,7 @@ export type RuntimeCapabilities = {
   session_provider_keys: boolean
   threads: boolean
   thread_create_idempotency: boolean
+  exact_route_thread_create: boolean
   thread_idle_precondition: boolean
   thread_patch_undo_turn_id: boolean
   thread_scoped_reads: boolean
@@ -68,6 +69,7 @@ export type RuntimeCapabilities = {
   worktrees: boolean
   job_operations: boolean
   thread_shell_consent: boolean
+  thread_standing_context: boolean
   turns: boolean
   turn_operation_idempotency: boolean
   turn_operation_lookup: boolean
@@ -86,6 +88,7 @@ export type RuntimeCapabilities = {
   worker_runtime: boolean
   fleet_run_create: boolean
   thread_fleet_members: boolean
+  thread_fleet_member_durable_operations_v1: boolean
   fleet_run_start: boolean
   fleet_event_replay: boolean
   fleet_event_stream: boolean
@@ -98,6 +101,9 @@ export type RuntimeCapabilities = {
   plugin_management: boolean
   agent_mail: boolean
   event_stream_resume: boolean
+  permission_rules: boolean
+  approval_remember_workspace: boolean
+  approval_grants_list: boolean
   [key: string]: Json | undefined
 }
 

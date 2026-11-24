@@ -176,6 +176,7 @@ pub const METHODS: &[MethodSpec] = &[
     row(Direction::HostToCore, "subagent/start", true),
     row(Direction::HostToCore, "subagent/result", true),
     row(Direction::HostToCore, "subagent/dispose", true),
+    row(Direction::HostToCore, "dsh/broker", true),
     MethodSpec {
         tiers: &[HostTier::Builtin],
         ..row(Direction::HostToCore, "proc/launch", true)
@@ -530,6 +531,92 @@ pub struct CoreCallParams {
     pub input: Value,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DshService {
+    Workspace,
+    Llm,
+    Network,
+    Settings,
+    Catalog,
+    Terminal,
+    Remote,
+    Attachments,
+    Plugins,
+}
+
+impl DshService {
+    pub const ALL: [Self; 8] = [
+        Self::Workspace,
+        Self::Llm,
+        Self::Network,
+        Self::Settings,
+        Self::Catalog,
+        Self::Terminal,
+        Self::Remote,
+        Self::Attachments,
+    ];
+
+    pub const BUILTIN_ONLY: [Self; 1] = [Self::Plugins];
+
+    pub const EVERY: [Self; 9] = [
+        Self::Workspace,
+        Self::Llm,
+        Self::Network,
+        Self::Settings,
+        Self::Catalog,
+        Self::Terminal,
+        Self::Remote,
+        Self::Attachments,
+        Self::Plugins,
+    ];
+
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Workspace => "workspace",
+            Self::Llm => "llm",
+            Self::Network => "network",
+            Self::Settings => "settings",
+            Self::Catalog => "catalog",
+            Self::Terminal => "terminal",
+            Self::Remote => "remote",
+            Self::Attachments => "attachments",
+            Self::Plugins => "plugins",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::EVERY
+            .into_iter()
+            .find(|service| service.name() == name)
+    }
+
+    #[must_use]
+    pub fn builtin_only(self) -> bool {
+        Self::BUILTIN_ONLY.contains(&self)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct DshBrokerParams {
+    pub owner: OwnerRef,
+    pub ticket: String,
+    pub service: String,
+    pub method: String,
+    pub input: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct DshBrokerTicketWire {
+    pub service: String,
+    pub ticket: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -764,6 +851,7 @@ pub enum HostRequest {
     SubagentStart(SubagentStartParams),
     SubagentResult(SubagentHandleParams),
     SubagentDispose(SubagentHandleParams),
+    DshBroker(DshBrokerParams),
     ExecutionRedeem(ExecutionRedeemParams),
     ProcClose(ProcSessionParams),
     NetStart(ProcLaunchParams),
@@ -788,6 +876,7 @@ impl HostRequest {
             Self::UserQuestion(params) => &params.owner.plugin_id,
             Self::SubagentStart(params) => &params.owner.plugin_id,
             Self::SubagentResult(params) | Self::SubagentDispose(params) => &params.owner.plugin_id,
+            Self::DshBroker(params) => &params.owner.plugin_id,
             Self::ExecutionRedeem(params) => &params.owner.plugin_id,
             Self::ProcClose(params) => &params.owner.plugin_id,
             Self::NetClose(params) => &params.owner.plugin_id,
@@ -921,6 +1010,10 @@ pub fn parse_host_message(value: Value, tier: HostTier) -> Result<HostMessage, P
             id,
             request: Box::new(HostRequest::SubagentDispose(params(&method, p)?)),
         },
+        ("dsh/broker", Some(id)) => HostMessage::Request {
+            id,
+            request: Box::new(HostRequest::DshBroker(params(&method, p)?)),
+        },
         ("session/checkpoint", Some(id)) => HostMessage::Request {
             id,
             request: Box::new(HostRequest::SessionCheckpoint(params(&method, p)?)),
@@ -1040,6 +1133,7 @@ impl HostMessage {
                 HostRequest::SessionCheckpoint(p) => {
                     request_value(*id, "session/checkpoint", to_value(p))
                 }
+                HostRequest::DshBroker(p) => request_value(*id, "dsh/broker", to_value(p)),
                 HostRequest::ProcClose(p) => request_value(*id, "proc/close", to_value(p)),
                 HostRequest::NetStart(p) => request_value(*id, "net/start", to_value(p)),
                 HostRequest::NetFetch(p) => request_value(*id, "net/fetch", to_value(p)),
@@ -1144,6 +1238,8 @@ pub struct ToolCallParams {
     pub question_ticket: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_ticket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broker_tickets: Option<Vec<DshBrokerTicketWire>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller_tools: Option<Vec<String>>,
     /// Per-invocation identity; never cached at activation or by the host root.
@@ -1348,6 +1444,7 @@ pub struct DeactivateResult {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlockWire {
     Text { text: String },
+    ImageRef { attachment_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

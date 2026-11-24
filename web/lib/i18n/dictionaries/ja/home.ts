@@ -3,124 +3,80 @@ import type { HomeDict } from "../types";
 /** Japanese home copy: useful work with chosen models and connected tools. */
 
 export const home: HomeDict = {
-  metaTitle: "Codewhale · あなたのパソコンで使えるオープンソースエージェント",
-  metaDescription: "Codewhale はターミナルで動くオープンソースのコーディングエージェントです。選んだクラウドやローカルモデルでプロジェクトを読み、編集し、テストできます。",
-  heroTitle: "あなたのパソコンで使えるオープンソースエージェント",
-  heroIntro: "ターミナルで {brand} を使ってソフトウェアを作成し、繰り返し実行できるワークフローを動かせます。Mac アプリで作業するには Computer Use を追加してください。",
+  metaTitle: "Codewhale · モデルは誰のものでもかまいません。エージェントはあなたのものであるべきです。",
+  metaDescription: "Codewhale は、ターミナルで使うオープンソースのコーディングエージェントで、Rust で書かれています。どんなモデルでも動き、1 つのタスクを複数のエージェントに分担させられます。そのコードは 1 行残らず読めます。",
+  heroTitle: "モデルは誰のものでもかまいません。エージェントはあなたのものであるべきです。",
+  heroTitleLead: "モデルは誰のものでもかまいません。",
+  heroIntro: "{brand} は、ターミナルで使うオープンソースのコーディングエージェントで、Rust で書かれています。どんなモデルでも動き、1 つのタスクを複数のエージェントに分担させられます。そのコードは 1 行残らず読めます。",
+  readTheCode: "コードを読む",
+  installNote: "バージョン {version} はリリース済みで、アカウントは不要です。",
+  captionReleased: "ライブのモデル、DeepSeek の API 経由の deepseek-flash を使った実際のセッションです。編集はモデルが書き、編集とテストの実行は表示どおりに行われました。0.10.3 の開発ビルドで記録しています。",
+  captureFrameNoPosture: "「プロンプト」と「結果」のフレームには、モデル名と承認モードが表示されます。",
+  frameLabelPrompt: "プロンプト",
+  frameLabelEdit: "編集",
+  frameLabelApproval: "承認",
+  frameLabelResult: "結果",
+  frameSummaryPrompt: "ターミナルの Codewhale。リクエスト「Add a --json flag to ls.py so the tests pass, then run the tests.」が送信され、ステータス行に Accept edits とモデル deepseek-flash が表示されています。",
+  frameSummaryEdit: "ターミナルの Codewhale。コマンドが待機している間にさかのぼって表示しています。ls.py と test_ls.py を読み、ls.py を更新しました。差分はスクリプトに --json フラグを追加します。",
+  frameSummaryApproval: "ターミナルで動く Codewhale。ls.py への変更が表示され、コマンド python3 -m unittest -v test_ls.py が承認を待っています。カードは承認待ちであることを示し、Allow と Deny の選択肢を提示しています。",
+  frameSummaryResult: "ターミナルの Codewhale。承認後、コマンドは 2 件のテストを実行して OK と出力しました。モデル deepseek-flash は、ls.py に --json を追加し、両方のテストが通ったと述べています。",
+  frameSummaryProvider: "ターミナルの Codewhale。「deepseek-flash」で検索したモデル選択画面に、DeepSeek、Fireworks AI、OpenRouter の deepseek-flash が並び、DeepSeek が選択されています。",
+  frameSummaryReceipt: "ターミナルの Codewhale。セッションのレシート: 変更したファイルと実行したコマンド (あなたが承認)、トークン合計とセッションの推定コスト。続いて編集と承認されたコマンド。",
   getCodewhale: "Codewhale をインストール",
   heroInstallAria: "インストールコマンド",
-  exploreProduct: "Codewhale を見る",
-  shotPreview: "ターミナルのプレビュー",
-  screenshotAlt:
-    "Codewhale v{version} のターミナル収録画面。会話、メッセージ入力欄、セッション操作を表示。",
-  latestRelease: "最新リリース {tag}",
-  releaseUnavailable: "リリース情報を取得できません",
-  proofContributors: "コントリビューター {count} 人",
-  currentSource: "ソース",
-  sourceCandidate: "未リリース",
-  publishedRelease: "リリース済み",
-  gainHeading: "ターミナルから開発と自動化を",
-  gainLede: "作りたいものや自動化したい作業を伝えてください。Codewhale は、あなたが指定したアクセス権限の範囲で、ファイルを編集し、コマンドを実行して結果を確認できます。",
-  gain: [
-    [
-      "アプリやツールを作る",
-      "アプリを作る、機能を追加する、スクリプトを書くといった作業に使えます。Codewhale は、プロジェクトのファイルを扱い、コードを実行して、作成したものをテストできます。"
-    ],
-    [
-      "繰り返す仕事を自動化",
-      "ターミナル、スクリプト、CI からワークフローを実行できます。大きなタスクでは、異なるモデルを使うエージェントの Fleet に作業の一部を任せられます。"
-    ],
-    [
-      "いつものツールをつなぐ",
-      "プラグインや MCP サーバーからツールを追加したり、自分のスクリプトから API を利用したりできます。サービスごとに設定と認証が必要です。"
-    ]
-  ],
-  chapterModels: "あなたのモデル",
-  modelsHeading: "使いたいモデルを選ぶ",
-  modelsBody:
-    "プロバイダーのアカウント、OpenAI 互換のエンドポイント、ローカルやセルフホストのモデルを接続できます。セッションと Fleet の各エージェントに、それぞれモデルを選べます。",
-  modelsFacts: [
-    [
-      "自分の API アカウント",
-      "自分のキーで DeepSeek、OpenAI、Anthropic、Google などのプロバイダーに接続できます。既定の deepseek-flash は、現在 DeepSeek-V4.1-Flash で動作します。"
-    ],
-    [
-      "自分のゲートウェイ",
-      "OpenAI 互換エンドポイントに接続し、提供されるモデルを選択。"
-    ],
-    [
-      "自分の推論環境",
-      "Ollama、vLLM、SGLang でローカルまたは自己ホスト型モデルを実行。"
-    ],
-    [
-      "自分の ChatGPT プラン",
-      "codewhale auth chatgpt でサインインすると、API キーの代わりに ChatGPT プランを使えます。実験的な機能です。"
-    ]
-  ],
-  modelsLink: "モデルとプロバイダーを見る",
-  startHeading: "使い始める",
-  startLede: "Codewhale をインストールし、モデルを接続して、プロジェクトフォルダーを開いてください。必要に応じて、プラグインやエージェントを追加できます。",
-  startGuideLink: "はじめかたガイドに沿って進める",
-  startVocabularyLink: "製品用語を見る",
-  chapterAvailability: "動作環境",
-  availabilityHeading: "現在利用できる機能と開発中の機能",
-  availabilityLede: "ターミナルとローカルブラウザクライアントは利用可能です。ネイティブのデスクトップアプリと再構築中のホスト型ウェブアプリは開発中です。",
-  availability: [
-    [
-      "ターミナルとローカルブラウザー",
-      "リリース済み",
-      "Linux、macOS、Windows にインストールし、codewhale を実行します。ローカルブラウザークライアントを使うには codewhale web を実行します。npm と Cargo でもインストールできます。Android の Termux 版はプレビューです。"
-    ],
-    [
-      "CodeWhale GUI（VS Code）",
-      "利用可能",
-      "コミュニティが保守する独立したプロジェクトです。同じ Codewhale Runtime 上で、VS Code のサイドバーからチャット、スレッド、ファイル変更を扱えます。VS Code Marketplace からインストールできます。",
-      "https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode"
-    ],
-    [
-      "ホスト型 Web アプリ",
-      "開発中",
-      "デスクトップアプリに合わせて作り直しており、まだ公開されていません。今すぐブラウザーで使うには、自分のマシンで codewhale web を実行してください。"
-    ],
-    [
-      "デスクトップ",
-      "開発ビルド",
-      "同じエンジンで動くネイティブアプリです。変更のレビューとコミット、複数プロジェクトにまたがる作業の確認、メッセージを編集して新しい分岐として再送信できます。一般向けのダウンロードはまだありません。"
-    ]
-  ],
-  availabilityNote: "ターミナル、ローカルブラウザー、GUI は Codewhale のアカウントなしで使えます。自分のプロバイダーキーを使う場合、その利用料金はプロバイダーから請求されます。",
-  surfacesHeading: "ファイルやツールを使って作業する",
-  surfaces: [
-    [
-      "ファイルとターミナル",
-      "ファイル作成、コマンド実行、データ分析、成果物のテストまで。作業フォルダと権限は自分で設定します。"
-    ],
-    [
-      "プラグインと接続アプリ",
-      "プラグインと MCP でスキルやツールを追加。エージェントに使わせたい接続を確認して有効にします。"
-    ],
-    [
-      "ブラウザとコンピューター操作 · プレビュー",
-      "許可したアクセス範囲で、ブラウザツールと Computer Use プラグインを使ってアプリやサイトを操作できます。"
-    ],
-    [
-      "続きから始められるセッション",
-      "会話、ツールの結果、作業履歴をまとめて保存。ターミナルやローカルブラウザからタスクを再開できます。"
-    ],
-    [
-      "エージェントのチーム",
-      "Fleet で大きな仕事を、役割やモデルの異なるエージェントに分担。進捗を一か所で確認できます。"
-    ]
-  ],
-  runtimeLink: "ツールと連携機能を見る",
-  installBandHeading: "macOS または Linux にインストールする",
+  shotPreview: "ターミナルセッションの録画",
   copy: "コピー",
   copied: "コピー済み ✓",
-  binaries: "バイナリ",
-  chinaMirrors: "中国ミラー",
-  installGuideLink: "インストールガイドを読む",
-  communityHeading: "Codewhale に貢献する",
-  communityBody: "{count} 人が Codewhale の開発に参加しています。GitHub でバグを報告したり、ドキュメントを改善したり、コードを提供したりできます。",
-  communityLinksAria: "コミュニティリンク",
-  contribute: "GitHub で参加",
+
+  sectionModelHeading: "どのモデルでも、あなたのエージェントを通して動けます。",
+  sectionModelBody: "組み込みのプロバイダー、OpenAI 互換のエンドポイント、またはあなたのマシン上のモデルを使え、ターンの合間にモデルを切り替えられます。Codewhale はアカウントなしであなたのリポジトリで動き、`codewhale web` を使えば自分のマシン上のブラウザーで操作できます。",
+  sectionControlHeading: "あなたのエージェントは、あなたに応えます。",
+  sectionControlBody: "確認なしで Codewhale に何をさせてよいかはあなたが決め、コマンドは macOS と Linux ではサンドボックス内で実行できます。セッションごとに、変更したファイル、実行したコマンド、各ステップを誰が承認したかを記したレシートが残ります。",
+  sectionAgentsHeading: "複数のエージェントが、あなたと一つのタスクを分け合えます。",
+  sectionAgentsBody: "Codewhale は、探索役、実装役、レビュー役などの役割を持つエージェントに仕事を分け、あなたはそれぞれを見守り、調べ、止められます。Fleet は台帳を保つので、再起動のあとも実行を再開できます。",
+  agentsRolesLabel: "サブエージェントが担える役割のうち三つ",
+  agentRoleExplore: "コードを読んで重要な箇所を整理します。ファイルは変更しません。",
+  agentRoleImplement: "一つの具体的な変更を、最小限の編集で行います。",
+  agentRoleReviewer: "変更を読み、見つけた問題を重大度で評価します。ファイルは変更しません。",
+  agentsLink: "サブエージェントの仕組みを読む",
+  directionShotAlt: "Codewhale デスクトップアプリ。左にセッション一覧、中央では失敗するテストを直すタスクが python3 -m pytest の実行許可を待っており、Allow と Deny が表示されています。",
+  directionShotCaption: "開発中のデスクトップアプリは同じエンジンで動きます。ここでは DeepSeek V4.1 Flash を Accept Edits で使い、テストコマンドの実行前に確認を求めています。",
+  directionShotLink: "デスクトップアプリを見る",
+  sectionDirectionHeading: "あなたのエージェントが向かう先は、ここです。",
+  sectionDirectionBody: "Codewhale は、ターミナル、デスクトップアプリ、ブラウザー、クラウドコンピューターにまたがる一つの環境になりつつあり、すべてが一つのエンジンで動きます。作業はそれらの間を移っても、あなたのものであり続けます。以下の各部分に、今日の状況を示しています。",
+  sectionOpenHeading: "Codewhale は、使う人たちによってオープンに作られています。",
+  sectionOpenBody: "1 つのモデル向けのオープンソースのターミナルツールとして始まり、多くの言語を話す数百人がいっしょに作るプロジェクトになりました。コードを読み、変更し、自分自身を説明させることができます。",
+  sectionStartHeading: "今日、あなたのエージェントをあなたのものにしましょう。",
+  sectionStartBody: "Codewhale をインストールし、すでにお持ちのモデルキーか、あなたのコンピューター上のモデルでリポジトリ内で実行してください。アカウントは不要で、`codewhale update` で最新に保てます。",
+
+  contributorsCount: {
+    other: "コントリビューター {n} 人",
+  },
+  factsLabel: "Codewhale の概要",
+  factRust: "Rust で記述",
+  factLicense: "オープンソース、{license} ライセンス",
+  factProviders: {
+    other: "プロバイダールート {n} 本",
+  },
+  factModels: {
+    other: "モデル {n} 種",
+  },
+
+  mapHeading: "ひとつのエンジン",
+  mapStateReleased: "リリース済み",
+  mapStateDeveloping: "開発中、ダウンロードなし",
+  mapStateInviteOnly: "招待制",
+  mapStateBeingBuilt: "構築中",
+  mapTerminal: "ターミナルアプリ",
+  mapTerminalSentence: "macOS、Linux、Windows にインストールし、任意のリポジトリで `codewhale` を実行します。",
+  mapLocalBrowser: "ローカルブラウザークライアント",
+  mapLocalBrowserSentence: "`codewhale web` を実行すると、ブラウザーで会話を読み、タスクを送り、承認に応答できます。ターミナルに付属し、アカウントは不要です。",
+  mapManyAgents: "1 つのタスクに多数のエージェント",
+  mapManyAgentsSentence: "サブエージェント、Fleet、ワークフローにより、複数のエージェントがそれぞれの役割で 1 つのタスクを分担できます。",
+  mapDesktop: "デスクトップアプリ",
+  mapDesktopSentence: "同じエンジンの上でデスクトップアプリを構築中で、公開ダウンロードはまだありません。",
+  mapCloud: "クラウドコンピューター",
+  mapCloudSentence: "クラウドコンピューターは招待制で、セッションがクラウド上のマシンで作業を続けられるよう構築中です。",
+  mapOneSession: "それらをつなぐ 1 つのセッション",
+  mapOneSessionSentence: "ターミナルからデスクトップ、ブラウザー、クラウドまで、あなたについていき、最後まであなたのものである 1 つのセッションを構築中です。",
 };

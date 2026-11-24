@@ -1,13 +1,10 @@
 /**
  * Cloudflare KV access via the OpenNext binding helper.
- * Falls back to in-memory cache for `next dev` outside of `wrangler dev`.
+ * Reads bindings from the process environment for `next dev` outside of `wrangler dev`.
  */
 import { readBoundedBody } from "./bounded-body";
 import type { DraftClaimLockNamespace } from "./draft-claim-lock";
-import type { CuratedDispatch } from "./types";
 import type { MerchEnv } from "./merch/types";
-
-const MEM = new Map<string, string>();
 
 export interface KVNamespace {
   get(key: string): Promise<string | null>;
@@ -35,6 +32,7 @@ export async function readBoundedKvJson(kv: KVStreamNamespace | undefined, key: 
 interface CloudflareEnv extends MerchEnv {
   DRAFT_CLAIM_LOCK?: DraftClaimLockNamespace;
   CURATED_KV?: KVNamespace & KVStreamNamespace;
+  ADMIN_LOGIN_LIMITER?: { limit(options: { key: string }): Promise<{ success: boolean }> };
   MERCH_INTEREST_LIMITER?: { limit(options: { key: string }): Promise<{ success: boolean }> };
   MERCH_INTEREST_SITE_ORIGIN?: string;
   DEEPSEEK_API_KEY?: string;
@@ -79,30 +77,5 @@ export async function getEnv(): Promise<CloudflareEnv> {
     return ctx.env as CloudflareEnv;
   } catch {
     return envFromProcess();
-  }
-}
-
-export async function getDispatch(): Promise<CuratedDispatch | null> {
-  const env = await getEnv();
-  const raw = env.CURATED_KV ? await env.CURATED_KV.get("dispatch:latest") : MEM.get("dispatch:latest") ?? null;
-  if (!raw) return null;
-  try {
-    return JSON.parse(raw) as CuratedDispatch;
-  } catch {
-    return null;
-  }
-}
-
-export async function putDispatch(d: CuratedDispatch): Promise<void> {
-  const env = await getEnv();
-  await putDispatchWithKv(env.CURATED_KV, d);
-}
-
-export async function putDispatchWithKv(kv: KVNamespace | undefined, d: CuratedDispatch): Promise<void> {
-  const value = JSON.stringify(d);
-  if (kv) {
-    await kv.put("dispatch:latest", value, { expirationTtl: 60 * 60 * 24 * 7 });
-  } else {
-    MEM.set("dispatch:latest", value);
   }
 }

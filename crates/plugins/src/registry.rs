@@ -7,20 +7,29 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::activation::{PluginActivationCapability, PluginActivationPolicy};
+use super::host_services::{
+    AgentPosture, HostService, HostServiceLine, HostServiceReview, PersonVia, PluginApprover,
+    PluginCohort, ReviewApproval, ReviewPeer, cohort_of,
+};
 use super::managed_policy::{
     ManagedPluginPolicy, ManagedPolicyOutcome, load_managed_policy, resolve_managed_policy_path,
 };
 use super::manifest::PluginInventory;
-use super::types::{LoadedPlugin, PluginDiagnostic, PluginDiagnosticLevel, PluginTrustStatus};
+use super::types::{
+    LoadedPlugin, PluginDiagnostic, PluginDiagnosticLevel, PluginReviewEntry, PluginScope,
+    PluginTrustStatus,
+};
 use codewhale_config::{PluginAuthority, PluginId};
 use codewhale_util::path_identity::metadata_is_link_or_reparse;
 #[cfg(windows)]
 use codewhale_util::path_identity::windows_file_identity;
 
 pub mod gc;
+mod withdrawn;
 
 const STATE_SCHEMA_VERSION: u32 = 1;
 const MAX_REVIEW_HISTORY: usize = 32;
+const RECEIPT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -46,6 +55,8 @@ struct PersistedPluginState {
     generation: u64,
     #[serde(default)]
     enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enabled_by: Option<PluginApprover>,
     #[serde(default)]
     trust: Option<TrustReceipt>,
     #[serde(default)]
@@ -59,6 +70,209 @@ struct TrustReceipt {
     capability_hash: String,
     reviewed_capabilities: PluginInventory,
     reviewed_at: String,
+    #[serde(default, skip_serializing_if = "receipt_version_is_unset")]
+    version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    approved_by: Option<PluginApprover>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    host_services: Vec<HostService>,
+}
+
+fn receipt_version_is_unset(version: &u32) -> bool {
+    *version == 0
+}
+
+impl TrustReceipt {
+    fn granted(&self) -> Vec<HostService> {
+        if self.version != RECEIPT_VERSION
+            || self.host_services.is_empty()
+            || !self
+                .host_services
+                .iter()
+                .all(|service| self.reviewed_capabilities.host_services.contains(service))
+            || super::manifest::hash_inventory(&self.reviewed_capabilities) != self.capability_hash
+        {
+            return Vec::new();
+        }
+        let mut granted = self.host_services.clone();
+        granted.sort();
+        granted.dedup();
+        granted
+    }
+}
+
+fn trust_receipt_matches(expected: Option<&TrustReceipt>, current: Option<&TrustReceipt>) -> bool {
+    match (expected, current) {
+        (None, None) => true,
+        (Some(expected), Some(current)) => {
+            expected.content_hash == current.content_hash
+                && expected.capability_hash == current.capability_hash
+                && expected.approved_by == current.approved_by
+        }
+        _ => false,
+    }
+}
+
+fn peer_name(id: &PluginId, names: &BTreeMap<PluginId, String>) -> String {
+    names.get(id).cloned().unwrap_or_else(|| {
+        id.as_str()
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    })
+}
+
+fn host_service_review_in(
+    state: &PluginStateFile,
+    plugin: &LoadedPlugin,
+    names: &BTreeMap<PluginId, String>,
+    cohort: &PluginCohort,
+) -> HostServiceReview {
+    let peers = |holds: bool, service: HostService| -> Vec<ReviewPeer> {
+        state
+            .plugins
+            .iter()
+            .filter(|(id, _)| **id != plugin.id)
+            .filter(|(_, entry)| {
+                entry.trust.as_ref().is_some_and(|receipt| {
+                    if cohort_of(receipt.approved_by.as_ref()) != *cohort {
+                        return false;
+                    }
+                    if holds {
+                        receipt.granted().contains(&service)
+                    } else {
+                        entry.enabled
+                            && receipt.reviewed_capabilities.native > 0
+                            && !receipt.granted().contains(&service)
+                    }
+                })
+            })
+            .map(|(id, _)| ReviewPeer {
+                id: id.as_str().to_string(),
+                name: peer_name(id, names),
+            })
+            .collect()
+    };
+    let lines = plugin
+        .inventory
+        .host_services
+        .iter()
+        .map(|service| HostServiceLine {
+            service: *service,
+            offered: super::host_services::offered(*service),
+            shared_with: peers(true, *service),
+            withheld_by: peers(false, *service),
+        })
+        .collect();
+    HostServiceReview::new(
+        plugin.id.as_str(),
+        &plugin.content_hash,
+        &plugin.capability_hash,
+        cohort,
+        lines,
+    )
+}
+
+fn check_approver(
+    approver: &PluginApprover,
+    plugin: &LoadedPlugin,
+    workspace: &Path,
+    shown: bool,
+) -> Result<(), String> {
+    let agent = match approver {
+        PluginApprover::Agent(agent) => agent,
+        PluginApprover::CommandLine if shown => {
+            return Err(
+                "An approval from the command line shows no review, so it cannot grant host services"
+                    .to_string(),
+            );
+        }
+        PluginApprover::Person { .. } | PluginApprover::CommandLine => return Ok(()),
+    };
+    if !shown {
+        return Err(
+            "An approval by the agent must carry the token of the review composed for the call"
+                .to_string(),
+        );
+    }
+    let identified = |value: &Option<String>| value.as_deref().is_some_and(|id| !id.is_empty());
+    if matches!(
+        agent.posture,
+        AgentPosture::FullAccess | AgentPosture::AutoReview
+    ) && !(identified(&agent.thread_id)
+        && identified(&agent.turn_id)
+        && identified(&agent.tool_call_id))
+    {
+        return Err(
+            "An approval by the agent must name the thread, turn and tool call that made it"
+                .to_string(),
+        );
+    }
+    let normalized_agent =
+        codewhale_config::normalize_project_workspace(Path::new(&agent.workspace));
+    let normalized_target = codewhale_config::normalize_project_workspace(workspace);
+    let workspaces_match = match (&normalized_agent, &normalized_target) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => Path::new(&agent.workspace) == workspace,
+    };
+    if agent.workspace.is_empty() || !workspaces_match {
+        return Err(
+            "An approval by the agent is limited to its own project, and this is not that project"
+                .to_string(),
+        );
+    }
+    if plugin.scope == PluginScope::Builtin {
+        return Err(
+            "A built-in plugin ships with Codewhale, so the agent cannot approve it; ask the person"
+                .to_string(),
+        );
+    }
+    if plugin.trusted()
+        && plugin
+            .approved_by
+            .as_ref()
+            .and_then(PluginApprover::agent_workspace)
+            .is_none()
+    {
+        return Err(format!(
+            "Plugin bundle `{}` holds a review for every project, so the agent cannot replace it; ask the person",
+            plugin.name()
+        ));
+    }
+    if plugin.trusted() && plugin.outside_reach {
+        return Err(format!(
+            "Plugin bundle `{}` holds the review of the agent of another project, so this agent cannot replace it; ask the person",
+            plugin.name()
+        ));
+    }
+    if plugin.scope == PluginScope::Workspace {
+        let inside = fs::canonicalize(workspace)
+            .is_ok_and(|project| plugin.canonical_root.starts_with(project));
+        if !inside {
+            return Err(format!(
+                "Plugin bundle `{}` is in a project plugin folder that resolves outside this project, so the agent cannot approve it; ask the person",
+                plugin.name()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn outside_reach(approver: Option<&PluginApprover>, workspace: &Path) -> bool {
+    approver
+        .and_then(PluginApprover::agent_workspace)
+        .is_some_and(|recorded| {
+            if recorded.is_empty() {
+                return true;
+            }
+            let norm_recorded = codewhale_config::normalize_project_workspace(Path::new(recorded));
+            let norm_target = codewhale_config::normalize_project_workspace(workspace);
+            match (norm_recorded, norm_target) {
+                (Ok(a), Ok(b)) => a != b,
+                _ => Path::new(recorded) != workspace,
+            }
+        })
 }
 
 #[derive(Debug, Clone, Default)]
@@ -114,6 +328,82 @@ impl PluginRegistry {
         view
     }
 
+    pub fn sync_user_plugins_from(&self, updated: &Self) -> Option<Self> {
+        if self.workspace == updated.workspace
+            || self.user_plugins_dir().is_none()
+            || self.user_plugins_dir() != updated.user_plugins_dir()
+            || self.state_path.is_none()
+            || self.state_path != updated.state_path
+        {
+            return None;
+        }
+        let summary = |reg: &Self| {
+            reg.plugins
+                .iter()
+                .map(|(id, p)| {
+                    (
+                        id.clone(),
+                        p.scope,
+                        p.content_hash.clone(),
+                        p.capability_hash.clone(),
+                        p.state_generation,
+                        p.enabled,
+                        p.trust_status,
+                        p.outside_reach,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = summary(self);
+        let mut candidates: Vec<LoadedPlugin> = self
+            .plugins
+            .values()
+            .filter(|p| p.scope != PluginScope::User)
+            .cloned()
+            .chain(
+                updated
+                    .plugins
+                    .values()
+                    .filter(|p| p.scope == PluginScope::User)
+                    .cloned(),
+            )
+            .collect();
+        candidates.sort_by(|left, right| {
+            left.scope
+                .cmp(&right.scope)
+                .then_with(|| left.name().cmp(right.name()))
+                .then_with(|| left.canonical_root.cmp(&right.canonical_root))
+        });
+
+        let mut view = self.clone();
+        view.plugins.clear();
+        view.names.clear();
+        let mut seen_roots = BTreeSet::new();
+        let mut seen_names = BTreeSet::new();
+        for plugin in candidates {
+            if !seen_roots.insert(plugin.canonical_root.clone()) {
+                continue;
+            }
+            if !seen_names.insert(plugin.name().to_string()) {
+                continue;
+            }
+            view.register_loaded(plugin);
+        }
+        view.state = updated.state.clone();
+        view.state_error = updated.state_error.clone();
+        view.managed_policy = updated.managed_policy.clone();
+        view.managed_policy_error = updated.managed_policy_error.clone();
+        view.apply_state();
+        let after = summary(&view);
+        if before == after
+            && view.state_error == self.state_error
+            && view.managed_policy_error == self.managed_policy_error
+        {
+            return None;
+        }
+        Some(view)
+    }
+
     pub fn native_catalog_requires_selection(&self, plugin_id: &str) -> bool {
         self.unselected_native_catalogs.contains(plugin_id)
     }
@@ -156,10 +446,10 @@ impl PluginRegistry {
         let file = codewhale_util::bundle_file::open_bundle_file(&source.path)
             .map_err(|_| "Native preset cannot be opened")?;
         let mut bytes = Vec::new();
-        file.take(64 * 1024 * 1024 + 1)
+        file.take(256 * 1024 * 1024 + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| "Native preset cannot be read")?;
-        if bytes.len() > 64 * 1024 * 1024 {
+        if bytes.len() > 256 * 1024 * 1024 {
             return Err("Native preset entry exceeds the bundle limit".into());
         }
         if codewhale_runtime::hashing::sha256_hex(&bytes) != selected.entry.sha256 {
@@ -277,9 +567,39 @@ impl PluginRegistry {
                 Some(_) => PluginTrustStatus::Trusted,
                 None => PluginTrustStatus::NeverReviewed,
             };
+            let receipt = persisted
+                .and_then(|state| state.trust.as_ref())
+                .filter(|_| plugin.trust_status == PluginTrustStatus::Trusted);
+            plugin.approved_by = receipt.and_then(|receipt| receipt.approved_by.clone());
+            plugin.enabled_by = persisted
+                .filter(|state| state.enabled)
+                .and_then(|state| state.enabled_by.clone());
+            plugin.host_services = receipt.map(TrustReceipt::granted).unwrap_or_default();
+            plugin.outside_reach = outside_reach(plugin.approved_by.as_ref(), &self.workspace);
+            plugin.reviewed_at = receipt.map(|receipt| receipt.reviewed_at.clone());
+            plugin.review_history = persisted
+                .map(|state| {
+                    state
+                        .review_history
+                        .iter()
+                        .rev()
+                        .take(MAX_REVIEW_HISTORY)
+                        .map(|entry| PluginReviewEntry {
+                            reviewed_at: entry.reviewed_at.clone(),
+                            approved_by: entry.approved_by.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             if self.state_error.is_some() {
                 plugin.enabled = false;
                 plugin.trust_status = PluginTrustStatus::NeverReviewed;
+                plugin.approved_by = None;
+                plugin.enabled_by = None;
+                plugin.host_services = Vec::new();
+                plugin.outside_reach = false;
+                plugin.reviewed_at = None;
+                plugin.review_history = Vec::new();
             }
             // The managed policy is enforced here — inside the single choke
             // point that turns persisted state into live enablement — so a
@@ -727,33 +1047,166 @@ impl PluginRegistry {
         }
     }
 
+    fn peer_names(&self) -> BTreeMap<PluginId, String> {
+        self.plugins
+            .iter()
+            .map(|(id, plugin)| (id.clone(), plugin.name().to_string()))
+            .collect()
+    }
+
+    #[must_use]
+    pub fn host_service_review(&self, selector: &str) -> Option<HostServiceReview> {
+        self.host_service_review_for(selector, &PluginApprover::person(PersonVia::Terminal))
+    }
+
+    #[must_use]
+    pub fn host_service_review_for(
+        &self,
+        selector: &str,
+        approver: &PluginApprover,
+    ) -> Option<HostServiceReview> {
+        if self.state_error.is_some() {
+            return None;
+        }
+        Some(host_service_review_in(
+            &self.state,
+            self.get(selector)?,
+            &self.peer_names(),
+            &approver.cohort(),
+        ))
+    }
+
     pub fn trust(&mut self, selector: &str) -> Result<(), String> {
+        self.trust_reviewed(
+            selector,
+            ReviewApproval {
+                approved_by: PluginApprover::person(PersonVia::Terminal),
+                host_services: None,
+            },
+        )
+    }
+
+    pub fn trust_reviewed(
+        &mut self,
+        selector: &str,
+        approval: ReviewApproval,
+    ) -> Result<(), String> {
         let plugin = self
             .get(selector)
-            .ok_or_else(|| format!("Plugin bundle `{selector}` was not found"))?;
-        let plugin = plugin.clone();
+            .ok_or_else(|| format!("Plugin bundle `{selector}` was not found"))?
+            .clone();
+        self.commit_trust_transaction(&plugin, approval, None)
+    }
+
+    pub fn trust_and_enable_by(
+        &mut self,
+        selector: &str,
+        approval: ReviewApproval,
+        enabled_by: PluginApprover,
+    ) -> Result<(), String> {
+        let plugin = self
+            .get(selector)
+            .ok_or_else(|| format!("Plugin bundle `{selector}` was not found"))?
+            .clone();
+        self.check_managed_policy_for_enable(&plugin)?;
+        self.check_enable_approver(
+            &plugin,
+            Some(&approval.approved_by),
+            outside_reach(Some(&approval.approved_by), &self.workspace),
+            &enabled_by,
+        )?;
+        self.check_activation_preconditions(&plugin)?;
+        self.commit_trust_transaction(&plugin, approval, Some(enabled_by))
+    }
+
+    fn commit_trust_transaction(
+        &mut self,
+        plugin: &LoadedPlugin,
+        approval: ReviewApproval,
+        also_enable_by: Option<PluginApprover>,
+    ) -> Result<(), String> {
         let id = plugin.id.clone();
+        check_approver(
+            &approval.approved_by,
+            plugin,
+            &self.workspace,
+            approval.host_services.is_some(),
+        )?;
         let state_path = self
             .state_path
             .as_deref()
             .ok_or_else(|| "Plugin registry has no persistence store".to_string())?;
-        stage_bundle(state_path, &plugin, StageIntent::Review)?;
-        let receipt = TrustReceipt {
+        let staged_path = stage_bundle(state_path, plugin, StageIntent::Review)?;
+        if also_enable_by.is_some()
+            && let Some(reason) =
+                staged_bundle_rejection(&staged_path, &plugin.content_hash, &plugin.capability_hash)
+        {
+            return Err(format!(
+                "Plugin bundle `{}` has no verified Codewhale runtime snapshot ({reason}); review and trust it again before enablement",
+                plugin.name()
+            ));
+        }
+        let names = self.peer_names();
+        let cohort = approval.approved_by.cohort();
+        let expected_entry = self.state.plugins.get(&id).cloned();
+        let expected_install_nonce = plugin.install_nonce.clone();
+        let mut receipt = TrustReceipt {
             content_hash: plugin.content_hash.clone(),
             capability_hash: plugin.capability_hash.clone(),
             reviewed_capabilities: plugin.inventory.clone(),
             reviewed_at: chrono::Utc::now().to_rfc3339(),
+            version: RECEIPT_VERSION,
+            approved_by: Some(approval.approved_by),
+            host_services: Vec::new(),
         };
         self.commit_state_change(|state| {
+            let current_entry = state.plugins.get(&id);
+            if current_entry.map_or(0, |entry| entry.generation) != plugin.state_generation
+                || !trust_receipt_matches(
+                    expected_entry.as_ref().and_then(|entry| entry.trust.as_ref()),
+                    current_entry.and_then(|entry| entry.trust.as_ref()),
+                )
+                || (plugin.trusted()
+                    && !current_entry
+                        .and_then(|entry| entry.trust.as_ref())
+                        .is_some_and(|current| {
+                            current.content_hash == plugin.content_hash
+                                && current.capability_hash == plugin.capability_hash
+                                && current.approved_by == plugin.approved_by
+                        }))
+                || super::discovery::read_install_nonce(&plugin.canonical_root)?
+                    != expected_install_nonce
+            {
+                return Err(format!(
+                    "Plugin bundle `{}` state or review changed; refresh plugin state and review it again",
+                    plugin.name()
+                ));
+            }
+            if let Some(shown) = approval.host_services.as_deref() {
+                let review = host_service_review_in(state, plugin, &names, &cohort);
+                if review.token != shown {
+                    return Err(format!(
+                        "The host service review for plugin bundle `{}` changed since it was shown; read it again before approving",
+                        plugin.name()
+                    ));
+                }
+                receipt.host_services = review.grants();
+            }
             let entry = state.plugins.entry(id).or_default();
             entry.generation = entry
                 .generation
                 .checked_add(1)
                 .ok_or_else(|| "Plugin authority generation is exhausted".to_string())?;
-            // Trust records review and staging only. Even if an older state
-            // kept the enablement bit across revocation or content drift,
-            // re-review must never reactivate the bundle implicitly.
-            entry.enabled = false;
+            match also_enable_by {
+                Some(enabled_by) => {
+                    entry.enabled = true;
+                    entry.enabled_by = Some(enabled_by);
+                }
+                None => {
+                    entry.enabled = false;
+                    entry.enabled_by = None;
+                }
+            }
             entry.trust = Some(receipt.clone());
             entry.review_history.push(receipt);
             if entry.review_history.len() > MAX_REVIEW_HISTORY {
@@ -781,13 +1234,10 @@ impl PluginRegistry {
     }
 
     pub fn enable(&mut self, selector: &str) -> Result<(), String> {
-        let plugin = self
-            .get(selector)
-            .ok_or_else(|| format!("Plugin bundle `{selector}` was not found"))?
-            .clone();
-        // The organization policy is the outermost gate: re-read it so a
-        // document that landed after discovery still refuses, and refuse
-        // before diagnosing trust or staging the user can never act on.
+        self.enable_by(selector, PluginApprover::person(PersonVia::Terminal))
+    }
+
+    fn check_managed_policy_for_enable(&mut self, plugin: &LoadedPlugin) -> Result<(), String> {
         self.refresh_managed_policy();
         if let Some(error) = self.managed_policy_error.as_deref() {
             let path = self.managed_policy_path.as_deref().map_or_else(
@@ -809,6 +1259,61 @@ impl PluginRegistry {
                 plugin.id.as_str()
             ));
         }
+        Ok(())
+    }
+
+    fn check_enable_approver(
+        &self,
+        plugin: &LoadedPlugin,
+        approved_by: Option<&PluginApprover>,
+        is_outside_reach: bool,
+        enabled_by: &PluginApprover,
+    ) -> Result<(), String> {
+        if matches!(enabled_by, PluginApprover::Agent(_)) {
+            if approved_by
+                .and_then(PluginApprover::agent_workspace)
+                .is_none()
+            {
+                return Err(format!(
+                    "Plugin bundle `{}` is approved for every project, so the agent cannot turn it on; ask the person",
+                    plugin.name()
+                ));
+            }
+            if is_outside_reach {
+                return Err(format!(
+                    "Plugin bundle `{}` was approved by the agent of another project, so it cannot be turned on here",
+                    plugin.name()
+                ));
+            }
+            check_approver(enabled_by, plugin, &self.workspace, true)?;
+        }
+        Ok(())
+    }
+
+    fn check_activation_preconditions(&self, plugin: &LoadedPlugin) -> Result<(), String> {
+        if !plugin.applicable {
+            return Err(format!(
+                "Plugin bundle `{}` does not apply to this host",
+                plugin.name()
+            ));
+        }
+        if !plugin.inventory.can_activate_supported_components() {
+            let unsupported = plugin.inventory.unsupported_labels();
+            return Err(format!(
+                "Plugin bundle `{}` has no supported declarative components to activate; inactive: {}",
+                plugin.name(),
+                unsupported.join(", ")
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn enable_by(&mut self, selector: &str, enabled_by: PluginApprover) -> Result<(), String> {
+        let plugin = self
+            .get(selector)
+            .ok_or_else(|| format!("Plugin bundle `{selector}` was not found"))?
+            .clone();
+        self.check_managed_policy_for_enable(&plugin)?;
         if !plugin.trusted() {
             return Err(format!(
                 "Plugin bundle `{}` requires capability review before enablement (trust: {})",
@@ -816,6 +1321,12 @@ impl PluginRegistry {
                 plugin.trust_status.as_str()
             ));
         }
+        self.check_enable_approver(
+            &plugin,
+            plugin.approved_by.as_ref(),
+            plugin.outside_reach,
+            &enabled_by,
+        )?;
         let snapshot_rejection = match plugin.staged_root.as_deref() {
             None => Some(
                 plugin
@@ -837,22 +1348,18 @@ impl PluginRegistry {
                 plugin.name()
             ));
         }
-        if !plugin.applicable {
-            return Err(format!(
-                "Plugin bundle `{}` does not apply to this host",
-                plugin.name()
-            ));
-        }
-        if !plugin.inventory.can_activate_supported_components() {
-            let unsupported = plugin.inventory.unsupported_labels();
-            return Err(format!(
-                "Plugin bundle `{}` has no supported declarative components to activate; inactive: {}",
-                plugin.name(),
-                unsupported.join(", ")
-            ));
-        }
+        self.check_activation_preconditions(&plugin)?;
         let id = plugin.id.clone();
+        let expected_install_nonce = plugin.install_nonce.clone();
         self.commit_state_change(|state| {
+            if super::discovery::read_install_nonce(&plugin.canonical_root)?
+                != expected_install_nonce
+            {
+                return Err(format!(
+                    "Plugin bundle `{}` state or review changed; refresh plugin state and review it if needed before enabling again",
+                    plugin.name()
+                ));
+            }
             let entry = state
                 .plugins
                 .get_mut(&id)
@@ -861,6 +1368,7 @@ impl PluginRegistry {
                         && entry.trust.as_ref().is_some_and(|receipt| {
                             receipt.content_hash == plugin.content_hash
                                 && receipt.capability_hash == plugin.capability_hash
+                                && receipt.approved_by == plugin.approved_by
                         })
                 })
                 .ok_or_else(|| {
@@ -874,6 +1382,7 @@ impl PluginRegistry {
                 .checked_add(1)
                 .ok_or_else(|| "Plugin authority generation is exhausted".to_string())?;
             entry.enabled = true;
+            entry.enabled_by = Some(enabled_by);
             Ok(())
         })
     }
@@ -890,6 +1399,7 @@ impl PluginRegistry {
                 .checked_add(1)
                 .ok_or_else(|| "Plugin authority generation is exhausted".to_string())?;
             entry.enabled = false;
+            entry.enabled_by = None;
             Ok(())
         })
     }
@@ -955,11 +1465,14 @@ impl PluginRegistry {
         let id = plugin.id.clone();
         let name = plugin.name().to_string();
         let applicable = plugin.applicable;
-        let carried = TrustReceipt {
+        let mut carried = TrustReceipt {
             content_hash: plugin.content_hash.clone(),
             capability_hash: plugin.capability_hash.clone(),
             reviewed_capabilities: plugin.inventory.clone(),
             reviewed_at: chrono::Utc::now().to_rfc3339(),
+            version: 0,
+            approved_by: None,
+            host_services: Vec::new(),
         };
         self.commit_state_change(|state| {
             let Some(predecessor) = builtin_predecessor(state, &id, &name).cloned() else {
@@ -968,9 +1481,14 @@ impl PluginRegistry {
             let Some(prior) = predecessor.trust else {
                 return Ok(());
             };
+            carried.approved_by.clone_from(&prior.approved_by);
+            if carried.approved_by.is_some() {
+                carried.version = RECEIPT_VERSION;
+            }
             let mut entry = PersistedPluginState {
                 generation: 1,
                 enabled: false,
+                enabled_by: None,
                 trust: None,
                 review_history: predecessor.review_history,
             };
@@ -981,6 +1499,9 @@ impl PluginRegistry {
                     return Ok(());
                 }
                 entry.enabled = predecessor.enabled && applicable;
+                if entry.enabled {
+                    entry.enabled_by = predecessor.enabled_by;
+                }
                 entry.trust = Some(carried.clone());
                 entry.review_history.push(carried);
                 if entry.review_history.len() > MAX_REVIEW_HISTORY {
@@ -1019,6 +1540,7 @@ impl PluginRegistry {
         let mut next = load_state_unlocked(path)?;
         mutate(&mut next)?;
         save_state(path, &next)?;
+        self.catalog_stamp.refresh_state(path);
         self.state = next;
         // Runtime selection rechecks the persisted review through its own
         // read lock. Publish the completed state transaction before deriving
@@ -1208,7 +1730,7 @@ fn persist_plugin_state_with_directory_sync(
 #[cfg(windows)]
 fn persist_plugin_state(mut temporary: tempfile::TempPath, path: &Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt as _;
-    use windows::Win32::Foundation::WIN32_ERROR;
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, WIN32_ERROR};
     use windows::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_TEMPORARY, MOVEFILE_REPLACE_EXISTING,
         MOVEFILE_WRITE_THROUGH, MoveFileExW, SetFileAttributesW,
@@ -1237,12 +1759,17 @@ fn persist_plugin_state(mut temporary: tempfile::TempPath, path: &Path) -> Resul
     })?;
 
     // The state lock serializes writers, but not everything that opens the
-    // stable file: another registry re-applies the state directory's
+    // stable file. Another registry re-applies the state directory's
     // inheritable ACL before it takes that lock, and Defender or the indexer
-    // can scan the file. Each holds the destination only briefly, and
-    // MoveFileExW then reports a refusal that clears on its own. Re-attempt
-    // only the rename, on the schedule the other atomic writers share; the
-    // hardened temporary and the stable file are both left untouched.
+    // can scan the file; each holds it only briefly. A plugin UI grant holds
+    // it for up to an hour. MoveFileExW refuses to replace a destination that
+    // any handle has open, so on access denied publish with std::fs::rename,
+    // which replaces a destination whose holders share delete access (POSIX
+    // rename: NTFS, Windows 10 1709 or later), and flush through a handle
+    // opened beforehand because that rename does not write through. When that
+    // is refused too, re-attempt on the schedule the other atomic writers
+    // share; a failed attempt leaves the hardened temporary and the stable
+    // file untouched.
     let mut attempt = 0;
     // SAFETY: both paths are NUL-terminated and live.
     while let Err(error) = unsafe {
@@ -1254,7 +1781,19 @@ fn persist_plugin_state(mut temporary: tempfile::TempPath, path: &Path) -> Resul
     } {
         // MoveFileExW reports an HRESULT; the shared classifier reads the
         // Win32 code it wraps.
-        let backoff = WIN32_ERROR::from_error(&error).and_then(|code| {
+        let code = WIN32_ERROR::from_error(&error);
+        if code == Some(ERROR_ACCESS_DENIED)
+            && let Ok(Some(source)) = open_existing_regular_file(&temporary_path, true)
+            && fs::rename(&temporary_path, path).is_ok()
+        {
+            temporary.disable_cleanup(true);
+            return source.sync_all().map_err(|error| {
+                format!(
+                    "plugin state was published but its durability could not be confirmed: {error}"
+                )
+            });
+        }
+        let backoff = code.and_then(|code| {
             codewhale_util::utils::windows_publish_retry_delay(
                 &std::io::Error::from_raw_os_error(code.0 as i32),
                 attempt,
@@ -2121,7 +2660,7 @@ fn copy_bundle_tree_bounded(
             copy_bundle_tree_bounded(&source_path, &destination_path, budget)?;
         } else if metadata.is_file() {
             budget.files = budget.files.saturating_add(1);
-            if budget.files > 4_096 {
+            if budget.files > 16_384 {
                 return Err("Plugin content exceeded the staging file limit".to_string());
             }
             let mut source_file = codewhale_util::bundle_file::open_bundle_file(&source_path)
@@ -2142,7 +2681,7 @@ fn copy_bundle_tree_bounded(
                     break;
                 }
                 budget.bytes = budget.bytes.saturating_add(read as u64);
-                if budget.bytes > 64 * 1024 * 1024 {
+                if budget.bytes > 256 * 1024 * 1024 {
                     return Err("Plugin content exceeded the staging byte limit".to_string());
                 }
                 destination_file
@@ -2352,7 +2891,7 @@ fn copy_bundle_directory_fd(
                 return Err("Plugin content may not contain hard-linked files".to_string());
             }
             budget.files = budget.files.saturating_add(1);
-            if budget.files > 4_096 {
+            if budget.files > 16_384 {
                 return Err("Plugin content exceeded the staging file limit".to_string());
             }
             // SAFETY: openat is anchored and O_NOFOLLOW prevents a file swap
@@ -2392,7 +2931,7 @@ fn copy_bundle_directory_fd(
                     break;
                 }
                 budget.bytes = budget.bytes.saturating_add(read as u64);
-                if budget.bytes > 64 * 1024 * 1024 {
+                if budget.bytes > 256 * 1024 * 1024 {
                     return Err("Plugin content exceeded the staging byte limit".to_string());
                 }
                 destination_file
@@ -2977,6 +3516,30 @@ pub fn capture_plugin_state_authority(
     authority: &PluginAuthority,
     expected: Option<&fs::File>,
 ) -> Result<fs::File, String> {
+    read_active_receipt(authority, expected).map(|(state_file, _)| state_file)
+}
+
+pub fn granted_host_services(authority: &PluginAuthority) -> Result<Vec<HostService>, String> {
+    reviewed_record(authority).map(|record| record.host_services)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewedRecord {
+    pub approved_by: Option<PluginApprover>,
+    pub host_services: Vec<HostService>,
+}
+
+pub fn reviewed_record(authority: &PluginAuthority) -> Result<ReviewedRecord, String> {
+    read_active_receipt(authority, None).map(|(_, receipt)| ReviewedRecord {
+        host_services: receipt.granted(),
+        approved_by: receipt.approved_by,
+    })
+}
+
+fn read_active_receipt(
+    authority: &PluginAuthority,
+    expected: Option<&fs::File>,
+) -> Result<(fs::File, TrustReceipt), String> {
     let policy_path = authority
         .managed_policy_source
         .as_deref()
@@ -3038,29 +3601,31 @@ pub fn capture_plugin_state_authority(
     .map_err(|_| {
         "Plugin authority state is invalid; the bundle is disabled fail-closed".to_string()
     })?;
-    let active = state
+    let receipt = state
         .plugins
         .get(&authority.plugin_id)
-        .is_some_and(|entry| {
-            entry.generation == authority.state_generation
-                && entry.enabled
-                && entry.trust.as_ref().is_some_and(|receipt| {
-                    receipt.content_hash == authority.content_hash
-                        && receipt.capability_hash == authority.capability_hash
-                })
-        });
-    if !active {
-        return Err(format!(
-            "Plugin bundle `{}` is disabled, revoked, or no longer matches its review receipt",
-            authority.plugin_name
-        ));
-    }
-    Ok(state_file)
+        .filter(|entry| entry.generation == authority.state_generation && entry.enabled)
+        .and_then(|entry| entry.trust.as_ref())
+        .filter(|receipt| {
+            receipt.content_hash == authority.content_hash
+                && receipt.capability_hash == authority.capability_hash
+        })
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "Plugin bundle `{}` is disabled, revoked, or no longer matches its review receipt",
+                authority.plugin_name
+            )
+        })?;
+    Ok((state_file, receipt))
 }
 
 #[cfg(test)]
 mod state_publication_tests {
-    use super::{PluginStateFile, harden_plugin_state_file, save_state_with_hardener};
+    use super::{
+        PluginStateFile, harden_plugin_state_file, open_existing_regular_file,
+        save_state_with_hardener,
+    };
 
     fn prepare_private_directory(_path: &std::path::Path) {
         #[cfg(unix)]
@@ -3091,6 +3656,42 @@ mod state_publication_tests {
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>();
         assert_eq!(entries, [std::ffi::OsString::from("state-鲸.json")]);
+    }
+
+    #[test]
+    fn state_publication_replaces_a_stable_file_that_a_reader_still_holds_open() {
+        use std::io::Read as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        prepare_private_directory(directory.path());
+        let state_path = directory.path().join("state.json");
+        std::fs::write(&state_path, b"old-authoritative-state").unwrap();
+        let mut held = open_existing_regular_file(&state_path, false)
+            .unwrap()
+            .unwrap();
+
+        save_state_with_hardener(
+            &state_path,
+            &PluginStateFile::default(),
+            harden_plugin_state_file,
+        )
+        .unwrap();
+
+        let mut published = open_existing_regular_file(&state_path, false)
+            .unwrap()
+            .unwrap();
+        assert!(!codewhale_util::files::same_file(&held, &published).unwrap());
+        let mut superseded = String::new();
+        held.read_to_string(&mut superseded).unwrap();
+        assert_eq!(superseded, "old-authoritative-state");
+        let mut current = String::new();
+        published.read_to_string(&mut current).unwrap();
+        assert!(current.contains("\"schema_version\": 1"));
+        let entries = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, [std::ffi::OsString::from("state.json")]);
     }
 
     #[test]

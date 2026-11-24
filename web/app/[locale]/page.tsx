@@ -1,256 +1,330 @@
 import { Fragment } from "react";
 import Image from "next/image";
 import Link from "next/link";
+import { DesktopShot } from "@/components/desktop-shot";
 import { HeroInstall } from "@/components/hero-install";
 import { Icon } from "@/components/icon";
-import { Section } from "@/components/page-header";
-import { Strata } from "@/components/strata";
-import { ReleaseUpdates } from "@/components/release-updates";
-import { NativeTerminalGallery } from "@/components/native-terminal-gallery";
-import { LivingHeroWhale } from "@/components/living-hero-whale";
-import { getFacts } from "@/lib/facts";
-import { CONTRIBUTION_PATHS, SKILL_CONTRIBUTION } from "@/lib/content/contributing";
-import { PLUGINS_COPY } from "@/lib/content/plugins";
-import { PRODUCT_COPY } from "@/lib/content/product";
+import { readAsOf } from "@/components/project-pulse";
+import { InlineCode } from "@/components/route/inline-code";
+import { RouteMap, type RoutePart } from "@/components/route/product-route";
+import { SessionFrames, type SessionFrame } from "@/components/route/session-frames";
+import { Status } from "@/components/status-badge";
+import { TerminalCapture } from "@/components/terminal-capture";
+import { releaseView, runtimeCapabilityContext } from "@/lib/capabilities";
+import { STATE_TONE, surfaceState } from "@/lib/surface-states";
+import { captureCaption, frameNote } from "@/lib/capture-caption";
 import { PARTNER_PROMO } from "@/lib/content/partner-promo";
-import { fill, getChrome, getComputerUse, getHome, pickText, splitToken } from "@/lib/i18n/dictionaries";
-import { DISCORD_URL } from "@/lib/i18n/links";
+import { PROJECT_COPY } from "@/lib/content/project";
+import { PRODUCT_MAP_STATE_KEY, PRODUCT_MAP_TEXT_KEYS, productMap, type ProductMapId } from "@/lib/content/product-map";
+import { getFacts } from "@/lib/facts";
+import { fill, getChrome, getContribute, getHome, pickText, splitToken } from "@/lib/i18n/dictionaries";
+import type { HomeDict } from "@/lib/i18n/dictionaries/types";
+import { REPO_URL } from "@/lib/i18n/links";
+import { pluralText } from "@/lib/i18n/plural";
 import { serializeJsonLd } from "@/lib/json-ld";
-import { TERMINAL_SCREENSHOT } from "@/lib/media-manifest";
+import { RELEASED_CAPTURE_FRAMES, type ReleasedCaptureFrameId } from "@/lib/released-capture.generated";
+import { parseExclusions, repoActivityView, type ActivityPull } from "@/lib/repo-activity";
 import { buildSoftwareApplicationJsonLd } from "@/lib/software-application-schema";
-import { getReleaseUpdates } from "@/lib/release-updates";
 
-// Resolve published releases at request time; source fetches cache for five
-// minutes. `getFacts()` rejects legacy or older KV snapshots.
-export const dynamic = "force-dynamic";
+export const revalidate = 300;
 
-/**
- * The whale-road homepage: the promise, capabilities and reading
- * sections sit on paper. The live v2 whale (the desktop app's own Director)
- * rests above the captured terminal with drawn water behind it,
- * and the page ends in the sea with the install action, running into the
- * footer.
- *
- * One memorable thing moves: the whale. It breathes, glances toward the
- * pointer, and performs its existing poses. Everything else is still.
- * Reduced motion shows its poster pose.
- *
- * Public copy resolves through `getHome(locale)`; product names and package
- * channels keep their canonical spelling.
- */
+const PART_DOC: Partial<Record<ProductMapId, string>> = {
+  terminal: "/install",
+  localBrowser: "/docs/web",
+  manyAgents: "/docs/fleet",
+};
+
+const SESSION_STEPS = [
+  { key: "02-task-prompt", name: "frameLabelPrompt", summary: "frameSummaryPrompt" },
+  { key: "03-task-diff", name: "frameLabelEdit", summary: "frameSummaryEdit" },
+  { key: "04-task-approval", name: "frameLabelApproval", summary: "frameSummaryApproval" },
+  { key: "05-task-result", name: "frameLabelResult", summary: "frameSummaryResult" },
+] as const satisfies readonly { key: string; name: keyof HomeDict; summary: keyof HomeDict }[];
+const SESSION_OPENS_ON = 3;
+const PROVIDER_ROWS = [7, 17] as const;
+const RECEIPT_ROWS_WIDE = [6, 37] as const;
+const RECEIPT_ROWS_NARROW = [2, 34] as const;
+const MERGED_ROWS = 8;
+const AGENT_ROLES = [
+  { name: "explore", text: "agentRoleExplore" },
+  { name: "implement", text: "agentRoleImplement" },
+  { name: "reviewer", text: "agentRoleReviewer" },
+] as const satisfies readonly { name: string; text: keyof HomeDict }[];
+
+const avatar = (url: string, size: number) => `${url}${url.includes("?") ? "&" : "?"}s=${size}`;
+
+function latestPerAccount(pulls: readonly ActivityPull[], limit: number): ActivityPull[] {
+  const seen = new Set<string>();
+  const rows: ActivityPull[] = [];
+  for (const pull of pulls) {
+    if (seen.has(pull.login)) continue;
+    seen.add(pull.login);
+    rows.push(pull);
+    if (rows.length === limit) break;
+  }
+  return rows;
+}
+
+function splitCount(text: string, count: string): [string, string] {
+  const at = text.indexOf(count);
+  return at < 0 ? [text, ""] : [text.slice(0, at), text.slice(at + count.length)];
+}
+
+interface Fact {
+  key: string;
+  before: string;
+  number: string | null;
+  after: string;
+  href: string;
+}
+
 export default async function HomePage({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
   const d = getHome(locale);
+  const chrome = getChrome(locale);
+  const contribute = getContribute(locale);
   const facts = await getFacts();
-  const updates = await getReleaseUpdates(facts.latestPublishedRelease);
-  const sourceVersion = facts.version ?? "unknown";
-  const publishedRelease = updates.terminal.release;
-  const sourceIsPublished = publishedRelease?.version === sourceVersion;
-  const showPromo = Date.now() < Date.parse(PARTNER_PROMO.endsAt);
+  const release = facts.latestPublishedRelease;
+  const jsonLd = buildSoftwareApplicationJsonLd(release, locale);
+  const numbers = new Intl.NumberFormat(chrome.dateLocale);
+  const promoLeft = Date.parse(PARTNER_PROMO.endsAt) - Date.now();
+  const promoDays = Math.max(1, Math.ceil(promoLeft / 86_400_000));
+  const showPromo = promoLeft > 0 && PARTNER_PROMO.locales.includes(locale);
 
-  // The install URL resolves published artifacts, so its structured version
-  // must come from the published-release receipt rather than source-candidate
-  // facts. When no release is known, the schema omits softwareVersion.
-  const jsonLd = buildSoftwareApplicationJsonLd(publishedRelease);
+  const parts: RoutePart[] = productMap({ capabilities: runtimeCapabilityContext(facts) }).map((row) => {
+    const keys = PRODUCT_MAP_TEXT_KEYS[row.id];
+    return {
+      id: row.id,
+      state: row.state,
+      name: d[keys.name],
+      stateWord: d[PRODUCT_MAP_STATE_KEY[row.state]],
+      sentence: row.sentenceHolds ? d[keys.sentence] : null,
+      href: row.state === "released" ? (PART_DOC[row.id] ?? null) : null,
+    };
+  });
 
-  // The lede typesets the brand in its own span. Splitting on the {brand}
-  // token keeps the sentence a single translated unit — no concatenation of
-  // fragments around a variable, and a locale may place the brand anywhere.
-  const ledeParts = splitToken(d.heroIntro, "brand");
+  const frame = (id: ReleasedCaptureFrameId, summary: string, rows?: readonly [number, number]) => (
+    <TerminalCapture data={RELEASED_CAPTURE_FRAMES[id]} label={summary} regionLabel={d.shotPreview} rows={rows} />
+  );
+  const sessionWide = SESSION_STEPS.map((step) => RELEASED_CAPTURE_FRAMES[`cols100/${step.key}`]);
+  const sessionCaption = captureCaption(sessionWide).caption;
+  const session: SessionFrame[] = SESSION_STEPS.map((step, index) => ({
+    key: step.key,
+    name: d[step.name],
+    wide: frame(`cols100/${step.key}`, d[step.summary]),
+    narrow: frame(`cols48/${step.key}`, d[step.summary]),
+    note: frameNote(sessionWide[index]).needsPostureNote,
+  }));
+
+  const desktopState = surfaceState("desktop");
+  const desktopPart = parts.find((part) => part.id === "desktop");
+  const released = releaseView(facts);
+  const counted = (key: string, forms: HomeDict["factModels"], n: number, href: string): Fact => {
+    const number = numbers.format(n);
+    const [before, after] = splitCount(pluralText(forms, n, locale, chrome.dateLocale), number);
+    return { key, before, number, after, href };
+  };
+  const plain = (key: string, text: string, href: string): Fact => ({ key, before: text, number: null, after: "", href });
+  const manyAgents = parts.find((part) => part.id === "manyAgents");
+  const factList: Fact[] = [
+    plain("rust", d.factRust, REPO_URL),
+    ...(facts.license ? [plain("license", fill(d.factLicense, { license: facts.license }), `${REPO_URL}/blob/main/LICENSE`)] : []),
+    ...(released.counts
+      ? [
+          counted("providers", d.factProviders, released.counts.providerRoutes, `/${locale}/models`),
+          counted("models", d.factModels, released.counts.models, `/${locale}/models`),
+        ]
+      : []),
+    ...(manyAgents?.state === "released" ? [plain("agents", manyAgents.name, `/${locale}${PART_DOC.manyAgents}`)] : []),
+  ];
+
+  const activity = repoActivityView();
+  const merged = latestPerAccount(activity?.pulls ?? [], MERGED_ROWS);
+  const accountForms = parseExclusions().confirmed ? contribute.mergedPeopleCount : contribute.mergedAccountsCount;
+  const accounts = activity?.count != null ? pluralText(accountForms, activity.count, locale, chrome.dateLocale) : null;
+  const accountsAsOf = readAsOf(activity?.readAt, locale);
+  const contributors = numbers.format(facts.contributorCount);
+  const [contributorsBefore, contributorsAfter] = splitCount(pluralText(d.contributorsCount, facts.contributorCount, locale, chrome.dateLocale), contributors);
+
+  const titleAnswer = d.heroTitle.slice(d.heroTitleLead.length).trim();
+  const brand = (text: string) =>
+    splitToken(text, "brand").map((part, index) => (
+      <Fragment key={index}>
+        {index > 0 ? <bdi>Codewhale</bdi> : null}
+        {part}
+      </Fragment>
+    ));
+
+  const install = (
+    <div className="home-install">
+      <HeroInstall locale={locale} ariaLabel={d.heroInstallAria} copyLabel={d.copy} copiedLabel={d.copied} />
+      <p className="home-version">
+        {release ? <span>{fill(d.installNote, { version: release.version })}</span> : null}
+        <a href={REPO_URL} className="home-version-link">
+          {d.readTheCode}
+        </a>
+      </p>
+    </div>
+  );
+  const factRow =
+    factList.length > 0 ? (
+      <ul className="home-facts" role="list" aria-label={d.factsLabel}>
+        {factList.map((fact) => {
+          const content = (
+            <>
+              {fact.before}
+              {fact.number ? <strong className="tabular">{fact.number}</strong> : null}
+              {fact.after}
+            </>
+          );
+          return (
+            <li key={fact.key}>
+              {fact.href.startsWith("/") ? <Link href={fact.href}>{content}</Link> : <a href={fact.href}>{content}</a>}
+            </li>
+          );
+        })}
+      </ul>
+    ) : null;
+  const sessionShot = (
+    <SessionFrames frames={session} initial={SESSION_OPENS_ON} label={d.shotPreview} caption={sessionCaption ? d[sessionCaption] : null} note={d.captureFrameNoPosture} />
+  );
 
   return (
     <div className="home">
-      <script
-        type="application/ld+json"
-        dangerouslySetInnerHTML={{ __html: serializeJsonLd(jsonLd) }}
-      />
+      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: serializeJsonLd(jsonLd) }} />
 
-      <div className="home-intro">
-        <div className="home-water" aria-hidden="true"><Strata /></div>
-        {/* PAPER — the promise, one primary action, the install command, and
-            the whale resting on the terminal below. */}
-        <section className="home-hero" aria-labelledby="home-title">
-          <div className="home-hero-inner">
-            <div className="home-hero-copy">
-              <h1 id="home-title" className="home-title">{d.heroTitle}</h1>
-              <p className="home-lede">
-                {ledeParts.map((part, index) => (
-                  <Fragment key={index}>
-                    {index > 0 && <strong>Codewhale</strong>}
-                    {part}
-                  </Fragment>
-                ))}
+      <section className="home-hero" data-hero="center" aria-labelledby="home-title">
+        <div className="home-hero-text">
+          <h1 id="home-title" className="home-title">
+            <span className="home-title-lead">{d.heroTitleLead}</span> <span className="home-title-answer">{titleAnswer}</span>
+          </h1>
+          <p className="home-subhead">{brand(d.heroIntro)}</p>
+          {install}
+        </div>
+        <div className="home-hero-shot">{sessionShot}</div>
+        {factRow}
+      </section>
+
+      <div className="home-sections">
+        <section className="home-section home-split" aria-labelledby="home-model">
+          <div className="home-text">
+            <h2 id="home-model" className="home-h2">{d.sectionModelHeading}</h2>
+            <p className="home-body"><InlineCode text={d.sectionModelBody} /></p>
+          </div>
+          <figure className="home-figure">
+            <div className="home-frame home-only-wide">{frame("cols56/01-model-picker", d.frameSummaryProvider, PROVIDER_ROWS)}</div>
+            <div className="home-frame home-only-narrow">{frame("cols48/01-model-picker", d.frameSummaryProvider, PROVIDER_ROWS)}</div>
+          </figure>
+        </section>
+
+        {showPromo && (
+          <aside className="home-promo-bar home-promo-inline" aria-label={PARTNER_PROMO.title}>
+            <div className="home-promo-bar-inner">
+              <Image src={PARTNER_PROMO.thumb.src} alt="" width={64} height={36} className="home-promo-bar-art" unoptimized />
+              <p>
+                <strong>{PARTNER_PROMO.title}</strong>
+                <span>{pickText(PARTNER_PROMO.bar, locale)}</span>
+                <span className="home-promo-bar-days">{fill(pickText(promoDays === 1 ? PARTNER_PROMO.dayLeft : PARTNER_PROMO.daysLeft, locale), { count: promoDays })}</span>
               </p>
-              <HeroInstall locale={locale} ariaLabel={d.heroInstallAria} copyLabel={d.copy} copiedLabel={d.copied} />
-              <div className="actions">
-                <Link href={`/${locale}/install`} className="btn btn-primary btn-lg">
-                  {d.getCodewhale}
-                </Link>
-                <Link href={`/${locale}/contribute`} className="btn btn-ghost btn-lg">
-                  {d.contribute}
-                  <Icon name="arrow-right" className="icon icon-flip" />
-                </Link>
-              </div>
+              <span className="home-promo-bar-tag">{pickText(PARTNER_PROMO.referralTag, locale)}</span>
+              <p className="home-promo-bar-disclosure">{pickText(PARTNER_PROMO.disclosure, locale)}</p>
+              <a href={PARTNER_PROMO.href} rel="sponsored noopener" className="btn btn-primary">
+                {pickText(PARTNER_PROMO.cta, locale)}
+                <Icon name="external" className="icon" />
+              </a>
             </div>
-            <div className="home-whale">
-              <LivingHeroWhale locale={locale} />
-            </div>
+          </aside>
+        )}
+
+        <section className="home-section home-split home-split-flip" aria-labelledby="home-control">
+          <div className="home-text">
+            <h2 id="home-control" className="home-h2">{d.sectionControlHeading}</h2>
+            <p className="home-body"><InlineCode text={d.sectionControlBody} /></p>
           </div>
+          <figure className="home-figure">
+            <div className="home-frame home-only-wide">{frame("cols56/06b-receipt-tall", d.frameSummaryReceipt, RECEIPT_ROWS_WIDE)}</div>
+            <div className="home-frame home-only-narrow">{frame("cols48/06b-receipt-tall", d.frameSummaryReceipt, RECEIPT_ROWS_NARROW)}</div>
+          </figure>
         </section>
 
-        <section className="home-terminal" aria-label={d.shotPreview}>
-          <div className="home-terminal-inner">
-            <figure className="home-shot figure">
-              <div className="figure-frame stage" dir="ltr">
-                <NativeTerminalGallery
-                  locale={locale}
-                  defaultFrame="home"
-                  regionLabel={d.shotPreview}
-                  label={fill(d.screenshotAlt, { version: TERMINAL_SCREENSHOT.version })}
-                />
-              </div>
-              <figcaption className="figure-caption">{d.shotPreview}</figcaption>
-            </figure>
-            <div
-              className="home-proof"
-              data-source-state={sourceIsPublished ? "published release" : "source candidate"}
-              data-source-state-label={sourceIsPublished ? d.publishedRelease : d.sourceCandidate}
-            >
-              <Link href={`/${locale}/changelog`} className="section-link">{getChrome(locale).footerChangelog}</Link>
-              <span>{facts.license ?? "MIT"}</span>
-            </div>
+        <section className="home-section home-split" aria-labelledby="home-agents">
+          <div className="home-text">
+            <h2 id="home-agents" className="home-h2">{d.sectionAgentsHeading}</h2>
+            <p className="home-body"><InlineCode text={d.sectionAgentsBody} /></p>
+            <p className="home-more">
+              <Link href={`/${locale}/docs/subagents`} className="link">{d.agentsLink}</Link>
+            </p>
           </div>
-        </section>
-      </div>
-
-      {/* PAPER — models, connections, and the getting-started path. */}
-      <div className="home-body">
-        <ReleaseUpdates key={`${locale}:${updates.fetchedAt}`} locale={locale} initial={updates} />
-        <Section
-          id="home-capabilities"
-          className="home-section"
-          title={pickText(PRODUCT_COPY.workHeading, locale)}
-          link={<Link href={`/${locale}/features`} className="section-link">{getChrome(locale).navFeatures}</Link>}
-        >
-          <dl className="home-work-patterns">
-            {PRODUCT_COPY.workPatterns.slice(0, 3).map((pattern) => (
-              <div key={pattern.href}>
-                <dt>{pickText(pattern.title, locale)}</dt>
-                <dd>
-                  <p>{pickText(pattern.body, locale)}</p>
-                  <Link className="section-link" href={pattern.href.startsWith("/") ? `/${locale}${pattern.href}` : pattern.href}><code>{pattern.command}</code></Link>
-                </dd>
+          <dl className="home-figure home-roles" aria-label={d.agentsRolesLabel}>
+            {AGENT_ROLES.map((role) => (
+              <div key={role.name}>
+                <dt><code>{role.name}</code></dt>
+                <dd>{d[role.text]}</dd>
               </div>
             ))}
           </dl>
-        </Section>
-
+        </section>
       </div>
 
-      <div className="home-computer-use">
-        <div className="home-computer-inner">
-          <Section
-            id="home-computer-use"
-            layout="split"
-            className="home-section"
-            label={pickText(PLUGINS_COPY.cuTitle, locale)}
-            title={pickText(PLUGINS_COPY.cuHomeTitle, locale)}
-            scope={pickText(PLUGINS_COPY.cuLabel, locale)}
-            link={<Link href={`/${locale}/computer-use`} className="btn btn-secondary">{getComputerUse(locale).setup}<Icon name="arrow-right" className="icon icon-flip" /></Link>}
-          >
-            <dl className="ruled-list">
-              {[0, 1, 6].map((index) => {
-                const feature = PLUGINS_COPY.cuFeatures[index];
-                return <div key={feature.title.en}><dt>{pickText(feature.title, locale)}</dt><dd>{pickText(feature.detail, locale)}</dd></div>;
-              })}
-            </dl>
-          </Section>
+      <section className="home-direction" aria-labelledby="home-direction">
+        <div className="home-direction-head">
+          <h2 id="home-direction" className="home-h3">{d.sectionDirectionHeading}</h2>
+          <p className="home-body"><InlineCode text={d.sectionDirectionBody} /></p>
         </div>
-      </div>
+        <RouteMap parts={parts} engine={d.mapHeading} label={d.sectionDirectionHeading} locale={locale} />
+        <figure className="home-desktop">
+          <div className="figure-frame home-desktop-frame">
+            <DesktopShot id="approval" alt={d.directionShotAlt} sizes="(max-width: 64rem) 100vw, 64rem" />
+          </div>
+          <figcaption className="home-desktop-caption">
+            {desktopPart ? <Status tone={STATE_TONE[desktopState]}>{desktopPart.name}: {desktopPart.stateWord}</Status> : null}
+            <span className="home-caption">{d.directionShotCaption}</span>
+            <Link href={`/${locale}/app`} className="link">{d.directionShotLink}</Link>
+          </figcaption>
+        </figure>
+      </section>
 
-      <div className="home-body">
-        <Section
-          id="home-models"
-          className="home-section"
-          title={d.modelsHeading}
-          scope={d.modelsBody}
-          link={<Link href={`/${locale}/models`} className="section-link">{d.modelsLink}<Icon name="arrow-right" className="icon icon-flip" /></Link>}
-        />
-
-        <Section
-          id="home-community"
-          className="home-section home-community"
-          title={d.communityHeading}
-          scope={fill(d.communityBody, { count: facts.contributorCount })}
-          link={<Link href={`/${locale}/contribute`} className="section-link">{d.contribute}<Icon name="arrow-right" className="icon icon-flip" /></Link>}
-        >
-          <div className="home-contribution-grid">
-            <a href={SKILL_CONTRIBUTION.href} className="home-skill">
-              <h3>{pickText(SKILL_CONTRIBUTION.title, locale)}</h3>
-              <p>{pickText(SKILL_CONTRIBUTION.body, locale)}</p>
-              <code dir="ltr">plugin.json<br />skills/hello/SKILL.md</code>
-              <Icon name="arrow-right" className="icon icon-flip" />
-            </a>
-            <nav aria-label={d.communityLinksAria}>
-              <ul className="dir-list" role="list">
-                {CONTRIBUTION_PATHS.map((path) => (
-                  <li key={path.href}>
-                    <a href={path.href} className="dir-row">
-                      <span className="dir-mark" aria-hidden="true"><Icon name={path.icon} /></span>
-                      <span className="dir-text">
-                        <span className="dir-title">{pickText(path.title, locale)}</span>
-                      </span>
-                      <span className="dir-action" aria-hidden="true"><Icon name="external" /></span>
-                    </a>
+      <div className="home-sections">
+        <section className="home-section home-split" aria-labelledby="home-open">
+          <div className="home-text">
+            <h2 id="home-open" className="home-h2">{d.sectionOpenHeading}</h2>
+            <p className="home-body"><InlineCode text={d.sectionOpenBody} /></p>
+          </div>
+          <div className="home-people">
+            <p className="home-count">
+              {contributorsBefore.trim() ? <span className="home-count-label">{contributorsBefore.trim()}</span> : null}
+              <a className="home-count-number tabular" href={`${REPO_URL}/blob/main/docs/CONTRIBUTORS.md`}>{contributors}</a>
+              {contributorsAfter.trim() ? <span className="home-count-label">{contributorsAfter.trim()}</span> : null}
+            </p>
+            {accounts ? (
+              <p className="home-accounts tabular" title={accountsAsOf}>
+                {accounts}
+                {accountsAsOf ? <span className="sr-only"> {accountsAsOf}</span> : null}
+              </p>
+            ) : null}
+            {merged.length > 0 ? (
+              <ol className="home-merged" role="list" aria-label={pickText(PROJECT_COPY.mergedHeading, locale)}>
+                {merged.map((pull) => (
+                  <li key={pull.number}>
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={avatar(pull.avatar, 48)} alt="" width={24} height={24} loading="lazy" decoding="async" />
+                    <span className="home-merged-login" dir="ltr">{pull.login}</span>
+                    <a className="home-merged-title" href={pull.url} dir="ltr" lang="en">{pull.title}</a>
                   </li>
                 ))}
-                <li>
-                  <a href={DISCORD_URL} className="dir-row">
-                    <span className="dir-mark" aria-hidden="true"><Icon name="message" /></span>
-                    <span className="dir-text"><span className="dir-title">Discord</span></span>
-                    <span className="dir-action" aria-hidden="true"><Icon name="external" /></span>
-                  </a>
-                </li>
-              </ul>
-            </nav>
+              </ol>
+            ) : null}
           </div>
-        </Section>
-
-        {showPromo && (
-          <section className="home-section home-promo" aria-labelledby="home-promo-title">
-            <a href={PARTNER_PROMO.href} rel="sponsored" className="home-promo-card">
-              <span className="figure-frame">
-                <Image
-                  src={PARTNER_PROMO.image.src}
-                  alt={pickText(PARTNER_PROMO.image.alt, locale)}
-                  width={PARTNER_PROMO.image.width}
-                  height={PARTNER_PROMO.image.height}
-                  unoptimized
-                />
-              </span>
-              <span className="home-promo-text">
-                <span className="home-promo-title" id="home-promo-title">{PARTNER_PROMO.title}</span>
-                <span className="home-promo-body">{pickText(PARTNER_PROMO.body, locale)}</span>
-                <span className="home-promo-body">{pickText(PARTNER_PROMO.disclosure, locale)}</span>
-                <span className="section-link">
-                  {pickText(PARTNER_PROMO.cta, locale)}
-                  <Icon name="external" />
-                </span>
-              </span>
-            </a>
-          </section>
-        )}
+        </section>
       </div>
 
-      {/* THE SEA AGAIN — the install action where the page ends; the water
-          runs on into the footer. */}
-      <section className="home-install stage sea-continues" aria-labelledby="home-install">
-        <div className="home-install-inner">
-          <h2 className="section-title" id="home-install">{d.startHeading}</h2>
-          <Link href={`/${locale}/install`} className="btn btn-primary btn-lg">
-            {d.getCodewhale}
-            <Icon name="arrow-right" className="icon icon-flip" />
-          </Link>
+      <section className="home-start" aria-labelledby="home-start">
+        <div className="home-start-inner">
+          <div className="home-text">
+            <h2 id="home-start" className="home-h2">{d.sectionStartHeading}</h2>
+            <p className="home-body"><InlineCode text={d.sectionStartBody} /></p>
+          </div>
+          {install}
         </div>
       </section>
     </div>

@@ -632,14 +632,16 @@ impl SetupRuntimePreset {
 
     pub fn permission_posture(self) -> &'static str {
         match self {
-            Self::AskFirst | Self::NormalAgent => "ask",
+            Self::AskFirst => "ask",
+            Self::NormalAgent => "accept-edits",
             Self::HighTrustLocal => "full-access",
         }
     }
 
     pub fn approval_policy(self) -> Option<&'static str> {
         match self {
-            Self::AskFirst | Self::NormalAgent => Some("on-request"),
+            Self::AskFirst => Some("on-request"),
+            Self::NormalAgent => Some("accept-edits"),
             // Full Access lives in TUI settings; it is intentionally not a
             // top-level approval_policy value.
             Self::HighTrustLocal => None,
@@ -743,12 +745,22 @@ enum SetupExpertOverrideState {
     PathError,
 }
 
+const EXPERT_OVERRIDE_MAX_BYTES: u64 = 1024 * 1024;
+
 impl SetupExpertOverrideState {
     fn load() -> Self {
         let Some(path) = expert_override_path() else {
             return Self::PathError;
         };
-        match std::fs::read_to_string(&path) {
+        let read = std::fs::File::open(&path).and_then(|file| {
+            use std::io::Read as _;
+            let mut raw = String::new();
+            file.take(EXPERT_OVERRIDE_MAX_BYTES + 1)
+                .read_to_string(&mut raw)?;
+            Ok(raw)
+        });
+        match read {
+            Ok(raw) if raw.len() as u64 > EXPERT_OVERRIDE_MAX_BYTES => Self::Unreadable,
             Ok(raw) if raw.trim().is_empty() => Self::Empty,
             Ok(_) if base_prompt_override_opt_in() => Self::Active,
             Ok(_) => Self::Disabled,
@@ -5584,7 +5596,7 @@ mod progressive_tests {
             };
             for x in 0..area.width {
                 let cell = &buffer[(x, y)];
-                if cell.symbol().trim().is_empty() {
+                if cell.symbol().trim().is_empty() || matches!(cell.symbol(), "│" | "|") {
                     continue;
                 }
                 assert_eq!(

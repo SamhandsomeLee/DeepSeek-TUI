@@ -46,6 +46,7 @@ fn frame_app() -> App {
     // The fixture config carries no key; a keyless launch paints "model not
     // connected" (U3). These rows are about a connected route.
     app.onboarding_needs_api_key = false;
+    app.low_motion = true;
     app
 }
 
@@ -147,7 +148,7 @@ fn count_rows_containing(rows: &[String], needle: &str) -> usize {
 }
 
 /// Every chrome fact paints in exactly one row of the composed default
-/// frame: the context reading, the mode and permission chips, the model,
+/// frame: the context reading, the permission dial chip, the model,
 /// the cost, the agent count, and the help hint.
 ///
 /// 160 columns joins the blocker sizes so both working-clock halves can
@@ -163,24 +164,21 @@ fn composed_frame_paints_each_fact_in_exactly_one_row() {
         let rows = draw(&mut app, width, height);
         let pct = super::info_context_percent(&app);
         let (_, model) = app.effective_route_identity_display();
-        let (mode, permission) = crate::tui::underwater::posture_chips(&app);
-        let mode = mode.expect("mode chip").0.into_owned();
-        let permission = permission.expect("permission chip").0.into_owned();
+        let permission = crate::tui::underwater::dial_chip(&app).0.into_owned();
         // The context reading paints exactly once, at every fullness
         // (#5950 — it used to go silent below 50%).
         let mut facts = vec![
-            ("mode chip", format!("   {mode} (")),
             // Mark 8: the permission in force is marked `●` and followed by
             // what its key does, not a parenthesised chord.
             ("permission chip", format!("● {permission}")),
             ("model", model),
             ("cost", super::session_cost_label(&app)),
-            ("agent count", "2 agents".to_string()),
             ("ttft", "ttft 400ms".to_string()),
         ];
         facts.push(("context reading", format!("context {pct}%")));
         facts.push(("output rate", "40 avg tok/s".to_string()));
         if width >= 120 {
+            facts.push(("agent count", "2 agents".to_string()));
             facts.push((
                 "help hint",
                 crate::tui::shell_key_routing::info_help_hint(app.ui_locale),
@@ -227,30 +225,25 @@ fn composed_frame_paints_each_fact_in_exactly_one_row() {
         );
         // The bar carries the working clock (#5914) — how long the current
         // turn has been doing what it is doing, and how long the session has
-        // worked. Both halves shed before the hint and the counts, so a
-        // narrow row keeps the affordances and drops the stopwatch. When
-        // both would paint, the session half needs ~125 columns here (the
-        // running hint also names the agent arrows, `← for agents · ↓ to
-        // manage`) and the turn half ~200; each paints in exactly one row wherever it
-        // paints. The metrics line carries no repository, branch or provider.
+        // worked. The turn half is the last live fact to shed (CW-8264), so
+        // it paints at every width here; against this fixture's pinned scope
+        // notice the counts need 120 columns beside it. The session half
+        // sheds first and needs ~175 with the running hint, which also names
+        // the agent arrows (`← for agents · ↓ to manage`). Each paints in
+        // exactly one row wherever it paints. The metrics line carries no
+        // repository, branch or provider.
         // First turn: the turn half names the phase and stays; the session
         // reading is the identical duration, so it is suppressed rather than
-        // stated twice (#6041). With no session half to paint, the turn
-        // clock sheds at the session rung (#6084) rather than first — but
-        // against this fixture's pinned scope notice, turn+counts+hint is
-        // still just over a 120-column budget, so the hint wins here and
-        // the turn half needs ~160. The shed-order contract itself lives
-        // in tideline_tests.
+        // stated twice (#6041). The shed-order contract itself lives in
+        // tideline_tests.
         let turn_needle = "agents underway 1m 15s";
-        if width >= 160 {
-            assert!(rows[posture].contains(turn_needle), "{}", rows[posture]);
-            assert_eq!(
-                count_rows_containing(&rows, turn_needle),
-                1,
-                "{width}x{height}: {turn_needle:?} paints in exactly one row:\n{}",
-                rows.join("\n")
-            );
-        }
+        assert!(rows[posture].contains(turn_needle), "{}", rows[posture]);
+        assert_eq!(
+            count_rows_containing(&rows, turn_needle),
+            1,
+            "{width}x{height}: {turn_needle:?} paints in exactly one row:\n{}",
+            rows.join("\n")
+        );
         assert!(
             !rows[posture].contains("worked 1m 15s"),
             "{width}x{height}: the duplicate session reading must not be stated: {}",
@@ -261,7 +254,7 @@ fn composed_frame_paints_each_fact_in_exactly_one_row() {
         let mut worked = working_app();
         worked.cumulative_turn_duration = Duration::from_secs(60);
         let rows = draw(&mut worked, width, height);
-        if width >= 160 {
+        if width >= 200 {
             let worked_needle = "worked 2m 15s";
             assert!(rows[posture].contains(worked_needle), "{}", rows[posture]);
             assert_eq!(
@@ -271,11 +264,7 @@ fn composed_frame_paints_each_fact_in_exactly_one_row() {
                 rows.join("\n")
             );
         }
-        // With both clock halves and the running arrow hints, the turn half
-        // needs more than 160 columns.
-        if width >= 200 {
-            assert!(rows[posture].contains(turn_needle), "{}", rows[posture]);
-        }
+        assert!(rows[posture].contains(turn_needle), "{}", rows[posture]);
         assert!(!rows[metrics].contains('⑂'), "{}", rows[metrics]);
         // No dead key hints anywhere in the frame.
         for row in &rows {
@@ -365,7 +354,7 @@ fn context_cap_warns_once_in_the_posture_bar() {
 fn double_tap_window_shows_the_send_now_hint() {
     let mut app = working_app();
     app.arm_double_tap_window();
-    let rows = draw(&mut app, 120, 32);
+    let rows = draw(&mut app, 160, 32);
     let composer = app.viewport.last_composer_area.unwrap().bottom() as usize;
     assert!(
         rows[composer].contains("Enter again to send now · Ctrl+Enter steers"),
@@ -442,9 +431,8 @@ fn row_presets_reclaim_rows_and_quiet_them_in_the_composed_frame() {
     let posture = posture_row(&rows).expect("compact paints the posture bar");
     let metrics = metrics_row(&rows).expect("compact paints the metrics line");
     assert_eq!(metrics, posture + 1);
-    let (mode, permission) = crate::tui::underwater::posture_chips(&app);
-    assert!(rows[posture].contains(permission.expect("permission chip").0.as_ref()));
-    assert!(rows[posture].contains(mode.expect("mode chip").0.as_ref()));
+    let permission = crate::tui::underwater::dial_chip(&app);
+    assert!(rows[posture].contains(permission.0.as_ref()));
     for gone in ["working", "2 agents", "Esc to interrupt"] {
         assert!(
             !rows[posture].contains(gone),
@@ -618,7 +606,8 @@ fn statusline_full_frame_presets_preserve_transcript_composer_and_hitboxes() {
                     column: cursor.0,
                     row: cursor.1,
                     modifiers: KeyModifiers::NONE,
-                }
+                },
+                Instant::now()
             ));
             assert_eq!(
                 app.cursor_position,
@@ -877,5 +866,43 @@ fn statusline_full_frame_context_reading_updates_below_and_at_warning() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn conversation_mode_label_shows_creator_and_nothing_for_standard() {
+    for (width, height) in [(80u16, 24u16), (120, 32)] {
+        let mut standard = frame_app();
+        let standard_rows = draw(&mut standard, width, height);
+        assert!(
+            standard_rows
+                .iter()
+                .all(|row| !row.contains("Creator mode") && !row.contains("Standard mode")),
+            "{width}x{height}: Standard shows nothing new:\n{}",
+            standard_rows.join("\n")
+        );
+
+        let mut creator = frame_app();
+        creator.install_conversation_mode(Some("creator".to_string()), None);
+        let rows = draw(&mut creator, width, height);
+        assert_eq!(
+            count_rows_containing(&rows, "Creator mode"),
+            1,
+            "{width}x{height}: the mode name paints once, as text:\n{}",
+            rows.join("\n")
+        );
+
+        let mut unavailable = frame_app();
+        unavailable.install_conversation_mode(
+            Some("creator".to_string()),
+            Some("Not ready yet in this version.".to_string()),
+        );
+        let rows = draw(&mut unavailable, width, height);
+        assert_eq!(
+            count_rows_containing(&rows, "Creator mode (unavailable)"),
+            1,
+            "{width}x{height}:\n{}",
+            rows.join("\n")
+        );
     }
 }

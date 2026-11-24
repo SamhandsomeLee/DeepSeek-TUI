@@ -155,8 +155,8 @@ describe("durable merch interest registration", () => {
 
 describe("private merch interest list and deletion", () => {
   async function signedIn(): Promise<{ auth: CommunityAgentEnv; headers: Record<string, string> }> {
-    const auth = { CURATED_KV: env.CURATED_KV, MAINTAINER_TOKEN: "local-maintainer-fixture" };
-    const sid = await createSession(auth.CURATED_KV);
+    const auth = { CURATED_KV: env.CURATED_KV, MAINTAINER_TOKEN: "local-fixture-token-0123456789-abcdefghij" };
+    const sid = await createSession(auth.CURATED_KV, auth.MAINTAINER_TOKEN);
     return { auth, headers: { Cookie: "mt_sid=" + sid } };
   }
   it("requires a real stored maintainer session for reading or deleting contacts", async () => {
@@ -164,6 +164,12 @@ describe("private merch interest list and deletion", () => {
     expect(response.status).toBe(401);
     expect(list).not.toHaveBeenCalled();
     expect(remove).not.toHaveBeenCalled();
+  });
+  it.each(["short", "rotated-fixture-token-9876543210-zyxwvutsrq"])("refuses an existing session once the configured maintainer token changes to %s", async (replacement) => {
+    const { auth, headers } = await signedIn();
+    const response = await handleAdminMerchInterest(new Request("https://codewhale.net/api/admin/merch/interest", { headers }), env, { ...auth, MAINTAINER_TOKEN: replacement });
+    expect(response.status).toBe(401);
+    expect(list).not.toHaveBeenCalled();
   });
   it("paginates only the private prefix and deletes an opaque id with same-origin CSRF", async () => {
     await handleMerchInterest(request(), env);
@@ -180,7 +186,7 @@ describe("private merch interest list and deletion", () => {
     expect((await second.json()).cursor).toBeNull();
     const deleting = (origin: string, id: string) => new Request("https://codewhale.net/api/admin/merch/interest", { method: "DELETE", headers: { ...headers, Origin: origin, "Content-Type": "application/json" }, body: JSON.stringify({ id }) });
     expect((await handleAdminMerchInterest(deleting("https://evil.example", first.entries[0].id), env, auth)).status).toBe(403);
-    expect((await handleAdminMerchInterest(deleting("https://codewhale.net", "dispatch:latest"), env, auth)).status).toBe(422);
+    expect((await handleAdminMerchInterest(deleting("https://codewhale.net", "agent:state:latest"), env, auth)).status).toBe(422);
     const removed = await handleAdminMerchInterest(deleting("https://codewhale.net", first.entries[0].id), env, auth);
     expect(await removed.json()).toEqual({ ok: true });
     expect(interestRecords()).toHaveLength(1);

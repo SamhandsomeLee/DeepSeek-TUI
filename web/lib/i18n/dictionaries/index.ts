@@ -1,7 +1,5 @@
 import { docsClaudeCode as enDocsClaudeCode } from "./en/docs-claude-code";
 import { docsClaudeCode as zhDocsClaudeCode } from "./zh/docs-claude-code";
-import { enterprise as enEnterprise, type EnterpriseDict } from "./en/enterprise";
-import { enterprise as zhEnterprise } from "./zh/enterprise";
 import { docsSkills as enDocsSkills } from "./en/docs-skills";
 import { docsSkills as zhDocsSkills } from "./zh/docs-skills";
 /**
@@ -23,7 +21,6 @@ import type {
   ChromeDict,
   ContributeDict,
   ConstitutionDict,
-  RuntimeDict,
   ComputerUseDict,
   DocsAuthDict,
   DocsConfigurationDict,
@@ -40,19 +37,16 @@ import type {
   DocsSubagentsDict,
   DocsTroubleshootingDict,
   DocsTrustDict,
+  DocsFirstTimeDict,
   DocsWebDict,
   DocsWorkDict,
   DocsPetDict,
   HomeDict,
   FeaturesDict,
   DocsPageDict,
-  DigestDict,
-  FeedDict,
-  CommunityDict,
   FaqDict,
   LegalPrivacyDict,
   LegalTermsDict,
-  RoadmapDict,
   StatesDict,
 } from "./types";
 import { features as features0 } from "./en/features";
@@ -107,6 +101,8 @@ import { docsAuth as enDocsAuth } from "./en/docs-auth";
 import { docsAuth as zhDocsAuth } from "./zh/docs-auth";
 import { docsTrust as enDocsTrust } from "./en/docs-trust";
 import { docsTrust as zhDocsTrust } from "./zh/docs-trust";
+import { docsFirstTime as enDocsFirstTime } from "./en/docs-first-time";
+import { docsFirstTime as zhDocsFirstTime } from "./zh/docs-first-time";
 import { docsReview as enDocsReview } from "./en/docs-review";
 import { docsReview as zhDocsReview } from "./zh/docs-review";
 import { docsVocabulary as enDocsVocabulary } from "./en/docs-vocabulary";
@@ -137,22 +133,28 @@ import { legalTerms as enLegalTerms } from "./en/legal-terms";
 import { legalTerms as zhLegalTerms } from "./zh/legal-terms";
 import { legalPrivacy as enLegalPrivacy } from "./en/legal-privacy";
 import { legalPrivacy as zhLegalPrivacy } from "./zh/legal-privacy";
-import { digest as enDigest } from "./en/digest";
-import { digest as zhDigest } from "./zh/digest";
-import { feed as enFeed } from "./en/feed";
-import { feed as zhFeed } from "./zh/feed";
-import { community as enCommunity } from "./en/community";
-import { community as zhCommunity } from "./zh/community";
 import { faq as enFaq } from "./en/faq";
 import { faq as zhFaq } from "./zh/faq";
-import { roadmap as enRoadmap } from "./en/roadmap";
-import { roadmap as zhRoadmap } from "./zh/roadmap";
 import { contribute as enContribute } from "./en/contribute";
 import { contribute as zhContribute } from "./zh/contribute";
+import { contribute as jaContribute } from "./ja/contribute";
+import { contribute as viContribute } from "./vi/contribute";
+import { contribute as koContribute } from "./ko/contribute";
+import { contribute as ruContribute } from "./ru/contribute";
+import { contribute as ukContribute } from "./uk/contribute";
+import { contribute as esContribute } from "./es/contribute";
+import { contribute as ptBrContribute } from "./pt-BR/contribute";
+import { contribute as frContribute } from "./fr/contribute";
+import { contribute as deContribute } from "./de/contribute";
+import { contribute as caContribute } from "./ca/contribute";
+import { contribute as idContribute } from "./id/contribute";
+import { contribute as hiContribute } from "./hi/contribute";
+import { contribute as trContribute } from "./tr/contribute";
+import { contribute as itContribute } from "./it/contribute";
+import { contribute as plContribute } from "./pl/contribute";
+import { contribute as arContribute } from "./ar/contribute";
 import { constitution as enConstitution } from "./en/constitution";
 import { constitution as zhConstitution } from "./zh/constitution";
-import { runtime as enRuntime } from "./en/runtime";
-import { runtime as zhRuntime } from "./zh/runtime";
 import { chrome as zhChrome } from "./zh/chrome";
 import { home as zhHome } from "./zh/home";
 import { chrome as jaChrome } from "./ja/chrome";
@@ -338,6 +340,10 @@ const DOCS_TRUST: Record<string, DocsTrustDict> = {
   zh: zhDocsTrust,
 };
 
+const DOCS_FIRST_TIME: Record<string, DocsFirstTimeDict> = {
+  zh: zhDocsFirstTime,
+};
+
 const DOCS_REVIEW: Record<string, DocsReviewDict> = {
   zh: zhDocsReview,
 };
@@ -347,9 +353,8 @@ const DOCS_VOCABULARY: Record<string, DocsVocabularyDict> = {
 };
 
 /**
- * Shared surface states, the changelog page, the two legal pages, the digest,
- * feed and community pages, the FAQ, the roadmap, and the contribute,
- * constitution and runtime pages follow the same optional per-locale rule as
+ * Shared surface states, the changelog page, the two legal pages, the FAQ,
+ * and the contribute and constitution pages follow the same optional per-locale rule as
  * the docs page dictionaries: English is the reference, every other locale
  * falls back to it at lookup time.
  */
@@ -369,36 +374,32 @@ const LEGAL_PRIVACY: Record<string, LegalPrivacyDict> = {
   zh: zhLegalPrivacy,
 };
 
-const DIGEST: Record<string, DigestDict> = {
-  zh: zhDigest,
-};
-
-const FEED: Record<string, FeedDict> = {
-  zh: zhFeed,
-};
-
-const COMMUNITY: Record<string, CommunityDict> = {
-  zh: zhCommunity,
-};
-
 const FAQ: Record<string, FaqDict> = {
   zh: zhFaq,
 };
 
-const ROADMAP: Record<string, RoadmapDict> = {
-  zh: zhRoadmap,
-};
-
 const CONTRIBUTE: Record<string, ContributeDict> = {
   zh: zhContribute,
+  ja: jaContribute,
+  vi: viContribute,
+  ko: koContribute,
+  ru: ruContribute,
+  uk: ukContribute,
+  es: esContribute,
+  "pt-BR": ptBrContribute,
+  fr: frContribute,
+  de: deContribute,
+  ca: caContribute,
+  id: idContribute,
+  hi: hiContribute,
+  tr: trContribute,
+  it: itContribute,
+  pl: plContribute,
+  ar: arContribute,
 };
 
 const CONSTITUTION: Record<string, ConstitutionDict> = {
   zh: zhConstitution,
-};
-
-const RUNTIME: Record<string, RuntimeDict> = {
-  zh: zhRuntime,
 };
 
 const FEATURES: Record<string, FeaturesDict> = {
@@ -498,6 +499,10 @@ export function getDocsTrust(locale: string): DocsTrustDict {
   return DOCS_TRUST[locale] ?? enDocsTrust;
 }
 
+export function getDocsFirstTime(locale: string): DocsFirstTimeDict {
+  return DOCS_FIRST_TIME[locale] ?? enDocsFirstTime;
+}
+
 export function getDocsReview(locale: string): DocsReviewDict {
   return DOCS_REVIEW[locale] ?? enDocsReview;
 }
@@ -535,24 +540,8 @@ export function getLegalPrivacy(locale: string): LegalPrivacyDict {
   return LEGAL_PRIVACY[locale] ?? enLegalPrivacy;
 }
 
-export function getDigest(locale: string): DigestDict {
-  return DIGEST[locale] ?? enDigest;
-}
-
-export function getFeed(locale: string): FeedDict {
-  return FEED[locale] ?? enFeed;
-}
-
-export function getCommunity(locale: string): CommunityDict {
-  return COMMUNITY[locale] ?? enCommunity;
-}
-
 export function getFaq(locale: string): FaqDict {
   return FAQ[locale] ?? enFaq;
-}
-
-export function getRoadmap(locale: string): RoadmapDict {
-  return ROADMAP[locale] ?? enRoadmap;
 }
 
 export function getContribute(locale: string): ContributeDict {
@@ -563,19 +552,13 @@ export function getConstitution(locale: string): ConstitutionDict {
   return CONSTITUTION[locale] ?? enConstitution;
 }
 
-export function getRuntime(locale: string): RuntimeDict {
-  return RUNTIME[locale] ?? enRuntime;
-}
-
 /**
- * Select one side of a legacy `{ en, zh }` content pair by locale. This is
- * the transitional bridge for `web/lib/content/` modules that still carry
- * two-language pairs (#5337 Phase 3 dissolves them into dictionaries): it
- * moves the branch out of page TSX and into the i18n layer, so call sites
- * stay locale-agnostic.
+ * Select the exact available locale from shared content, with English fallback.
+ * Legacy two-language content keeps the same fallback; migrated content can
+ * supply the remaining routed locales through the dictionary spine.
  */
-export function pickText(pair: { en: string; zh: string }, locale: string): string {
-  return pair[pickTextLocale(locale)];
+export function pickText(pair: { en: string; zh: string; [locale: string]: string | undefined }, locale: string): string {
+  return pair[locale] ?? pair.en;
 }
 
 /** The actual language selected by the legacy two-language content bridge. */
@@ -602,6 +585,7 @@ export const EN_DOCS_WORK = enDocsWork;
 export const EN_DOCS_PET = enDocsPet;
 export const EN_DOCS_AUTH = enDocsAuth;
 export const EN_DOCS_TRUST = enDocsTrust;
+export const EN_DOCS_FIRST_TIME = enDocsFirstTime;
 export const EN_DOCS_REVIEW = enDocsReview;
 export const EN_DOCS_VOCABULARY = enDocsVocabulary;
 export const EN_COMPUTER_USE = enComputerUse;
@@ -609,14 +593,9 @@ export const EN_STATES = enStates;
 export const EN_CHANGELOG = enChangelog;
 export const EN_LEGAL_TERMS = enLegalTerms;
 export const EN_LEGAL_PRIVACY = enLegalPrivacy;
-export const EN_DIGEST = enDigest;
-export const EN_FEED = enFeed;
-export const EN_COMMUNITY = enCommunity;
 export const EN_FAQ = enFaq;
-export const EN_ROADMAP = enRoadmap;
 export const EN_CONTRIBUTE = enContribute;
 export const EN_CONSTITUTION = enConstitution;
-export const EN_RUNTIME = enRuntime;
 
 /** Interpolate `{name}` tokens in a dictionary template. Unknown tokens are
  * left intact so a template/variable drift is visible in review, not silent. */
@@ -640,10 +619,6 @@ export function splitToken(template: string, token: string): string[] {
 
 export function getDocsSkills(locale: string): DocsPageDict {
   return locale === "zh" ? zhDocsSkills : enDocsSkills;
-}
-
-export function getEnterprise(locale: string): EnterpriseDict {
-  return locale === "zh" ? zhEnterprise : enEnterprise;
 }
 
 export function getDocsClaudeCode(locale: string): DocsPageDict {

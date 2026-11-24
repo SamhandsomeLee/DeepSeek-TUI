@@ -1,6 +1,7 @@
 //! Agent Fleet control plane — local-first manager, ledger, and workers.
 
 pub mod acp;
+pub mod agents;
 pub mod alerts;
 pub mod artifacts;
 pub mod capability_badges;
@@ -10,6 +11,8 @@ pub mod executor;
 pub mod host;
 pub mod identity;
 pub mod ledger;
+#[cfg(all(test, unix))]
+mod link_tests;
 pub mod manager;
 pub mod members;
 pub mod placement;

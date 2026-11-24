@@ -13,21 +13,20 @@
  * render time, never typed here.
  */
 
+import { AVAILABILITY_ROWS } from "./availability";
+import type { CapabilityClaim } from "../capabilities";
+import { FACTS } from "../facts.generated";
 import type { LocalizedText } from "./vocabulary";
+
+const PUBLISHED_TAG = FACTS.latestPublishedRelease?.tag ?? "main";
 
 export interface ProductRow {
   title: LocalizedText;
   body: LocalizedText;
+  capability?: CapabilityClaim;
 }
 
-export interface ProductAvailabilityRow {
-  surface: LocalizedText;
-  status: LocalizedText;
-  detail: LocalizedText;
-  /** Locale-relative route with the full story, an absolute external URL, or null. */
-  href: string | null;
-  linkLabel: LocalizedText | null;
-}
+export type { ProductAvailabilityRow } from "./availability";
 
 export const PRODUCT_COPY = {
   metadata: {
@@ -49,13 +48,14 @@ export const PRODUCT_COPY = {
   workHeading: { en: "Keep larger tasks moving", zh: "推进更大的任务" },
   workPatterns: [
     {
-      title: { en: "Operate", zh: "Operate" },
+      title: { en: "Work", zh: "Work" },
       body: {
-        en: "Plan, delegate and verify a larger task. Operate uses the same permissions as Work.",
-        zh: "计划、委派并验证较大的任务。Operate 遵循与 Work 相同的权限。",
+        en: "Plan, delegate and verify a larger task in Work.",
+        zh: "在 Work 中计划、委派并验证较大的任务。",
       },
       href: "/docs/modes",
-      command: "/mode operate",
+      command: "/mode work",
+      capability: { feature: "modes" },
     },
     {
       title: { en: "Fleet", zh: "Fleet" },
@@ -65,6 +65,7 @@ export const PRODUCT_COPY = {
       },
       href: "/docs/fleet",
       command: "/fleet setup",
+      capability: { feature: "fleet" },
     },
     {
       title: { en: "Workflows", zh: "Workflows" },
@@ -72,17 +73,19 @@ export const PRODUCT_COPY = {
         en: "Save steps, parallel work and review gates as a process you can run again.",
         zh: "把步骤、并行工作与审阅关卡保存为可重复运行的流程。",
       },
-      href: "https://github.com/codewhale-hq/Codewhale/blob/v0.10.2/docs/AUTOMATIC_WORKFLOWS.md",
+      href: `https://github.com/codewhale-hq/Codewhale/blob/${PUBLISHED_TAG}/docs/AUTOMATIC_WORKFLOWS.md`,
       command: "codewhale workflow run <workflow>",
+      capability: { feature: "workflows" },
     },
     {
       title: { en: "Skills and plugins", zh: "技能与插件" },
       body: {
-        en: "Save a checklist or report format in a Markdown skill, then share it as a plugin.",
-        zh: "用 Markdown 技能保存清单或报告格式，再打包为插件分享。",
+        en: "Save a checklist or report format in a Markdown skill, then share it inside a plugin.",
+        zh: "用 Markdown 技能保存清单或报告格式，再放进插件中分享。",
       },
       href: "/docs/skills",
       command: "SKILL.md",
+      capability: { feature: "skills" },
     },
     {
       title: { en: "Receipts and undo", zh: "回执与撤销" },
@@ -92,80 +95,23 @@ export const PRODUCT_COPY = {
       },
       href: "/docs/review",
       command: "/receipts",
+      capability: { feature: "receipts" },
     },
   ],
 
   availabilityHeading: { en: "Where it runs", zh: "运行平台" },
-  availability: [
-    {
-      surface: { en: "Terminal", zh: "终端" },
-      status: { en: "Released", zh: "已发布" },
-      detail: {
-        en: "Install release binaries for Linux, macOS, or Windows; npm and Cargo also work, and Android on Termux is a preview. The interactive TUI and codewhale exec for scripts ship together.",
-        zh: "安装适用于 Linux、macOS 或 Windows 的发布版二进制；也可以用 npm 和 Cargo 安装，Android 上的 Termux 为预览。交互式 TUI 与用于脚本的 codewhale exec 一同发布。",
-      },
-      href: "/install",
-      linkLabel: { en: "Install guide", zh: "安装指南" },
-    },
-    {
-      surface: { en: "Local browser", zh: "本地浏览器" },
-      status: { en: "Included with the terminal", zh: "随终端提供" },
-      detail: {
-        en: "Run codewhale web to open Codewhale in your browser. Read the conversation, send a task, and answer approvals on your machine.",
-        zh: "运行 codewhale web，在浏览器中打开 Codewhale。在本机上查看对话、发送任务并回应审批。",
-      },
-      href: "/docs/web",
-      linkLabel: { en: "Local browser guide", zh: "本地浏览器指南" },
-    },
-    {
-      surface: { en: "CodeWhale GUI (VS Code)", zh: "CodeWhale GUI（VS Code）" },
-      status: { en: "Available", zh: "可用" },
-      detail: {
-        en: "A separate community project: chat, threads, and file changes in a VS Code sidebar over the local Runtime. Install it from the VS Code Marketplace; the source is on GitHub.",
-        zh: "独立的社区项目：在 VS Code 侧边栏中连接本地 Runtime，进行对话、管理线程并查看文件变更。可从 VS Code Marketplace 安装；源码见 GitHub。",
-      },
-      href: "https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode",
-      linkLabel: { en: "VS Code Marketplace", zh: "VS Code Marketplace" },
-    },
-    {
-      surface: { en: "Hosted web app", zh: "托管网页应用" },
-      status: { en: "In development", zh: "开发中" },
-      detail: {
-        en: "Being rebuilt to match the desktop app, and not open yet. For a browser view today, run codewhale web on your machine.",
-        zh: "正在重建，以与桌面应用保持一致，暂未开放。如需现在在浏览器中使用，请在本机运行 codewhale web。",
-      },
-      href: null,
-      linkLabel: null,
-    },
-    {
-      surface: { en: "Desktop", zh: "桌面端" },
-      status: { en: "Development build", zh: "开发版本" },
-      detail: {
-        en: "A native app on the same engine. Review and commit changes, follow work across projects, and edit a message to resend it as a new branch. No public download yet.",
-        zh: "基于同一引擎的原生应用。审阅并提交改动、跨项目跟进工作，还能编辑一条消息并作为新分支重新发送。暂无公开下载。",
-      },
-      href: null,
-      linkLabel: null,
-    },
-    {
-      surface: { en: "Computer Use", zh: "Computer Use" },
-      status: { en: "Mac beta", zh: "Mac 测试版" },
-      detail: { en: "Background app control on macOS 13.5 or later. Requires the separate helper and plugin.", zh: "在 macOS 13.5 或更高版本上后台操作应用。需要单独安装辅助应用与插件。" },
-      href: "/computer-use",
-      linkLabel: { en: "Set up Computer Use", zh: "设置 Computer Use" },
-    },
-  ] satisfies ProductAvailabilityRow[],
+  availability: AVAILABILITY_ROWS.filter((row) => row.pages.includes("product")),
 
-  controlHeading: { en: "Set permissions and approvals", zh: "设置权限与审批方式" },
+  controlHeading: { en: "Set permissions", zh: "设置权限" },
   modes: [
-    { title: { en: "Plan", zh: "Plan" }, body: { en: "Blocks file mutation and shell execution. Permitted research may contact external services; session state can still be saved.", zh: "禁止文件修改与 shell 执行。获准的研究可访问外部服务；会话状态仍可保存。" } },
-    { title: { en: "Work", zh: "Work" }, body: { en: "Edits files and runs commands within the permission you set.", zh: "在你设定的权限内修改文件、运行命令。" } },
-    { title: { en: "Operate", zh: "Operate" }, body: { en: "Coordinates larger jobs, delegating to other agents when useful. Uses the same tools and permission boundaries as Work.", zh: "协调较大的任务，按需委派其他智能体。使用与 Work 相同的工具，遵循相同的权限边界。" } },
+    { title: { en: "Plan", zh: "Plan" }, capability: { feature: "modes" }, body: { en: "Blocks file mutation and shell execution. Permitted research may contact external services; session state can still be saved.", zh: "禁止文件修改与 shell 执行。获准的研究可访问外部服务；会话状态仍可保存。" } },
+    { title: { en: "Work", zh: "Work" }, capability: { feature: "modes" }, body: { en: "Edits files and runs commands within the permission you set.", zh: "在你设定的权限内修改文件、运行命令。" } },
   ] satisfies ProductRow[],
   permissions: [
-    { title: { en: "Ask", zh: "Ask" }, body: { en: "Prompts according to the active approval rules; saved permissions and hard policy boundaries still apply.", zh: "按当前审批规则询问；已保存的权限与强制策略边界仍然生效。" } },
-    { title: { en: "Auto-Review", zh: "Auto-Review" }, body: { en: "Automatically reviews eligible actions and reports any action it cannot approve.", zh: "自动审核符合条件的操作，并报告无法批准的操作。" } },
-    { title: { en: "Full Access", zh: "Full Access" }, body: { en: "Reduces approval prompts. It does not bypass hard policy boundaries or grant access outside the allowed scope.", zh: "减少审批提示，但不会绕过强制策略边界，也不会授予允许范围之外的访问权限。" } },
+    { title: { en: "Ask", zh: "Ask" }, capability: { feature: "permission-postures" }, body: { en: "Prompts according to the active approval rules; saved permissions and hard policy boundaries still apply.", zh: "按当前审批规则询问；已保存的权限与强制策略边界仍然生效。" } },
+    { title: { en: "Accept Edits", zh: "Accept Edits" }, capability: { feature: "permission-postures", describesCurrentRow: true }, body: { en: "Allows ordinary edits inside a git workspace and asks before commands or sensitive-file edits. New source-candidate installs use this posture; an explicit saved choice stays in control.", zh: "允许 Git 工作区内的普通文件编辑，并在运行命令或修改敏感文件前询问。新安装的源码候选版本使用此设置；明确保存的选择始终优先。" } },
+    { title: { en: "Auto-Review", zh: "Auto-Review" }, capability: { feature: "permission-postures" }, body: { en: "Automatically reviews eligible actions and reports any action it cannot approve.", zh: "自动审核符合条件的操作，并报告无法批准的操作。" } },
+    { title: { en: "Full Access", zh: "Full Access" }, capability: { feature: "permission-postures" }, body: { en: "Allows commands to reach anything on this computer. Managed policy and repository law still apply.", zh: "允许命令访问这台计算机上的任何内容。托管策略与仓库规则仍然适用。" } },
   ] satisfies ProductRow[],
 
   actions: {

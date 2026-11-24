@@ -1,74 +1,80 @@
 import type { DocsModesDict } from "../types";
 
-/**
- * English reference dictionary for `app/[locale]/docs/modes/page.tsx`
- * ("Set modes and approvals"). Checked against docs/MODES.md (modes,
- * postures, persistence), docs/INSTALL.md §10 (approval keys, Ask applies
- * workspace edits), and docs/CONFIGURATION.md (`[approval]`).
- */
 export const docsModes: DocsModesDict = {
   metaTitle: "Set modes and approvals · Codewhale Docs",
   metaDescription:
-    "Choose Plan, Work, or Operate for the kind of work, and Ask, Auto-Review, or Full Access for how often Codewhale stops to ask you.",
+    "Choose Plan, Work or Operate and set when Codewhale asks for approval. You decide what it may do without asking.",
   bodyClassName: "text-ink-soft leading-relaxed",
   title: "Set modes and approvals",
   lede:
-    "Two separate controls decide what Codewhale does on its own. The mode sets the kind of work — look, change, or coordinate. The approval setting decides when it stops to ask you. Change either one from the keyboard at any time between turns.",
+    "Plan lets you inspect and agree on an approach before making changes. Work and Operate can edit files and run commands within the permissions you choose. You decide what it may do without asking.",
   sections: [
     {
+      id: "versions",
+      title: "Check which version you use",
+      blocks: [
+        { code: "codewhale --version", lang: "Shell" },
+        {
+          p: "This page describes the published release named at the top of the page. Behavior that exists only in the project's source is in the labelled section at the end.",
+        },
+      ],
+    },
+    {
       id: "modes",
-      title: "Pick a mode",
+      title: "Choose Plan, Work or Operate",
+      until: { feature: "modes", describesCurrentRow: true },
       blocks: [
         {
           rows: [
             [
               "Plan",
-              "Look and plan only. Codewhale can read the workspace and research, but it cannot edit files or run shell commands. Use it to understand a codebase or agree on an approach first.",
+              "Codewhale can read the workspace and perform permitted research, but it cannot edit files or run shell commands. Research may contact external services, and session state can still be saved.",
             ],
             [
               "Work",
-              "Everyday coding. Codewhale reads, edits, and runs commands, within the approval setting you chose. This is the default.",
+              "Codewhale reads, edits files and runs commands within the approval, sandbox and policy boundaries you set. It can delegate independent tasks to other agents.",
             ],
             [
               "Operate",
-              "Larger goals. Same permissions as Work, but Codewhale plans named steps, hands independent steps to sub-agents in parallel, and checks each result before it reports done.",
+              "The same tools and authority as Work, with more emphasis on delegating multi-part work to parallel agents and on checking results before calling the work done. It does not bypass the approval, sandbox or policy boundaries Work uses.",
             ],
           ],
         },
         {
-          p: "Press Tab with an empty composer to cycle Plan → Work → Operate, or type `/mode` to open the picker. You can also switch directly:",
+          p: "With an empty composer, Tab cycles Plan → Work → Operate. Open `/mode` to choose a mode, or enter one of these commands:",
         },
         { code: "/mode plan\n/mode work\n/mode operate", lang: "Codewhale" },
         {
-          p: "The mode you pick becomes the mode your next session starts in. Codewhale refuses mode changes while a turn is running; press Esc to stop the turn first.",
+          p: "After a successful Plan response, Codewhale asks whether to continue in Work with Ask or Auto-Review, or to keep planning. Switching to Work sends the approved plan as a follow-up.",
         },
       ],
     },
     {
       id: "approvals",
-      title: "Choose when it asks",
+      title: "Set when Codewhale asks",
+      until: { feature: "permission-postures", describesCurrentRow: true },
       blocks: [
         {
-          p: "Press Shift+Tab to cycle Ask → Auto-Review → Full Access. Plan is always read-only, whatever you pick here.",
+          p: "Press Shift+Tab to cycle the permission posture: Ask → Auto-Review → Full Access. A fresh install starts in Ask. The posture is separate from the mode.",
         },
         {
           rows: [
             [
               "Ask",
-              "The default. File edits inside the workspace are applied and shown to you as a diff. Shell commands and other consequential tools stop for your approval.",
+              "The default. Codewhale asks before a command runs. Saved approvals and policy rules still apply.",
             ],
             [
               "Auto-Review",
-              "Reviews tool actions automatically, but may still ask you to resolve a choice. Calls that are provably safe run. Publishing and destructive background actions are always blocked. Anything else gets one independent model review; high-risk calls and failed reviews are denied, not run.",
+              "Provably safe calls run, while the deterministic safety floor blocks publishing and destructive background actions. Other held calls receive one independent model review; high-risk calls and failed reviews are denied. Codewhale may still ask you to resolve a user choice.",
             ],
             [
               "Full Access",
-              "No approval prompts. Repository rules and managed policy still block what they block. Use it only in a workspace you trust.",
+              "Commands can reach anything on this computer without approval prompts. Managed policy and repository law still apply.",
             ],
           ],
         },
         {
-          note: "Ask applies workspace file edits without asking. Commit or stash anything you care about before you start, and use [Review what changed](/docs/review) to check or roll back edits.",
+          note: "Use [Review what changed](/docs/review) to inspect edits and available restore points.",
         },
       ],
     },
@@ -77,25 +83,82 @@ export const docsModes: DocsModesDict = {
       title: "Answer an approval prompt",
       blocks: [
         {
-          p: "When Codewhale stops at an approval, it shows the exact command. Answer with one key:",
+          p: "Read the proposed tool call and the options on its card before answering. Ordinary tool approval cards support these keys when the matching option is offered:",
         },
         {
           rows: [
             ["y", "Allow this call once."],
-            ["a", "Allow it for the rest of this session."],
-            ["n", "Deny it. Codewhale is told the call was refused."],
-            ["Esc", "Stop the whole turn."],
+            ["a", "Choose the displayed session approval option when it is offered."],
+            ["p", "Save the displayed exact repository allow rule when it is offered."],
+            ["n", "Deny the call and tell Codewhale it was refused."],
+            ["Esc", "Stop the current turn on its own approval card. On a child agent's card, hide the card while its approval remains pending."],
           ],
           codeTerms: true,
         },
         {
-          p: "The highlighted option on a new prompt is Deny, so pressing Enter without reading refuses the call. To change that, or to deny prompts that wait too long, set it in `~/.codewhale/config.toml`:",
+          p: "Workflow plan cards have different options, including editing or canceling the plan. Follow the labels on that card rather than the ordinary tool shortcuts above.",
         },
         {
-          code: `[approval]
-default_selection = "allow_once"   # default: "deny"
-timeout_seconds = 300              # default: wait indefinitely`,
+          p: "A new approval card highlights Deny by default, so Enter refuses the call unless you changed that setting. Approval prompts wait indefinitely by default; set a timeout in your user configuration to deny unanswered prompts after 300 seconds:",
+        },
+        {
+          code: `[approval]\ndefault_selection = "deny"\ntimeout_seconds = 300`,
           lang: "config.toml",
+        },
+        {
+          p: "The default user configuration is `~/.codewhale/config.toml`; see [Change settings](/docs/configuration) if you use a custom configuration path. Prompt settings change how a required card behaves, rather than granting permission to tools.",
+        },
+      ],
+    },
+  ],
+  sourceGroups: [
+    {
+      claim: { feature: "modes", describesCurrentRow: true },
+      sections: [
+        {
+          id: "source-modes",
+          title: "Plan and Work",
+          blocks: [
+            {
+              p: "Plan and Work are the two modes. `/mode operate` still works as an alias for Work and explains that Operate was retired. Tab only completes commands, file mentions and suggestions; it never changes modes or sends text.",
+            },
+            { code: "/mode plan\n/mode work", lang: "Codewhale" },
+            {
+              p: "After a successful Plan response, Codewhale asks whether to continue in Work with Ask, Accept Edits or Auto-Review, or to keep planning.",
+            },
+          ],
+        },
+      ],
+    },
+    {
+      claim: { feature: "permission-postures", describesCurrentRow: true },
+      sections: [
+        {
+          id: "source-approvals",
+          title: "One permission dial",
+          blocks: [
+            {
+              p: "Shift+Tab steps one permission dial: Ask → Accept Edits → Plan → Auto-Review → Full Access → Ask. Plan is the Plan mode; every other stop uses Work.",
+            },
+            {
+              rows: [
+                [
+                  "Ask",
+                  "Codewhale asks before every file edit and command, including edits inside the workspace. Saved approvals and policy rules still apply.",
+                ],
+                [
+                  "Accept Edits",
+                  "Ordinary file edits inside the workspace's git work tree can run without a prompt. Commands, network and MCP actions still ask, as do sensitive-file edits, edits outside the workspace and edits in a folder without git. ACP sessions treat this setting as Ask.",
+                ],
+              ],
+            },
+            {
+              note: "New installs start with Accept Edits when no posture is saved. An explicit saved choice stays in control; managed approval policy can lock the setting.",
+            },
+            {
+              p: "The dial works while a turn is running unless another modal blocks it. A change applies at the agent's next step; a previously approved call runs only if the new posture is equal or broader. Each effective change appears in the transcript.",
+            },
+          ],
         },
       ],
     },
@@ -104,18 +167,18 @@ timeout_seconds = 300              # default: wait indefinitely`,
     {
       href: "/docs/review",
       label: "Review what changed",
-      note: "See the diff for a session and roll files back to an earlier turn.",
+      note: "Inspect session changes and restore available file snapshots.",
     },
     {
       href: "/docs/sandbox",
       label: "Limit what commands can touch",
-      note: "An approval is not a sandbox. See what the operating system enforces on each platform.",
+      note: "See what the operating system enforces on each platform.",
     },
     {
       href: "/docs/subagents",
       label: "Run agents in parallel",
-      note: "What Operate does with independent steps, and how to watch it.",
+      note: "Delegate independent tasks and follow each agent's progress.",
     },
   ],
-  sourceNote: "Source documents: docs/MODES.md, docs/INSTALL.md §10, docs/CONFIGURATION.md · Update docs-map.ts when changing.",
+  sourceNote: "Source: docs/MODES.md, docs/KEYBINDINGS.md and docs/CONFIGURATION.md at the published release tag; the in-source section follows main.",
 };

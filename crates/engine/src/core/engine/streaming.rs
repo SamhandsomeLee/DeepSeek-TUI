@@ -237,13 +237,21 @@ pub(super) fn tool_call_limit_error() -> codewhale_error_taxonomy::ErrorEnvelope
     )
 }
 
-/// Bounded authorization for proven pre-dispatch connection retries.
+/// Bounded authorization for re-sending a request whose stream never opened.
+/// The turn loop holds one budget for proven pre-dispatch connection failures
+/// (`stream.max_resumes`) and one for response-header timeouts
+/// (`stream.open_retries`).
 ///
 /// Mechanism, not comment: [`StreamRetryBudget::authorize`] is the only way
 /// to spend a resume and it returns `None` once `limit` resumes (default
 /// [`DEFAULT_STREAM_MAX_RESUMES`]) have been issued, so no call site can loop past
 /// the budget even if a guard predicate is relaxed. A healthy stream round
 /// resets it.
+///
+/// Not covered: a header-timeout re-send does not know whether the provider
+/// processed (and billed) the first request, so that request's usage stays
+/// recorded as unknown. A stream that opened is never re-sent, and neither is
+/// an RLM completion request.
 #[derive(Debug)]
 pub(super) struct StreamRetryBudget {
     spent: u32,
@@ -594,28 +602,6 @@ fn trailing_marker_prefix_len(text: &str, markers: &[&str]) -> usize {
         .unwrap_or(0)
 }
 
-fn trailing_start_marker_prefix_len(text: &str) -> usize {
-    if fast_reject_marker_text(text) {
-        return 0;
-    }
-    TOOL_CALL_MARKER_PAIRS
-        .iter()
-        .flat_map(|(marker, _)| {
-            marker
-                .char_indices()
-                .map(|(idx, _)| idx)
-                .filter(|idx| *idx > 0)
-                .chain(std::iter::once(marker.len()))
-                .filter(|idx| *idx < marker.len())
-                .filter(|idx| {
-                    let prefix = &marker[..*idx];
-                    text.ends_with(prefix)
-                })
-        })
-        .max()
-        .unwrap_or(0)
-}
-
 #[cfg(any(test, feature = "test-support"))]
 pub fn filter_tool_call_delta(delta: &str, in_tool_call: &mut bool) -> String {
     let mut state = ToolCallDeltaFilterState {
@@ -671,7 +657,7 @@ pub fn filter_tool_call_delta_with_state(
             state.active_end_marker = None;
         } else {
             let Some((idx, len, end_marker)) = find_first_start_marker(rest) else {
-                let keep = trailing_start_marker_prefix_len(rest);
+                let keep = trailing_marker_prefix_len(rest, &TOOL_CALL_START_MARKERS);
                 if keep > 0 {
                     let split = rest.len() - keep;
                     output.push_str(&rest[..split]);

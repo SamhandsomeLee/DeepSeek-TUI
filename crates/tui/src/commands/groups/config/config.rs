@@ -9,8 +9,7 @@
 
 use codewhale_command_contract::config::{
     CommandAccountState, CommandPetBodyStyle, CommandPetControl, CommandPetLabel,
-    CommandPetTextLanguage, CommandWorkSurfaceContext, CommandWorkflowSummary, ConfigMessage,
-    ConfigReply, TrustPathError,
+    CommandWorkSurfaceContext, CommandWorkflowSummary, ConfigMessage, ConfigReply, TrustPathError,
 };
 use codewhale_command_contract::facets::CommandModeSelection;
 use codewhale_command_contract::handler::{CommandCapabilities, CommandContexts};
@@ -460,32 +459,18 @@ pub fn config(contexts: CommandContexts<'_>, arg: Option<&str>) -> ConfigCommand
         let name = tokens.first().copied().unwrap_or("");
         return to_result(facet.apply_preset(name, persist), &mut parts, &prepared);
     }
-    let parts2 = raw.splitn(2, ' ').collect::<Vec<&str>>();
-    if parts2.len() == 1 {
-        let token = parts2[0];
-        if matches!(
-            token.to_ascii_lowercase().as_str(),
-            "tui" | "web" | "native"
-        ) {
-            return ConfigCommandResult::action(ConfigAction::OpenConfigView);
+    let key = first_word.unwrap_or(raw);
+    match raw_words.next() {
+        None => {
+            if matches!(key.to_ascii_lowercase().as_str(), "tui" | "web" | "native") {
+                return ConfigCommandResult::action(ConfigAction::OpenConfigView);
+            }
+            to_result(facet.get_value(key), &mut parts, &prepared)
         }
-        to_result(facet.get_value(token), &mut parts, &prepared)
-    } else {
-        let raw_value = parts2[1];
-        let persist = raw_value.ends_with(" --save") || raw_value.ends_with(" -s");
-        let value = if persist {
-            raw_value
-                .strip_suffix(" --save")
-                .or_else(|| raw_value.strip_suffix(" -s"))
-                .unwrap_or(raw_value)
-        } else {
-            raw_value
-        };
-        to_result(
-            facet.set_value(parts2[0], value, persist),
-            &mut parts,
-            &prepared,
-        )
+        Some(rest) => {
+            let (value, persist) = split_save_flag(rest);
+            to_result(facet.set_value(key, value, persist), &mut parts, &prepared)
+        }
     }
 }
 
@@ -570,8 +555,8 @@ pub fn settings(contexts: CommandContexts<'_>, arg: Option<&str>) -> ConfigComma
     }
 }
 
-/// `/mode [act|plan|operate|1|2|3]` and the `/jihua`/`/zidong` aliases.
-/// `/mode [act|plan|operate|1|2|3]` (aliases `/jihua`, `/zidong`).
+/// `/mode [work|plan|1|2]` (aliases `/jihua`, `/zidong`). A retired Operate
+/// spelling selects Work and says so.
 ///
 /// The command owns the alias handling, parse and message composition; the
 /// mode-policy facet applies the selection and reports the outcome.
@@ -599,32 +584,53 @@ pub fn mode(contexts: CommandContexts<'_>, arg: Option<&str>) -> ConfigCommandRe
             }
         };
     }
+    let retired = if CommandMode::is_retired_operate_alias(arg) {
+        " Operate mode was retired; /fleet runs parallel agents."
+    } else {
+        ""
+    };
     match CommandMode::parse(arg) {
         Some(mode) => {
             let selection = facet.select_mode(mode);
             let label = facet.mode_label(mode);
             match selection {
                 CommandModeSelection::Changed => ConfigCommandResult::with_message_and_action(
-                    format!("Switched to {label} mode."),
+                    format!("Switched to {label} mode.{retired}"),
                     ConfigAction::ModeChanged(mode),
                 ),
-                CommandModeSelection::PersistedSame => {
-                    ConfigCommandResult::message(facet.mode_startup_default_receipt(mode))
-                }
+                CommandModeSelection::PersistedSame => ConfigCommandResult::message(format!(
+                    "{}{retired}",
+                    facet.mode_startup_default_receipt(mode)
+                )),
                 CommandModeSelection::Refused => {
                     ConfigCommandResult::message(facet.setting_locked_mode_message())
                 }
             }
         }
+        None if is_conversation_mode_word(arg) => {
+            ConfigCommandResult::action(ConfigAction::SetConversationMode {
+                id: arg.trim().to_ascii_lowercase(),
+            })
+        }
         None => ConfigCommandResult::error(format!("Usage: {MODE_USAGE}")),
     }
 }
 
+fn is_conversation_mode_word(arg: &str) -> bool {
+    let arg = arg.trim();
+    !arg.is_empty()
+        && arg.len() <= 64
+        && !arg.chars().all(|c| c.is_ascii_digit())
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 /// `/mode` usage, shared with the registration metadata.
-pub(super) const MODE_USAGE: &str = "/mode [work|plan|1|2]";
+pub(super) const MODE_USAGE: &str = "/mode [work|plan|1|2|<conversation mode>]";
 
 /// `/pet` usage, shared with the registration metadata.
-pub const PET_USAGE: &str = "/pet [on|off|inspect|status|appearance|style [smooth|pixel]|language [auto|en|zh-Hans|zh-Hant|ja]|window|source|export|sound [on|off]|avatar [whale|cove|braille|pixels|particles|whale-girl|key]|action [name|live]|view [name|live]]";
+pub const PET_USAGE: &str = "/pet [on|off|inspect|status|appearance|style [smooth|pixel]|source|export|sound [on|off]|avatar [whale|cove|braille|pixels|particles|whale-girl|key]|action [name|live]|view [name|live]]";
 
 pub fn connect(contexts: CommandContexts<'_>, arg: Option<&str>) -> ConfigCommandResult {
     let raw = arg.map(str::trim).unwrap_or("");
@@ -996,6 +1002,11 @@ pub fn import_claude(contexts: CommandContexts<'_>, arg: Option<&str>) -> Config
                 "\nFull report: {}",
                 facet.display_path(&outcome.report_path)
             ));
+        } else {
+            message.push_str("\n(the report could not be written; the summary above is complete)");
+        }
+        if bundle.is_some() && !artifacts.wrote_bundle {
+            message.push_str("\n(the portable bundle could not be written)");
         }
         return ConfigCommandResult::message(message);
     }
@@ -1018,12 +1029,14 @@ pub fn import_claude(contexts: CommandContexts<'_>, arg: Option<&str>) -> Config
             "\nPortable bundle (review, then `codewhale config import {}`): apply it there for the consent/rollback path.",
             facet.display_path(&artifacts.bundle_path)
         ));
+    } else if bundle.is_some() {
+        message.push_str("\n(the portable bundle could not be written)");
     }
     ConfigCommandResult::message(message)
 }
 
 /// `/pet [on|off|...]`.
-/// `/pet [on|off|inspect|status|appearance|window|source|export|sound on|off|avatar [key]|action [name|live]|view [name|live]]`.
+/// `/pet [on|off|inspect|status|appearance|source|export|sound on|off|avatar [key]|action [name|live]|view [name|live]]`.
 /// The command owns the verb parsing and message composition; the pet facet
 /// observes and mutates the pet state and resolves the localized labels.
 pub fn pet(contexts: CommandContexts<'_>, arg: Option<&str>) -> ConfigCommandResult {
@@ -1102,27 +1115,8 @@ pub fn pet(contexts: CommandContexts<'_>, arg: Option<&str>) -> ConfigCommandRes
             let Some(body) = CommandPetBodyStyle::parse(value) else {
                 return usage();
             };
-            queued(
-                facet,
-                CommandPetControl::Appearance {
-                    body: Some(body),
-                    language: None,
-                },
-            )
+            queued(facet, CommandPetControl::Appearance { body })
         }
-        ["language", value] => {
-            let Some(language) = CommandPetTextLanguage::parse(value) else {
-                return usage();
-            };
-            queued(
-                facet,
-                CommandPetControl::Appearance {
-                    body: None,
-                    language: Some(language),
-                },
-            )
-        }
-        ["window"] => queued(facet, CommandPetControl::Window),
         ["source"] => queued(facet, CommandPetControl::Select),
         ["export"] => {
             if facet.export() {
@@ -1421,6 +1415,14 @@ fn parse_search_rest(rest: &str) -> (SearchOp<'_>, bool) {
     (op, persist)
 }
 
+fn split_save_flag(rest: &str) -> (&str, bool) {
+    let rest = rest.trim();
+    match rest.rsplit_once(char::is_whitespace) {
+        Some((value, "--save" | "-s")) => (value.trim_end(), true),
+        _ => (rest, false),
+    }
+}
+
 /// A parsed `/config notifications…` tail.
 #[derive(Debug, PartialEq, Eq)]
 enum NotificationsOp<'a> {
@@ -1431,10 +1433,7 @@ enum NotificationsOp<'a> {
 
 /// Parse the `/config notifications …` grammar in the command.
 fn parse_notifications_rest(rest: &str) -> (NotificationsOp<'_>, bool) {
-    let (rest, persist) = rest
-        .strip_suffix(" --save")
-        .or_else(|| rest.strip_suffix(" -s"))
-        .map_or((rest, false), |value| (value.trim_end(), true));
+    let (rest, persist) = split_save_flag(rest);
     let op = if rest.is_empty() || rest == "status" {
         NotificationsOp::Status
     } else {
@@ -2006,6 +2005,26 @@ mod tests {
             (SearchOp::Set("tavily"), true)
         );
         assert_eq!(parse_search_rest("a b"), (SearchOp::Usage, false));
+    }
+
+    #[test]
+    fn save_flag_splits_on_any_whitespace() {
+        assert_eq!(
+            split_save_flag("deepseek-v4\u{3000}--save"),
+            ("deepseek-v4", true)
+        );
+        assert_eq!(split_save_flag("on\t-s"), ("on", true));
+        assert_eq!(split_save_flag("--save"), ("--save", false));
+        assert_eq!(
+            parse_notifications_rest("method\u{3000}sound\u{3000}--save"),
+            (
+                NotificationsOp::Set {
+                    key: "method",
+                    value: "sound",
+                },
+                true,
+            )
+        );
     }
 
     #[test]

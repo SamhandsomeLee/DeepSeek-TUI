@@ -6,14 +6,11 @@ import type { ChromeDict } from "../types";
  */
 export const chrome: ChromeDict = {
   navDocs: "Docs",
-  navStart: "Start",
-  navInstall: "Install",
-  navFaq: "FAQ",
-  navCommunity: "Community",
   navContribute: "Contribute",
+  navSignIn: "Sign in",
+  navDesktop: "Desktop",
 
   navFeatures: "Capabilities",
-  navProduct: "Product",
   navModels: "Models",
   navPlugins: "Plugins",
 
@@ -28,6 +25,7 @@ export const chrome: ChromeDict = {
 
   menuOpen: "Open menu",
   menuClose: "Close menu",
+  translationMachineDraft: "This translation is a machine draft with no native review yet.",
 
   themeAuto: "auto",
   themeLight: "light",
@@ -35,19 +33,17 @@ export const chrome: ChromeDict = {
   themeAria: "Theme: {mode} (click to cycle)",
   themeTitle: "Theme · auto / light / dark",
 
-  footerTagline:
-    "Build apps. Automate work.",
   footerProduct: "Product",
   footerProject: "Project",
   footerDocs: "Docs",
   footerGuide: "Getting started",
   footerInstall: "Install",
   footerModels: "Models",
-  footerRuntime: "Runtime",
   footerFaq: "FAQ",
-  footerIssues: "Issues",
   footerContribute: "Contribute",
+  footerRoadmap: "Roadmap",
   footerLicense: "MIT license",
+  footerMerch: "Merchandise",
   footerTerms: "Terms",
   footerPrivacy: "Privacy",
   footerChangelog: "Changelog",
@@ -55,8 +51,25 @@ export const chrome: ChromeDict = {
   footerReleases: " · Releases: ",
   footerReleasesLink: "GitHub Releases",
   footerSecurity: "Security",
+  footerLegal: "Legal",
 
   switcherLabel: "Language",
   switcherSwitchTo: "Switch to {label}",
   partialBadge: "(partial)",
+
+  stateReleased: "Released",
+  stateAvailable: "Available",
+  stateBeta: "Beta",
+  stateDev: "Development build",
+  stateOpen: "Open",
+  stateInviteOnly: "Invite-only",
+  stateNotOpen: "Not open yet",
+  stateNotPublic: "Not public",
+  stateInSource: "In source, not yet released",
+  numbersAsOf: "As of {date}",
+  downloadMacos: "Download for macOS",
+  downloadVersion: "Version {version}",
+  downloadSize: "Size {size}",
+  downloadChecksum: "SHA-256 checksum",
+  downloadSigned: "Signed and notarized",
 };

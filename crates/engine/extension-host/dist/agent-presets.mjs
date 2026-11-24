@@ -20,8 +20,26 @@ function isNullable(value) {
 function isNonNullable(value) {
   return !isNullable(value);
 }
+function isPlainObject(data2) {
+  return data2 && typeof data2 === "object" && !Array.isArray(data2);
+}
+function filterKeys(object, filter) {
+  return Object.fromEntries(Object.entries(object).filter(([key, value]) => filter(key, value)));
+}
 function mapValues(object, transform) {
   return Object.fromEntries(Object.entries(object).map(([key, value]) => [key, transform(value, key)]));
+}
+function pick(source, keys, forced) {
+  if (!keys) return { ...source };
+  const result = {};
+  for (const key of keys) if (forced || source[key] !== void 0) result[key] = source[key];
+  return result;
+}
+function omit(source, keys) {
+  if (!keys) return { ...source };
+  const result = { ...source };
+  for (const key of keys) Reflect.deleteProperty(result, key);
+  return result;
 }
 function defineProperty(object, key, value) {
   return Object.defineProperty(object, key, {
@@ -30,21 +48,43 @@ function defineProperty(object, key, value) {
     enumerable: false
   });
 }
+function snapshot(value, ancestors = /* @__PURE__ */ new Set()) {
+  if (typeof value === "function") throw new TypeError("volatile config cannot contain functions");
+  if (value === null || typeof value !== "object") return value;
+  if (ancestors.has(value)) throw new TypeError("volatile config cannot contain cycles");
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) return Object.freeze(value.map((item) => snapshot(item, ancestors)));
+    if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) throw new TypeError("volatile config objects must be plain objects or arrays");
+    return Object.freeze(Object.fromEntries(Object.entries(value).map(([key, item]) => [key, snapshot(item, ancestors)])));
+  } finally {
+    ancestors.delete(value);
+  }
+}
+function createVolatile(value) {
+  let current2 = snapshot(value);
+  return Object.freeze({
+    get: () => current2,
+    [write]: (value2) => {
+      current2 = value2;
+    }
+  });
+}
 function isVolatile(value) {
   return typeof value === "object" && value !== null && write in value;
 }
 function volatileEntries(value) {
   const ancestors = /* @__PURE__ */ new Set();
-  function visit(value2, path) {
+  function visit(value2, path2) {
     if (isVolatile(value2)) return [{
-      path,
+      path: path2,
       ref: value2
     }];
     if (!value2 || typeof value2 !== "object" || ancestors.has(value2)) return [];
     if (!Array.isArray(value2) && Object.getPrototypeOf(value2) !== Object.prototype && Object.getPrototypeOf(value2) !== null) return [];
     ancestors.add(value2);
     try {
-      return Object.entries(value2).flatMap(([key, child]) => visit(child, [...path, key]));
+      return Object.entries(value2).flatMap(([key, child]) => visit(child, [...path2, key]));
     } finally {
       ancestors.delete(value2);
     }
@@ -63,6 +103,31 @@ function isArrayBufferLike(value) {
 }
 function isArrayBufferSource(value) {
   return isArrayBufferLike(value) || ArrayBuffer.isView(value);
+}
+function clone(source, refs = /* @__PURE__ */ new Map()) {
+  if (!source || typeof source !== "object") return source;
+  if (is("Date", source)) return new Date(source.valueOf());
+  if (is("RegExp", source)) return new RegExp(source.source, source.flags);
+  if (isArrayBufferLike(source)) return source.slice(0);
+  if (ArrayBuffer.isView(source)) return source.buffer.slice(source.byteOffset, source.byteOffset + source.byteLength);
+  const cached = refs.get(source);
+  if (cached) return cached;
+  if (Array.isArray(source)) {
+    const result2 = [];
+    refs.set(source, result2);
+    source.forEach((value, index) => {
+      result2[index] = Reflect.apply(clone, null, [value, refs]);
+    });
+    return result2;
+  }
+  const result = Object.create(Object.getPrototypeOf(source));
+  refs.set(source, result);
+  for (const key of Reflect.ownKeys(source)) {
+    const descriptor2 = { ...Reflect.getOwnPropertyDescriptor(source, key) };
+    if ("value" in descriptor2) descriptor2.value = Reflect.apply(clone, null, [descriptor2.value, refs]);
+    Reflect.defineProperty(result, key, descriptor2);
+  }
+  return result;
 }
 function deepEqual(a, b, strict) {
   const ancestors = /* @__PURE__ */ new Set();
@@ -187,16 +252,16 @@ var init_lib = __esm({
         return timezoneOffset;
       }
       Time2.getTimezoneOffset = getTimezoneOffset;
-      function getDateNumber(date = /* @__PURE__ */ new Date(), offset2) {
-        if (typeof date === "number") date = new Date(date);
+      function getDateNumber(date2 = /* @__PURE__ */ new Date(), offset2) {
+        if (typeof date2 === "number") date2 = new Date(date2);
         if (offset2 === void 0) offset2 = timezoneOffset;
-        return Math.floor((date.valueOf() / Time2.minute - offset2) / 1440);
+        return Math.floor((date2.valueOf() / Time2.minute - offset2) / 1440);
       }
       Time2.getDateNumber = getDateNumber;
       function fromDateNumber(value, offset2) {
-        const date = new Date(value * Time2.day);
+        const date2 = new Date(value * Time2.day);
         if (offset2 === void 0) offset2 = timezoneOffset;
-        return new Date(+date + offset2 * Time2.minute);
+        return new Date(+date2 + offset2 * Time2.minute);
       }
       Time2.fromDateNumber = fromDateNumber;
       const numeric = /\d+(?:\.\d+)?/.source;
@@ -213,12 +278,12 @@ var init_lib = __esm({
         return (parseFloat(capture[1]) * Time2.week || 0) + (parseFloat(capture[2]) * Time2.day || 0) + (parseFloat(capture[3]) * Time2.hour || 0) + (parseFloat(capture[4]) * Time2.minute || 0) + (parseFloat(capture[5]) * Time2.second || 0);
       }
       Time2.parseTime = parseTime;
-      function parseDate(date) {
-        const parsed = parseTime(date);
-        if (parsed) date = Date.now() + parsed;
-        else if (/^\d{1,2}(:\d{1,2}){1,2}$/.test(date)) date = `${(/* @__PURE__ */ new Date()).toLocaleDateString()}-${date}`;
-        else if (/^\d{1,2}-\d{1,2}-\d{1,2}(:\d{1,2}){1,2}$/.test(date)) date = `${(/* @__PURE__ */ new Date()).getFullYear()}-${date}`;
-        return date ? new Date(date) : /* @__PURE__ */ new Date();
+      function parseDate(date2) {
+        const parsed = parseTime(date2);
+        if (parsed) date2 = Date.now() + parsed;
+        else if (/^\d{1,2}(:\d{1,2}){1,2}$/.test(date2)) date2 = `${(/* @__PURE__ */ new Date()).toLocaleDateString()}-${date2}`;
+        else if (/^\d{1,2}-\d{1,2}-\d{1,2}(:\d{1,2}){1,2}$/.test(date2)) date2 = `${(/* @__PURE__ */ new Date()).getFullYear()}-${date2}`;
+        return date2 ? new Date(date2) : /* @__PURE__ */ new Date();
       }
       Time2.parseDate = parseDate;
       function format(ms) {
@@ -292,11 +357,12 @@ function withProp(target, prop, value) {
     writable: false
   }));
 }
-function createShadow(ctx, target, property, receiver) {
-  if (!property) return receiver;
-  const origin = Reflect.getOwnPropertyDescriptor(target, property)?.value;
-  if (!origin) return receiver;
-  return withProp(receiver, property, ctx.extend({ [symbols.shadow]: origin }));
+function createShadow(useSite, target, property2, receiver) {
+  if (!property2) return receiver;
+  const value = getPropertyDescriptor(target, property2)?.value;
+  if (!value) return receiver;
+  const defSite = value[symbols.shadow] ?? value;
+  return withProp(receiver, property2, useSite.extend({ [symbols.shadow]: defSite }));
 }
 function createShadowMethod(ctx, value, outer, shadow) {
   return new Proxy(value, { apply: (target, thisArg, args) => {
@@ -305,37 +371,40 @@ function createShadowMethod(ctx, value, outer, shadow) {
   } });
 }
 function createTraceable(ctx, value, tracker) {
-  if (ctx[symbols.shadow] && !tracker.noShadow) ctx = Object.getPrototypeOf(ctx);
+  const defSite = ctx[symbols.shadow] ?? ctx;
+  const useSite = ctx[symbols.shadow] ? Object.getPrototypeOf(ctx) : ctx;
   const proxy = new Proxy(value, {
     get: (target, prop, receiver) => {
       if (prop === symbols.original) return target;
-      if (prop === tracker.property) return ctx;
+      if (prop === symbols.caller) return defSite;
+      if (prop === tracker.property) return useSite;
       if (typeof prop === "symbol") return Reflect.get(target, prop, receiver);
-      if (tracker.associate && ctx.reflect.props[`${tracker.associate}.${prop}`]) return Reflect.get(ctx, `${tracker.associate}.${prop}`, withProp(ctx, symbols.receiver, receiver));
+      if (tracker.associate && useSite.reflect.props[`${tracker.associate}.${prop}`]) return Reflect.get(ctx, `${tracker.associate}.${prop}`, withProp(ctx, symbols.receiver, receiver));
       let shadow, innerValue;
       const desc = getPropertyDescriptor(target, prop);
       if (desc && "value" in desc) innerValue = desc.value;
       else {
-        shadow = createShadow(ctx, target, tracker.property, receiver);
+        shadow = createShadow(useSite, target, tracker.property, receiver);
         innerValue = Reflect.get(target, prop, shadow);
       }
       const innerTracker = innerValue?.[symbols.tracker];
-      if (innerTracker) return createTraceable(ctx, innerValue, innerTracker);
+      if (innerTracker) return createTraceable(useSite, innerValue, innerTracker);
       else if (!tracker.noShadow && typeof innerValue === "function") {
-        shadow ??= createShadow(ctx, target, tracker.property, receiver);
-        return createShadowMethod(ctx, innerValue, receiver, shadow);
+        shadow ??= createShadow(useSite, target, tracker.property, receiver);
+        return createShadowMethod(useSite, innerValue, receiver, shadow);
       } else return innerValue;
     },
     set: (target, prop, value2, receiver) => {
       if (prop === symbols.original) return false;
+      if (prop === symbols.caller) return false;
       if (prop === tracker.property) return false;
       if (typeof prop === "symbol") return Reflect.set(target, prop, value2, receiver);
-      if (tracker.associate && ctx.reflect.props[`${tracker.associate}.${prop}`]) return Reflect.set(ctx, `${tracker.associate}.${prop}`, value2, withProp(ctx, symbols.receiver, receiver));
-      const shadow = createShadow(ctx, target, tracker.property, receiver);
+      if (tracker.associate && useSite.reflect.props[`${tracker.associate}.${prop}`]) return Reflect.set(ctx, `${tracker.associate}.${prop}`, value2, withProp(ctx, symbols.receiver, receiver));
+      const shadow = createShadow(useSite, target, tracker.property, receiver);
       return Reflect.set(target, prop, value2, shadow);
     },
     apply: (target, thisArg, args) => {
-      return applyTraceable(proxy, target, thisArg, args);
+      return applyTraceable(tracker.noShadow ? proxy : createShadow(useSite, target, tracker.property, proxy), target, thisArg, args);
     }
   });
   return proxy;
@@ -346,7 +415,8 @@ function applyTraceable(proxy, value, thisArg, args) {
 }
 function createCallable(name, proto, tracker) {
   const self = function(...args) {
-    return applyTraceable(createTraceable(self["ctx"], self, tracker), self, this, args);
+    const proxy = createTraceable(self["ctx"], self, tracker);
+    return Reflect.apply(proxy, this, args);
   };
   defineProperty(self, "name", name);
   return Object.setPrototypeOf(self, proto);
@@ -389,21 +459,6 @@ function buildOuterStack(offset2 = 0) {
   const outerError = /* @__PURE__ */ new Error();
   return () => outerError.stack.split("\n").slice(3 + offset2);
 }
-function isBailed(value) {
-  return value !== null && value !== false && value !== void 0;
-}
-function isAggregateError(error) {
-  return error instanceof Error && Array.isArray(error["errors"]);
-}
-function enhanceError(error) {
-  const lines = error.stack.split("\n");
-  lines.splice(0, 2, `Error: ${error.message}`);
-  error.stack = lines.join("\n");
-  return error;
-}
-function isSpecialProperty(prop) {
-  return typeof prop === "symbol" || RESERVED_WORDS.includes(prop) || parseInt(prop).toString() === prop || prop.startsWith("_");
-}
 function resolveConfig(runtime, config) {
   if (!runtime.Config) return config;
   const result = runtime.Config["~standard"].validate(config);
@@ -431,6 +486,21 @@ function emitPluginDisposed(context, fiber) {
     context.logger.error(error);
   }
 }
+function isBailed(value) {
+  return value !== null && value !== false && value !== void 0;
+}
+function isAggregateError(error) {
+  return error instanceof Error && Array.isArray(error["errors"]);
+}
+function enhanceError(error) {
+  const lines = error.stack.split("\n");
+  lines.splice(0, 2, `Error: ${error.message}`);
+  error.stack = lines.join("\n");
+  return error;
+}
+function isSpecialProperty(prop) {
+  return typeof prop === "symbol" || RESERVED_WORDS.includes(prop) || parseInt(prop).toString() === prop || prop.startsWith("_");
+}
 function isApplicable(object) {
   return object && typeof object === "object" && typeof object.apply === "function";
 }
@@ -446,17 +516,17 @@ function Inject(name, config) {
       const inject = (value[symbols.metadata] ??= {}).inject ??= /* @__PURE__ */ Object.create(null);
       inject[name] = config;
       decorator.addInitializer(function() {
-        const property = this[symbols.tracker]?.property;
+        const property2 = this[symbols.tracker]?.property;
         (this[symbols.initHooks] ??= []).push(() => {
           this.ctx.inject(inject, (ctx) => {
-            return value.call(property ? withProps(this, { [property]: ctx }) : this);
+            return value.call(property2 ? withProps(this, { [property2]: ctx }) : this);
           });
         });
       });
     } else throw new Error("@Inject() can only be used on class or class methods");
   };
 }
-var DisposableList, symbols, GeneratorFunction, AsyncGeneratorFunction, EventsService, defaultFormatters, Logger, c16, c256, LoggerService, RESERVED_WORDS, ReflectService, kValidationError, ValidationError, effectInertia, CordisError, INACTIVE, Fiber, RegistryService, Context, Service;
+var DisposableList, symbols, GeneratorFunction, AsyncGeneratorFunction, kValidationError, ValidationError, effectInertia, CordisError, INACTIVE, Fiber, EventsService, defaultFormatters, Logger, c16, c256, LoggerService, RESERVED_WORDS, ReflectService, RegistryService, Context, Service;
 var init_lib2 = __esm({
   "node_modules/@deepseek-ai/cordis/lib/index.js"() {
     init_lib();
@@ -492,6 +562,7 @@ var init_lib2 = __esm({
     };
     symbols = {
       shadow: /* @__PURE__ */ Symbol.for("cordis.shadow"),
+      caller: /* @__PURE__ */ Symbol.for("cordis.caller"),
       receiver: /* @__PURE__ */ Symbol.for("cordis.receiver"),
       original: /* @__PURE__ */ Symbol.for("cordis.original"),
       metadata: /* @__PURE__ */ Symbol.for("cordis.metadata"),
@@ -513,9 +584,530 @@ var init_lib2 = __esm({
     }.constructor;
     AsyncGeneratorFunction = async function* () {
     }.constructor;
+    kValidationError = /* @__PURE__ */ Symbol.for("ValidationError");
+    ValidationError = class extends TypeError {
+      name = "ValidationError";
+      /**
+      * Build the aggregated message from schema issues.
+      *
+      * @param issues — the standard-schema issues, one message line each.
+      */
+      constructor(issues) {
+        super(`invalid config:
+` + issues.map((issue) => {
+          if (issue.path) return `  - ${issue.message} (at ${issue.path.join(".")})`;
+          else return `  - ${issue.message}`;
+        }).join("\n"));
+      }
+    };
+    Object.defineProperty(ValidationError.prototype, kValidationError, { value: true });
+    effectInertia = /* @__PURE__ */ new WeakMap();
+    CordisError = class CordisError2 extends Error {
+      code;
+      /**
+      * @param code — the stable error code; also the default message.
+      * @param message — optional human-readable override.
+      */
+      constructor(code, message) {
+        super(message ?? CordisError2.Code[code]);
+        this.code = code;
+      }
+    };
+    (function(CordisError3) {
+      CordisError3.Code = { INACTIVE_EFFECT: "cannot create effect on inactive context" };
+    })(CordisError || (CordisError = {}));
+    INACTIVE = "__INACTIVE__";
+    Fiber = class {
+      parent;
+      inject;
+      runtime;
+      /** Unique id within the registry; 0 for the root fiber, `null` once disposed. */
+      uid;
+      /** The context this fiber's plugin runs in (extends the parent context). */
+      ctx;
+      /** Raw plugin input retained for the next activation. */
+      config;
+      /** Current lifecycle state; transitions emit `internal/status`. */
+      state = 0;
+      /** Dispose this fiber: unload the plugin, then settle once cleanup finished. */
+      dispose;
+      /** Required implementations retained through dependent teardown. */
+      committed;
+      /** Service implementations owned by this fiber, including isolated provisions. */
+      provisions = /* @__PURE__ */ new Set();
+      /** The in-flight load/unload transition, if one is currently running. */
+      inertia;
+      _hooks = /* @__PURE__ */ Object.create(null);
+      _disposables = new DisposableList();
+      context;
+      _error;
+      _revision = 0;
+      _configRevision = 0;
+      _effectiveConfig;
+      _runner;
+      _store = /* @__PURE__ */ Object.create(null);
+      _release;
+      /**
+      * Create a fiber. Plugin authors normally obtain fibers from `ctx.plugin()`
+      * rather than constructing them directly.
+      *
+      * @param parent — the context the plugin was loaded from.
+      * @param config — raw config, validated against the runtime's schema.
+      * @param inject — resolved dependency map (service name → intercept config).
+      * @param runtime — the shared plugin runtime, or `null` for the root fiber.
+      * @param getOuterStack — captures the caller stack for effect diagnostics.
+      */
+      constructor(parent, config, inject, runtime, getOuterStack) {
+        this.parent = parent;
+        this.inject = inject;
+        this.runtime = runtime;
+        this.config = config;
+        const collect = (dispose) => {
+          this._disposables.push(dispose);
+        };
+        if (runtime) {
+          this.uid = parent.registry.counter;
+          this.ctx = this.context = parent.extend({ fiber: this });
+          const injectEntries = Object.entries(this.inject);
+          if (injectEntries.length) {
+            this.ctx[Context.intercept] = Object.create(parent[Context.intercept]);
+            for (const [name, config2] of injectEntries) {
+              if (isNullable(config2)) continue;
+              this.ctx[Context.intercept][name] = config2;
+            }
+          }
+          this._runner = {
+            epoch: INACTIVE,
+            getOuterStack,
+            execute: function() {
+              const config2 = this.resolveConfig(this.config);
+              this._effectiveConfig = config2;
+              if (isConstructor(runtime.callback)) {
+                const instance = new runtime.callback(this.ctx, config2);
+                for (const hook of instance?.[symbols.initHooks] ?? []) hook();
+                return instance?.[symbols.init]?.();
+              } else return runtime.callback(this.ctx, config2);
+            },
+            collect
+          };
+          this.dispose = parent.fiber.effect(() => {
+            const remove = runtime.fibers.push(this);
+            return async () => {
+              this.uid = null;
+              emitPluginDisposed(this.context, this);
+              if (this.ctx.registry.has(runtime.callback)) {
+                remove();
+                if (!runtime.fibers.length) this.ctx.registry.delete(runtime.callback);
+              }
+              this._setEpoch(INACTIVE);
+              if (!this.inertia) this._updateState(() => {
+                this.inertia = this._unload();
+                return 5;
+              });
+              while (this.inertia) await this.inertia;
+            };
+          }, "ctx.plugin()");
+          try {
+            this.context.emit("internal/plugin", this);
+          } catch (error) {
+            Promise.resolve(this.dispose()).catch((reason) => this.ctx.logger.error(reason));
+            throw error;
+          }
+          if (this.uid !== null && parent.fiber.state !== 5) {
+            for (const name of Object.keys(this.inject)) this._checkImpl(name);
+            this._refresh();
+          }
+        } else {
+          this.uid = 0;
+          this.ctx = this.context = parent;
+          this.state = 2;
+          this.committed = /* @__PURE__ */ Object.create(null);
+          this._runner = {
+            epoch: "0",
+            getOuterStack,
+            execute: () => {
+            },
+            collect
+          };
+          this.dispose = () => this.restart();
+        }
+      }
+      /** The plugin's display name, inherited from the nearest named ancestor, else `'root'`. */
+      get name() {
+        let fiber = this;
+        do {
+          if (fiber.runtime?.name) return fiber.runtime.name;
+          fiber = fiber.parent.fiber;
+        } while (fiber !== fiber.parent.fiber);
+        return "root";
+      }
+      /**
+      * Throw if the fiber has already been disposed.
+      *
+      * @returns nothing when the fiber is still active.
+      * @throws {CordisError} `INACTIVE_EFFECT` when the fiber's uid has been cleared.
+      */
+      assertActive() {
+        if (this.uid !== null) return;
+        throw new CordisError("INACTIVE_EFFECT");
+      }
+      _execute(runner) {
+        const oldEpoch = runner.epoch;
+        return composeError((info) => {
+          const safeCollect = (dispose) => {
+            if (typeof dispose === "function") runner.collect(dispose);
+            else if (!isNullable(dispose)) throw new TypeError("Invalid effect");
+          };
+          const effect = runner.execute.call(this);
+          if (typeof effect === "function") return runner.collect(effect);
+          else if (isNullable(effect)) {
+          } else if (!isObject(effect)) throw new TypeError("Invalid effect");
+          else if ("then" in effect) return effect.then(safeCollect);
+          else if (Symbol.iterator in effect) {
+            info.error = /* @__PURE__ */ new Error();
+            const iter = effect[Symbol.iterator]();
+            while (true) {
+              const result = iter.next();
+              safeCollect(result.value);
+              if (result.done) return;
+            }
+          } else if (Symbol.asyncIterator in effect) {
+            const iter = effect[Symbol.asyncIterator]();
+            return (async () => {
+              await Promise.resolve();
+              info.error = /* @__PURE__ */ new Error();
+              while (true) {
+                if (runner.epoch !== oldEpoch) return;
+                const result = await iter.next();
+                safeCollect(result.value);
+                if (result.done) return;
+              }
+            })();
+          } else throw new TypeError("Invalid effect");
+        }, runner.getOuterStack);
+      }
+      effect(execute, label2 = "anonymous") {
+        this.assertActive();
+        if (this.state === 5) throw new CordisError("INACTIVE_EFFECT");
+        const disposables = [];
+        let disposing = false;
+        let disposalTask;
+        const dispose = () => {
+          if (disposing) return disposalTask;
+          disposing = true;
+          let task2;
+          for (const disposable of disposables.splice(0).reverse()) if (task2) task2 = task2.then(() => runDisposable(disposable));
+          else {
+            const result = runDisposable(disposable);
+            if (isObject(result) && "then" in result) task2 = result;
+          }
+          return disposalTask = task2;
+        };
+        const meta = {
+          label: label2,
+          children: []
+        };
+        const runner = {
+          execute,
+          epoch: true,
+          collect: (dispose2) => {
+            disposables.push(dispose2);
+            this._disposables.delete(dispose2);
+            if (dispose2[symbols.effect]) meta.children.push(dispose2[symbols.effect]);
+          },
+          getOuterStack: buildOuterStack()
+        };
+        let task;
+        let executing = true;
+        let resolveSetup;
+        let rejectSetup;
+        let setupBarrier;
+        let setupFailed = false;
+        let inFlight;
+        let removeWrapper = () => false;
+        const waitForSetup = () => {
+          setupBarrier ??= new Promise((resolve7, reject) => {
+            resolveSetup = resolve7;
+            rejectSetup = reject;
+          });
+          return setupBarrier;
+        };
+        const disposeAfter = (setup) => {
+          return Promise.resolve(setup).then(() => dispose(), async (reason) => {
+            await dispose();
+            throw reason;
+          });
+        };
+        const finalizeDisposal = (callback) => {
+          let result;
+          try {
+            result = callback();
+          } catch (error) {
+            removeWrapper();
+            throw error;
+          }
+          if (isObject(result) && "then" in result) {
+            const pending = Promise.resolve(result).finally(() => {
+              removeWrapper();
+              if (inFlight === pending) inFlight = void 0;
+            });
+            return inFlight = pending;
+          }
+          removeWrapper();
+          return result;
+        };
+        const wrapper = defineProperty(() => {
+          if (!runner.epoch) return setupFailed ? inFlight : void 0;
+          runner.epoch = false;
+          return finalizeDisposal(() => {
+            if (executing) return disposeAfter(waitForSetup());
+            return task ? disposeAfter(task) : dispose();
+          });
+        }, symbols.effect, meta);
+        effectInertia.set(wrapper, () => inFlight);
+        removeWrapper = this._disposables.push(wrapper);
+        try {
+          task = this._execute(runner);
+        } catch (reason) {
+          executing = false;
+          setupFailed = true;
+          runner.epoch = false;
+          let cleanup;
+          try {
+            cleanup = finalizeDisposal(dispose);
+          } finally {
+            rejectSetup?.(reason);
+          }
+          if (isObject(cleanup) && "then" in cleanup) cleanup.catch((error) => this.ctx.logger.error(error));
+          throw reason;
+        }
+        executing = false;
+        if (setupBarrier) Promise.resolve(task).then(resolveSetup, rejectSetup);
+        task?.catch(() => {
+          if (!runner.epoch) return dispose();
+          return finalizeDisposal(dispose);
+        }).catch((error) => this.ctx.logger.error(error));
+        const disposeAsync = () => {
+          if (!runner.epoch) return;
+          runner.epoch = false;
+          return finalizeDisposal(dispose);
+        };
+        wrapper.then = async (onFulfilled, onRejected) => {
+          return Promise.resolve(task).then(() => disposeAsync).then(onFulfilled, onRejected);
+        };
+        return wrapper;
+      }
+      /**
+      * Return metadata for currently registered effects.
+      *
+      * @returns one {@link EffectMeta} tree per labeled live effect.
+      */
+      getEffects() {
+        return [...this._disposables].map((dispose) => dispose[symbols.effect]).filter(Boolean);
+      }
+      _getState() {
+        if (this.uid === null) return 4;
+        if (this._error) return 3;
+        if (this._runner.epoch !== INACTIVE) return 2;
+        return 0;
+      }
+      _updateState(callback) {
+        const oldState = this.state;
+        this.state = callback() ?? this._getState();
+        if (oldState === this.state) return;
+        this.context.emit("internal/status", this, oldState);
+        if (oldState !== 2 && this.state !== 2) return;
+        for (const key of Reflect.ownKeys(this.ctx.reflect.store)) {
+          const impl = this.ctx.reflect.store[key];
+          if (impl.ctx.fiber !== this) continue;
+          this.ctx.isolate(impl.name, impl.isolate).reflect.notify([impl.name]);
+        }
+      }
+      _checkImpl(name) {
+        const impl = this.ctx.reflect._getImpl(name, true);
+        if (!impl) return delete this._store[name];
+        try {
+          if (impl.check && !impl.check.call(getTraceable(this.ctx, impl.value))) return delete this._store[name];
+        } catch (error) {
+          impl.ctx.logger.error(error);
+          return delete this._store[name];
+        }
+        this._store[name] = impl;
+      }
+      _refresh() {
+        let epoch = `${this._revision}`;
+        for (const name of Object.keys(this.inject)) {
+          const impl = this._store[name];
+          if (!impl) {
+            epoch = INACTIVE;
+            break;
+          }
+          epoch += ":" + impl.uid;
+        }
+        this._setEpoch(epoch);
+      }
+      _setEpoch(epoch) {
+        const oldEpoch = this._runner.epoch;
+        if (epoch === oldEpoch) return;
+        if (this._error) return;
+        this._runner.epoch = epoch;
+        if (this.inertia) return;
+        this._updateState(() => {
+          if (epoch !== INACTIVE && oldEpoch === INACTIVE) {
+            this.inertia = this._reload();
+            return 1;
+          } else {
+            this.inertia = this._unload();
+            return 5;
+          }
+        });
+      }
+      /** Raw input retained for the next activation, without evaluating expressions or validating it. */
+      get rawConfig() {
+        return this.ctx.fiber.config;
+      }
+      /** Retain raw input without changing the running config or triggering an update. */
+      set rawConfig(config) {
+        this.ctx.fiber.config = config;
+        this.ctx.fiber._configRevision++;
+      }
+      /**
+      * The object passed to plugin activation or the latest successful update that retained the instance.
+      * Candidate resolution does not publish it; volatile updates retain its references.
+      * Undefined before activation and readable after unload; callers requiring a live instance check `state`.
+      */
+      get effectiveConfig() {
+        return this.ctx.fiber._effectiveConfig;
+      }
+      /**
+      * Evaluate and validate a candidate using this fiber's `internal/config` hooks and runtime schema.
+      * Does not publish the result, replace raw input, or commit running volatile references.
+      * Required injections must be available when a hook uses them.
+      * @param config Raw candidate input.
+      * @returns The candidate's resolved config, retaining the schema's result identity.
+      * @throws {ValidationError} when the runtime schema rejects the candidate; hook errors propagate.
+      */
+      resolveConfig(config) {
+        const fiber = this.ctx.fiber;
+        return fiber.context.waterfall("internal/config", fiber, () => config);
+      }
+      async _reload() {
+        this.committed = { ...this._store };
+        for (const impl of Object.values(this.committed)) {
+          if (impl.ctx.fiber === this) continue;
+          impl.dependents.add(this);
+        }
+        const oldEpoch = this._runner.epoch;
+        try {
+          await Promise.resolve();
+          if (this._runner.epoch === oldEpoch) await this._execute(this._runner);
+        } catch (reason) {
+          this.ctx.logger.error(reason);
+          if (this._runner.epoch === oldEpoch) {
+            this._error = reason;
+            this._runner.epoch = INACTIVE;
+          }
+        }
+        this._updateState(() => {
+          if (this._runner.epoch === oldEpoch) this.inertia = void 0;
+          else {
+            this.inertia = this._unload();
+            return 5;
+          }
+        });
+      }
+      async _unload() {
+        while ([...this.provisions].some((impl) => impl.dependents.size)) await new Promise((resolve7) => this._release = resolve7);
+        this._release = void 0;
+        await Promise.all(this._disposables.clear().map(async (dispose) => {
+          try {
+            await composeError(async (info) => {
+              await Promise.resolve();
+              info.error = /* @__PURE__ */ new Error();
+              await runDisposable(dispose);
+            }, this._runner.getOuterStack);
+          } catch (reason) {
+            this.ctx.logger.error(reason);
+          }
+        }));
+        for (const impl of Object.values(this.committed ?? {})) {
+          if (!impl.dependents.delete(this) || impl.dependents.size) continue;
+          impl.release?.();
+          impl.ctx.fiber._release?.();
+        }
+        this.committed = void 0;
+        this._updateState(() => {
+          if (this._runner.epoch === INACTIVE) this.inertia = void 0;
+          else {
+            this.inertia = this._reload();
+            return 1;
+          }
+        });
+      }
+      /**
+      * Wait for current lifecycle work and rethrow startup errors.
+      *
+      * @returns this fiber, once it has settled into a stable state.
+      * @throws the config-validation or plugin-startup error, if any.
+      */
+      async await() {
+        while (this.inertia) await this.inertia;
+        if (this._error) throw this._error;
+        return this;
+      }
+      /**
+      * Dispose and immediately reload this plugin with its current config.
+      *
+      * @returns a promise resolving once the reload settled.
+      * @throws {CordisError} `INACTIVE_EFFECT` when the fiber is already disposed.
+      */
+      async restart() {
+        const fiber = this.ctx.fiber;
+        fiber.assertActive();
+        fiber._revision++;
+        fiber._refresh();
+        await fiber.await();
+      }
+      /**
+      * Resolve a candidate, retain its raw config and apply it through the update waterfall.
+      * @param config Raw config; pending fibers defer resolution until activation.
+      * @param noSave Suppress the persistence notification when true.
+      * @returns The awaited update/restart result, or undefined when a synchronous listener handles it.
+      * @throws {ValidationError} when an active fiber's candidate is invalid.
+      */
+      update(config, noSave = false) {
+        const fiber = this.ctx.fiber;
+        fiber.assertActive();
+        const loaded = fiber._runner.epoch !== INACTIVE;
+        const resolved = loaded ? fiber.resolveConfig(config) : void 0;
+        if (!noSave) fiber.context.emit("internal/commit", fiber, config);
+        fiber.config = config;
+        fiber._error = void 0;
+        const configRevision = ++fiber._configRevision;
+        const epoch = fiber._runner.epoch;
+        const committed = fiber.committed;
+        let restarted = false;
+        const restart = () => {
+          restarted = true;
+          return fiber.restart();
+        };
+        const publish = () => {
+          if (!restarted && fiber.uid !== null && fiber._configRevision === configRevision && fiber._runner.epoch === epoch && fiber.committed === committed) fiber._effectiveConfig = resolved;
+        };
+        const result = loaded ? fiber.context.waterfall(fiber, "internal/update", resolved, restart) : restart();
+        if (result === void 0) {
+          publish();
+          return;
+        }
+        const task = Promise.resolve(result).then(publish);
+        task.catch(() => {
+        });
+        return task;
+      }
+    };
     EventsService = class {
       ctx;
-      _hooks = {};
+      _hooks = /* @__PURE__ */ Object.create(null);
       constructor(ctx) {
         this.ctx = ctx;
         defineProperty(this, symbols.tracker, {
@@ -523,32 +1115,44 @@ var init_lib2 = __esm({
           noShadow: true
         });
         this.on("internal/listener", function(name, listener, options) {
-          if (name === "internal/update" && !options.global) return (this.fiber._hooks["internal/update"] ??= new DisposableList())[options.prepend ? "unshift" : "push"](listener);
+          if (name === "internal/update" && !options.global) {
+            const hooks = this.fiber._hooks["internal/update"] ??= new DisposableList();
+            const method = options.prepend ? "unshift" : "push";
+            return this.fiber.effect(() => hooks[method](listener), 'ctx.on("internal/update")');
+          }
         });
-        this.on("internal/update", function(config, noSave, next) {
+        this.on("internal/update", function(config, next) {
           const cbs = [...this._hooks["internal/update"] || []];
           const _next = () => {
-            return (cbs.shift() ?? next).call(this, config, noSave, _next);
+            return (cbs.shift() ?? next).call(this, config, _next);
           };
           return _next();
         }, {
           global: true,
           prepend: true
         });
+        this.on("internal/config", (fiber, next) => {
+          const config = next();
+          return fiber.runtime ? resolveConfig(fiber.runtime, config) : config;
+        });
       }
-      /**
-      * Resolve listeners for one dispatch and apply context filtering.
-      *
-      * @param type — the dispatch mode, reported on `internal/dispatch`.
-      * @param args — the raw dispatch arguments; consumed up to the event name.
-      * @returns the matching listener callbacks, bound to the dispatch `this`.
-      */
-      dispatch(type2, args) {
+      _resolve(type2, args) {
         const thisArg = typeof args[0] === "object" || typeof args[0] === "function" ? args.shift() : null;
         const name = args.shift();
-        if (!name.startsWith("internal/")) this.emit("internal/dispatch", type2, name, args, thisArg);
+        if ((typeof name !== "string" || !name.startsWith("internal/")) && this._hooks["internal/dispatch"]?.length) this.emit("internal/dispatch", type2, name, args, thisArg);
         const filter = thisArg?.[Context.filter];
-        return (this._hooks[name] || []).filter((hook) => hook.global || !filter || filter.call(thisArg, hook.ctx)).map((hook) => hook.callback.bind(thisArg));
+        return [thisArg, (this._hooks[name] || []).filter((hook) => hook.global || !filter || filter.call(thisArg, hook.ctx)).map((hook) => hook.callback)];
+      }
+      /**
+      * Resolve bound callbacks using the event's context filter.
+      * @param type Dispatch mode reported to observers.
+      * @param args Dispatch arguments, consumed through the event name.
+      * @returns Matching callbacks bound to the dispatch receiver.
+      * DSH retains callback enumeration for per-listener error containment.
+      */
+      dispatch(type2, args) {
+        const [thisArg, callbacks] = this._resolve(type2, args);
+        return callbacks.map((callback) => callback.bind(thisArg));
       }
       /**
       * Run listeners concurrently and wait for all of them.
@@ -557,7 +1161,8 @@ var init_lib2 = __esm({
       * @returns a promise resolving once every listener has settled.
       */
       async parallel(...args) {
-        const errors = (await Promise.allSettled(this.dispatch("emit", args).map(async (cb) => cb(...args)))).filter((result) => result.status === "rejected");
+        const [thisArg, callbacks] = this._resolve("parallel", args);
+        const errors = (await Promise.allSettled(callbacks.map(async (callback) => Reflect.apply(callback, thisArg, args)))).filter((result) => result.status === "rejected");
         if (errors.length) throw new AggregateError(errors.map((error) => error.reason));
       }
       /**
@@ -566,7 +1171,8 @@ var init_lib2 = __esm({
       * @param args — optional `this`, the event name, then listener arguments.
       */
       emit(...args) {
-        this.dispatch("emit", args).map((cb) => cb(...args));
+        const [thisArg, callbacks] = this._resolve("emit", args);
+        for (const callback of callbacks) Reflect.apply(callback, thisArg, args);
       }
       /**
       * Run listeners in order, awaiting each, until one returns a bail value.
@@ -575,8 +1181,9 @@ var init_lib2 = __esm({
       * @returns the first bail value (see {@link isBailed}), if any.
       */
       async serial(...args) {
-        for (const cb of this.dispatch("serial", args)) {
-          const result = await cb(...args);
+        const [thisArg, callbacks] = this._resolve("serial", args);
+        for (const callback of callbacks) {
+          const result = await Reflect.apply(callback, thisArg, args);
           if (isBailed(result)) return result;
         }
       }
@@ -587,8 +1194,9 @@ var init_lib2 = __esm({
       * @returns the first bail value (see {@link isBailed}), if any.
       */
       bail(...args) {
-        for (const cb of this.dispatch("bail", args)) {
-          const result = cb(...args);
+        const [thisArg, callbacks] = this._resolve("bail", args);
+        for (const callback of callbacks) {
+          const result = Reflect.apply(callback, thisArg, args);
           if (isBailed(result)) return result;
         }
       }
@@ -603,45 +1211,39 @@ var init_lib2 = __esm({
       * @returns the outermost listener's return value.
       */
       waterfall(...args) {
-        const cbs = this.dispatch("waterfall", args);
+        const [thisArg, callbacks] = this._resolve("waterfall", args);
         const inner = args.pop();
-        const next = () => {
-          return (cbs.shift() ?? inner)(...args);
+        const dispatch = () => {
+          const callback = callbacks.shift();
+          if (!callback) return inner();
+          let called = false;
+          const next = () => {
+            if (called) throw new Error("next() called multiple times");
+            called = true;
+            return dispatch();
+          };
+          return Reflect.apply(callback, thisArg, [...args, next]);
         };
-        args.push(next);
-        return next();
+        return dispatch();
       }
-      /**
-      * Store a listener record as an effect on the current fiber.
-      *
-      * @param label — effect label shown in fiber diagnostics.
-      * @param hooks — the listener list for one event.
-      * @param callback — the listener to store.
-      * @param options — placement and filtering options.
-      * @returns a disposer that unregisters the listener.
-      */
-      register(label, hooks, callback, options) {
+      register(label2, name, callback, options) {
         const method = options.prepend ? "unshift" : "push";
         return this.ctx.fiber.effect(() => {
-          hooks[method]({
+          (this._hooks[name] ??= [])[method]({
             ctx: this.ctx,
             callback,
             ...options
           });
-          return () => this.unregister(hooks, callback);
-        }, label);
+          return () => this.unregister(name, callback);
+        }, label2);
       }
-      /**
-      * Remove a stored listener record.
-      *
-      * @param hooks — the listener list for one event.
-      * @param callback — the listener to remove.
-      * @returns `true` if the listener was found and removed.
-      */
-      unregister(hooks, callback) {
+      unregister(name, callback) {
+        const hooks = this._hooks[name];
+        if (!hooks) return;
         const index = hooks.findIndex((hook) => hook.callback === callback);
         if (index >= 0) {
           hooks.splice(index, 1);
+          if (!hooks.length) delete this._hooks[name];
           return true;
         }
       }
@@ -662,9 +1264,8 @@ var init_lib2 = __esm({
         listener = this.ctx.reflect.bind(listener);
         const result = this.bail(this.ctx, "internal/listener", name, listener, options);
         if (result) return result;
-        const hooks = this._hooks[name] ||= [];
-        const label = `ctx.on(${typeof name === "string" ? JSON.stringify(name) : name.toString()})`;
-        return this.register(label, hooks, listener, options);
+        const label2 = `ctx.on(${typeof name === "string" ? JSON.stringify(name) : name.toString()})`;
+        return this.register(label2, name, listener, options);
       }
       /**
       * Register an event listener that disposes itself after the first call.
@@ -736,8 +1337,8 @@ var init_lib2 = __esm({
         this.service = service;
         Object.assign(this, options);
         this.error = this._method("error", 0);
-        this.info = this._method("info", 1);
-        this.warn = this._method("warn", 2);
+        this.info = this._method("info", 2);
+        this.warn = this._method("warn", 1);
         this.debug = this._method("debug", 3);
       }
       _method(type2, level) {
@@ -752,7 +1353,7 @@ var init_lib2 = __esm({
           const sn = ++this.service._snMessage;
           const ts = Date.now();
           for (const exporter of this.service.exporters.values()) {
-            if ((exporter.levels?.[this.name] ?? exporter.levels?.default ?? this.level ?? 1) < level) continue;
+            if ((exporter.levels?.[this.name] ?? exporter.levels?.default ?? this.level ?? 2) < level) continue;
             const message = {
               sn,
               ts,
@@ -872,7 +1473,9 @@ var init_lib2 = __esm({
           colors: 3,
           export: (message) => {
             self.buffer.push(message);
-            if (self.buffer.length > self.bufferSize) self.buffer = self.buffer.slice(-self.bufferSize);
+            const overflow = self.buffer.length - self.bufferSize;
+            if (overflow === 1) self.buffer.shift();
+            else if (overflow > 1) self.buffer.splice(0, overflow);
           }
         });
         return self;
@@ -901,7 +1504,7 @@ var init_lib2 = __esm({
       }
       [symbols.invoke](name) {
         const config = this._resolveConfig();
-        const fiber = (this.ctx[symbols.shadow] ?? this.ctx).fiber;
+        const fiber = (this[symbols.caller] ?? this.ctx).fiber;
         name ??= config.name;
         name ??= hyphenate(fiber.name);
         return new Logger({
@@ -933,12 +1536,14 @@ var init_lib2 = __esm({
           try {
             const def = target.reflect.props[prop];
             if (def?.type === "accessor") return def.get.call(ctx, ctx[symbols.receiver], error);
-            if (!ctx.fiber.runtime) return ctx.reflect.get(prop, false);
+            const defSite = ctx[symbols.shadow] ?? ctx;
+            if (!defSite.fiber.runtime) return ctx.reflect.get(prop, false);
             return ctx.events.waterfall("internal/get", ctx, prop, error, () => {
-              const key = target[symbols.isolate][prop];
-              let fiber = (ctx[symbols.shadow] ?? ctx).fiber;
+              const key = defSite[symbols.isolate][prop];
+              let fiber = defSite.fiber;
               while (true) {
-                const impl = fiber.store?.[prop];
+                let impl = fiber.committed?.[prop];
+                for (const provision of fiber.provisions) if (provision.name === prop && provision.ctx[symbols.isolate][prop] === key) impl = provision;
                 if (impl) return getTraceable(ctx, impl.value);
                 if (prop in fiber.inject) {
                   error.message = `cannot get required service "${prop}" in inactive context`;
@@ -983,6 +1588,7 @@ var init_lib2 = __esm({
       store = /* @__PURE__ */ Object.create(null);
       /** Declared context properties (services and accessors), by name. */
       props = /* @__PURE__ */ Object.create(null);
+      _implCounter = 0;
       constructor(ctx) {
         this.ctx = ctx;
         defineProperty(this, symbols.tracker, {
@@ -1023,7 +1629,7 @@ var init_lib2 = __esm({
         const key = this.ctx[symbols.isolate][name];
         const impl = key && this.store[key];
         if (!impl) return;
-        if (strict && impl.fiber.state !== 2) return;
+        if (strict && impl.ctx.fiber.state !== 2) return;
         return impl;
       }
       /**
@@ -1039,7 +1645,7 @@ var init_lib2 = __esm({
         const key = this.ctx[symbols.isolate][name];
         const impl = this.store[key];
         if (!impl) throw new Error(`cannot set property "${name}" without provide`);
-        if (impl.fiber !== this.ctx.fiber) throw new Error(`cannot set property "${name}" in multiple fibers`);
+        if (impl.ctx.fiber !== this.ctx.fiber) throw new Error(`cannot set property "${name}" in multiple fibers`);
         impl.value = value;
         return true;
       }
@@ -1061,20 +1667,27 @@ var init_lib2 = __esm({
           this.ctx.root[symbols.isolate][name] ??= Symbol(name);
           const key = this.ctx[symbols.isolate][name];
           const impl = {
+            uid: ++this._implCounter,
             name,
             value,
-            fiber: this.ctx.fiber,
-            check
+            ctx: this.ctx,
+            check,
+            isolate: key,
+            dependents: /* @__PURE__ */ new Set()
           };
-          if (this.store[key]) throw new Error(`service "${name}" has been registered at <${this.store[key].fiber.name}>`);
+          if (this.store[key]) throw new Error(`service "${name}" has been registered at <${this.store[key].ctx.fiber.name}>`);
           this.store[key] = impl;
-          this.ctx.fiber.store[name] = impl;
+          this.ctx.fiber.provisions.add(impl);
           if (this.ctx.fiber.state === 2) this.notify([name]);
           return async () => {
-            delete this.store[key];
-            const fibers = this.notify([name]);
-            await Promise.allSettled(fibers.map((fiber) => fiber.await()));
-            delete this.ctx.fiber.store[name];
+            if (this.store[impl.isolate] === impl) delete this.store[impl.isolate];
+            this.ctx.isolate(name, impl.isolate).reflect.notify([name]);
+            await new Promise((resolve7) => {
+              impl.release = resolve7;
+              if (!impl.dependents.size) resolve7();
+            });
+            impl.release = void 0;
+            this.ctx.fiber.provisions.delete(impl);
           };
         }, `ctx.provide(${JSON.stringify(name)})`);
       }
@@ -1083,10 +1696,8 @@ var init_lib2 = __esm({
       *
       * @param names — the service names that changed.
       * @param filter — restricts notification to matching isolation scopes.
-      * @returns the fibers whose dependency state was refreshed.
       */
       notify(names, filter = (ctx, name) => ctx[symbols.isolate][name] === this.ctx[symbols.isolate][name]) {
-        const fibers = [];
         for (const runtime of this.ctx.registry.values()) for (const fiber of runtime.fibers) {
           let hasUpdate = false;
           for (const name of names) {
@@ -1097,14 +1708,12 @@ var init_lib2 = __esm({
           }
           if (!hasUpdate) continue;
           fiber._refresh();
-          fibers.push(fiber);
         }
         for (const name of names) {
           const self = Object.create(this.ctx);
           self[symbols.filter] = (target) => filter(target, name);
           this.ctx.events.emit(self, "internal/service", name, this._getImpl(name, false)?.value);
         }
-        return fibers;
       }
       /**
       * Define a computed context property backed by get/set hooks.
@@ -1182,488 +1791,17 @@ var init_lib2 = __esm({
         });
       }
     };
-    kValidationError = /* @__PURE__ */ Symbol.for("ValidationError");
-    ValidationError = class extends TypeError {
-      name = "ValidationError";
-      /**
-      * Build the aggregated message from schema issues.
-      *
-      * @param issues — the standard-schema issues, one message line each.
-      */
-      constructor(issues) {
-        super(`invalid config:
-` + issues.map((issue) => {
-          if (issue.path) return `  - ${issue.message} (at ${issue.path.join(".")})`;
-          else return `  - ${issue.message}`;
-        }).join("\n"));
-      }
-    };
-    Object.defineProperty(ValidationError.prototype, kValidationError, { value: true });
-    effectInertia = /* @__PURE__ */ new WeakMap();
-    CordisError = class CordisError2 extends Error {
-      code;
-      /**
-      * @param code — the stable error code; also the default message.
-      * @param message — optional human-readable override.
-      */
-      constructor(code, message) {
-        super(message ?? CordisError2.Code[code]);
-        this.code = code;
-      }
-    };
-    (function(CordisError3) {
-      CordisError3.Code = { INACTIVE_EFFECT: "cannot create effect on inactive context" };
-    })(CordisError || (CordisError = {}));
-    INACTIVE = "__INACTIVE__";
-    Fiber = class {
-      parent;
-      inject;
-      runtime;
-      /** Unique id within the registry; 0 for the root fiber, `null` once disposed. */
-      uid;
-      /** The context this fiber's plugin runs in (extends the parent context). */
-      ctx;
-      /** The validated plugin config (updated by `update()`). */
-      config;
-      /** The raw plugin config, re-resolved before each activation. */
-      _config;
-      /** Current lifecycle state; transitions emit `internal/status`. */
-      state = 0;
-      /** Dispose this fiber: unload the plugin, then settle once cleanup finished. */
-      dispose;
-      /** Snapshot of required service implementations while loaded; `undefined` otherwise. */
-      store;
-      /** The in-flight load/unload transition, if one is currently running. */
-      inertia;
-      _hooks = /* @__PURE__ */ Object.create(null);
-      _disposables = new DisposableList();
-      context;
-      _error;
-      _runner;
-      _store = /* @__PURE__ */ Object.create(null);
-      /**
-      * Create a fiber. Plugin authors normally obtain fibers from `ctx.plugin()`
-      * rather than constructing them directly.
-      *
-      * @param parent — the context the plugin was loaded from.
-      * @param config — raw config, validated against the runtime's schema.
-      * @param inject — resolved dependency map (service name → intercept config).
-      * @param runtime — the shared plugin runtime, or `null` for the root fiber.
-      * @param getOuterStack — captures the caller stack for effect diagnostics.
-      */
-      constructor(parent, config, inject, runtime, getOuterStack) {
-        this.parent = parent;
-        this.inject = inject;
-        this.runtime = runtime;
-        this._config = config;
-        const collect = (dispose) => {
-          this._disposables.push(dispose);
-        };
-        if (runtime) {
-          this.uid = parent.registry.counter;
-          this.ctx = this.context = parent.extend({ fiber: this });
-          const injectEntries = Object.entries(this.inject);
-          if (injectEntries.length) {
-            this.ctx[Context.intercept] = Object.create(parent[Context.intercept]);
-            for (const [name, config2] of injectEntries) {
-              if (isNullable(config2)) continue;
-              this.ctx[Context.intercept][name] = config2;
-            }
-          }
-          this._runner = {
-            epoch: INACTIVE,
-            getOuterStack,
-            execute: function() {
-              if (isConstructor(runtime.callback)) {
-                const instance = new runtime.callback(this.ctx, this.config);
-                for (const hook of instance?.[symbols.initHooks] ?? []) hook();
-                return instance?.[symbols.init]?.();
-              } else return runtime.callback(this.ctx, this.config);
-            },
-            collect
-          };
-          this.dispose = parent.fiber.effect(() => {
-            const remove = runtime.fibers.push(this);
-            return async () => {
-              this.uid = null;
-              emitPluginDisposed(this.context, this);
-              if (this.ctx.registry.has(runtime.callback)) {
-                remove();
-                if (!runtime.fibers.length) this.ctx.registry.delete(runtime.callback);
-              }
-              this._setEpoch(INACTIVE);
-              if (!this.inertia) this._updateState(() => {
-                this.inertia = this._unload();
-                return 5;
-              });
-              while (this.inertia) await this.inertia;
-            };
-          }, "ctx.plugin()");
-          try {
-            this.context.emit("internal/plugin", this);
-          } catch (error) {
-            Promise.resolve(this.dispose()).catch((reason) => this.ctx.logger.error(reason));
-            throw error;
-          }
-          if (this.uid !== null && parent.fiber.state !== 5) {
-            for (const name of Object.keys(this.inject)) this._checkImpl(name);
-            this._refresh();
-          }
-        } else {
-          this.uid = 0;
-          this.ctx = this.context = parent;
-          this.state = 2;
-          this.store = /* @__PURE__ */ Object.create(null);
-          this._runner = {
-            epoch: "",
-            getOuterStack,
-            execute: () => {
-            },
-            collect
-          };
-          this.dispose = () => this.restart();
-        }
-      }
-      /** The plugin's display name, inherited from the nearest named ancestor, else `'root'`. */
-      get name() {
-        let fiber = this;
-        do {
-          if (fiber.runtime?.name) return fiber.runtime.name;
-          fiber = fiber.parent.fiber;
-        } while (fiber !== fiber.parent.fiber);
-        return "root";
-      }
-      /**
-      * Throw if the fiber has already been disposed.
-      *
-      * @returns nothing when the fiber is still active.
-      * @throws {CordisError} `INACTIVE_EFFECT` when the fiber's uid has been cleared.
-      */
-      assertActive() {
-        if (this.uid !== null) return;
-        throw new CordisError("INACTIVE_EFFECT");
-      }
-      _execute(runner) {
-        const oldEpoch = runner.epoch;
-        return composeError((info) => {
-          const safeCollect = (dispose) => {
-            if (typeof dispose === "function") runner.collect(dispose);
-            else if (!isNullable(dispose)) throw new TypeError("Invalid effect");
-          };
-          const effect = runner.execute.call(this);
-          if (typeof effect === "function") return runner.collect(effect);
-          else if (isNullable(effect)) {
-          } else if (!isObject(effect)) throw new TypeError("Invalid effect");
-          else if ("then" in effect) return effect.then(safeCollect);
-          else if (Symbol.iterator in effect) {
-            info.error = /* @__PURE__ */ new Error();
-            const iter = effect[Symbol.iterator]();
-            while (true) {
-              const result = iter.next();
-              safeCollect(result.value);
-              if (result.done) return;
-            }
-          } else if (Symbol.asyncIterator in effect) {
-            const iter = effect[Symbol.asyncIterator]();
-            return (async () => {
-              await Promise.resolve();
-              info.error = /* @__PURE__ */ new Error();
-              while (true) {
-                if (runner.epoch !== oldEpoch) return;
-                const result = await iter.next();
-                safeCollect(result.value);
-                if (result.done) return;
-              }
-            })();
-          } else throw new TypeError("Invalid effect");
-        }, runner.getOuterStack);
-      }
-      effect(execute, label = "anonymous") {
-        this.assertActive();
-        if (this.state === 5) throw new CordisError("INACTIVE_EFFECT");
-        const disposables = [];
-        let disposing = false;
-        let disposalTask;
-        const dispose = () => {
-          if (disposing) return disposalTask;
-          disposing = true;
-          let task2;
-          for (const disposable of disposables.splice(0).reverse()) if (task2) task2 = task2.then(() => runDisposable(disposable));
-          else {
-            const result = runDisposable(disposable);
-            if (isObject(result) && "then" in result) task2 = result;
-          }
-          return disposalTask = task2;
-        };
-        const meta = {
-          label,
-          children: []
-        };
-        const runner = {
-          execute,
-          epoch: true,
-          collect: (dispose2) => {
-            disposables.push(dispose2);
-            this._disposables.delete(dispose2);
-            if (dispose2[symbols.effect]) meta.children.push(dispose2[symbols.effect]);
-          },
-          getOuterStack: buildOuterStack()
-        };
-        let task;
-        let executing = true;
-        let resolveSetup;
-        let rejectSetup;
-        let setupBarrier;
-        let setupFailed = false;
-        let inFlight;
-        let removeWrapper = () => false;
-        const waitForSetup = () => {
-          setupBarrier ??= new Promise((resolve6, reject) => {
-            resolveSetup = resolve6;
-            rejectSetup = reject;
-          });
-          return setupBarrier;
-        };
-        const disposeAfter = (setup) => {
-          return Promise.resolve(setup).then(() => dispose(), async (reason) => {
-            await dispose();
-            throw reason;
-          });
-        };
-        const finalizeDisposal = (callback) => {
-          let result;
-          try {
-            result = callback();
-          } catch (error) {
-            removeWrapper();
-            throw error;
-          }
-          if (isObject(result) && "then" in result) {
-            const pending = Promise.resolve(result).finally(() => {
-              removeWrapper();
-              if (inFlight === pending) inFlight = void 0;
-            });
-            return inFlight = pending;
-          }
-          removeWrapper();
-          return result;
-        };
-        const wrapper = defineProperty(() => {
-          if (!runner.epoch) return setupFailed ? inFlight : void 0;
-          runner.epoch = false;
-          return finalizeDisposal(() => {
-            if (executing) return disposeAfter(waitForSetup());
-            return task ? disposeAfter(task) : dispose();
-          });
-        }, symbols.effect, meta);
-        effectInertia.set(wrapper, () => inFlight);
-        removeWrapper = this._disposables.push(wrapper);
-        try {
-          task = this._execute(runner);
-        } catch (reason) {
-          executing = false;
-          setupFailed = true;
-          runner.epoch = false;
-          let cleanup;
-          try {
-            cleanup = finalizeDisposal(dispose);
-          } finally {
-            rejectSetup?.(reason);
-          }
-          if (isObject(cleanup) && "then" in cleanup) cleanup.catch((error) => this.ctx.logger.error(error));
-          throw reason;
-        }
-        executing = false;
-        if (setupBarrier) Promise.resolve(task).then(resolveSetup, rejectSetup);
-        task?.catch(() => {
-          if (!runner.epoch) return dispose();
-          return finalizeDisposal(dispose);
-        }).catch((error) => this.ctx.logger.error(error));
-        const disposeAsync = () => {
-          if (!runner.epoch) return;
-          runner.epoch = false;
-          return finalizeDisposal(dispose);
-        };
-        wrapper.then = async (onFulfilled, onRejected) => {
-          return Promise.resolve(task).then(() => disposeAsync).then(onFulfilled, onRejected);
-        };
-        return wrapper;
-      }
-      /**
-      * Return metadata for currently registered effects.
-      *
-      * @returns one {@link EffectMeta} tree per labeled live effect.
-      */
-      getEffects() {
-        return [...this._disposables].map((dispose) => dispose[symbols.effect]).filter(Boolean);
-      }
-      _getState() {
-        if (this.uid === null) return 4;
-        if (this._error) return 3;
-        if (this._runner.epoch !== INACTIVE) return 2;
-        return 0;
-      }
-      _updateState(callback) {
-        const oldState = this.state;
-        this.state = callback() ?? this._getState();
-        if (oldState === this.state) return;
-        this.context.emit("internal/status", this, oldState);
-        if (oldState !== 2 && this.state !== 2) return;
-        for (const key of Reflect.ownKeys(this.ctx.reflect.store)) {
-          const impl = this.ctx.reflect.store[key];
-          if (impl.fiber !== this) continue;
-          this.ctx.reflect.notify([impl.name]);
-        }
-      }
-      _checkImpl(name) {
-        const impl = this.ctx.reflect._getImpl(name, true);
-        if (!impl) return delete this._store[name];
-        try {
-          if (impl.check && !impl.check.call(getTraceable(this.ctx, impl.value))) return delete this._store[name];
-        } catch (error) {
-          impl.fiber.ctx.logger.error(error);
-          return delete this._store[name];
-        }
-        this._store[name] = impl;
-      }
-      _refresh() {
-        let epoch = false;
-        epoch = "";
-        for (const name of Object.keys(this.inject)) {
-          const impl = this._store[name];
-          if (!impl) {
-            epoch = INACTIVE;
-            break;
-          }
-          epoch += ":" + impl.fiber.uid;
-        }
-        this._setEpoch(epoch);
-      }
-      _setEpoch(epoch) {
-        const oldEpoch = this._runner.epoch;
-        if (epoch === oldEpoch) return;
-        this._runner.epoch = epoch;
-        if (this.inertia) return;
-        this._updateState(() => {
-          if (epoch !== INACTIVE && oldEpoch === INACTIVE) {
-            this.inertia = this._reload();
-            return 1;
-          } else {
-            this.inertia = this._unload();
-            return 5;
-          }
-        });
-      }
-      _resolveConfig(config) {
-        config = this.context.waterfall(this, "internal/config", config, () => config);
-        return this.runtime ? resolveConfig(this.runtime, config) : config;
-      }
-      async _reload() {
-        this.store = { ...this._store };
-        const oldEpoch = this._runner.epoch;
-        try {
-          await Promise.resolve();
-          if (this._runner.epoch === oldEpoch) {
-            this.config = this._resolveConfig(this._config);
-            await this._execute(this._runner);
-            this._error = void 0;
-          }
-        } catch (reason) {
-          this.ctx.logger.error(reason);
-          this._error = reason;
-          this._runner.epoch = INACTIVE;
-        }
-        this._updateState(() => {
-          if (this._runner.epoch === oldEpoch) this.inertia = void 0;
-          else {
-            this.inertia = this._unload();
-            return 5;
-          }
-        });
-      }
-      async _unload() {
-        await Promise.all(this._disposables.clear().map(async (dispose) => {
-          try {
-            await composeError(async (info) => {
-              await Promise.resolve();
-              info.error = /* @__PURE__ */ new Error();
-              await runDisposable(dispose);
-            }, this._runner.getOuterStack);
-          } catch (reason) {
-            this.ctx.logger.error(reason);
-          }
-        }));
-        this.store = void 0;
-        this._updateState(() => {
-          if (this._runner.epoch === INACTIVE) this.inertia = void 0;
-          else {
-            this.inertia = this._reload();
-            return 1;
-          }
-        });
-      }
-      /**
-      * Wait for current lifecycle work and rethrow startup errors.
-      *
-      * @returns this fiber, once it has settled into a stable state.
-      * @throws the config-validation or plugin-startup error, if any.
-      */
-      async await() {
-        while (this.inertia) await this.inertia;
-        if (this._error) throw this._error;
-        return this;
-      }
-      /**
-      * Dispose and immediately reload this plugin with its current config.
-      *
-      * @returns a promise resolving once the reload settled.
-      * @throws {CordisError} `INACTIVE_EFFECT` when the fiber is already disposed.
-      */
-      async restart() {
-        this.assertActive();
-        this._setEpoch(INACTIVE);
-        this._refresh();
-        await this.await();
-      }
-      /**
-      * Validate and apply new config, then restart the plugin.
-      *
-      * Runs the `internal/update` waterfall first, so update hooks (and HMR)
-      * can veto or replace the restart.
-      *
-      * @param config — the new raw config; validated before anything restarts.
-      * @param noSave — hint for persistence hooks not to write the change back.
-      * @returns nothing; the restart runs behind the `internal/update` waterfall.
-      * @throws {ValidationError} when the new config fails validation.
-      */
-      update(config, noSave = false) {
-        this.assertActive();
-        this._config = config;
-        if (this.state !== 2) {
-          this._error = void 0;
-          this._setEpoch(INACTIVE);
-          this._refresh();
-          return;
-        }
-        config = this._resolveConfig(config);
-        this.context.waterfall(this, "internal/update", config, noSave, () => {
-          this.config = config;
-          this._error = void 0;
-          return this.restart();
-        });
-      }
-    };
     (function(Inject3) {
-      function resolve6(inject, result = /* @__PURE__ */ Object.create(null)) {
+      function resolve7(inject, result = /* @__PURE__ */ Object.create(null)) {
         if (!inject) return result;
         if (Array.isArray(inject)) for (const name of inject) result[name] = null;
         else if (Reflect.has(inject, symbols.checkProto)) {
-          Object.assign(result, resolve6(Object.getPrototypeOf(inject)));
+          Object.assign(result, resolve7(Object.getPrototypeOf(inject)));
           for (const name of Object.keys(inject)) result[name] = inject[name] ?? null;
         } else for (const name of Object.keys(inject)) result[name] = inject[name] ?? null;
         return result;
       }
-      Inject3.resolve = resolve6;
+      Inject3.resolve = resolve7;
     })(Inject || (Inject = {}));
     RegistryService = class {
       ctx;
@@ -1872,9 +2010,9 @@ var init_lib2 = __esm({
       * @param label — scope label to join; defaults to a fresh unique symbol.
       * @returns a child context whose `name` service resolves in the new scope.
       */
-      isolate(name, label) {
+      isolate(name, label2) {
         const shadow = Object.create(this[symbols.isolate]);
-        shadow[name] = label ?? Symbol(name);
+        shadow[name] = label2 ?? Symbol(name);
         return this.extend({ [symbols.isolate]: shadow });
       }
       intercept(name, config) {
@@ -1987,34 +2125,34 @@ function normalizePromptSection(value) {
   if (Object.keys(value).some((key) => key !== "id" && key !== "text" && key !== "interpolate")) {
     throw new TypeError("prompt section supports only id and text, plus optional model-cwd interpolation");
   }
-  const { id, text: text2, interpolate: interpolate2 } = value;
+  const { id, text: text4, interpolate: interpolate2 } = value;
   if (typeof id !== "string" || !SECTION_ID.test(id)) {
     throw new TypeError("prompt section id must be lower case, start with a letter, and use a-z, 0-9, _ or - (at most 64 characters)");
   }
-  if (typeof text2 !== "string" || text2.trim().length === 0) {
+  if (typeof text4 !== "string" || text4.trim().length === 0) {
     throw new TypeError(`prompt section "${id}" needs non-empty text`);
   }
-  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(text2)) {
+  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(text4)) {
     throw new TypeError(`prompt section "${id}" text contains control characters`);
   }
-  if (Buffer.byteLength(text2, "utf8") > MAX_PROMPT_SECTION_BYTES) {
+  if (Buffer.byteLength(text4, "utf8") > MAX_PROMPT_SECTION_BYTES) {
     throw new RangeError(`prompt section "${id}" exceeds ${MAX_PROMPT_SECTION_BYTES} UTF-8 bytes`);
   }
   if (interpolate2 !== void 0 && interpolate2 !== "model-cwd") throw new TypeError("prompt interpolation supports only model-cwd");
-  if (interpolate2 !== void 0) validatePromptTemplate(text2);
-  return Object.freeze({ id, text: text2, ...interpolate2 === void 0 ? {} : { interpolate: interpolate2 } });
+  if (interpolate2 !== void 0) validatePromptTemplate(text4);
+  return Object.freeze({ id, text: text4, ...interpolate2 === void 0 ? {} : { interpolate: interpolate2 } });
 }
-function validatePromptTemplate(text2) {
-  for (let open = text2.indexOf("{{"); open >= 0; ) {
-    const group = /^\{\{([^{}]*)\}\}/u.exec(text2.slice(open));
+function validatePromptTemplate(text4) {
+  for (let open = text4.indexOf("{{"); open >= 0; ) {
+    const group = /^\{\{([^{}]*)\}\}/u.exec(text4.slice(open));
     if (!group) {
-      if (text2.indexOf("}}", open + 2) >= 0) throw new TypeError("malformed prompt variable reference");
-      open = text2.indexOf("{{", open + 2);
+      if (text4.indexOf("}}", open + 2) >= 0) throw new TypeError("malformed prompt variable reference");
+      open = text4.indexOf("{{", open + 2);
       continue;
     }
     if (!/^[a-z][a-z0-9_]*$/u.test(group[1])) throw new TypeError("malformed prompt variable reference");
     if (group[1] !== "model" && group[1] !== "cwd") throw new TypeError(`unknown Core prompt variable "{{${group[1]}}}"; supported variables: model, cwd`);
-    open = text2.indexOf("{{", open + group[0].length);
+    open = text4.indexOf("{{", open + group[0].length);
   }
 }
 var MAX_PROMPT_SECTION_BYTES, MAX_PROMPT_OWNER_BYTES, MAX_PROMPT_HOST_BYTES, SECTION_ID;
@@ -2080,12 +2218,12 @@ var init_group = __esm({
       }
       remove(id, isDispose = false) {
         const entry = this.tree.store[id];
-        if (!entry) return;
+        if (!entry || entry.parent !== this) return;
+        delete this.tree.store[id];
         entry.fiber?.dispose();
         if (!isDispose) {
           this.unlink(entry.options);
         }
-        delete this.tree.store[id];
         this.context.emit("loader/partial-dispose", entry, entry.options, false);
       }
       async update(config) {
@@ -2115,9 +2253,7 @@ var init_group = __esm({
         super(ctx, ctx.fiber.entry.parent.tree);
         this.ctx = ctx;
         this.config = config;
-        ctx.on("internal/update", (config2) => {
-          this.update(config2);
-        });
+        ctx.on("internal/update", (config2) => this.update(config2));
       }
       ctx;
       config;
@@ -2132,6 +2268,17 @@ var init_group = __esm({
 });
 
 // src/dsh/upstream/loader/src/config/tree.ts
+function members(entry) {
+  const { tree } = entry.parent;
+  const result = [entry];
+  const group = entry.subgroup;
+  if (group?.tree !== tree) return result;
+  for (const options of group.data) {
+    const member = tree.store[options.id];
+    if (member?.parent === group) result.push(...members(member));
+  }
+  return result;
+}
 var EntryTree;
 var init_tree = __esm({
   "src/dsh/upstream/loader/src/config/tree.ts"() {
@@ -2174,6 +2321,13 @@ var init_tree = __esm({
           await Promise.allSettled(tasks);
         }
       }
+      /**
+       * Assign a random tree-local id when `options.id` is absent. Explicit ids
+       * may contain `EntryTree.sep`; `resolve()` and `resolveGroup()` cannot
+       * address such entries by nested path.
+       * @param options - Entry options; a generated id is written to `options.id`.
+       * @returns The existing or generated id.
+       */
       ensureId(options) {
         if (!options.id) {
           do {
@@ -2204,29 +2358,49 @@ var init_tree = __esm({
       /** Create an entry in the root group or a nested group. */
       async create(options, parent = null, position = Infinity) {
         const group = this.resolveGroup(parent);
+        const id = group.tree.ensureId(options);
         group.data.splice(position, 0, options);
-        group.tree.write();
+        group.tree.commit({ id, group, options });
         return group.create(options);
       }
       /** Stop and remove an entry from its parent group. */
       remove(id) {
         const entry = this.resolve(id);
-        entry.parent.remove(id);
-        entry.parent.tree.write();
+        const group = entry.parent;
+        const legacy = entry.options;
+        group.remove(legacy.id);
+        group.tree.commit({ id: legacy.id, group, legacy });
       }
       /** Update an entry and optionally move it to another group. */
       async update(id, options, parent, position) {
         const entry = this.resolve(id);
         const source = entry.parent;
+        const legacy = { ...entry.options };
         if (parent !== void 0) {
           const target = this.resolveGroup(parent);
+          const moved = target.tree === source.tree ? [] : members(entry);
+          for (const member of moved) {
+            const { id: id2 } = member.options;
+            if (target.tree.store[id2]) throw new Error(`entry ${id2} already exists in the target tree`);
+          }
           source.unlink(entry.options);
           target.data.splice(position ?? Infinity, 0, entry.options);
-          target.tree.write();
           entry.parent = target;
+          for (const member of moved) {
+            delete source.tree.store[member.options.id];
+            target.tree.store[member.options.id] = member;
+            if (member.subgroup?.tree === source.tree) member.subgroup.tree = target.tree;
+          }
         }
-        source.tree.write();
-        return entry.update(options, false, true);
+        const task = entry.update(options, false, true);
+        if (entry.parent.tree !== source.tree) {
+          source.tree.commit({ id: legacy.id, group: source, legacy });
+          entry.parent.tree.commit({ id: legacy.id, group: entry.parent, options: entry.options });
+        } else {
+          const from2 = entry.parent === source ? void 0 : source;
+          entry.parent.tree.commit({ id: legacy.id, group: entry.parent, from: from2, options: entry.options, legacy });
+        }
+        return task;
       }
       /** Import a plugin module from a specifier or `cordis:` builtin. */
       import(name, getOuterStack) {
@@ -2378,7 +2552,7 @@ var init_entry = __esm({
         if (this.options.group) return false;
         let entry = this;
         do {
-          if (this.disabledOf(entry.options)) return true;
+          if (this._resolveDisabled(entry.options)) return true;
           entry = entry.parent.ctx.fiber.entry;
         } while (entry);
         return false;
@@ -2387,17 +2561,19 @@ var init_entry = __esm({
        * Effective disabled state: a `!!js` expression evaluates against the loader
        * context. The raw node stays in the options, so write-back keeps the form.
        */
-      disabledOf(options) {
+      _resolveDisabled(options) {
         return isJsExpr(options.disabled) ? Boolean(this.evaluate(options.disabled.__jsExpr)) : Boolean(options.disabled);
       }
       evaluate(expr) {
         return evaluate(this.ctx, expr);
       }
-      _patchContext(diff) {
-        this.context.waterfall("loader/patch-context", this, () => {
+      async _patchContext(diff) {
+        await this.context.waterfall("loader/patch-context", this, async () => {
           Object.setPrototypeOf(this.ctx, this.parent.ctx);
           if (this.fiber?.uid && (diff.includes("config") || this.options.group)) {
-            this.fiber.update(this.options.config, true);
+            const fiber = this.fiber.ctx.fiber;
+            for (const name of Object.keys(fiber.inject)) fiber._checkImpl(name);
+            await fiber.update(this.options.config, true);
           }
         });
       }
@@ -2422,7 +2598,7 @@ var init_entry = __esm({
         }
         sortKeys(this.options);
         if (this.disabled) {
-          this.fiber?.dispose();
+          await this.fiber?.dispose();
           return;
         }
         if (this.fiber?.uid) {
@@ -2432,11 +2608,11 @@ var init_entry = __esm({
             key === "config"
           ));
           const volatileOnly = changes.length === 1 && changes[0] === "config" && this.fiber.state === FiberState.ACTIVE && Object.getPrototypeOf(this.ctx) === this.parent.ctx && equalExceptVolatile(legacy.config, this.options.config, this.fiber.runtime?.Config);
-          if (volatileOnly) this.fiber._config = this.options.config;
+          if (volatileOnly) this.fiber.rawConfig = this.options.config;
           const pending = volatileOnly && this._commitVolatile() ? [] : changes;
           if (!pending.length && !force) return;
           this.context.emit("loader/partial-dispose", this, legacy, true);
-          this._patchContext(pending);
+          await this._patchContext(pending);
         } else {
           await this.init();
         }
@@ -2447,27 +2623,27 @@ var init_entry = __esm({
        * @returns `false` when an ordinary effective value changed, so the caller applies the ordinary update lifecycle.
        */
       _commitVolatile() {
-        const fiber = this.fiber;
-        const refs = volatileEntries(fiber.config);
+        const fiber = this.fiber.ctx.fiber;
+        const refs = volatileEntries(fiber.effectiveConfig);
         if (!refs.length) return true;
         const raw = this.options.config;
         let candidate;
         try {
-          candidate = resolveConfig(fiber.runtime, fiber.ctx.waterfall(fiber, "internal/config", raw, () => raw));
+          candidate = fiber.resolveConfig(raw);
         } catch (error) {
           this.ctx.logger.warn("volatile config update failed for %C", this.options.id);
           this.ctx.logger.warn(error);
           return true;
         }
-        if (!deepEqual(fiber.config, candidate, true)) {
+        if (!deepEqual(fiber.effectiveConfig, candidate, true)) {
           this.ctx.logger.debug("ordinary config values of %C changed with its volatile values; applying the ordinary update", this.options.id);
           return false;
         }
-        const paths = refs.flatMap(({ path, ref: ref2 }) => {
-          const source = path.reduce((value, key) => Reflect.get(value, key), candidate);
+        const paths = refs.flatMap(({ path: path2, ref: ref2 }) => {
+          const source = path2.reduce((value, key) => Reflect.get(value, key), candidate);
           if (deepEqual(ref2.get(), source.get(), true)) return [];
           updateVolatile(ref2, source);
-          return [path];
+          return [path2];
         });
         if (!paths.length) return true;
         const self = Object.create(fiber.ctx);
@@ -2495,11 +2671,11 @@ var init_entry = __esm({
         } finally {
           this._initTask = void 0;
         }
-        const notify = () => {
+        this.fiber?.await().catch(() => {
+        }).finally(() => {
           if (this.loader.getTasks().length) return;
           this.ctx.reflect.notify(["loader"]);
-        };
-        this.fiber?.await().then(notify, notify);
+        });
       }
       async _init() {
         let moduleNamespace;
@@ -2508,13 +2684,11 @@ var init_entry = __esm({
         } catch (error) {
           this.ctx.logger.error(error);
           return;
-        } finally {
-          this._initTask = void 0;
         }
         const plugin = this.loader.unwrapExports(moduleNamespace);
-        this._patchContext([]);
+        await this._patchContext([]);
         this.loader.showLog(this, "apply");
-        this.fiber = this.ctx.registry.plugin(plugin, this.options.config, this.getOuterStack).ctx.fiber;
+        this.fiber = this.ctx.registry.plugin(plugin, this.options.config, this.getOuterStack);
         this.moduleNamespace = moduleNamespace;
       }
     };
@@ -2535,14 +2709,14 @@ function isolate(ctx) {
   const delims = /* @__PURE__ */ Object.create(null);
   function access2(entry, name, create = false) {
     let realm;
-    const label = entry.options.isolate?.[name];
-    if (!label) return;
-    if (label === true) {
+    const label2 = entry.options.isolate?.[name];
+    if (!label2) return;
+    if (label2 === true) {
       realm = entry.realm ??= new LocalRealm(entry);
     } else if (create) {
-      realm = realms[label] ??= new GlobalRealm(label);
+      realm = realms[label2] ??= new GlobalRealm(label2);
     } else {
-      realm = realms[label];
+      realm = realms[label2];
     }
     return realm?.access(name, create);
   }
@@ -2550,7 +2724,7 @@ function isolate(ctx) {
     entry.ctx[Context.intercept] = Object.create(entry.ctx[Context.intercept]);
     entry.ctx[Context.isolate] = Object.create(entry.ctx[Context.isolate]);
   });
-  ctx.on("loader/patch-context", (entry, next) => {
+  ctx.on("loader/patch-context", async (entry, next) => {
     const newMap = Object.create(entry.parent.ctx[Context.isolate]);
     for (const name of Object.keys(entry.options.isolate ?? {})) {
       newMap[name] = access2(entry, name, true);
@@ -2564,23 +2738,26 @@ function isolate(ctx) {
       for (const symbol of [oldMap[name], newMap[name]]) {
         const impl = symbol && entry.ctx.reflect.store[symbol];
         if (!impl) continue;
-        if (!impl.fiber) {
+        const fiber = impl.ctx.fiber;
+        if (!fiber) {
           entry.ctx.logger.warn(new Error(`expected service ${name} to be implemented`));
           continue;
         }
-        diff[name] = [oldMap[name], newMap[name], entry.ctx[delim], impl.fiber.ctx[delim]];
-        if (entry.ctx[delim] !== impl.fiber.ctx[delim]) break;
+        diff[name] = [oldMap[name], newMap[name], entry.ctx[delim], fiber.ctx[delim]];
+        if (entry.ctx[delim] !== fiber.ctx[delim]) break;
       }
     }
     Object.setPrototypeOf(entry.ctx[Context.isolate], entry.parent.ctx[Context.isolate]);
     Object.setPrototypeOf(entry.ctx[Context.intercept], entry.parent.ctx[Context.intercept]);
     swap(entry.ctx[Context.isolate], newMap);
     swap(entry.ctx[Context.intercept], entry.options.intercept);
-    next();
+    await next();
     for (const [symbol1, symbol2, flag1, flag2] of Object.values(diff)) {
-      if (flag1 === flag2 && entry.ctx.reflect.store[symbol1] && !entry.ctx.reflect.store[symbol2]) {
-        entry.ctx.reflect.store[symbol2] = entry.ctx.reflect.store[symbol1];
+      const impl = entry.ctx.reflect.store[symbol1];
+      if (flag1 === flag2 && impl && !entry.ctx.reflect.store[symbol2]) {
+        entry.ctx.reflect.store[symbol2] = impl;
         delete entry.ctx.reflect.store[symbol1];
+        impl.isolate = symbol2;
       }
     }
     ctx.reflect.notify(Object.keys(diff), (ctx2, name) => {
@@ -2596,10 +2773,10 @@ function isolate(ctx) {
     }
   });
   ctx.on("loader/partial-dispose", (entry, legacy, active) => {
-    for (const [name, label] of Object.entries(legacy.isolate ?? {})) {
-      if (label === true) continue;
-      if (active && entry.options.isolate?.[name] === label) continue;
-      const realm = realms[label];
+    for (const [name, label2] of Object.entries(legacy.isolate ?? {})) {
+      if (label2 === true) continue;
+      if (active && entry.options.isolate?.[name] === label2) continue;
+      const realm = realms[label2];
       if (!realm) continue;
       for (const entry2 of ctx.loader.entries()) {
         if (entry2.options.isolate?.[name] === realm.label) return;
@@ -2643,9 +2820,9 @@ var init_isolate = __esm({
       }
     };
     GlobalRealm = class extends Realm {
-      constructor(label) {
+      constructor(label2) {
         super();
-        this.label = label;
+        this.label = label2;
       }
       label;
       get suffix() {
@@ -2724,21 +2901,22 @@ var init_src = __esm({
           noShadow: true
         });
         ctx.reflect.provide("loader", this, this[Service.check]);
-        ctx.on("internal/config", function(_config, next) {
+        ctx.on("internal/config", (fiber, next) => {
           const config2 = next();
-          if (!this.entry || this.parent.fiber?.entry === this.entry) return config2;
-          const plugin = this.runtime?.callback;
-          if (plugin?.[EntryGroup.key]) return config2;
-          return interpolate(this.ctx, config2);
-        }, { global: true });
-        ctx.on("internal/update", function(config2, noSave, next) {
-          if (!this.entry || noSave || this.parent.fiber?.entry === this.entry) return next();
-          const unparse = this.runtime?.Config?.simplify;
-          this.entry.options.config = unparse ? unparse.call(this.runtime.Config, config2) : config2;
-          this.entry.parent.tree.write();
-          return next();
-        }, { global: true, prepend: true });
-        ctx.on("internal/update", function(config2, _, next) {
+          if (!fiber.entry || fiber.parent.fiber?.entry === fiber.entry) return config2;
+          if (fiber.runtime?.callback?.[EntryGroup.key]) return config2;
+          return interpolate(fiber.ctx, config2);
+        });
+        ctx.on("internal/commit", (fiber, config2) => {
+          if (!fiber.entry || fiber.parent.fiber?.entry === fiber.entry) return;
+          const schema3 = fiber.runtime?.Config;
+          const unparse = schema3?.simplify;
+          const { entry } = fiber;
+          const legacy = { ...entry.options };
+          entry.options.config = unparse ? unparse.call(schema3, config2) : config2;
+          entry.parent.tree.commit({ id: entry.options.id, group: entry.parent, options: entry.options, legacy });
+        });
+        ctx.on("internal/update", function(config2, next) {
           if (!this.entry || this.parent.fiber?.entry === this.entry) return next();
           self.showLog(this.entry, "reload");
           return next();
@@ -2752,12 +2930,15 @@ var init_src = __esm({
           if (!fiber.entry) return;
           if (fiber.parent.fiber?.entry === fiber.entry) return;
           if (!ctx.registry.has(fiber.runtime.callback)) return;
-          const treeOwner = fiber.entry.parent.tree.ctx.fiber;
-          if (!treeOwner.uid || treeOwner.state === FiberState.UNLOADING) return;
-          this.showLog(fiber.entry, "unload");
-          if (fiber.entry.disabled) return;
-          fiber.entry.options.disabled = true;
-          fiber.entry.parent.tree.write();
+          if (!fiber.entry.parent.tree.ctx.fiber.uid) return;
+          const { entry } = fiber;
+          this.showLog(entry, "unload");
+          if (fiber.parent.fiber.state === FiberState.UNLOADING) return;
+          if (entry.parent.tree.store[entry.options.id] !== entry) return;
+          if (entry.disabled) return;
+          const legacy = { ...entry.options };
+          entry.options.disabled = true;
+          entry.parent.tree.commit({ id: entry.options.id, group: entry.parent, options: entry.options, legacy });
         });
         ctx.plugin(isolate);
       }
@@ -2768,7 +2949,7 @@ var init_src = __esm({
       // EntryTree retains upstream's documented native ESM fallback.
       internal = void 0;
       builtins = /* @__PURE__ */ Object.create(null);
-      write() {
+      commit(_change) {
       }
       [Service.check]() {
         const config = Service.prototype[Service.resolveConfig].call(this);
@@ -2820,7 +3001,7 @@ function requireCommon() {
     else if (isNothing(sequence)) return [];
     return [sequence];
   }
-  function extend2(target, source) {
+  function extend3(target, source) {
     if (source) {
       const sourceKeys = Object.keys(source);
       for (let index = 0, length = sourceKeys.length; index < length; index += 1) {
@@ -2845,13 +3026,13 @@ function requireCommon() {
   common.toArray = toArray;
   common.repeat = repeat;
   common.isNegativeZero = isNegativeZero;
-  common.extend = extend2;
+  common.extend = extend3;
   return common;
 }
 function requireException() {
   if (hasRequiredException) return exception;
   hasRequiredException = 1;
-  function formatError(exception2, compact) {
+  function formatError(exception2, compact3) {
     let where = "";
     const message = exception2.reason || "(unknown reason)";
     if (!exception2.mark) return message;
@@ -2859,7 +3040,7 @@ function requireException() {
       where += 'in "' + exception2.mark.name + '" ';
     }
     where += "(" + (exception2.mark.line + 1) + ":" + (exception2.mark.column + 1) + ")";
-    if (!compact && exception2.mark.snippet) {
+    if (!compact3 && exception2.mark.snippet) {
       where += "\n\n" + exception2.mark.snippet;
     }
     return message + " " + where;
@@ -2878,8 +3059,8 @@ function requireException() {
   }
   YAMLException2.prototype = Object.create(Error.prototype);
   YAMLException2.prototype.constructor = YAMLException2;
-  YAMLException2.prototype.toString = function toString2(compact) {
-    return this.name + ": " + formatError(this, compact);
+  YAMLException2.prototype.toString = function toString3(compact3) {
+    return this.name + ": " + formatError(this, compact3);
   };
   exception = YAMLException2;
   return exception;
@@ -3068,10 +3249,10 @@ function requireSchema() {
     }
     return result;
   }
-  function Schema2(definition) {
+  function Schema22(definition) {
     return this.extend(definition);
   }
-  Schema2.prototype.extend = function extend2(definition) {
+  Schema22.prototype.extend = function extend3(definition) {
     let implicit = [];
     let explicit = [];
     if (definition instanceof Type2) {
@@ -3100,7 +3281,7 @@ function requireSchema() {
         throw new YAMLException2("Specified list of YAML types (or a single Type object) contains a non-Type object.");
       }
     });
-    const result = Object.create(Schema2.prototype);
+    const result = Object.create(Schema22.prototype);
     result.implicit = (this.implicit || []).concat(implicit);
     result.explicit = (this.explicit || []).concat(explicit);
     result.compiledImplicit = compileList(result, "implicit");
@@ -3108,7 +3289,7 @@ function requireSchema() {
     result.compiledTypeMap = compileMap(result.compiledImplicit, result.compiledExplicit);
     return result;
   };
-  schema = Schema2;
+  schema = Schema22;
   return schema;
 }
 function requireStr() {
@@ -3150,8 +3331,8 @@ function requireMap() {
 function requireFailsafe() {
   if (hasRequiredFailsafe) return failsafe;
   hasRequiredFailsafe = 1;
-  const Schema2 = requireSchema();
-  failsafe = new Schema2({
+  const Schema22 = requireSchema();
+  failsafe = new Schema22({
     explicit: [
       requireStr(),
       requireSeq(),
@@ -3496,9 +3677,9 @@ function requireTimestamp() {
       delta = (tzHour * 60 + tzMinute) * 6e4;
       if (match[9] === "-") delta = -delta;
     }
-    const date = new Date(Date.UTC(year, month, day, hour, minute, second, fraction));
-    if (delta) date.setTime(date.getTime() - delta);
-    return date;
+    const date2 = new Date(Date.UTC(year, month, day, hour, minute, second, fraction));
+    if (delta) date2.setTime(date2.getTime() - delta);
+    return date2;
   }
   function representYamlTimestamp(object) {
     return object.toISOString();
@@ -3959,16 +4140,16 @@ function requireLoader() {
       result: state.result
     };
   }
-  function restoreState(state, snapshot) {
-    state.position = snapshot.position;
-    state.line = snapshot.line;
-    state.lineStart = snapshot.lineStart;
-    state.lineIndent = snapshot.lineIndent;
-    state.firstTabInLine = snapshot.firstTabInLine;
-    state.tag = snapshot.tag;
-    state.anchor = snapshot.anchor;
-    state.kind = snapshot.kind;
-    state.result = snapshot.result;
+  function restoreState(state, snapshot2) {
+    state.position = snapshot2.position;
+    state.line = snapshot2.line;
+    state.lineStart = snapshot2.lineStart;
+    state.lineIndent = snapshot2.lineIndent;
+    state.firstTabInLine = snapshot2.firstTabInLine;
+    state.tag = snapshot2.tag;
+    state.anchor = snapshot2.anchor;
+    state.kind = snapshot2.kind;
+    state.result = snapshot2.result;
   }
   const directiveHandlers = {
     YAML: function handleYamlDirective(state, name, args) {
@@ -5330,14 +5511,14 @@ function requireDumper() {
     let hasFoldableLine = false;
     const shouldTrackWidth = lineWidth !== -1;
     let previousLineBreak = -1;
-    let plain2 = isPlainSafeFirst(codePointAt(string, 0)) && isPlainSafeLast(codePointAt(string, string.length - 1));
+    let plain4 = isPlainSafeFirst(codePointAt(string, 0)) && isPlainSafeLast(codePointAt(string, string.length - 1));
     if (singleLineOnly || forceQuotes) {
       for (i2 = 0; i2 < string.length; char >= 65536 ? i2 += 2 : i2++) {
         char = codePointAt(string, i2);
         if (!isPrintable(char)) {
           return STYLE_DOUBLE;
         }
-        plain2 = plain2 && isPlainSafe(char, prevChar, inblock);
+        plain4 = plain4 && isPlainSafe(char, prevChar, inblock);
         prevChar = char;
       }
     } else {
@@ -5353,13 +5534,13 @@ function requireDumper() {
         } else if (!isPrintable(char)) {
           return STYLE_DOUBLE;
         }
-        plain2 = plain2 && isPlainSafe(char, prevChar, inblock);
+        plain4 = plain4 && isPlainSafe(char, prevChar, inblock);
         prevChar = char;
       }
       hasFoldableLine = hasFoldableLine || shouldTrackWidth && (i2 - previousLineBreak - 1 > lineWidth && string[previousLineBreak + 1] !== " ");
     }
     if (!hasLineBreak && !hasFoldableLine) {
-      if (plain2 && !forceQuotes && !testAmbiguousType(string)) {
+      if (plain4 && !forceQuotes && !testAmbiguousType(string)) {
         return STYLE_PLAIN;
       }
       return quotingType === QUOTING_TYPE_DOUBLE ? STYLE_DOUBLE : STYLE_SINGLE;
@@ -5501,7 +5682,7 @@ function requireDumper() {
     state.tag = _tag;
     state.dump = "[" + _result + "]";
   }
-  function writeBlockSequence(state, level, object, compact) {
+  function writeBlockSequence(state, level, object, compact3) {
     let _result = "";
     const _tag = state.tag;
     for (let index = 0, length = object.length; index < length; index += 1) {
@@ -5510,7 +5691,7 @@ function requireDumper() {
         value = state.replacer.call(object, String(index), value);
       }
       if (writeNode(state, level + 1, value, true, true, false, true) || typeof value === "undefined" && writeNode(state, level + 1, null, true, true, false, true)) {
-        if (!compact || _result !== "") {
+        if (!compact3 || _result !== "") {
           _result += generateNextLine(state, level);
         }
         if (state.dump && CHAR_LINE_FEED === state.dump.charCodeAt(0)) {
@@ -5551,7 +5732,7 @@ function requireDumper() {
     state.tag = _tag;
     state.dump = "{" + _result + "}";
   }
-  function writeBlockMapping(state, level, object, compact) {
+  function writeBlockMapping(state, level, object, compact3) {
     let _result = "";
     const _tag = state.tag;
     const objectKeyList = Object.keys(object);
@@ -5564,7 +5745,7 @@ function requireDumper() {
     }
     for (let index = 0, length = objectKeyList.length; index < length; index += 1) {
       let pairBuffer = "";
-      if (!compact || _result !== "") {
+      if (!compact3 || _result !== "") {
         pairBuffer += generateNextLine(state, level);
       }
       const objectKey = objectKeyList[index];
@@ -5632,7 +5813,7 @@ function requireDumper() {
     }
     return false;
   }
-  function writeNode(state, level, object, block, compact, iskey, isblockseq) {
+  function writeNode(state, level, object, block, compact3, iskey, isblockseq) {
     state.tag = null;
     state.dump = object;
     if (!detectType(state, object, false)) {
@@ -5651,7 +5832,7 @@ function requireDumper() {
       duplicate = duplicateIndex !== -1;
     }
     if (state.tag !== null && state.tag !== "?" || duplicate || state.indent !== 2 && level > 0) {
-      compact = false;
+      compact3 = false;
     }
     if (duplicate && state.usedDuplicates[duplicateIndex]) {
       state.dump = "*ref_" + duplicateIndex;
@@ -5661,7 +5842,7 @@ function requireDumper() {
       }
       if (type2 === "[object Object]") {
         if (block && Object.keys(state.dump).length !== 0) {
-          writeBlockMapping(state, level, state.dump, compact);
+          writeBlockMapping(state, level, state.dump, compact3);
           if (duplicate) {
             state.dump = "&ref_" + duplicateIndex + state.dump;
           }
@@ -5674,9 +5855,9 @@ function requireDumper() {
       } else if (type2 === "[object Array]") {
         if (block && state.dump.length !== 0) {
           if (state.noArrayIndent && !isblockseq && level > 0) {
-            writeBlockSequence(state, level - 1, state.dump, compact);
+            writeBlockSequence(state, level - 1, state.dump, compact3);
           } else {
-            writeBlockSequence(state, level, state.dump, compact);
+            writeBlockSequence(state, level, state.dump, compact3);
           }
           if (duplicate) {
             state.dump = "&ref_" + duplicateIndex + state.dump;
@@ -5764,9 +5945,9 @@ function requireJsYaml() {
   hasRequiredJsYaml = 1;
   const loader2 = requireLoader();
   const dumper2 = requireDumper();
-  function renamed(from, to) {
+  function renamed(from2, to) {
     return function() {
-      throw new Error("Function yaml." + from + " is removed in js-yaml 4. Use yaml." + to + " instead, which is now safe by default.");
+      throw new Error("Function yaml." + from2 + " is removed in js-yaml 4. Use yaml." + to + " instead, which is now safe by default.");
     };
   }
   jsYaml.Type = requireType();
@@ -5827,18 +6008,193 @@ var init_js_yaml = __esm({
   }
 });
 
-// src/dsh/upstream/include/src/index.ts
-import { extname } from "node:path";
-import { access, constants, readFile, rename, writeFile } from "node:fs/promises";
-import { setTimeout as delay } from "node:timers/promises";
-import { fileURLToPath, pathToFileURL } from "node:url";
-function retryableWriteError(error) {
-  const code = error?.code;
-  return code === "EACCES" || code === "EBUSY" || code === "EPERM";
+// src/dsh/upstream/include/src/journal.ts
+function diffOptions(legacy, options) {
+  const changes = {};
+  for (const key of /* @__PURE__ */ new Set([...Object.keys(legacy), ...Object.keys(options)])) {
+    if (key === "id") continue;
+    if (deepEqual(legacy[key], options[key])) continue;
+    changes[key] = options[key];
+  }
+  return changes;
 }
-function applyEntryPatches(data2, patches, warn) {
-  if (!patches?.length) return [...data2];
+function mergeRecords(older, newer) {
+  if (!older) return newer;
+  if (newer.kind === "remove") {
+    return older.kind === "upsert" && older.created ? void 0 : newer;
+  }
+  if (older.kind === "remove") {
+    return { ...newer, created: false };
+  }
+  const relocated = newer.parent !== void 0;
+  return {
+    kind: "upsert",
+    created: older.created,
+    parent: relocated ? newer.parent : older.parent,
+    position: relocated ? newer.position : older.position,
+    changes: { ...older.changes, ...newer.changes }
+  };
+}
+function merge2(journal, id, record3) {
+  const merged = mergeRecords(journal.get(id), record3);
+  if (merged) {
+    journal.set(id, merged);
+  } else {
+    journal.delete(id);
+  }
+}
+function record(journal, change, parent) {
+  const { id, options, legacy } = change;
+  if (!options) {
+    return merge2(journal, id, { kind: "remove" });
+  }
+  const position = change.group.data.indexOf(options);
+  if (!legacy) {
+    return merge2(journal, id, { kind: "upsert", created: true, parent, position, changes: omit(options, ["id"]) });
+  }
+  merge2(journal, id, {
+    kind: "upsert",
+    created: false,
+    parent: change.from ? parent : void 0,
+    position,
+    changes: diffOptions(legacy, options)
+  });
+}
+function flatten(data2, parent = null, result = /* @__PURE__ */ new Map()) {
+  data2.forEach((options, position) => {
+    if (options.id) result.set(options.id, { parent, position, options, list: data2 });
+    if (options.group && Array.isArray(options.config)) {
+      flatten(options.config, options.id ?? null, result);
+    }
+  });
+  return result;
+}
+function applyChanges(options, changes, filter) {
+  for (const [key, value] of Object.entries(changes)) {
+    if (filter && !filter(key)) continue;
+    if (value === void 0) {
+      delete options[key];
+    } else {
+      options[key] = value;
+    }
+  }
+}
+function detach(data2, id) {
+  const flat = flatten(data2).get(id);
+  if (!flat) return;
+  flat.list.splice(flat.list.indexOf(flat.options), 1);
+  return flat.options;
+}
+function place(data2, options, parent, position) {
+  let list2 = data2;
+  if (parent !== null) {
+    const group = flatten(data2).get(parent);
+    if (!group?.options.group) return false;
+    list2 = group.options.config ??= [];
+  }
+  list2.splice(Math.min(position, list2.length), 0, options);
+  return true;
+}
+function applyJournal(data2, journal, filter = () => true, warn = () => {
+}) {
+  for (const [id, record3] of journal) {
+    if (!filter(id, null)) continue;
+    if (record3.kind === "remove") {
+      detach(data2, id);
+      continue;
+    }
+    const flat = flatten(data2).get(id);
+    if (!flat) {
+      const options = { id };
+      applyChanges(options, record3.changes, (key) => filter(id, key));
+      const parent = record3.parent ?? null;
+      if (!place(data2, options, parent, record3.position)) {
+        warn("cannot place entry %C: group %C not found", id, parent);
+      }
+      continue;
+    }
+    applyChanges(flat.options, record3.changes, (key) => filter(id, key));
+    if (record3.parent !== void 0 && flat.parent !== record3.parent) {
+      detach(data2, id);
+      if (!place(data2, flat.options, record3.parent, record3.position)) {
+        warn("cannot move entry %C: group %C not found", id, record3.parent);
+        place(data2, flat.options, flat.parent, flat.position);
+      }
+    }
+  }
+  return data2;
+}
+function reconcile(journal, base, theirs, fileOwned) {
+  const conflicts = [];
+  for (const [id, record3] of journal) {
+    if (!fileOwned(id, null)) continue;
+    const b = base.get(id);
+    const t = theirs.get(id);
+    if (record3.kind === "remove") {
+      if (!t) {
+        journal.delete(id);
+      } else if (!b || !deepEqual(t.options, b.options)) {
+        conflicts.push({ id, reason: b ? "modified in file, removed at runtime" : "added in file, removed at runtime" });
+        journal.delete(id);
+      }
+      continue;
+    }
+    if (!t) {
+      if (b) {
+        conflicts.push({ id, reason: "removed in file, modified at runtime" });
+        journal.delete(id);
+      }
+      continue;
+    }
+    if (record3.created) record3.created = false;
+    for (const key of Object.keys(record3.changes)) {
+      if (!fileOwned(id, key)) continue;
+      const bv = b?.options?.[key];
+      const tv = t.options[key];
+      if (deepEqual(bv, tv) || deepEqual(tv, record3.changes[key])) continue;
+      conflicts.push({ id, reason: `key "${key}" modified both in file and at runtime` });
+      delete record3.changes[key];
+    }
+    if (record3.parent !== void 0 && b && t.parent !== b.parent && t.parent !== record3.parent) {
+      conflicts.push({ id, reason: "moved both in file and at runtime" });
+      record3.parent = void 0;
+    }
+    const moved = record3.parent !== void 0 && record3.parent !== t.parent;
+    if (!Object.keys(record3.changes).length && !moved) {
+      journal.delete(id);
+    }
+  }
+  return conflicts;
+}
+var init_journal = __esm({
+  "src/dsh/upstream/include/src/journal.ts"() {
+    "use strict";
+    init_lib();
+  }
+});
+
+// src/dsh/upstream/include/src/patch.ts
+function randomId(used) {
+  let id;
+  do {
+    id = Math.random().toString(16).slice(2, 10);
+  } while (used(id));
+  return id;
+}
+function ensureIds(entries, used) {
+  for (const entry of entries) {
+    if (!entry.id) entry.id = randomId(used);
+    if (entry.group && Array.isArray(entry.config)) ensureIds(entry.config, used);
+  }
+}
+function ensureInsertIds(patches, used) {
+  for (const patch of patches ?? []) {
+    if (patch.insert) ensureIds(patch.insert, used);
+  }
+}
+function applyPatches(data2, patches, warn) {
   data2 = structuredClone(data2);
+  if (!patches?.length) return data2;
   const entryMap = /* @__PURE__ */ new Map();
   const buildMap = (entries) => {
     for (const entry of entries) {
@@ -5852,6 +6208,7 @@ function applyEntryPatches(data2, patches, warn) {
   for (const patch of patches) {
     const { id, insert, name, ...overrides } = patch;
     if (insert) {
+      const clone2 = structuredClone(insert);
       if (id) {
         const target2 = entryMap.get(id);
         if (!target2) {
@@ -5863,11 +6220,11 @@ function applyEntryPatches(data2, patches, warn) {
           continue;
         }
         if (!Array.isArray(target2.config)) target2.config = [];
-        target2.config.push(...insert);
+        target2.config.push(...clone2);
       } else {
-        data2.push(...insert);
+        data2.push(...clone2);
       }
-      buildMap(insert);
+      buildMap(clone2);
       continue;
     }
     if (!id) {
@@ -5890,13 +6247,142 @@ function applyEntryPatches(data2, patches, warn) {
   }
   return data2;
 }
-var JsExpr, entryListSchema, schema2, writable, supported, WRITE_RETRY_LIMIT, WRITE_RETRY_DELAY_MS, Include;
+function routeJournal(journal, data2, patches, warn) {
+  const index = new PatchIndex(patches);
+  let patched = false;
+  const insertList = (owner) => owner.options.config ??= [];
+  const placeAt = (options, parent, position) => {
+    const owner = index.entry(parent);
+    if (owner.type === "insert") {
+      const list2 = insertList(owner);
+      list2.splice(Math.min(position, list2.length), 0, options);
+      patched = true;
+    } else if (!place(data2, options, parent, position)) {
+      warn("cannot place entry %C: group %C not found", options.id, parent);
+    }
+  };
+  for (const [id, record3] of journal) {
+    const owner = index.entry(id);
+    if (record3.kind === "remove") {
+      if (owner.type === "insert") {
+        owner.list.splice(owner.list.indexOf(owner.options), 1);
+        patched = true;
+      } else {
+        detach(data2, id);
+      }
+      continue;
+    }
+    const current2 = owner.type === "insert" ? owner : flatten(data2).get(id);
+    if (!current2) {
+      const options = { id };
+      applyChanges(options, record3.changes);
+      placeAt(options, record3.parent ?? null, record3.position);
+      continue;
+    }
+    if (record3.parent !== void 0 && current2.parent !== record3.parent) {
+      if (owner.type === "insert") {
+        owner.list.splice(owner.list.indexOf(owner.options), 1);
+        patched = true;
+      } else {
+        detach(data2, id);
+      }
+      applyChanges(current2.options, record3.changes);
+      placeAt(current2.options, record3.parent, record3.position);
+      continue;
+    }
+    if (owner.type === "insert") {
+      applyChanges(current2.options, record3.changes);
+      patched = true;
+      continue;
+    }
+    const patchChanges = {};
+    applyChanges(current2.options, record3.changes, (key) => {
+      const keyOwner = index.key(id, key);
+      if (keyOwner.type !== "patch") return true;
+      (patchChanges[keyOwner.index] ??= {})[key] = record3.changes[key];
+      return false;
+    });
+    for (const [i2, changes] of Object.entries(patchChanges)) {
+      applyChanges(patches[i2], changes);
+      patched = true;
+    }
+  }
+  return patched;
+}
+var PatchIndex;
+var init_patch = __esm({
+  "src/dsh/upstream/include/src/patch.ts"() {
+    "use strict";
+    init_lib();
+    init_journal();
+    PatchIndex = class {
+      constructor(patches) {
+        this.patches = patches;
+        patches.forEach((patch, index) => {
+          const { id, insert } = patch;
+          if (insert) {
+            const walk = (list2, parent) => {
+              for (const options of list2) {
+                this.inserts.set(options.id, { type: "insert", index, list: list2, options, parent });
+                if (options.group && Array.isArray(options.config)) walk(options.config, options.id);
+              }
+            };
+            walk(insert, id ?? null);
+            return;
+          }
+          if (!id) return;
+          const keys = this.keys.get(id) ?? /* @__PURE__ */ new Map();
+          for (const key of Object.keys(omit(patch, ["id", "insert", "name"]))) {
+            keys.set(key, index);
+          }
+          this.keys.set(id, keys);
+        });
+      }
+      patches;
+      keys = /* @__PURE__ */ new Map();
+      inserts = /* @__PURE__ */ new Map();
+      /** Owner of the entry as a whole. */
+      entry(id) {
+        if (id === null) return { type: "file" };
+        return this.inserts.get(id) ?? { type: "file" };
+      }
+      /** Owner of one key of an entry. */
+      key(id, key) {
+        const insert = this.inserts.get(id);
+        if (insert) return insert;
+        const index = this.keys.get(id)?.get(key);
+        return index === void 0 ? { type: "file" } : { type: "patch", index };
+      }
+      fileOwned(id, key) {
+        return (key === null ? this.entry(id) : this.key(id, key)).type === "file";
+      }
+    };
+  }
+});
+
+// src/dsh/upstream/include/src/index.ts
+import { basename, dirname, extname, join } from "node:path";
+import { access, constants, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { setTimeout as sleep } from "node:timers/promises";
+import { fileURLToPath, pathToFileURL } from "node:url";
+function isENOENT(error) {
+  return error?.code === "ENOENT";
+}
+function isTransientRenameError(error) {
+  const code = error?.code;
+  return code === "EACCES" || code === "EPERM" || code === "EBUSY";
+}
+var JsExpr, entryListSchema, schema2, types2, ConfigFileError, StaleWriteError, RENAME_RETRIES, RENAME_BACKOFF, Include;
 var init_src2 = __esm({
   "src/dsh/upstream/include/src/index.ts"() {
     "use strict";
     init_src();
     init_lib2();
+    init_lib();
     init_js_yaml();
+    init_journal();
+    init_patch();
+    init_patch();
     JsExpr = new Type("tag:yaml.org,2002:js", {
       kind: "scalar",
       resolve: (data2) => typeof data2 === "string",
@@ -5906,14 +6392,24 @@ var init_src2 = __esm({
     });
     entryListSchema = JSON_SCHEMA.extend(JsExpr);
     schema2 = entryListSchema;
-    writable = {
+    types2 = {
       ".json": "application/json",
       ".yaml": "application/yaml",
       ".yml": "application/yaml"
     };
-    supported = new Set(Object.keys(writable));
-    WRITE_RETRY_LIMIT = 10;
-    WRITE_RETRY_DELAY_MS = 50;
+    ConfigFileError = class extends Error {
+      constructor(stage, path2, cause) {
+        super(`failed to ${stage} config file ${path2}`, { cause });
+        this.stage = stage;
+      }
+      stage;
+      name = "ConfigFileError";
+    };
+    StaleWriteError = class extends Error {
+      name = "StaleWriteError";
+    };
+    RENAME_RETRIES = 10;
+    RENAME_BACKOFF = 20;
     Include = class extends EntryTree {
       constructor(ctx, config) {
         super(ctx);
@@ -5921,158 +6417,322 @@ var init_src2 = __esm({
         this.enableLogs = config.enableLogs ?? ctx.fiber.entry?.parent.tree.enableLogs ?? false;
         this.filename = fileURLToPath(new URL(this.config.path, this.ctx.baseUrl));
         const ext = extname(this.filename);
-        if (!supported.has(ext)) {
+        if (!types2[ext]) {
           throw new Error(`extension "${ext}" not supported`);
         }
-        this.type = writable[ext];
-        this.readonly = !this.type;
+        this.type = types2[ext];
         this.ctx.baseUrl = new URL(".", pathToFileURL(this.filename)).href;
-        ctx.on("internal/update", (config2, _, next) => {
+        ensureInsertIds(config.patches, (id) => !!this.store[id]);
+        ctx.on("internal/update", (config2, next) => {
           if (config2.path !== this.config.path) return next();
           this.config = config2;
-          this.root.update(this.applyPatches(this.data, config2.patches)).catch((error) => {
-            this.ctx.logger.warn("config update at %C failed", this.filename);
-            this.ctx.logger.warn(error);
-          });
+          ensureInsertIds(config2.patches, (id) => !!this.store[id]);
+          this._scheduleApply();
+          return this._applyTask;
         });
       }
       config;
       static inject = ["loader"];
-      // Tree-carrier marker (the Group plugin declares the same): this config is
-      // entry and patch lists, so the Loader's `internal/config` interpolation
-      // keeps it literal — a `!!js` expression inside a nested row's config
-      // belongs to that row's fiber, resolving lazily in the row's own context.
-      // Include's own fields (`path`, `enableLogs`) therefore stay literal too.
+      // Child entries evaluate their expressions against their own injections.
       static [EntryGroup.key] = true;
       filename;
       type;
-      readonly;
-      content;
-      data;
-      writeTask;
-      pendingWrite;
-      writeQueue = Promise.resolve();
-      async checkAccess() {
-        if (!this.type) return;
-        try {
-          await access(this.filename, constants.W_OK);
-        } catch {
-          this.readonly = true;
-        }
-      }
-      async read(forced = false) {
-        const content = await readFile(this.filename, "utf8");
-        if (!forced && this.content === content) return false;
-        let data2;
-        if (this.type === "application/yaml") {
-          data2 = load(content, { schema: entryListSchema });
-        } else if (this.type === "application/json") {
-          data2 = JSON.parse(content);
-        } else {
-          const module = await import(
-            /* @vite-ignore */
-            this.filename
-          );
-          data2 = module.default || module;
-        }
-        if (!Array.isArray(data2)) {
-          throw new TypeError(`config file must be a top-level array of entries: ${this.filename}`);
-        }
-        this.content = content;
-        this.data = data2;
-        await this.checkAccess();
-        return true;
-      }
-      applyPatches(data2, patches = this.config.patches) {
-        return applyEntryPatches(data2, patches, (message, ...args) => {
-          this.ctx.root.logger?.("loader").warn(message, ...args);
-        });
-      }
+      /** The last file state we read or wrote. */
+      cache;
+      /** Tree-side changes that have not reached the file yet. */
+      journal = /* @__PURE__ */ new Map();
+      /** Ids we assigned to entries the file leaves anonymous. */
+      anonymous = /* @__PURE__ */ new Map();
+      dirtyRead = false;
+      dirtyWrite = false;
+      _draining;
+      /** Only the latest intended tree is ever applied; older ones are skipped. */
+      _pendingTree;
+      _applyTask;
+      _disposed = false;
+      _seq = 0;
+      persistenceError;
+      warn = (format, ...args) => {
+        this.ctx.root.logger?.("loader").warn(format, ...args);
+      };
       async *[Service.init]() {
         try {
-          await this.read();
+          await this._read();
         } catch (error) {
-          if (error?.code !== "ENOENT") throw error;
-          if (this.config.initial) {
-            await this._writeFile(this.config.initial);
-            await this.read(true);
-          } else {
+          const cause = error instanceof ConfigFileError && error.stage === "read" ? error.cause : void 0;
+          if (!isENOENT(cause)) throw error;
+          if (!this.config.initial) {
             throw new Error(`config file not found: ${this.filename}`);
           }
+          const initial = structuredClone(this.config.initial);
+          ensureIds(initial, (id) => !!this.store[id]);
+          await this._writeText(this.dump(initial));
+          await this._read();
         }
         yield () => this.stop();
-        await this.root.update(this.applyPatches(this.data));
+        await this._applyTask;
       }
       async stop() {
+        this._disposed = true;
+        this._pendingTree = void 0;
+        if (this.journal.size) {
+          this.dirtyWrite = true;
+          this._drain();
+        }
         try {
-          await this.flushWrite();
+          await this.flush();
         } finally {
           this.root.stop();
-          await this.flushWrite();
         }
       }
       /**
-       * Re-read the file and refresh child entries when content changed. An
-       * unreadable or unparsable file logs a warning and keeps the last good
-       * tree: a hot-reload of a live app must never take the process down.
+       * Resolves once every pending read and write has been processed and the
+       * tree reflects the outcome. Retries pending writes and rejects while changes remain unsaved.
        */
-      async refresh() {
-        try {
-          if (!await this.read()) return;
-          await this.root.update(this.applyPatches(this.data));
-        } catch (error) {
-          this.ctx.logger.warn("config reload at %C failed; keeping the running tree", this.filename);
-          this.ctx.logger.warn(error);
+      async flush() {
+        if (this.journal.size && !this._draining) {
+          this.dirtyWrite = true;
+          this._drain();
         }
+        while (this._draining || this._applyTask) {
+          await this._draining;
+          await this._applyTask;
+        }
+        if (this.journal.size) {
+          throw this.persistenceError ?? new Error(`config file ${this.filename} has ${this.journal.size} unsaved change(s)`);
+        }
+        this.persistenceError = void 0;
       }
-      async _writeFile(config) {
-        if (this.readonly) {
-          throw new Error(`cannot overwrite readonly config`);
-        }
-        if (this.type === "application/yaml") {
-          this.content = dump(config, { schema: schema2 });
-        } else if (this.type === "application/json") {
-          this.content = JSON.stringify(config, null, 2);
-        }
-        await writeFile(this.filename + ".tmp", this.content);
-        for (let retry = 0; ; retry++) {
-          try {
-            await rename(this.filename + ".tmp", this.filename);
-            return;
-          } catch (error) {
-            if (!retryableWriteError(error) || retry >= WRITE_RETRY_LIMIT) throw error;
-            await delay((retry + 1) * WRITE_RETRY_DELAY_MS);
+      /** Re-read the file and reconcile the tree with it. */
+      refresh() {
+        this.dirtyRead = true;
+        this._drain();
+        return this.flush();
+      }
+      /** Called synchronously by the loader once a tree-side change is in place. */
+      commit(change) {
+        this.context.emit("loader/config-update");
+        const parent = change.group === this.root ? null : change.group.ctx.fiber.entry.options.id;
+        record(this.journal, change, parent);
+        this.dirtyWrite = true;
+        this._drain();
+      }
+      _drain() {
+        if (this._draining) return;
+        this._draining = this._loop().finally(() => {
+          this._draining = void 0;
+        });
+      }
+      async _loop() {
+        while (this.dirtyRead || this.dirtyWrite) {
+          if (this.dirtyRead) {
+            this.dirtyRead = false;
+            try {
+              await this._read();
+            } catch (error) {
+              this.persistenceError = error;
+              this.ctx.logger.warn(error);
+              if (this.dirtyRead) continue;
+              return;
+            }
+          }
+          if (this.dirtyWrite) {
+            this.dirtyWrite = false;
+            try {
+              await this._write();
+            } catch (error) {
+              this.persistenceError = error;
+              this.ctx.logger.error(error);
+            }
           }
         }
       }
-      writeFile(config) {
-        clearTimeout(this.writeTask);
-        this.pendingWrite = config;
-        this.writeTask = setTimeout(() => {
-          void this.flushWrite();
-        }, 0);
+      async _read() {
+        let content;
+        try {
+          content = await readFile(this.filename, "utf8");
+        } catch (error) {
+          throw new ConfigFileError("read", this.filename, error);
+        }
+        if (content === this.cache?.content) return;
+        let data2;
+        try {
+          data2 = this.type === "application/yaml" ? load(content, { schema: schema2 }) : JSON.parse(content);
+        } catch (error) {
+          throw new ConfigFileError("parse", this.filename, error);
+        }
+        if (!Array.isArray(data2)) {
+          throw new ConfigFileError("validate", this.filename, new TypeError("config file must be a top-level array"));
+        }
+        this._assignIds(data2);
+        if (this.cache) {
+          const index = new PatchIndex(this.config.patches ?? []);
+          const conflicts = reconcile(this.journal, flatten(this.cache.data), flatten(data2), (id, key) => index.fileOwned(id, key));
+          for (const { id, reason } of conflicts) {
+            this.ctx.logger.error("config conflict in %C: entry %C %s; file wins", this.filename, id, reason);
+          }
+        }
+        this.cache = { content, data: data2 };
+        this._scheduleApply();
+        if (this.journal.size) this.dirtyWrite = true;
       }
-      flushWrite() {
-        clearTimeout(this.writeTask);
-        this.writeTask = void 0;
-        const config = this.pendingWrite;
-        this.pendingWrite = void 0;
-        if (config === void 0) return this.writeQueue;
-        const run = this.writeQueue.then(
-          () => this._writeFile(config),
-          () => this._writeFile(config)
-        );
-        this.writeQueue = run;
-        void run.catch((error) => {
-          this.ctx.root.logger?.("loader").warn("failed to write config file %C", this.filename);
-          this.ctx.root.logger?.("loader").warn(error);
+      async _write() {
+        if (!this.cache || !this.journal.size) return;
+        const current2 = await readFile(this.filename, "utf8").catch((error) => {
+          if (isENOENT(error)) return void 0;
+          throw error;
         });
-        return run;
+        if (current2 === void 0) {
+          this.ctx.logger.warn("config file %C is missing, %d pending change(s) kept in memory", this.filename, this.journal.size);
+          return;
+        }
+        if (current2 !== this.cache.content) {
+          this.dirtyRead = true;
+          this.dirtyWrite = true;
+          return;
+        }
+        const batch = this.journal;
+        this.journal = /* @__PURE__ */ new Map();
+        const restore = () => {
+          for (const [id, record3] of this.journal) merge2(batch, id, record3);
+          this.journal = batch;
+        };
+        const data2 = structuredClone(this.cache.data);
+        const patches = structuredClone(this.config.patches ?? []);
+        if (routeJournal(batch, data2, patches, this.warn)) {
+          this.config = { ...this.config, patches };
+          if (this.ctx.fiber.entry) {
+            try {
+              Promise.resolve(this.ctx.fiber.update(this.config)).catch((error) => {
+                this.ctx.logger.error(error);
+              });
+            } catch (error) {
+              this.ctx.logger.error(error);
+            }
+          } else {
+            this.ctx.logger.warn("patches of %C changed at runtime but cannot be persisted", this.filename);
+          }
+        }
+        if (deepEqual(data2, this.cache.data)) {
+          this._scheduleApply();
+          return;
+        }
+        const text4 = this.dump(data2);
+        try {
+          await access(this.filename, constants.W_OK);
+        } catch {
+          restore();
+          this.ctx.logger.warn("config file %C is read-only, %d pending change(s) kept in memory", this.filename, this.journal.size);
+          return;
+        }
+        try {
+          await this._writeText(text4, this.cache.content);
+        } catch (error) {
+          restore();
+          if (error instanceof StaleWriteError) {
+            this.dirtyRead = true;
+            this.dirtyWrite = true;
+            return;
+          }
+          this.ctx.logger.warn("failed to write config file %C, %d pending change(s) kept in memory", this.filename, this.journal.size);
+          throw error;
+        }
+        this.cache = { content: text4, data: data2 };
+        this._scheduleApply();
       }
-      /** Schedule a write of the current root entry data. */
-      write() {
-        this.context.emit("loader/config-update");
-        return this.writeFile(this.root.data);
+      /**
+       * Write through a temp file and a rename, so that no reader ever sees a
+       * truncated file. When `expected` is given, the rename (and every retry of
+       * it) only goes ahead while the file still holds that content.
+       */
+      async _writeText(text4, expected) {
+        const tmp = join(dirname(this.filename), `.${basename(this.filename)}.${process.pid}.${this._seq++}.tmp`);
+        try {
+          await writeFile(tmp, text4);
+          for (let attempt = 0; ; attempt++) {
+            if (expected !== void 0) {
+              const current2 = await readFile(this.filename, "utf8").catch((error) => {
+                if (isENOENT(error)) return void 0;
+                throw error;
+              });
+              if (current2 !== expected) throw new StaleWriteError();
+            }
+            try {
+              await rename(tmp, this.filename);
+              return;
+            } catch (error) {
+              if (attempt >= RENAME_RETRIES || !isTransientRenameError(error)) throw error;
+            }
+            await sleep(RENAME_BACKOFF * (attempt + 1));
+          }
+        } catch (error) {
+          await rm(tmp, { force: true }).catch(() => {
+          });
+          throw error;
+        }
+      }
+      dump(data2) {
+        return this.type === "application/yaml" ? dump(data2, { schema: schema2 }) : JSON.stringify(data2, null, 2);
+      }
+      /**
+       * Entries the file leaves anonymous get an id here, before the loader sees
+       * them. One that looks exactly like an entry we named on the previous read
+       * keeps that id, so editing a neighbor does not restart it; anything else
+       * gets a fresh id. Assigned ids stay in memory until the next write.
+       */
+      _assignIds(data2) {
+        const used = /* @__PURE__ */ new Set();
+        const pending = [];
+        const walk = (entries, parent) => {
+          for (const options of entries) {
+            if (options.id) {
+              used.add(options.id);
+            } else {
+              pending.push({ options, parent });
+            }
+            if (options.group && Array.isArray(options.config)) {
+              walk(options.config, options.id ?? null);
+            }
+          }
+        };
+        walk(data2, null);
+        const previous = this.anonymous;
+        this.anonymous = /* @__PURE__ */ new Map();
+        for (const { options, parent } of pending) {
+          let id;
+          for (const [candidate, info] of previous) {
+            if (info.parent !== parent || !deepEqual(info.options, options)) continue;
+            id = candidate;
+            previous.delete(candidate);
+            break;
+          }
+          if (!id) {
+            do {
+              id = Math.random().toString(16).slice(2, 10);
+            } while (used.has(id) || this.store[id]);
+          }
+          used.add(id);
+          this.anonymous.set(id, { parent, options: structuredClone(options) });
+          const rest = { ...options };
+          for (const key of Object.keys(options)) delete options[key];
+          Object.assign(options, { id }, rest);
+        }
+      }
+      _scheduleApply() {
+        if (this._disposed || !this.cache) return;
+        const tree = applyPatches(this.cache.data, this.config.patches, this.warn);
+        this._pendingTree = applyJournal(tree, this.journal, void 0, this.warn);
+        this._applyTask ??= (async () => {
+          try {
+            while (this._pendingTree) {
+              const tree2 = this._pendingTree;
+              this._pendingTree = void 0;
+              await this.root.update(tree2);
+            }
+          } finally {
+            this._applyTask = void 0;
+          }
+        })();
       }
     };
   }
@@ -6097,8 +6757,8 @@ function isJson(value, depth = 0) {
         if (array && key === "length") continue;
         if (typeof key !== "string") return false;
         if (array && (!/^(0|[1-9]\d*)$/u.test(key) || Number(key) >= value.length)) return false;
-        const descriptor = Object.getOwnPropertyDescriptor(value, key);
-        if (!descriptor.enumerable || !("value" in descriptor) || !isJson(descriptor.value, depth + 1)) return false;
+        const descriptor2 = Object.getOwnPropertyDescriptor(value, key);
+        if (!descriptor2.enumerable || !("value" in descriptor2) || !isJson(descriptor2.value, depth + 1)) return false;
       }
       return true;
     }
@@ -6147,8 +6807,8 @@ function reviewedMcpModule() {
         if (typeof timeout !== "number" || !Number.isInteger(timeout) || timeout < 1e3 || timeout > 864e5 || timeout % 1e3 !== 0) throw new Error("MCP timeout must be whole seconds within Core bounds");
         options.execute_timeout = timeout / 1e3;
       }
-      if (config.failOnStartupError === true) throw new Error("failOnStartupError requires explicit Core MCP connection qualification before activation");
-      if (config.failOnStartupError !== void 0 && config.failOnStartupError !== false) throw new Error("MCP startup gate must be a boolean");
+      if (config.failOnStartupError !== void 0 && typeof config.failOnStartupError !== "boolean") throw new Error("MCP startup gate must be a boolean");
+      if (config.failOnStartupError === true) options.required = true;
       let server;
       if (config.transport === "stdio") {
         const cwd = config.cwd ?? "";
@@ -6171,11 +6831,11 @@ var init_mcp2 = __esm({
 // src/shims/skills.ts
 function normalizeSkillRoot(value) {
   if (typeof value !== "object" || value === null || Array.isArray(value) || Object.keys(value).some((key) => key !== "path")) throw new TypeError("skill root supports only path");
-  const { path } = value;
-  if (typeof path !== "string" || !path || Buffer.byteLength(path, "utf8") > 512 || /[\\:\u0000-\u001f\u007f-\u009f]/u.test(path) || path.split("/").some((part) => !part || part === "." || part === "..")) {
+  const { path: path2 } = value;
+  if (typeof path2 !== "string" || !path2 || Buffer.byteLength(path2, "utf8") > 512 || /[\\:\u0000-\u001f\u007f-\u009f]/u.test(path2) || path2.split("/").some((part) => !part || part === "." || part === "..")) {
     throw new TypeError("skill root path must be a bounded bundle-relative path with normal slash-separated components");
   }
-  return Object.freeze({ path });
+  return Object.freeze({ path: path2 });
 }
 var init_skills = __esm({
   "src/shims/skills.ts"() {
@@ -6191,13 +6851,13 @@ function reviewedSkillModule() {
     if (config.includeDefaultRoots !== false || config.watch !== false) throw new Error("filesystem row must explicitly disable default roots and watchers");
     if (config.providerName !== void 0 && (typeof config.providerName !== "string" || !config.providerName || config.providerName.length > 64)) throw new Error("skill providerName must be bounded");
     if (!Array.isArray(config.customSkillDirs) || !config.customSkillDirs.length || config.customSkillDirs.length > 8) throw new Error("filesystem row needs 1–8 reviewed roots");
-    const roots = config.customSkillDirs.map((path) => normalizeSkillRoot({ path }));
+    const roots = config.customSkillDirs.map((path2) => normalizeSkillRoot({ path: path2 }));
     const seen = /* @__PURE__ */ new Set();
-    for (const { path } of roots) {
-      if (seen.has(path)) throw new Error("duplicate filesystem root");
-      seen.add(path);
+    for (const { path: path2 } of roots) {
+      if (seen.has(path2)) throw new Error("duplicate filesystem root");
+      seen.add(path2);
     }
-    for (const { path } of roots) ctx.skills.registerRoot({ path: `source/${path}` });
+    for (const { path: path2 } of roots) ctx.skills.registerRoot({ path: `source/${path2}` });
   } };
 }
 var init_skill_filesystem = __esm({
@@ -6210,35 +6870,35 @@ var init_skill_filesystem = __esm({
 // src/dsh/canonical-path.ts
 import { realpathSync } from "node:fs";
 import { posix, win32 } from "node:path";
-function canonicalPath(path, platform = process.platform) {
-  if (platform !== "win32") return realpathSync(path);
+function canonicalPath(path2, platform = process.platform) {
+  if (platform !== "win32") return realpathSync(path2);
   try {
-    return stripVerbatim(realpathSync.native(path), platform);
+    return stripVerbatim(realpathSync.native(path2), platform);
   } catch (error) {
     const code = error && typeof error === "object" && "code" in error ? error.code : void 0;
     if (code === "EPERM" || code === "EACCES") {
-      return stripVerbatim(win32.normalize(path), platform);
+      return stripVerbatim(win32.normalize(path2), platform);
     }
     throw error;
   }
 }
-function stripVerbatim(path, platform = process.platform) {
-  if (platform !== "win32") return path;
-  if (/^[\\/]{2}\?[\\/]UNC[\\/]/i.test(path)) return `\\\\${path.slice(8)}`;
-  if (/^[\\/]{2}\?[\\/]/.test(path)) return path.slice(4);
-  return path;
+function stripVerbatim(path2, platform = process.platform) {
+  if (platform !== "win32") return path2;
+  if (/^[\\/]{2}\?[\\/]UNC[\\/]/i.test(path2)) return `\\\\${path2.slice(8)}`;
+  if (/^[\\/]{2}\?[\\/]/.test(path2)) return path2.slice(4);
+  return path2;
 }
-function pathKey(path, platform = process.platform) {
-  if (platform !== "win32") return posix.normalize(path);
-  return win32.normalize(stripVerbatim(path, platform)).toLowerCase();
+function pathKey(path2, platform = process.platform) {
+  if (platform !== "win32") return posix.normalize(path2);
+  return win32.normalize(stripVerbatim(path2, platform)).toLowerCase();
 }
 function samePath(a, b, platform = process.platform) {
   return pathKey(a, platform) === pathKey(b, platform);
 }
 function insideKey(root, target, platform = process.platform) {
-  const path = platform === "win32" ? win32 : posix;
-  const inside = path.relative(stripVerbatim(root, platform), stripVerbatim(target, platform));
-  if (inside === ".." || inside.startsWith(`..${path.sep}`) || path.isAbsolute(inside)) return void 0;
+  const path2 = platform === "win32" ? win32 : posix;
+  const inside = path2.relative(stripVerbatim(root, platform), stripVerbatim(target, platform));
+  if (inside === ".." || inside.startsWith(`..${path2.sep}`) || path2.isAbsolute(inside)) return void 0;
   return platform === "win32" ? inside.split(win32.sep).join("/") : inside;
 }
 function isUnlinkedInside(root, key, target, platform = process.platform) {
@@ -6253,8 +6913,8 @@ function isUnlinkedInside(root, key, target, platform = process.platform) {
 }
 function unlinkedKeyMatches(canonicalRoot, key, canonicalTarget, platform = process.platform) {
   if (!key || key.split("/").some((part) => !part || part === "." || part === "..")) return false;
-  const path = platform === "win32" ? win32 : posix;
-  return samePath(path.join(stripVerbatim(canonicalRoot, platform), ...key.split("/")), canonicalTarget, platform);
+  const path2 = platform === "win32" ? win32 : posix;
+  return samePath(path2.join(stripVerbatim(canonicalRoot, platform), ...key.split("/")), canonicalTarget, platform);
 }
 var init_canonical_path = __esm({
   "src/dsh/canonical-path.ts"() {
@@ -6266,18 +6926,18 @@ var init_canonical_path = __esm({
 function isMatchAll(matcher) {
   return matcher === void 0 || matcher === "" || matcher === "*";
 }
-function compileRegex(pattern) {
+function compileRegex(pattern2) {
   try {
-    return new RegExp(pattern);
+    return new RegExp(pattern2);
   } catch (_syntaxError) {
     return void 0;
   }
 }
 function matcherDiagnostic(matcher, mode) {
   if (isMatchAll(matcher)) return void 0;
-  const pattern = matcher;
-  if (mode === "claude-code" && CLAUDE_LITERAL.test(pattern)) return void 0;
-  return compileRegex(pattern) === void 0 ? `invalid ${mode} regex matcher ${JSON.stringify(pattern)}` : void 0;
+  const pattern2 = matcher;
+  if (mode === "claude-code" && CLAUDE_LITERAL.test(pattern2)) return void 0;
+  return compileRegex(pattern2) === void 0 ? `invalid ${mode} regex matcher ${JSON.stringify(pattern2)}` : void 0;
 }
 var CLAUDE_LITERAL;
 var init_matcher = __esm({
@@ -6415,10 +7075,10 @@ import { resolve, relative, isAbsolute, sep } from "node:path";
 function reviewedHookModule(dialect, root, files) {
   return { name: `hooks-${dialect}`, inject: ["shellHooks"], apply(ctx, config) {
     if (!config || typeof config.configPath !== "string") throw new Error("hook bridge needs its reviewed configPath");
-    const path = resolve(root, config.configPath);
-    const inside = relative(root, path).split(sep).join("/");
-    if (!inside || inside.startsWith("../") || isAbsolute(inside) || !files[inside] || !isUnlinkedInside(root, inside, path) || !lstatSync(path).isFile()) throw new Error("hook config is absent from the reviewed regular-file closure");
-    const bytes = readFileSync(path);
+    const path2 = resolve(root, config.configPath);
+    const inside = relative(root, path2).split(sep).join("/");
+    if (!inside || inside.startsWith("../") || isAbsolute(inside) || !files[inside] || !isUnlinkedInside(root, inside, path2) || !lstatSync(path2).isFile()) throw new Error("hook config is absent from the reviewed regular-file closure");
+    const bytes = readFileSync(path2);
     if (bytes.length > 1024 * 1024 || createHash("sha256").update(bytes).digest("hex") !== files[inside]) throw new Error("hook config changed after review or exceeds 1 MiB");
     if (config.projectDir !== void 0) throw new Error("explicit projectDir is unsupported; each process uses its current core workspace");
     if (config.pluginRoot !== void 0 && config.pluginRoot !== "." && config.pluginRoot !== root) throw new Error("pluginRoot must be this reviewed bundle root");
@@ -6462,14 +7122,14 @@ var init_runtime = __esm({
 });
 
 // node_modules/acorn/dist/acorn.mjs
-function isInAstralSet(code, set2) {
+function isInAstralSet(code, set3) {
   var pos = 65536;
-  for (var i2 = 0; i2 < set2.length; i2 += 2) {
-    pos += set2[i2];
+  for (var i2 = 0; i2 < set3.length; i2 += 2) {
+    pos += set3[i2];
     if (pos > code) {
       return false;
     }
-    pos += set2[i2 + 1];
+    pos += set3[i2 + 1];
     if (pos >= code) {
       return true;
     }
@@ -6535,9 +7195,9 @@ function kw(name, options) {
 function isNewLine(code) {
   return code === 10 || code === 13 || code === 8232 || code === 8233;
 }
-function nextLineBreak(code, from, end) {
+function nextLineBreak(code, from2, end) {
   if (end === void 0) end = code.length;
-  for (var i2 = from; i2 < end; i2++) {
+  for (var i2 = from2; i2 < end; i2++) {
     var next = code.charCodeAt(i2);
     if (isNewLine(next)) {
       return i2 < end - 1 && next === 13 && code.charCodeAt(i2 + 1) === 10 ? i2 + 2 : i2 + 1;
@@ -6602,10 +7262,10 @@ function getOptions(opts) {
   return options;
 }
 function pushComment(options, array) {
-  return function(block, text2, start, end, startLoc, endLoc) {
+  return function(block, text4, start, end, startLoc, endLoc) {
     var comment = {
       type: block ? "Block" : "Line",
-      value: text2,
+      value: text4,
       start,
       end
     };
@@ -6746,7 +7406,7 @@ function stringToBigInt(str2) {
   }
   return BigInt(str2.replace(/_/g, ""));
 }
-var astralIdentifierCodes, astralIdentifierStartCodes, nonASCIIidentifierChars, nonASCIIidentifierStartChars, reservedWords, ecma5AndLessKeywords, keywords$1, keywordRelationalOperator, nonASCIIidentifierStart, nonASCIIidentifier, TokenType, beforeExpr, startsExpr, keywords, types$1, lineBreak, lineBreakG, nonASCIIwhitespace, skipWhiteSpace, ref, hasOwnProperty, toString, hasOwn, isArray, regexpCache, loneSurrogate, Position, SourceLocation, defaultOptions, warnedAboutEcmaVersion, SCOPE_TOP, SCOPE_FUNCTION, SCOPE_ASYNC, SCOPE_GENERATOR, SCOPE_ARROW, SCOPE_SIMPLE_CATCH, SCOPE_SUPER, SCOPE_DIRECT_SUPER, SCOPE_CLASS_STATIC_BLOCK, SCOPE_CLASS_FIELD_INIT, SCOPE_SWITCH, SCOPE_VAR, BIND_NONE, BIND_VAR, BIND_LEXICAL, BIND_FUNCTION, BIND_SIMPLE_CATCH, BIND_OUTSIDE, Parser, prototypeAccessors, pp$9, literal, DestructuringErrors, pp$8, loopLabel, switchLabel, empty$1, FUNC_STATEMENT, FUNC_HANGING_STATEMENT, FUNC_NULLABLE_ID, pp$7, TokContext, types2, pp$6, pp$5, empty, pp$4, pp$3, Scope, Node, pp$2, scriptValuesAddedInUnicode, ecma9BinaryProperties, ecma10BinaryProperties, ecma11BinaryProperties, ecma12BinaryProperties, ecma13BinaryProperties, ecma14BinaryProperties, unicodeBinaryProperties, ecma14BinaryPropertiesOfStrings, unicodeBinaryPropertiesOfStrings, unicodeGeneralCategoryValues, ecma9ScriptValues, ecma10ScriptValues, ecma11ScriptValues, ecma12ScriptValues, ecma13ScriptValues, ecma14ScriptValues, unicodeScriptValues, data, ecmaVersion, i, list, pp$1, BranchID, RegExpValidationState, CharSetNone, CharSetOk, CharSetString, Token, pp, INVALID_TEMPLATE_ESCAPE_ERROR, version;
+var astralIdentifierCodes, astralIdentifierStartCodes, nonASCIIidentifierChars, nonASCIIidentifierStartChars, reservedWords, ecma5AndLessKeywords, keywords$1, keywordRelationalOperator, nonASCIIidentifierStart, nonASCIIidentifier, TokenType, beforeExpr, startsExpr, keywords, types$1, lineBreak, lineBreakG, nonASCIIwhitespace, skipWhiteSpace, ref, hasOwnProperty, toString, hasOwn, isArray, regexpCache, loneSurrogate, Position, SourceLocation, defaultOptions, warnedAboutEcmaVersion, SCOPE_TOP, SCOPE_FUNCTION, SCOPE_ASYNC, SCOPE_GENERATOR, SCOPE_ARROW, SCOPE_SIMPLE_CATCH, SCOPE_SUPER, SCOPE_DIRECT_SUPER, SCOPE_CLASS_STATIC_BLOCK, SCOPE_CLASS_FIELD_INIT, SCOPE_SWITCH, SCOPE_VAR, BIND_NONE, BIND_VAR, BIND_LEXICAL, BIND_FUNCTION, BIND_SIMPLE_CATCH, BIND_OUTSIDE, Parser, prototypeAccessors, pp$9, literal, DestructuringErrors, pp$8, loopLabel, switchLabel, empty$1, FUNC_STATEMENT, FUNC_HANGING_STATEMENT, FUNC_NULLABLE_ID, pp$7, TokContext, types3, pp$6, pp$5, empty, pp$4, pp$3, Scope, Node, pp$2, scriptValuesAddedInUnicode, ecma9BinaryProperties, ecma10BinaryProperties, ecma11BinaryProperties, ecma12BinaryProperties, ecma13BinaryProperties, ecma14BinaryProperties, unicodeBinaryProperties, ecma14BinaryPropertiesOfStrings, unicodeBinaryPropertiesOfStrings, unicodeGeneralCategoryValues, ecma9ScriptValues, ecma10ScriptValues, ecma11ScriptValues, ecma12ScriptValues, ecma13ScriptValues, ecma14ScriptValues, unicodeScriptValues, data, ecmaVersion, i, list, pp$1, BranchID, RegExpValidationState, CharSetNone, CharSetOk, CharSetString, Token, pp, INVALID_TEMPLATE_ESCAPE_ERROR, version;
 var init_acorn = __esm({
   "node_modules/acorn/dist/acorn.mjs"() {
     astralIdentifierCodes = [509, 0, 227, 0, 150, 4, 294, 9, 1368, 2, 2, 1, 6, 3, 41, 2, 5, 0, 166, 1, 574, 3, 9, 9, 7, 9, 32, 4, 318, 1, 78, 5, 71, 10, 50, 3, 123, 2, 54, 14, 32, 10, 3, 1, 11, 3, 46, 10, 8, 0, 46, 9, 7, 2, 37, 13, 2, 9, 6, 1, 45, 0, 13, 2, 49, 13, 9, 3, 2, 11, 83, 11, 7, 0, 3, 0, 158, 11, 6, 9, 7, 3, 56, 1, 2, 6, 3, 1, 3, 2, 10, 0, 11, 1, 3, 6, 4, 4, 68, 8, 2, 0, 3, 0, 2, 3, 2, 4, 2, 0, 15, 1, 83, 17, 10, 9, 5, 0, 82, 19, 13, 9, 214, 6, 3, 8, 28, 1, 83, 16, 16, 9, 82, 12, 9, 9, 7, 19, 58, 14, 5, 9, 243, 14, 166, 9, 71, 5, 2, 1, 3, 3, 2, 0, 2, 1, 13, 9, 120, 6, 3, 6, 4, 0, 29, 9, 41, 6, 2, 3, 9, 0, 10, 10, 47, 15, 199, 7, 137, 9, 54, 7, 2, 7, 17, 9, 57, 21, 2, 13, 123, 5, 4, 0, 2, 1, 2, 6, 2, 0, 9, 9, 49, 4, 2, 1, 2, 4, 9, 9, 55, 9, 266, 3, 10, 1, 2, 0, 49, 6, 4, 4, 14, 10, 5350, 0, 7, 14, 11465, 27, 2343, 9, 87, 9, 39, 4, 60, 6, 26, 9, 535, 9, 470, 0, 2, 54, 8, 3, 82, 0, 12, 1, 19628, 1, 4178, 9, 519, 45, 3, 22, 543, 4, 4, 5, 9, 7, 3, 6, 31, 3, 149, 2, 1418, 49, 513, 54, 5, 49, 9, 0, 15, 0, 23, 4, 2, 14, 1361, 6, 2, 16, 3, 6, 2, 1, 2, 4, 101, 0, 161, 6, 10, 9, 357, 0, 62, 13, 499, 13, 245, 1, 2, 9, 233, 0, 3, 0, 8, 1, 6, 0, 475, 6, 110, 6, 6, 9, 4759, 9, 787719, 239];
@@ -6769,9 +7429,9 @@ var init_acorn = __esm({
     keywordRelationalOperator = /^in(stanceof)?$/;
     nonASCIIidentifierStart = new RegExp("[" + nonASCIIidentifierStartChars + "]");
     nonASCIIidentifier = new RegExp("[" + nonASCIIidentifierStartChars + nonASCIIidentifierChars + "]");
-    TokenType = function TokenType2(label, conf) {
+    TokenType = function TokenType2(label2, conf) {
       if (conf === void 0) conf = {};
-      this.label = label;
+      this.label = label2;
       this.keyword = conf.keyword;
       this.beforeExpr = !!conf.beforeExpr;
       this.startsExpr = !!conf.startsExpr;
@@ -7820,8 +8480,8 @@ var init_acorn = __esm({
     };
     pp$8.parseLabeledStatement = function(node, maybeName, expr, context) {
       for (var i$1 = 0, list2 = this.labels; i$1 < list2.length; i$1 += 1) {
-        var label = list2[i$1];
-        if (label.name === maybeName) {
+        var label2 = list2[i$1];
+        if (label2.name === maybeName) {
           this.raise(expr.start, "Label '" + maybeName + "' is already declared");
         }
       }
@@ -8706,7 +9366,7 @@ var init_acorn = __esm({
       this.override = override;
       this.generator = !!generator;
     };
-    types2 = {
+    types3 = {
       b_stat: new TokContext("{", false),
       b_expr: new TokContext("{", true),
       b_tmpl: new TokContext("${", false),
@@ -8722,17 +9382,17 @@ var init_acorn = __esm({
     };
     pp$6 = Parser.prototype;
     pp$6.initialContext = function() {
-      return [types2.b_stat];
+      return [types3.b_stat];
     };
     pp$6.curContext = function() {
       return this.context[this.context.length - 1];
     };
     pp$6.braceIsBlock = function(prevType) {
       var parent = this.curContext();
-      if (parent === types2.f_expr || parent === types2.f_stat) {
+      if (parent === types3.f_expr || parent === types3.f_stat) {
         return true;
       }
-      if (prevType === types$1.colon && (parent === types2.b_stat || parent === types2.b_expr)) {
+      if (prevType === types$1.colon && (parent === types3.b_stat || parent === types3.b_expr)) {
         return !parent.isExpr;
       }
       if (prevType === types$1._return || prevType === types$1.name && this.exprAllowed) {
@@ -8742,7 +9402,7 @@ var init_acorn = __esm({
         return true;
       }
       if (prevType === types$1.braceL) {
-        return parent === types2.b_stat;
+        return parent === types3.b_stat;
       }
       if (prevType === types$1._var || prevType === types$1._const || prevType === types$1.name) {
         return false;
@@ -8779,31 +9439,31 @@ var init_acorn = __esm({
         return;
       }
       var out = this.context.pop();
-      if (out === types2.b_stat && this.curContext().token === "function") {
+      if (out === types3.b_stat && this.curContext().token === "function") {
         out = this.context.pop();
       }
       this.exprAllowed = !out.isExpr;
     };
     types$1.braceL.updateContext = function(prevType) {
-      this.context.push(this.braceIsBlock(prevType) ? types2.b_stat : types2.b_expr);
+      this.context.push(this.braceIsBlock(prevType) ? types3.b_stat : types3.b_expr);
       this.exprAllowed = true;
     };
     types$1.dollarBraceL.updateContext = function() {
-      this.context.push(types2.b_tmpl);
+      this.context.push(types3.b_tmpl);
       this.exprAllowed = true;
     };
     types$1.parenL.updateContext = function(prevType) {
       var statementParens = prevType === types$1._if || prevType === types$1._for || prevType === types$1._with || prevType === types$1._while;
-      this.context.push(statementParens ? types2.p_stat : types2.p_expr);
+      this.context.push(statementParens ? types3.p_stat : types3.p_expr);
       this.exprAllowed = true;
     };
     types$1.incDec.updateContext = function() {
     };
     types$1._function.updateContext = types$1._class.updateContext = function(prevType) {
-      if (prevType.beforeExpr && prevType !== types$1._else && !(prevType === types$1.semi && this.curContext() !== types2.p_stat) && !(prevType === types$1._return && lineBreak.test(this.input.slice(this.lastTokEnd, this.start))) && !((prevType === types$1.colon || prevType === types$1.braceL) && this.curContext() === types2.b_stat)) {
-        this.context.push(types2.f_expr);
+      if (prevType.beforeExpr && prevType !== types$1._else && !(prevType === types$1.semi && this.curContext() !== types3.p_stat) && !(prevType === types$1._return && lineBreak.test(this.input.slice(this.lastTokEnd, this.start))) && !((prevType === types$1.colon || prevType === types$1.braceL) && this.curContext() === types3.b_stat)) {
+        this.context.push(types3.f_expr);
       } else {
-        this.context.push(types2.f_stat);
+        this.context.push(types3.f_stat);
       }
       this.exprAllowed = false;
     };
@@ -8814,20 +9474,20 @@ var init_acorn = __esm({
       this.exprAllowed = true;
     };
     types$1.backQuote.updateContext = function() {
-      if (this.curContext() === types2.q_tmpl) {
+      if (this.curContext() === types3.q_tmpl) {
         this.context.pop();
       } else {
-        this.context.push(types2.q_tmpl);
+        this.context.push(types3.q_tmpl);
       }
       this.exprAllowed = false;
     };
     types$1.star.updateContext = function(prevType) {
       if (prevType === types$1._function) {
         var index = this.context.length - 1;
-        if (this.context[index] === types2.f_expr) {
-          this.context[index] = types2.f_expr_gen;
+        if (this.context[index] === types3.f_expr) {
+          this.context[index] = types3.f_expr_gen;
         } else {
-          this.context[index] = types2.f_gen;
+          this.context[index] = types3.f_gen;
         }
       }
       this.exprAllowed = true;
@@ -9223,7 +9883,7 @@ var init_acorn = __esm({
           var startPos = this.start, startLoc = this.startLoc, containsEsc = this.containsEsc;
           var id = this.parseIdent(false);
           if (this.options.ecmaVersion >= 8 && !containsEsc && id.name === "async" && !this.canInsertSemicolon() && this.eat(types$1._function)) {
-            this.overrideContext(types2.f_expr);
+            this.overrideContext(types3.f_expr);
             return this.parseFunction(this.startNodeAt(startPos, startLoc), 0, false, true, forInit);
           }
           if (canBeArrow && !this.canInsertSemicolon()) {
@@ -9272,7 +9932,7 @@ var init_acorn = __esm({
           node.elements = this.parseExprList(types$1.bracketR, true, true, refDestructuringErrors);
           return this.finishNode(node, "ArrayExpression");
         case types$1.braceL:
-          this.overrideContext(types2.b_expr);
+          this.overrideContext(types3.b_expr);
           return this.parseObj(false, refDestructuringErrors);
         case types$1._function:
           node = this.startNode();
@@ -10102,11 +10762,11 @@ var init_acorn = __esm({
       this.backReferenceNames = [];
       this.branchID = null;
     };
-    RegExpValidationState.prototype.reset = function reset(start, pattern, flags) {
+    RegExpValidationState.prototype.reset = function reset(start, pattern2, flags) {
       var unicodeSets = flags.indexOf("v") !== -1;
       var unicode = flags.indexOf("u") !== -1;
       this.start = start | 0;
-      this.source = pattern + "";
+      this.source = pattern2 + "";
       this.flags = flags;
       if (unicodeSets && this.parser.options.ecmaVersion >= 15) {
         this.switchU = true;
@@ -11741,7 +12401,7 @@ var init_acorn = __esm({
         }
         ++this.pos;
       }
-      var pattern = this.input.slice(start, this.pos);
+      var pattern2 = this.input.slice(start, this.pos);
       ++this.pos;
       var flagsStart = this.pos;
       var flags = this.readWord1();
@@ -11749,15 +12409,15 @@ var init_acorn = __esm({
         this.unexpected(flagsStart);
       }
       var state = this.regexpState || (this.regexpState = new RegExpValidationState(this));
-      state.reset(start, pattern, flags);
+      state.reset(start, pattern2, flags);
       this.validateRegExpFlags(state);
       this.validateRegExpPattern(state);
       var value = null;
       try {
-        value = new RegExp(pattern, flags);
+        value = new RegExp(pattern2, flags);
       } catch (e) {
       }
-      return this.finishToken(types$1.regexp, { pattern, flags, value });
+      return this.finishToken(types$1.regexp, { pattern: pattern2, flags, value });
     };
     pp.readInt = function(radix, len, maybeLegacyOctalNumericLiteral) {
       var allowSeparators = this.options.ecmaVersion >= 12 && len === void 0;
@@ -12145,7 +12805,7 @@ var init_acorn = __esm({
       tokTypes: types$1,
       keywordTypes: keywords,
       TokContext,
-      tokContexts: types2,
+      tokContexts: types3,
       isIdentifierChar,
       isIdentifierStart,
       Token,
@@ -12171,7 +12831,7 @@ var init_compatibility = __esm({
   "src/dsh/compatibility.json"() {
     compatibility_default = {
       version: 3,
-      target_dsh_version: "0.2.1-rc.5",
+      target_dsh_version: "0.2.2-rc.1",
       provided_services: {
         dsh: [
           "tools",
@@ -12182,7 +12842,13 @@ var init_compatibility = __esm({
           "userQuestions",
           "subagents",
           "agents",
-          "systemPrompt"
+          "systemPrompt",
+          "llm",
+          "credentials",
+          "settings",
+          "pluginManager",
+          "deepseekAccount",
+          "terminal"
         ],
         cordis: [
           "logger",
@@ -12194,7 +12860,9 @@ var init_compatibility = __esm({
           "prompt",
           "avatars",
           "mcp",
-          "shellHooks"
+          "shellHooks",
+          "remote",
+          "workspace"
         ]
       },
       refused_services: [
@@ -12219,14 +12887,29 @@ var init_compatibility = __esm({
         "avatars",
         "mcp",
         "logger",
-        "userQuestions"
+        "userQuestions",
+        "remote",
+        "workspace",
+        "settings",
+        "pluginManager",
+        "deepseekAccount",
+        "terminal"
       ],
       row_bridges: {
         "@deepseek-ai/dsh-mcp-client": "mcp",
         "@deepseek-ai/dsh-skill-filesystem": "skills",
         "@deepseek-ai/dsh-hooks-claude-code": "hooks-claude-code",
         "@deepseek-ai/dsh-hooks-codex": "hooks-codex",
-        "@deepseek-ai/dsh-persona": "persona"
+        "@deepseek-ai/dsh-persona": "persona",
+        "@deepseek-ai/dsh-storage": "host-spine",
+        "@deepseek-ai/dsh-storage-json": "host-spine",
+        "@deepseek-ai/dsh-storage-domain": "host-spine",
+        "@deepseek-ai/dsh-workspace": "host-spine",
+        "@deepseek-ai/dsh-code-runtime-worker-thread": "host-spine",
+        "@deepseek-ai/dsh-tool-subagent/model-selection-settings": "host-spine",
+        "@deepseek-ai/dsh-agent-preset-registry": "host-spine",
+        "@deepseek-ai/dsh-cordis-host-runner": "host-spine",
+        "@deepseek-ai/dsh-host-webserver": "host-spine"
       },
       module_singletons: {
         "@codewhale/dsh-composition": "dsh-composition",
@@ -12247,24 +12930,44 @@ var init_compatibility = __esm({
       },
       definition_api: {
         package: "@deepseek-ai/dsh-tools",
-        version: "0.2.1-rc.5",
+        version: "0.2.2-rc.1",
         license: "MIT",
-        tarball: "https://registry.npmjs.org/@deepseek-ai/dsh-tools/-/dsh-tools-0.2.1-rc.5.tgz",
-        integrity: "sha512-tOEMsbG1jH4EV80xcGucfeWsKHLjnETjRLtSnyFrVl2oma95tzTHBjti5MK60IvT2ijcCWhx8CrUKcqRksfDPA==",
-        source_file: "lib/index.js",
-        source_sha256: "1e53932e7c4213ea24a7d87f06960b7a7702cb21f8a5741c97242b4a470a442a",
-        source_lines: [
-          [
-            8,
-            888
-          ],
-          [
-            2625,
-            2655
-          ]
-        ],
+        tarball: "https://registry.npmjs.org/@deepseek-ai/dsh-tools/-/dsh-tools-0.2.2-rc.1.tgz",
+        integrity: "sha512-svB49dLPCHkKHgGwik3dTvEH0sL1vKwIzlQgqjE4qzEqFbSEROW8fByk3g2y2lxDv8TqgEUa0Vp2qFrVbm2lfw==",
         license_sha256: "ebb4f09972aee8608be255debaf78451a68e95c290f55c240dec2ecfa16ea6be",
-        tarball_sha256: "9614366d61214a304f937d0f3b8481d5827d2aef4529f3bff9eb49ef8ac65283"
+        tarball_sha256: "bb94ee037bd7d3efe2d0654c6a1fa7084b268b895fa0ca6ceeb7e65d4fd6da72",
+        sources: [
+          {
+            file: "lib/shared-DTdn5dXO.js",
+            sha256: "d02f0d8f36878313b0dae3a1bba5b77f7db4cffc77a0b72772048a36bacf2cf0",
+            lines: [
+              [
+                22,
+                548
+              ]
+            ]
+          },
+          {
+            file: "lib/index.js",
+            sha256: "1889cbf718d64518dd83245d4dba1e1f080b2c5326259c3ed5b1be7a7666a2bd",
+            lines: [
+              [
+                7,
+                377
+              ]
+            ]
+          },
+          {
+            file: "lib/shared-DTdn5dXO.js",
+            sha256: "d02f0d8f36878313b0dae3a1bba5b77f7db4cffc77a0b72772048a36bacf2cf0",
+            lines: [
+              [
+                566,
+                596
+              ]
+            ]
+          }
+        ]
       },
       command_followup: "one-text-message-submit-on-success",
       pure_api: {
@@ -12288,11 +12991,11 @@ var init_compatibility = __esm({
         packages: [
           {
             package: "@deepseek-ai/dsh-brand",
-            version: "0.2.1-rc.5",
+            version: "0.2.2-rc.1",
             license: "MIT",
-            tarball: "https://registry.npmjs.org/@deepseek-ai/dsh-brand/-/dsh-brand-0.2.1-rc.5.tgz",
-            integrity: "sha512-7lUfWjWWAkrb/CFtMbXgjXLYQnL3KJwv+GLMTgY5EZ/4sOH0ufZUX8xlBWyMpdV2LqdvJ1yPKQ+mopH71/wbMQ==",
-            tarball_sha256: "9a0d30b3466783f7b0e52a636602630ab62f39598df9568600ddfaad97b389ca",
+            tarball: "https://registry.npmjs.org/@deepseek-ai/dsh-brand/-/dsh-brand-0.2.2-rc.1.tgz",
+            integrity: "sha512-ShGNEmNuEQA+bfkspWC2kGrdbrM4dFNhqlrNHIWsHO+PgVH1KoTKTLSraT1pt0A8YYk/moKE0gL2gY9dNBU+rw==",
+            tarball_sha256: "d953cb5e8dcd69be0b0347ce9a3b36421eefa751820cbe909f4a185348ad5530",
             source_file: "lib/index.js",
             source_sha256: "14feb59256b891982b2017d73ed03ee65e2a7365f48e4902a856acb0e52d5eb0",
             excerpts: [
@@ -12311,11 +13014,11 @@ var init_compatibility = __esm({
           },
           {
             package: "@deepseek-ai/dsh-util-crypto",
-            version: "0.2.1-rc.5",
+            version: "0.2.2-rc.1",
             license: "MIT",
-            tarball: "https://registry.npmjs.org/@deepseek-ai/dsh-util-crypto/-/dsh-util-crypto-0.2.1-rc.5.tgz",
-            integrity: "sha512-7mGcnCH0BzIUzbnnC2Vx17Q/O3/+EfMHNt9iC2VaGr9SK010HYUpei/+6wrZsuGy77rqAUNhU6VB35wQTLM/VA==",
-            tarball_sha256: "3d99b1120718249a52fe854b84f4bacae21464345073d560019974268e19a089",
+            tarball: "https://registry.npmjs.org/@deepseek-ai/dsh-util-crypto/-/dsh-util-crypto-0.2.2-rc.1.tgz",
+            integrity: "sha512-I9Nhh3/64HPzjdR/mUt0J534FYHgodMUe0coXtA91+kxGcJQcSHOYouewv4hf0NWw0BuLh5zihTdtldZtobOWA==",
+            tarball_sha256: "c9ef0dfed280c83202f1d7bd5d32b1139a92a2fc375da62962ef709c3d1e4a6a",
             source_file: "lib/index.js",
             source_sha256: "640b26c8e5a1156c6c8e8749a22f805c9c0e34444778eb4ee9529be3e88ec862",
             excerpts: [
@@ -12334,13 +13037,13 @@ var init_compatibility = __esm({
           },
           {
             package: "@deepseek-ai/dsh-llm",
-            version: "0.2.1-rc.5",
+            version: "0.2.2-rc.1",
             license: "MIT",
-            tarball: "https://registry.npmjs.org/@deepseek-ai/dsh-llm/-/dsh-llm-0.2.1-rc.5.tgz",
-            integrity: "sha512-g9mSILkqY7wByl0tpLBhXxWxQ3MoNzXokuJq86R/snPL3v1OonXv1b46wtvldEgyr88aK1gBBlifMsRnXjMWTA==",
-            tarball_sha256: "6b422d70aee363dcce81be0481dda9d801c2ae03a4f314497e407d184df2313c",
+            tarball: "https://registry.npmjs.org/@deepseek-ai/dsh-llm/-/dsh-llm-0.2.2-rc.1.tgz",
+            integrity: "sha512-XeEvH+6bpkjx0E2P1B5ZE+WWa+VHp4DimQaJDKNUZEFouqHMuN1B61TIz6IzUquRxa/6X4yJy+qXQ9WwAeMw5w==",
+            tarball_sha256: "cbf45039d3ef63e26987de514928a847a8c2d0b049df8fb24c11684e203b05d4",
             source_file: "lib/index.js",
-            source_sha256: "d18d8ae4c8d961e628708c1e4698e09716a0ebb80e55a672e0bde1029bec1155",
+            source_sha256: "8e541fc98a11897706a122fde1db42f8b2a41b3b354ba3fcb932e9a16929ac6a",
             excerpts: [
               {
                 name: "createMessage",
@@ -12381,13 +13084,13 @@ var init_compatibility = __esm({
           },
           {
             package: "@deepseek-ai/dsh-session",
-            version: "0.2.1-rc.5",
+            version: "0.2.2-rc.1",
             license: "MIT",
-            tarball: "https://registry.npmjs.org/@deepseek-ai/dsh-session/-/dsh-session-0.2.1-rc.5.tgz",
-            integrity: "sha512-A5NdQFgeY4qi29+lBzgZiOloiFe+E1iBbIRjJTplee79rswYGUUmUZYmOvAcdmk4tERkY2S9htuc+V+jNifqRw==",
-            tarball_sha256: "8571710817dbf5172079168861bfaef581efc26a4b83a4c003f2d1ef632ae7b4",
+            tarball: "https://registry.npmjs.org/@deepseek-ai/dsh-session/-/dsh-session-0.2.2-rc.1.tgz",
+            integrity: "sha512-e0zx9HFNn8EyqrymGQS85SjKOyr61//ChTgIVDlCBSZvBB723fuXyi9LiHIIuPTlkgmWJl3gm5J51ebEXew7PQ==",
+            tarball_sha256: "b8b1b4a7b9c8efbdbe4c134ed3b18cddf11842b62ad7675c21c05b3afef1cfb5",
             source_file: "lib/index.js",
-            source_sha256: "2f5dd07cb5c744a29abbb8003a8a4cefd9e582c6e2538074ca299a0ddd02a3bf",
+            source_sha256: "6fad466aa1f7aa64bfa038681ead5721f66c88e9891e25d357d2b8edbccd5494",
             excerpts: [
               {
                 name: "SessionId",
@@ -12404,19 +13107,19 @@ var init_compatibility = __esm({
           },
           {
             package: "@deepseek-ai/dsh-system-prompt",
-            version: "0.2.1-rc.5",
+            version: "0.2.2-rc.1",
             license: "MIT",
-            tarball: "https://registry.npmjs.org/@deepseek-ai/dsh-system-prompt/-/dsh-system-prompt-0.2.1-rc.5.tgz",
-            integrity: "sha512-HWW0k4Ug4XjRbCghLZYFMpLh8Ywcuh/bS7DAnjWfq4HbwwB+hV0XXJRF3iCf5600uYArfbuv4Ttz+4PHKu7k9w==",
-            tarball_sha256: "f223700954221de8cce2feaf6d6fbf526aa2ea5fd261fc0791edf1f858c31a02",
+            tarball: "https://registry.npmjs.org/@deepseek-ai/dsh-system-prompt/-/dsh-system-prompt-0.2.2-rc.1.tgz",
+            integrity: "sha512-1p9imdrenPnJTkLb6Coq+ELBDjngblM/YGP1Pa/xf1oisjLHcCoK2n9kkOUTIfgvoFtqWfxZJNZeKef71ZmlrA==",
+            tarball_sha256: "5ecb3f2ff2f0c037287c22c1ef917f1ce5cdd4c8055d51da6646ed5a39fe02a9",
             source_file: "lib/index.js",
-            source_sha256: "7be9f7aafbf345d01ddcc12fd297b16e9a1d41283a6a04073b867becca0bf020",
+            source_sha256: "18b692b03bbb717589085f63b126cbcf22963763c5a0565bb3a7a5d254e8e4a7",
             excerpts: [
               {
                 name: "PERSONA_PREFIX_SECTION",
                 lines: [
-                  59,
-                  59
+                  61,
+                  61
                 ],
                 sha256: "11338254c278626eea6887b9cb5dc94d16f2ab4dae4bd7e555ea608c4b15648f"
               }
@@ -12427,19 +13130,19 @@ var init_compatibility = __esm({
           },
           {
             package: "@deepseek-ai/dsh-util-values",
-            version: "0.2.1-rc.5",
+            version: "0.2.2-rc.1",
             license: "MIT",
-            tarball: "https://registry.npmjs.org/@deepseek-ai/dsh-util-values/-/dsh-util-values-0.2.1-rc.5.tgz",
-            integrity: "sha512-PL8TerJM/4jpZ2ArwgTpFbeDiAVnqkSh8Xinw2iEu8B6a+axmshzL4dCpwpf+uB8GHdXAhGz1cT+SBQwX/2TLQ==",
-            tarball_sha256: "2472d81f0dc4597bc5c4eeff493686a2b59a6b27cb6eb6654394192066d6ec05",
+            tarball: "https://registry.npmjs.org/@deepseek-ai/dsh-util-values/-/dsh-util-values-0.2.2-rc.1.tgz",
+            integrity: "sha512-UN4B/Fa9zAunYN3UuXDQ3QknxF/lMKNwTu2WxXKKEC+Ejz745po7I/JmsVFVa7+socfuwwTmVrfSsddRVU+lew==",
+            tarball_sha256: "e5de9a3c2600c70d72dba702cd0dfc8097264b7b6a7f393f4cfa799c81ecf759",
             source_file: "lib/index.js",
-            source_sha256: "4322a2aacdfe38476d2bbc62338120beea1e1660346d7db5b6c1e1f927a26b7c",
+            source_sha256: "8b4ffdf40126d48bd22017b4671f7e90612d01833fc865f7a0b60d3de4183e8b",
             excerpts: [
               {
                 name: "deepFreeze",
                 lines: [
-                  824,
-                  860
+                  809,
+                  845
                 ],
                 sha256: "66ee7f28877afa912496ba944a581ac74e7b87390e6a47c4c640d8f477bdc6e2"
               }
@@ -12450,19 +13153,19 @@ var init_compatibility = __esm({
           },
           {
             package: "@deepseek-ai/dsh-user-questions",
-            version: "0.2.1-rc.5",
+            version: "0.2.2-rc.1",
             license: "MIT",
-            tarball: "https://registry.npmjs.org/@deepseek-ai/dsh-user-questions/-/dsh-user-questions-0.2.1-rc.5.tgz",
-            integrity: "sha512-Yz4c6YO804nvJ6DVJGPZSAF3DCJ7HJgpylBL6KfbI7Au3a6MV49mLLEv5cWs67qL/tyQMsJO9DI2N/xPlczEXA==",
-            tarball_sha256: "5a2cb8c9451b4288c26a3c132b60aac15229a33bae34ce3c7bb0050906d6a8bc",
+            tarball: "https://registry.npmjs.org/@deepseek-ai/dsh-user-questions/-/dsh-user-questions-0.2.2-rc.1.tgz",
+            integrity: "sha512-COY40boWZ7XEszSvMGZ4CY5ze5ujCdA+Trtqx5C6ioqWzH9e8YbkY7AxyCOadxVO++5zAsqvsAfq65cZUPIMGA==",
+            tarball_sha256: "e7c1c38234fea9c0634ec95272bd1005c48ce890d2b935c8442b4ae7fee1b51e",
             source_file: "lib/index.js",
-            source_sha256: "e1c51afac2e31be8593c6426976e5f31dbe2a709b85ae1ea43ed406146f54265",
+            source_sha256: "69fee77aa57cc43de583d53a4877394c4cf3b5d58b8d7579fd8095c0a015bfbd",
             excerpts: [
               {
                 name: "UserQuestionError",
                 lines: [
-                  429,
-                  434
+                  430,
+                  435
                 ],
                 sha256: "5d49a4ecdf40039b26824f3575a79820b48ed011f90641870f44fe5a41bf5ced"
               }
@@ -12474,12 +13177,12 @@ var init_compatibility = __esm({
         ],
         reuse: {
           package: "@deepseek-ai/dsh-util-values",
-          version: "0.2.1-rc.5",
+          version: "0.2.2-rc.1",
           file: "lib/index.js",
           symbol: "deepFreeze",
           lines: [
-            824,
-            860
+            809,
+            845
           ],
           sha256: "66ee7f28877afa912496ba944a581ac74e7b87390e6a47c4c640d8f477bdc6e2"
         },
@@ -12514,12 +13217,39 @@ var init_compatibility = __esm({
 
 // src/dsh/resolve-hooks.ts
 import { fileURLToPath as fileURLToPath2, pathToFileURL as pathToFileURL2 } from "node:url";
-import { resolve as resolve2, isAbsolute as isAbsolute2, dirname } from "node:path";
-function keyIn(closure, path) {
-  const canonical = insideKey(closure.canonicalRoot, path);
+import { resolve as resolve2, isAbsolute as isAbsolute2, dirname as dirname2 } from "node:path";
+function packageName(specifier) {
+  const parts = specifier.split("/");
+  return specifier.startsWith("@") ? parts.slice(0, 2).join("/") : parts[0];
+}
+function classifySpecifier(specifier) {
+  if (specifier.startsWith(".") || specifier.startsWith("/") || specifier.includes(":")) return null;
+  if (Object.hasOwn(SINGLETONS, specifier)) return SINGLETONS[specifier];
+  const name = packageName(specifier);
+  if (Object.hasOwn(SINGLETONS, name)) {
+    if (specifier !== name) throw new UnsupportedPeerError(specifier);
+    return SINGLETONS[name];
+  }
+  if (name.startsWith("@deepseek-ai/dsh-") || name.startsWith("@deepseek-ai/cordis-")) {
+    throw new UnsupportedPeerError(name);
+  }
+  return null;
+}
+function explainImportError(error) {
+  const match = error instanceof Error ? /Cannot find package '([^']+)'/.exec(error.message) : null;
+  if (!match) return error;
+  try {
+    classifySpecifier(match[1]);
+  } catch (unsupported) {
+    return unsupported;
+  }
+  return error;
+}
+function keyIn(closure, path2) {
+  const canonical = insideKey(closure.canonicalRoot, path2);
   if (canonical !== void 0) return canonical;
   for (const root of closure.rawRoots) {
-    const raw = insideKey(root, path);
+    const raw = insideKey(root, path2);
     if (raw !== void 0) return raw;
   }
 }
@@ -12529,7 +13259,7 @@ function admitReviewedClosure(baseUrl, files) {
   const id = pathKey(canonicalRoot);
   const accepted = /* @__PURE__ */ Object.create(null);
   const keys = Object.keys(files);
-  if (keys.length > 4096) throw new Error("reviewed composition closure exceeds its file limit");
+  if (keys.length > 16384) throw new Error("reviewed composition closure exceeds its file limit");
   for (const key of keys) {
     if (!key || key.split("/").some((part) => !part || part === "." || part === "..") || key.includes("\\") || key.includes(":") || isAbsolute2(key) || !/^[a-f0-9]{64}$/.test(files[key])) throw new Error("invalid reviewed composition closure file");
     accepted[key] = files[key];
@@ -12548,25 +13278,25 @@ function admitReviewedClosure(baseUrl, files) {
     if (current2 && --current2.refs === 0) reviewedClosures.delete(id);
   };
 }
-async function importReviewedModule(baseUrl, path) {
+async function importReviewedModule(baseUrl, path2) {
   const rawRoot = resolve2(fileURLToPath2(baseUrl));
   const id = pathKey(canonicalPath(rawRoot));
   const receipt = reviewedClosures.get(id);
   if (!receipt) throw new Error("composition module closure is no longer admitted");
-  const entry = resolve2(rawRoot, path);
+  const entry = resolve2(rawRoot, path2);
   const admitted = closureAt(pathToFileURL2(entry).href);
   if (!admitted || admitted.root !== id || !(admitted.path in receipt.files)) throw new Error("composition module is absent from reviewed closure");
   return import(pathToFileURL2(entry).href);
 }
 function closureAt(url) {
   if (!url?.startsWith("file:")) return;
-  const path = resolve2(fileURLToPath2(url));
+  const path2 = resolve2(fileURLToPath2(url));
   for (const [root, receipt] of reviewedClosures) {
-    const inside = keyIn(receipt, path);
+    const inside = keyIn(receipt, path2);
     if (inside !== void 0) return { root, receipt, path: inside };
   }
 }
-var SINGLETONS, reviewedClosures;
+var SINGLETONS, UnsupportedPeerError, reviewedClosures;
 var init_resolve_hooks = __esm({
   "src/dsh/resolve-hooks.ts"() {
     "use strict";
@@ -12575,7 +13305,1179 @@ var init_resolve_hooks = __esm({
     init_bun_closure();
     init_compatibility();
     SINGLETONS = compatibility_default.module_singletons;
+    UnsupportedPeerError = class extends Error {
+      constructor(specifier) {
+        super(`requires \`${specifier}\`, which the Codewhale extension host does not provide`);
+        this.specifier = specifier;
+        this.name = "UnsupportedPeerError";
+      }
+      specifier;
+    };
     reviewedClosures = /* @__PURE__ */ new Map();
+  }
+});
+
+// src/dsh/missing-services.ts
+function describeMissingServices(names, { scoped: classifyScoped = true } = {}) {
+  const absent = names.filter((name) => !classifyScoped || !PROVIDED_SERVICES.has(name));
+  const scoped = names.filter((name) => classifyScoped && PROVIDED_SERVICES.has(name));
+  const parts = [];
+  if (absent.length > 0) {
+    const owned = absent.filter((name) => REFUSED_SERVICES.has(name));
+    const reasons = [...new Set(absent.flatMap((name) => UNPROVIDED_REASONS.filter(([matches]) => matches(name)).map(([, reason]) => reason)))];
+    parts.push(`${quoted(absent)}, not provided by the Codewhale extension host in this phase` + (reasons.length > 0 ? ` (${reasons.join("; ")})` : "") + (owned.length > 0 ? `; ${quoted(owned)} belong${owned.length === 1 ? "s" : ""} to the Codewhale core and no reviewed bridge exposes ${owned.length === 1 ? "it" : "them"} yet` : ""));
+  }
+  if (scoped.length > 0) parts.push(`${quoted(scoped)}, provided by the host but unavailable in this scope`);
+  return parts.join("; ");
+}
+var REFUSED_SERVICES, PROVIDED_SERVICES, UNPROVIDED_REASONS, quoted;
+var init_missing_services = __esm({
+  "src/dsh/missing-services.ts"() {
+    "use strict";
+    init_compatibility();
+    REFUSED_SERVICES = new Set(compatibility_default.refused_services);
+    PROVIDED_SERVICES = new Set(Object.values(compatibility_default.provided_services).flat());
+    UNPROVIDED_REASONS = [
+      [(name) => name === "webServer" || name === "connection", "DSH Web UI services; Codewhale has no plugin web server"],
+      [(name) => name === "agentPresets", "the DSH 0.2.2 agent-preset registry is not adopted"],
+      [(name) => name.startsWith("@deepseek-ai/dsh-client-"), "DSH client UI services"]
+    ];
+    quoted = (names) => names.map((name) => `\`${name}\``).join(", ");
+  }
+});
+
+// node_modules/@deepseek-ai/schemastery/lib/index.mjs
+function mergeDesc(original, messages) {
+  const result = typeof original === "string" ? { "": original } : { ...original };
+  for (const locale in messages) {
+    const value = messages[locale];
+    if (value?.$description || value?.$desc) result[locale] = value.$description || value.$desc;
+    else if (typeof value === "string") result[locale] = value;
+  }
+  return result;
+}
+function getInner(value) {
+  return value?.$value ?? value?.$inner;
+}
+function extractKeys(data2) {
+  return filterKeys(data2 ?? {}, (key) => !key.startsWith("$"));
+}
+function validateVolatileSchema(schema3, path2 = [], blocked = false, seen = /* @__PURE__ */ new Map()) {
+  const states = seen.get(schema3) ?? /* @__PURE__ */ new Set();
+  if (states.has(blocked)) return;
+  states.add(blocked);
+  seen.set(schema3, states);
+  if (schema3.meta?.volatile && blocked) throw new ValidationError2("volatile fields require a fixed object path without an enclosing volatile field", { path: path2 });
+  const nested = blocked || !!schema3.meta?.volatile;
+  if (schema3.dict) for (const [key, child] of Object.entries(schema3.dict)) validateVolatileSchema(child, [...path2, key], nested, seen);
+  if (schema3.sKey) validateVolatileSchema(schema3.sKey, [...path2, "<key>"], true, seen);
+  if (schema3.inner && (schema3.type !== "lazy" || schema3.inner[kSchema])) validateVolatileSchema(schema3.inner, [...path2, "*"], true, seen);
+  if (schema3.list) for (let index = 0; index < schema3.list.length; index++) validateVolatileSchema(schema3.list[index], [...path2, String(index)], true, seen);
+}
+function checkWithinRange(data2, meta, description, options, skipMin = false) {
+  const { max = Infinity, min = -Infinity } = meta;
+  if (data2 > max) throw new ValidationError2(`expected ${description} <= ${max} but got ${data2}`, options);
+  if (data2 < min && !skipMin) throw new ValidationError2(`expected ${description} >= ${min} but got ${data2}`, options);
+}
+function decimalShift(data2, digits) {
+  const str2 = data2.toString();
+  if (str2.includes("e")) return data2 * Math.pow(10, digits);
+  const index = str2.indexOf(".");
+  if (index === -1) return data2 * Math.pow(10, digits);
+  const frac = str2.slice(index + 1);
+  const integer = str2.slice(0, index);
+  if (frac.length <= digits) return +(integer + frac.padEnd(digits, "0"));
+  return +(integer + frac.slice(0, digits) + "." + frac.slice(digits));
+}
+function isMultipleOf(data2, min, step) {
+  step = Math.abs(step);
+  if (!/^\d+\.\d+$/.test(step.toString())) return (data2 - min) % step === 0;
+  const index = step.toString().indexOf(".");
+  const digits = step.toString().slice(index + 1).length;
+  return Math.abs(decimalShift(data2, digits) - decimalShift(min, digits)) % decimalShift(step, digits) === 0;
+}
+function property(data2, key, schema3, options) {
+  try {
+    const [value, adapted] = Schema2.resolve(data2[key], schema3, {
+      ...options,
+      path: [...options.path || [], key]
+    });
+    if (adapted !== void 0) data2[key] = adapted;
+    return value;
+  } catch (e) {
+    if (!options?.autofix) throw e;
+    delete data2[key];
+    return schema3.meta.volatile ? createVolatile(schema3.meta.default) : schema3.meta.default;
+  }
+}
+function merge3(result, data2) {
+  for (const key in data2) {
+    if (key in result) continue;
+    result[key] = data2[key];
+  }
+}
+function defineMethod(name, keys, format) {
+  formatters[name] = format;
+  Object.assign(Schema2, { [name](...args) {
+    const schema3 = new Schema2({ type: name });
+    keys.forEach((key, index) => {
+      switch (key) {
+        case "sKey":
+          schema3.sKey = args[index] ?? Schema2.string();
+          break;
+        case "inner":
+          schema3.inner = Schema2.from(args[index]);
+          break;
+        case "list":
+          schema3.list = args[index].map(Schema2.from);
+          break;
+        case "dict":
+          schema3.dict = mapValues(args[index], Schema2.from);
+          break;
+        case "bits":
+          schema3.bits = {};
+          for (const key2 in args[index]) {
+            if (typeof args[index][key2] !== "number") continue;
+            schema3.bits[key2] = args[index][key2];
+          }
+          break;
+        case "callback": {
+          const callback = schema3.callback = args[index];
+          callback["toJSON"] ||= () => callback.toString();
+          break;
+        }
+        case "constructor": {
+          const constructor = schema3.constructor = args[index];
+          if (typeof constructor === "function") constructor["toJSON"] ||= () => constructor["name"];
+          break;
+        }
+        default:
+          schema3[key] = args[index];
+      }
+    });
+    if (name === "object" || name === "dict") schema3.meta.default = {};
+    else if (name === "array" || name === "tuple") schema3.meta.default = [];
+    else if (name === "bitset") schema3.meta.default = 0;
+    return schema3;
+  } });
+}
+var kSchema, kValidationError2, ValidationError2, Schema2, resolvers, checkedVolatile, formatters;
+var init_lib3 = __esm({
+  "node_modules/@deepseek-ai/schemastery/lib/index.mjs"() {
+    init_lib();
+    kSchema = /* @__PURE__ */ Symbol.for("schemastery");
+    kValidationError2 = /* @__PURE__ */ Symbol.for("ValidationError");
+    globalThis.__schemastery_index__ ??= 0;
+    globalThis.__schemastery_refs__ = void 0;
+    ValidationError2 = class extends TypeError {
+      options;
+      name = "ValidationError";
+      constructor(message, options) {
+        let prefix = "$";
+        for (const segment of options.path || []) if (typeof segment === "string") prefix += "." + segment;
+        else if (typeof segment === "number") prefix += "[" + segment + "]";
+        else if (typeof segment === "symbol") prefix += `[Symbol(${segment.toString()})]`;
+        if (prefix.startsWith(".")) prefix = prefix.slice(1);
+        super((prefix === "$" ? "" : `${prefix} `) + message);
+        this.options = options;
+      }
+      static is(error) {
+        return !!error?.[kValidationError2];
+      }
+    };
+    Object.defineProperty(ValidationError2.prototype, kValidationError2, { value: true });
+    Schema2 = function(options) {
+      const schema3 = function(data2, options2 = {}) {
+        return Schema2.resolve(data2, schema3, options2)[0];
+      };
+      if (options.refs) {
+        const refs = mapValues(options.refs, (options2) => new Schema2(options2));
+        const getRef = (uid) => refs[uid];
+        for (const key in refs) {
+          const options2 = refs[key];
+          options2.sKey = getRef(options2.sKey);
+          options2.inner = getRef(options2.inner);
+          options2.list = options2.list && options2.list.map(getRef);
+          options2.dict = options2.dict && mapValues(options2.dict, getRef);
+        }
+        return refs[options.uid];
+      }
+      Object.assign(schema3, options);
+      if (typeof schema3.callback === "string") try {
+        schema3.callback = new Function("return " + schema3.callback)();
+      } catch {
+      }
+      Object.defineProperty(schema3, "uid", { value: globalThis.__schemastery_index__++ });
+      Object.setPrototypeOf(schema3, Schema2.prototype);
+      schema3.meta ||= {};
+      schema3.toString = schema3.toString.bind(schema3);
+      return schema3;
+    };
+    Schema2.prototype = Object.create(Function.prototype);
+    Schema2.prototype[kSchema] = true;
+    Object.defineProperty(Schema2.prototype, "~standard", { get() {
+      return {
+        version: 1,
+        vendor: "schemastery",
+        validate: (value) => {
+          try {
+            return { value: Schema2.resolve(value, this, {})[0] };
+          } catch (error) {
+            if (ValidationError2.is(error)) return { issues: [{
+              message: error.message,
+              path: error.options.path
+            }] };
+            throw error;
+          }
+        }
+      };
+    } });
+    Schema2.ValidationError = ValidationError2;
+    Schema2.prototype.toJSON = function toJSON() {
+      if (globalThis.__schemastery_refs__) {
+        globalThis.__schemastery_refs__[this.uid] ??= JSON.parse(JSON.stringify({ ...this }));
+        return this.uid;
+      }
+      globalThis.__schemastery_refs__ = { [this.uid]: { ...this } };
+      globalThis.__schemastery_refs__[this.uid] = JSON.parse(JSON.stringify({ ...this }));
+      const result = {
+        uid: this.uid,
+        refs: globalThis.__schemastery_refs__
+      };
+      globalThis.__schemastery_refs__ = void 0;
+      return result;
+    };
+    Schema2.prototype.set = function set2(key, value) {
+      this.dict[key] = value;
+      return this;
+    };
+    Schema2.prototype.push = function push(value) {
+      this.list.push(value);
+      return this;
+    };
+    Schema2.prototype.i18n = function i18n(messages) {
+      const schema3 = Schema2(this);
+      const desc = mergeDesc(schema3.meta.description, messages);
+      if (Object.keys(desc).length) schema3.meta.description = desc;
+      if (schema3.dict) schema3.dict = mapValues(schema3.dict, (inner, key) => {
+        return inner.i18n(mapValues(messages, (data2) => getInner(data2)?.[key] ?? data2?.[key]));
+      });
+      if (schema3.list) schema3.list = schema3.list.map((inner, index) => {
+        return inner.i18n(mapValues(messages, (data2 = {}) => {
+          if (Array.isArray(getInner(data2))) return getInner(data2)[index];
+          if (Array.isArray(data2)) return data2[index];
+          return extractKeys(data2);
+        }));
+      });
+      if (schema3.inner) schema3.inner = schema3.inner.i18n(mapValues(messages, (data2) => {
+        if (getInner(data2)) return getInner(data2);
+        return extractKeys(data2);
+      }));
+      if (schema3.sKey) schema3.sKey = schema3.sKey.i18n(mapValues(messages, (data2) => data2?.$key));
+      return schema3;
+    };
+    Schema2.prototype.extra = function extra(key, value) {
+      const schema3 = Schema2(this);
+      schema3.meta = {
+        ...schema3.meta,
+        [key]: value
+      };
+      return schema3;
+    };
+    for (const key of [
+      "required",
+      "disabled",
+      "collapse",
+      "hidden",
+      "loose"
+    ]) Object.assign(Schema2.prototype, { [key](value = true) {
+      const schema3 = Schema2(this);
+      schema3.meta = {
+        ...schema3.meta,
+        [key]: value
+      };
+      return schema3;
+    } });
+    Schema2.prototype.deprecated = function deprecated() {
+      const schema3 = Schema2(this);
+      schema3.meta.badges ||= [];
+      schema3.meta.badges.push({
+        text: "deprecated",
+        type: "danger"
+      });
+      return schema3;
+    };
+    Schema2.prototype.experimental = function experimental() {
+      const schema3 = Schema2(this);
+      schema3.meta.badges ||= [];
+      schema3.meta.badges.push({
+        text: "experimental",
+        type: "warning"
+      });
+      return schema3;
+    };
+    Schema2.prototype.pattern = function pattern(regexp) {
+      const schema3 = Schema2(this);
+      const pattern2 = pick(regexp, ["source", "flags"]);
+      schema3.meta = {
+        ...schema3.meta,
+        pattern: pattern2
+      };
+      return schema3;
+    };
+    Schema2.prototype.simplify = function simplify(value) {
+      if (isVolatile(value)) value = value.get();
+      if (deepEqual(value, this.meta.default, this.type === "dict")) return null;
+      if (isNullable(value)) return value;
+      if (this.type === "object" || this.type === "dict") {
+        const result = {};
+        for (const key in value) {
+          const item = (this.type === "object" ? this.dict[key] : this.inner)?.simplify(value[key]);
+          if (this.type === "dict" || !isNullable(item)) result[key] = item;
+        }
+        if (deepEqual(result, this.meta.default, this.type === "dict")) return null;
+        return result;
+      } else if (this.type === "array" || this.type === "tuple") {
+        const result = [];
+        value.forEach((value2, index) => {
+          const schema3 = this.type === "array" ? this.inner : this.list[index];
+          const item = schema3 ? schema3.simplify(value2) : value2;
+          result.push(item);
+        });
+        return result;
+      } else if (this.type === "intersect") {
+        const result = {};
+        for (const item of this.list) Object.assign(result, item.simplify(value));
+        return result;
+      } else if (this.type === "union") for (const schema3 of this.list) try {
+        Schema2.resolve(value, schema3, {});
+        return schema3.simplify(value);
+      } catch {
+      }
+      return value;
+    };
+    Schema2.prototype.toString = function toString2(inline) {
+      return formatters[this.type]?.(this, inline) ?? `Schema<${this.type}>`;
+    };
+    Schema2.prototype.role = function role(role, extra2) {
+      const schema3 = Schema2(this);
+      schema3.meta = {
+        ...schema3.meta,
+        role,
+        extra: extra2
+      };
+      return schema3;
+    };
+    for (const key of [
+      "default",
+      "link",
+      "comment",
+      "description",
+      "max",
+      "min",
+      "step"
+    ]) Object.assign(Schema2.prototype, { [key](value) {
+      const schema3 = Schema2(this);
+      schema3.meta = {
+        ...schema3.meta,
+        [key]: value
+      };
+      return schema3;
+    } });
+    Schema2.prototype.volatile = function volatile() {
+      if (this.meta.volatile) throw new TypeError("volatile schema is already wrapped");
+      return this.extra("volatile", true);
+    };
+    resolvers = {};
+    checkedVolatile = /* @__PURE__ */ Symbol("checked-volatile-schema");
+    Schema2.extend = function extend2(type2, resolve7) {
+      resolvers[type2] = resolve7;
+    };
+    Schema2.resolve = function resolve3(data2, schema3, options = {}, strict = false) {
+      if (!schema3) return [data2];
+      if (!options[checkedVolatile]) {
+        validateVolatileSchema(schema3, options.path);
+        options = {
+          ...options,
+          [checkedVolatile]: true
+        };
+      }
+      if (schema3.meta?.volatile) {
+        const inner = Schema2(schema3);
+        inner.meta = {
+          ...schema3.meta,
+          volatile: false
+        };
+        const [value, adapted] = Schema2.resolve(data2, inner, options, strict);
+        try {
+          return [createVolatile(value), adapted];
+        } catch (error) {
+          throw new ValidationError2(error instanceof Error ? error.message : String(error), options);
+        }
+      }
+      if (options.ignore?.(data2, schema3)) return [data2];
+      if (isNullable(data2) && schema3.type !== "lazy") {
+        if (schema3.meta.required) throw new ValidationError2(`missing required value`, options);
+        let current2 = schema3;
+        let fallback = schema3.meta.default;
+        while (current2?.type === "intersect" && isNullable(fallback)) {
+          current2 = current2.list[0];
+          fallback = current2?.meta.default;
+        }
+        if (isNullable(fallback)) return [data2];
+        data2 = clone(fallback);
+      }
+      const callback = resolvers[schema3.type];
+      if (!callback) throw new ValidationError2(`unsupported type "${schema3.type}"`, options);
+      try {
+        return callback(data2, schema3, options, strict);
+      } catch (error) {
+        if (!schema3.meta.loose) throw error;
+        return [schema3.meta.default];
+      }
+    };
+    Schema2.from = function from(source) {
+      if (isNullable(source)) return Schema2.any();
+      else if ([
+        "string",
+        "number",
+        "boolean"
+      ].includes(typeof source)) return Schema2.const(source).required();
+      else if (source[kSchema]) return source;
+      else if (typeof source === "function") switch (source) {
+        case String:
+          return Schema2.string().required();
+        case Number:
+          return Schema2.number().required();
+        case Boolean:
+          return Schema2.boolean().required();
+        case Function:
+          return Schema2.function().required();
+        default:
+          return Schema2.is(source).required();
+      }
+      else throw new TypeError(`cannot infer schema from ${source}`);
+    };
+    Schema2.lazy = function lazy(builder) {
+      const toJSON2 = () => {
+        if (!schema3.inner[kSchema]) {
+          schema3.inner = schema3.builder();
+          schema3.inner.meta = {
+            ...schema3.meta,
+            ...schema3.inner.meta
+          };
+        }
+        return schema3.inner.toJSON();
+      };
+      const schema3 = new Schema2({
+        type: "lazy",
+        builder,
+        inner: { toJSON: toJSON2 }
+      });
+      return schema3;
+    };
+    Schema2.natural = function natural() {
+      return Schema2.number().step(1).min(0);
+    };
+    Schema2.percent = function percent() {
+      return Schema2.number().step(0.01).min(0).max(1).role("slider");
+    };
+    Schema2.date = function date() {
+      return Schema2.union([Schema2.is(Date), Schema2.transform(Schema2.string().role("datetime"), (value, options) => {
+        const date2 = new Date(value);
+        if (isNaN(+date2)) throw new ValidationError2(`invalid date "${value}"`, options);
+        return date2;
+      }, true)]);
+    };
+    Schema2.regExp = function regExp(flag = "") {
+      return Schema2.union([Schema2.is(RegExp), Schema2.transform(Schema2.string().role("regexp", { flag }), (value, options) => {
+        try {
+          return new RegExp(value, flag);
+        } catch (e) {
+          throw new ValidationError2(e.message, options);
+        }
+      }, true)]);
+    };
+    Schema2.arrayBuffer = function arrayBuffer(encoding) {
+      return Schema2.union([
+        Schema2.is(ArrayBuffer),
+        Schema2.is(SharedArrayBuffer),
+        Schema2.transform(Schema2.any(), (value, options) => {
+          if (Binary.isSource(value)) return Binary.fromSource(value);
+          throw new ValidationError2(`expected ArrayBufferSource but got ${value}`, options);
+        }, true),
+        ...encoding ? [Schema2.transform(Schema2.string(), (value, options) => {
+          try {
+            return encoding === "base64" ? Binary.fromBase64(value) : Binary.fromHex(value);
+          } catch (e) {
+            throw new ValidationError2(e.message, options);
+          }
+        }, true)] : []
+      ]);
+    };
+    Schema2.extend("lazy", (data2, schema3, options, strict) => {
+      if (!schema3.inner[kSchema]) {
+        schema3.inner = schema3.builder();
+        schema3.inner.meta = {
+          ...schema3.meta,
+          ...schema3.inner.meta
+        };
+        validateVolatileSchema(schema3.inner, options.path, true);
+      }
+      return Schema2.resolve(data2, schema3.inner, options, strict);
+    });
+    Schema2.extend("any", (data2) => {
+      return [data2];
+    });
+    Schema2.extend("never", (data2, _, options) => {
+      throw new ValidationError2(`expected nullable but got ${data2}`, options);
+    });
+    Schema2.extend("const", (data2, { value }, options) => {
+      if (deepEqual(data2, value)) return [value];
+      throw new ValidationError2(`expected ${value} but got ${data2}`, options);
+    });
+    Schema2.extend("string", (data2, { meta }, options) => {
+      if (typeof data2 !== "string") throw new ValidationError2(`expected string but got ${data2}`, options);
+      if (meta.pattern) {
+        const regexp = new RegExp(meta.pattern.source, meta.pattern.flags);
+        if (!regexp.test(data2)) throw new ValidationError2(`expect string to match regexp ${regexp}`, options);
+      }
+      checkWithinRange(data2.length, meta, "string length", options);
+      return [data2];
+    });
+    Schema2.extend("number", (data2, { meta }, options) => {
+      if (typeof data2 !== "number") throw new ValidationError2(`expected number but got ${data2}`, options);
+      checkWithinRange(data2, meta, "number", options);
+      const { step } = meta;
+      if (step && !isMultipleOf(data2, meta.min ?? 0, step)) throw new ValidationError2(`expected number multiple of ${step} but got ${data2}`, options);
+      return [data2];
+    });
+    Schema2.extend("boolean", (data2, _, options) => {
+      if (typeof data2 === "boolean") return [data2];
+      throw new ValidationError2(`expected boolean but got ${data2}`, options);
+    });
+    Schema2.extend("bitset", (data2, { bits, meta }, options) => {
+      let value = 0, keys = [];
+      if (typeof data2 === "number") {
+        value = data2;
+        for (const key in bits) if (data2 & bits[key]) keys.push(key);
+      } else if (Array.isArray(data2)) {
+        keys = data2;
+        for (const key of keys) {
+          if (typeof key !== "string") throw new ValidationError2(`expected string but got ${key}`, options);
+          if (key in bits) value |= bits[key];
+        }
+      } else throw new ValidationError2(`expected number or array but got ${data2}`, options);
+      if (value === meta.default) return [value];
+      return [value, keys];
+    });
+    Schema2.extend("function", (data2, _, options) => {
+      if (typeof data2 === "function") return [data2];
+      throw new ValidationError2(`expected function but got ${data2}`, options);
+    });
+    Schema2.extend("is", (data2, { constructor }, options) => {
+      if (typeof constructor === "function") {
+        if (data2 instanceof constructor) return [data2];
+        throw new ValidationError2(`expected ${constructor.name} but got ${data2}`, options);
+      } else {
+        if (isNullable(data2)) throw new ValidationError2(`expected ${constructor} but got ${data2}`, options);
+        let prototype = Object.getPrototypeOf(data2);
+        while (prototype) {
+          if (prototype.constructor?.name === constructor) return [data2];
+          prototype = Object.getPrototypeOf(prototype);
+        }
+        throw new ValidationError2(`expected ${constructor} but got ${data2}`, options);
+      }
+    });
+    Schema2.extend("array", (data2, { inner, meta }, options) => {
+      if (!Array.isArray(data2)) throw new ValidationError2(`expected array but got ${data2}`, options);
+      checkWithinRange(data2.length, meta, "array length", options, !isNullable(inner.meta.default));
+      return [data2.map((_, index) => property(data2, index, inner, options))];
+    });
+    Schema2.extend("dict", (data2, { inner, sKey }, options, strict) => {
+      if (!isPlainObject(data2)) throw new ValidationError2(`expected object but got ${data2}`, options);
+      const result = {};
+      for (const key in data2) {
+        let rKey;
+        try {
+          rKey = Schema2.resolve(key, sKey, options)[0];
+        } catch (error) {
+          if (strict) continue;
+          throw error;
+        }
+        result[rKey] = property(data2, key, inner, options);
+        data2[rKey] = data2[key];
+        if (key !== rKey) delete data2[key];
+      }
+      return [result];
+    });
+    Schema2.extend("tuple", (data2, { list: list2 }, options, strict) => {
+      if (!Array.isArray(data2)) throw new ValidationError2(`expected array but got ${data2}`, options);
+      const result = list2.map((inner, index) => property(data2, index, inner, options));
+      if (strict) return [result];
+      result.push(...data2.slice(list2.length));
+      return [result];
+    });
+    Schema2.extend("object", (data2, { dict }, options, strict) => {
+      if (!isPlainObject(data2)) throw new ValidationError2(`expected object but got ${data2}`, options);
+      const result = {};
+      for (const key in dict) {
+        const value = property(data2, key, dict[key], options);
+        if (!isNullable(value) || key in data2) result[key] = value;
+      }
+      if (!strict) merge3(result, data2);
+      return [result];
+    });
+    Schema2.extend("union", (data2, { list: list2, toString: toString3 }, options, strict) => {
+      const messages = [];
+      for (const inner of list2) try {
+        return Schema2.resolve(data2, inner, options, strict);
+      } catch (error) {
+        messages.push(error);
+      }
+      throw new ValidationError2(`expected ${toString3()} but got ${JSON.stringify(data2)}`, options);
+    });
+    Schema2.extend("intersect", (data2, { list: list2, toString: toString3 }, options, strict) => {
+      if (!list2.length) return [data2];
+      let result;
+      for (const inner of list2) {
+        const value = Schema2.resolve(data2, inner, options, true)[0];
+        if (isNullable(value)) continue;
+        if (isNullable(result)) result = value;
+        else if (typeof result !== typeof value) throw new ValidationError2(`expected ${toString3()} but got ${JSON.stringify(data2)}`, options);
+        else if (typeof value === "object") merge3(result ??= {}, value);
+        else if (result !== value) throw new ValidationError2(`expected ${toString3()} but got ${JSON.stringify(data2)}`, options);
+      }
+      if (!strict && isPlainObject(data2)) merge3(result, data2);
+      return [result];
+    });
+    Schema2.extend("transform", (data2, { inner, callback, preserve }, options) => {
+      const [result, adapted = data2] = Schema2.resolve(data2, inner, options, true);
+      if (preserve) return [callback(result)];
+      else return [callback(result), callback(adapted)];
+    });
+    formatters = {};
+    defineMethod("is", ["constructor"], ({ constructor }) => {
+      if (typeof constructor === "function") return constructor.name;
+      else return constructor;
+    });
+    defineMethod("any", [], () => "any");
+    defineMethod("never", [], () => "never");
+    defineMethod("const", ["value"], ({ value }) => typeof value === "string" ? JSON.stringify(value) : value);
+    defineMethod("string", [], () => "string");
+    defineMethod("number", [], () => "number");
+    defineMethod("boolean", [], () => "boolean");
+    defineMethod("bitset", ["bits"], () => "bitset");
+    defineMethod("function", [], () => "function");
+    defineMethod("array", ["inner"], ({ inner }) => `${inner.toString(true)}[]`);
+    defineMethod("dict", ["inner", "sKey"], ({ inner, sKey }) => `{ [key: ${sKey.toString()}]: ${inner.toString()} }`);
+    defineMethod("tuple", ["list"], ({ list: list2 }) => `[${list2.map((inner) => inner.toString()).join(", ")}]`);
+    defineMethod("object", ["dict"], ({ dict }) => {
+      if (Object.keys(dict).length === 0) return "{}";
+      return `{ ${Object.entries(dict).map(([key, inner]) => {
+        return `${key}${inner.meta.required ? "" : "?"}: ${inner.toString()}`;
+      }).join(", ")} }`;
+    });
+    defineMethod("union", ["list"], ({ list: list2 }, inline) => {
+      const result = list2.map(({ toString: format }) => format()).join(" | ");
+      return inline ? `(${result})` : result;
+    });
+    defineMethod("intersect", ["list"], ({ list: list2 }) => {
+      return `${list2.map((inner) => inner.toString(true)).join(" & ")}`;
+    });
+    defineMethod("transform", [
+      "inner",
+      "callback",
+      "preserve"
+    ], ({ inner }, isInner) => inner.toString(isInner));
+  }
+});
+
+// src/dsh/cot-translation.ts
+function isRecord2(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function validateEndpoint(value) {
+  const url = new URL(value);
+  if (!["http:", "https:"].includes(url.protocol) || url.username !== "" || url.password !== "" || url.hash !== "") {
+    throw new Error(
+      "Translation endpoint must be an HTTP(S) URL without credentials or a fragment"
+    );
+  }
+  return url.href;
+}
+function mapLanguage(tag, provider) {
+  const lower = tag.toLowerCase();
+  if (lower === "zh" || lower === "zh-cn" || lower === "zh-sg" || lower === "zh-hans") {
+    return provider === "google" ? "zh-CN" : "zh-Hans";
+  }
+  if (lower === "zh-tw" || lower === "zh-hk" || lower === "zh-mo" || lower === "zh-hant") {
+    return provider === "google" ? "zh-TW" : "zh-Hant";
+  }
+  return tag;
+}
+function parseGooglePayload(payload) {
+  if (!Array.isArray(payload) || !Array.isArray(payload[0]) || payload[0].length === 0) {
+    throw new TranslationError(
+      "TRANSLATION_INVALID_RESPONSE",
+      "Google translation returned invalid payload"
+    );
+  }
+  const parts = [];
+  for (const segment of payload[0]) {
+    if (!Array.isArray(segment) || typeof segment[0] !== "string") {
+      throw new TranslationError(
+        "TRANSLATION_INVALID_RESPONSE",
+        "Google translation returned invalid payload"
+      );
+    }
+    parts.push(segment[0]);
+  }
+  return parts.join("");
+}
+function parseBingPayload(payload) {
+  if (!Array.isArray(payload) || payload.length === 0 || !isRecord2(payload[0])) {
+    throw new TranslationError(
+      "TRANSLATION_INVALID_RESPONSE",
+      "Bing translation returned invalid payload"
+    );
+  }
+  const translations = payload[0].translations;
+  if (!Array.isArray(translations) || translations.length === 0 || !isRecord2(translations[0]) || typeof translations[0].text !== "string") {
+    throw new TranslationError(
+      "TRANSLATION_INVALID_RESPONSE",
+      "Bing translation returned invalid payload"
+    );
+  }
+  return translations[0].text;
+}
+function raceWithSignal(promise, signal) {
+  if (signal.aborted) {
+    promise.catch(() => {
+    });
+    return Promise.reject(signal.reason);
+  }
+  return new Promise((resolve7, reject) => {
+    let settled = false;
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      promise.catch(() => {
+      });
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        resolve7(value);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      }
+    );
+  });
+}
+async function readBoundedResponseJson(response, maxResponseBytes, provider, signal) {
+  if (!response.body) {
+    throw new TranslationError(
+      "TRANSLATION_INVALID_RESPONSE",
+      `${provider} translation returned empty body`
+    );
+  }
+  if (signal.aborted) {
+    void response.body.cancel().catch(() => {
+    });
+    throw signal.reason;
+  }
+  const chunks = [];
+  let totalBytes = 0;
+  let reader;
+  let cancelled = false;
+  const cancelReader = () => {
+    if (cancelled || !reader) return;
+    cancelled = true;
+    void reader.cancel().catch(() => {
+    });
+  };
+  const onAbort = () => {
+    cancelReader();
+  };
+  try {
+    reader = response.body.getReader();
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) {
+      cancelReader();
+      throw signal.reason;
+    }
+    while (true) {
+      const { done, value } = await raceWithSignal(reader.read(), signal);
+      if (done) break;
+      if (!value) continue;
+      totalBytes += value.byteLength;
+      if (totalBytes > maxResponseBytes) {
+        cancelReader();
+        throw new TranslationError(
+          "TRANSLATION_RESPONSE_LIMIT",
+          `${provider} translation response exceeded size limit`
+        );
+      }
+      chunks.push(value);
+    }
+  } catch (error) {
+    cancelReader();
+    if (signal.aborted) throw signal.reason;
+    if (error instanceof TranslationError) throw error;
+    throw new TranslationError(
+      "TRANSLATION_REQUEST_FAILED",
+      `${provider} translation request failed`
+    );
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+    reader?.releaseLock();
+  }
+  const merged = new Uint8Array(totalBytes);
+  let offset2 = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset2);
+    offset2 += chunk.byteLength;
+  }
+  try {
+    return JSON.parse(new TextDecoder("utf-8").decode(merged));
+  } catch {
+    throw new TranslationError(
+      "TRANSLATION_INVALID_RESPONSE",
+      `${provider} translation returned invalid JSON`
+    );
+  }
+}
+function reviewedCotTranslationModule() {
+  return TranslatorService;
+}
+var ANONYMOUS_PROVIDERS, VALID_PROVIDERS, LANGUAGE_PREFERENCE_PATTERN, MAX_CONFIG_TEXT_CHARS, MAX_CONFIG_RESPONSE_BYTES, MAX_LANGUAGE_TAG_LENGTH, MAX_SESSION_ID_LENGTH, TranslationError, TranslatorConfigSchema, CotTranslationConfigSchema, TranslatorService;
+var init_cot_translation = __esm({
+  "src/dsh/cot-translation.ts"() {
+    "use strict";
+    init_lib2();
+    init_lib3();
+    ANONYMOUS_PROVIDERS = ["bing", "google"];
+    VALID_PROVIDERS = /* @__PURE__ */ new Set([
+      "google",
+      "bing",
+      "deepseek-account",
+      "deepseek-official"
+    ]);
+    LANGUAGE_PREFERENCE_PATTERN = /^(?:auto|[a-zA-Z]{2,8}(?:-[a-zA-Z0-9]{1,8})*)$/;
+    MAX_CONFIG_TEXT_CHARS = 1048576;
+    MAX_CONFIG_RESPONSE_BYTES = 8 * 1024 * 1024;
+    MAX_LANGUAGE_TAG_LENGTH = 64;
+    MAX_SESSION_ID_LENGTH = 256;
+    TranslationError = class extends Error {
+      code;
+      constructor(code, message) {
+        super(message);
+        this.name = "TranslationError";
+        this.code = code;
+      }
+    };
+    TranslatorConfigSchema = Schema2.object({
+      provider: Schema2.union(["google", "bing", "deepseek-account", "deepseek-official"]).default("bing"),
+      googleEndpoint: Schema2.transform(Schema2.string(), validateEndpoint).default("https://translate.googleapis.com/translate_a/single"),
+      bingEndpoint: Schema2.transform(Schema2.string(), validateEndpoint).default("https://edge.microsoft.com/translate/translatetext"),
+      timeoutMs: Schema2.natural().min(1).max(2147483647).default(1e4),
+      maxTextChars: Schema2.natural().min(2).max(MAX_CONFIG_TEXT_CHARS).default(4e3),
+      maxResponseBytes: Schema2.natural().min(1).max(MAX_CONFIG_RESPONSE_BYTES).default(1048576),
+      deepseekTimeoutMs: Schema2.natural().min(1).max(2147483647).default(6e4),
+      deepseekMaxOutputTokens: Schema2.natural().min(1).max(131072).default(8192)
+    });
+    CotTranslationConfigSchema = Schema2.object({
+      provider: Schema2.union(["google", "bing", "deepseek-account", "deepseek-official"]).default("bing"),
+      targetLanguage: Schema2.string().pattern(LANGUAGE_PREFERENCE_PATTERN).default("auto")
+    });
+    TranslatorService = class extends Service {
+      static inject = ["credentials", "llm"];
+      static provide = "translator";
+      static Config = TranslatorConfigSchema;
+      config;
+      lifetime = new AbortController();
+      pending = /* @__PURE__ */ new Set();
+      constructor(ctx, config) {
+        super(ctx, "translator");
+        this.config = TranslatorConfigSchema(config ?? {});
+        ctx.effect(() => async () => {
+          this.lifetime.abort(new Error("Translator service disposed"));
+          await Promise.allSettled([...this.pending]);
+        });
+      }
+      get maxTextChars() {
+        return this.config.maxTextChars;
+      }
+      combineSignal(signal) {
+        return signal ? AbortSignal.any([this.lifetime.signal, signal]) : this.lifetime.signal;
+      }
+      assertTextLimit(text4) {
+        if (typeof text4 !== "string") {
+          throw new TranslationError(
+            "TRANSLATION_INVALID_RESPONSE",
+            "Translation text must be a string"
+          );
+        }
+        if (text4.length > this.config.maxTextChars) {
+          throw new TranslationError(
+            "TRANSLATION_TEXT_LIMIT",
+            `Translation text exceeds maximum length (${this.config.maxTextChars} characters)`
+          );
+        }
+      }
+      async availableProviders(signal) {
+        const combined = this.combineSignal(signal);
+        if (combined.aborted) throw combined.reason;
+        return [...ANONYMOUS_PROVIDERS];
+      }
+      resolve(request) {
+        if (this.lifetime.signal.aborted) throw this.lifetime.signal.reason;
+        if (!isRecord2(request)) {
+          throw new TranslationError(
+            "TRANSLATION_INVALID_RESPONSE",
+            "Translation request must be an object"
+          );
+        }
+        this.assertTextLimit(request.text);
+        const provider = request.provider ?? this.config.provider;
+        if (typeof provider !== "string" || !VALID_PROVIDERS.has(provider)) {
+          throw new TranslationError(
+            "TRANSLATION_INVALID_RESPONSE",
+            "Unsupported translation provider"
+          );
+        }
+        if (typeof request.targetLanguage !== "string" || request.targetLanguage.trim() === "" || request.targetLanguage.length > MAX_LANGUAGE_TAG_LENGTH) {
+          throw new TranslationError(
+            "TRANSLATION_INVALID_RESPONSE",
+            "Target language is required"
+          );
+        }
+        const sourceLanguage = request.sourceLanguage ?? "auto";
+        if (typeof sourceLanguage !== "string" || sourceLanguage.trim() === "" || sourceLanguage.length > MAX_LANGUAGE_TAG_LENGTH) {
+          throw new TranslationError(
+            "TRANSLATION_INVALID_RESPONSE",
+            "Source language must be a bounded non-empty string"
+          );
+        }
+        if (request.sessionId !== void 0 && (typeof request.sessionId !== "string" || request.sessionId.trim() === "" || request.sessionId.length > MAX_SESSION_ID_LENGTH)) {
+          throw new TranslationError(
+            "TRANSLATION_INVALID_RESPONSE",
+            "Session ID must be a bounded non-empty string"
+          );
+        }
+        return {
+          text: request.text,
+          sourceLanguage,
+          targetLanguage: request.targetLanguage,
+          provider,
+          ...request.sessionId !== void 0 ? { sessionId: request.sessionId } : {}
+        };
+      }
+      async translate(spec, signal) {
+        const combined = this.combineSignal(signal);
+        if (combined.aborted) throw combined.reason;
+        if (!isRecord2(spec)) {
+          throw new TranslationError(
+            "TRANSLATION_INVALID_RESPONSE",
+            "Translation spec must be an object"
+          );
+        }
+        this.assertTextLimit(spec.text);
+        if (typeof spec.provider !== "string" || !VALID_PROVIDERS.has(spec.provider)) {
+          throw new TranslationError(
+            "TRANSLATION_INVALID_RESPONSE",
+            "Unsupported translation provider"
+          );
+        }
+        if (typeof spec.targetLanguage !== "string" || spec.targetLanguage.trim() === "" || spec.targetLanguage.length > MAX_LANGUAGE_TAG_LENGTH) {
+          throw new TranslationError(
+            "TRANSLATION_INVALID_RESPONSE",
+            "Target language is required"
+          );
+        }
+        if (typeof spec.sourceLanguage !== "string" || spec.sourceLanguage.trim() === "" || spec.sourceLanguage.length > MAX_LANGUAGE_TAG_LENGTH) {
+          throw new TranslationError(
+            "TRANSLATION_INVALID_RESPONSE",
+            "Source language must be a bounded non-empty string"
+          );
+        }
+        if (spec.sessionId !== void 0 && (typeof spec.sessionId !== "string" || spec.sessionId.trim() === "" || spec.sessionId.length > MAX_SESSION_ID_LENGTH)) {
+          throw new TranslationError(
+            "TRANSLATION_INVALID_RESPONSE",
+            "Session ID must be a bounded non-empty string"
+          );
+        }
+        if (spec.provider === "deepseek-account" || spec.provider === "deepseek-official") {
+          throw new TranslationError(
+            "TRANSLATION_UNAVAILABLE",
+            `Paid translation route ${spec.provider} is not offered in this build`
+          );
+        }
+        if (spec.text === "") {
+          return "";
+        }
+        const provider = spec.provider;
+        const run = this.executeAnonymous(provider, spec, combined);
+        this.pending.add(run);
+        try {
+          return await run;
+        } finally {
+          this.pending.delete(run);
+        }
+      }
+      async executeAnonymous(provider, spec, combined) {
+        const timeoutController = new AbortController();
+        const timer = setTimeout(() => {
+          timeoutController.abort(
+            new TranslationError(
+              "TRANSLATION_TIMEOUT",
+              `${provider} translation timed out`
+            )
+          );
+        }, this.config.timeoutMs);
+        const effectiveSignal = AbortSignal.any([
+          combined,
+          timeoutController.signal
+        ]);
+        try {
+          const target = mapLanguage(spec.targetLanguage, provider);
+          const source = spec.sourceLanguage === "auto" ? "auto" : mapLanguage(spec.sourceLanguage, provider);
+          let url;
+          let init;
+          if (provider === "google") {
+            url = new URL(this.config.googleEndpoint);
+            url.searchParams.delete("client");
+            url.searchParams.delete("sl");
+            url.searchParams.delete("tl");
+            url.searchParams.delete("dt");
+            url.searchParams.delete("q");
+            init = {
+              method: "POST",
+              headers: { "content-type": "application/x-www-form-urlencoded" },
+              body: new URLSearchParams({
+                client: "gtx",
+                sl: source,
+                tl: target,
+                dt: "t",
+                q: spec.text
+              }).toString(),
+              redirect: "error",
+              credentials: "omit",
+              signal: effectiveSignal
+            };
+          } else {
+            url = new URL(this.config.bingEndpoint);
+            if (source === "auto") {
+              url.searchParams.delete("from");
+            } else {
+              url.searchParams.set("from", source);
+            }
+            url.searchParams.set("to", target);
+            url.searchParams.set("isEnterpriseClient", "false");
+            init = {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify([spec.text]),
+              redirect: "error",
+              credentials: "omit",
+              signal: effectiveSignal
+            };
+          }
+          const hostCtx = this.ctx;
+          const fetchPromise = Promise.resolve().then(
+            () => hostCtx.credentials.fetch(url.href, init)
+          );
+          fetchPromise.then(
+            (res) => {
+              if (effectiveSignal.aborted) {
+                void res?.body?.cancel?.().catch(() => {
+                });
+              }
+            },
+            () => {
+            }
+          );
+          let response;
+          try {
+            response = await raceWithSignal(fetchPromise, effectiveSignal);
+          } catch (error) {
+            if (combined.aborted) throw combined.reason;
+            if (timeoutController.signal.aborted) {
+              throw timeoutController.signal.reason;
+            }
+            if (error instanceof TranslationError) throw error;
+            throw new TranslationError(
+              "TRANSLATION_REQUEST_FAILED",
+              `${provider} translation request failed`
+            );
+          }
+          if (combined.aborted) {
+            void response?.body?.cancel?.().catch(() => {
+            });
+            throw combined.reason;
+          }
+          if (timeoutController.signal.aborted) {
+            void response?.body?.cancel?.().catch(() => {
+            });
+            throw timeoutController.signal.reason;
+          }
+          if (response.redirected) {
+            if (response.body) {
+              await raceWithSignal(
+                response.body.cancel().catch(() => {
+                }),
+                effectiveSignal
+              ).catch(() => {
+              });
+            }
+            if (combined.aborted) throw combined.reason;
+            if (timeoutController.signal.aborted) {
+              throw timeoutController.signal.reason;
+            }
+            throw new TranslationError(
+              "TRANSLATION_REQUEST_FAILED",
+              `${provider} translation response was redirected`
+            );
+          }
+          if (!response.ok) {
+            if (response.body) {
+              await raceWithSignal(
+                response.body.cancel().catch(() => {
+                }),
+                effectiveSignal
+              ).catch(() => {
+              });
+            }
+            if (combined.aborted) throw combined.reason;
+            if (timeoutController.signal.aborted) {
+              throw timeoutController.signal.reason;
+            }
+            throw new TranslationError(
+              "TRANSLATION_HTTP_ERROR",
+              `${provider} translation failed (HTTP ${response.status})`
+            );
+          }
+          const payload = await readBoundedResponseJson(
+            response,
+            this.config.maxResponseBytes,
+            provider,
+            effectiveSignal
+          );
+          return provider === "google" ? parseGooglePayload(payload) : parseBingPayload(payload);
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+    };
   }
 });
 
@@ -12593,13 +14495,13 @@ __export(composition_exports, {
 });
 import { createHash as createHash2 } from "node:crypto";
 import { readFile as readFile2 } from "node:fs/promises";
-import { isAbsolute as isAbsolute3, relative as relative2, resolve as resolve3, sep as sep2 } from "node:path";
+import { isAbsolute as isAbsolute3, relative as relative2, resolve as resolve4, sep as sep2 } from "node:path";
 import { fileURLToPath as fileURLToPath3 } from "node:url";
 function digest(bytes) {
   return createHash2("sha256").update(bytes).digest("hex");
 }
-function plainRelative(path) {
-  return typeof path === "string" && path.length > 0 && path.length <= 4096 && !isAbsolute3(path) && !path.startsWith("/") && !/[\\:\u0000-\u001f\u007f]/u.test(path) && path.split("/").every((part) => part !== "" && part !== "." && part !== "..");
+function plainRelative(path2) {
+  return typeof path2 === "string" && path2.length > 0 && path2.length <= 4096 && !isAbsolute3(path2) && !path2.startsWith("/") && !/[\\:\u0000-\u001f\u007f]/u.test(path2) && path2.split("/").every((part) => part !== "" && part !== "." && part !== "..");
 }
 function boundData(root) {
   let nodes = 0;
@@ -12633,6 +14535,10 @@ function checkRows(rows, depth = 0, count = { value: 0 }) {
     if (row === null || typeof row !== "object" || Array.isArray(row)) throw new Error("entry row must be an object");
     assignmentSafe(row);
     if (row.id !== void 0 && (typeof row.id !== "string" || row.id.length > 512)) throw new Error("entry id must be a bounded string");
+    const isolate2 = row.isolate;
+    if (isolate2 !== void 0 && isolate2 !== null && (typeof isolate2 !== "object" || Array.isArray(isolate2) || Object.hasOwn(isolate2, "translator"))) {
+      throw new Error("composition row cannot override translator isolation");
+    }
     if (!(row.group === true && row.name === void 0) && (typeof row.name !== "string" || row.name.length === 0 || row.name.length > 4096)) throw new Error("entry name must be a bounded string");
     if ((row.group || row.name === "cordis:group" || row.name === "@deepseek-ai/cordis-plugin-group") && Array.isArray(row.config)) checkRows(row.config, depth + 1, count);
   }
@@ -12682,7 +14588,7 @@ function reviewComposition(spec) {
   const skipped = [];
   let entries = [];
   for (const [i2, patch] of patches.entries()) {
-    entries = applyEntryPatches(entries, [patch], (message, ...args) => {
+    entries = applyPatches(entries, [patch], (message, ...args) => {
       let index = 0;
       const reason = message.replace(/%C/g, () => JSON.stringify(args[index++]));
       warnings.push(reason);
@@ -12716,12 +14622,19 @@ function validateInventory(group) {
     if (entry.subtree) validateInventory(entry.subtree.root);
   }
 }
+function describeCause(error) {
+  return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+}
+function fiberStateName(state) {
+  return Object.entries(FiberState).find(([, value]) => value === state)?.[0] ?? String(state);
+}
 async function mountReviewedComposition(ctx, baseUrl, spec) {
   const review = reviewComposition(spec);
   function groups(rows) {
     for (const row of rows) {
       if (row.group === true && row.name === void 0) row.name = "cordis:group";
-      if (row.group === true && Array.isArray(row.config)) groups(row.config);
+      if (row.name === AGENT_PRESETS) row.isolate = { ...row.isolate, agentPresets: true };
+      if ((row.group === true || row.name === "cordis:group" || row.name === "@deepseek-ai/cordis-plugin-group") && Array.isArray(row.config)) groups(row.config);
     }
   }
   groups(review.entries);
@@ -12731,7 +14644,8 @@ async function mountReviewedComposition(ctx, baseUrl, spec) {
   const loaderCtx = ctx.extend({
     baseUrl,
     [Context.isolate]: Object.assign(Object.create(ctx[Context.isolate]), {
-      loader: installed.ctx[Context.isolate].loader
+      loader: installed.ctx[Context.isolate].loader,
+      translator: /* @__PURE__ */ Symbol("translator")
     })
   });
   const config = { baseUrl, spec, review, releaseClosure: admitReviewedClosure(baseUrl, spec.files) };
@@ -12764,7 +14678,7 @@ function leakedServices(ctx, mount) {
   for (const key of Object.getOwnPropertySymbols(ctx.reflect.store)) {
     const impl = ctx.reflect.store[key];
     if (impl === void 0) continue;
-    let current2 = impl.fiber;
+    let current2 = impl.ctx.fiber;
     while (current2 !== mount && current2.parent.fiber !== current2) current2 = current2.parent.fiber;
     if (current2 === mount && rootIsolate[impl.name] === key) leaked.push(impl.name);
   }
@@ -12773,6 +14687,8 @@ function leakedServices(ctx, mount) {
 async function mountReviewedPreset(ctx, baseUrl, spec, catalog, selected) {
   if (!selected) throw new Error("agent-presets: explicit selection is required when no default is configured");
   const entries = structuredClone(reviewComposition(spec).entries);
+  const snapshot2 = { catalog, selected, base_url: baseUrl };
+  const receipt = issuePresetReceipt(snapshot2);
   let found = 0;
   function prepare(rows) {
     for (const row of rows) {
@@ -12781,14 +14697,22 @@ async function mountReviewedPreset(ctx, baseUrl, spec, catalog, selected) {
       } else if (row.name === AGENT_PRESETS) {
         found++;
         row.isolate = { ...row.isolate, agentPresets: true };
-        row.config = { codewhale_reviewed: { catalog, selected, base_url: baseUrl } };
+        row.config = { codewhale_reviewed: snapshot2, codewhale_receipt: receipt };
       }
     }
   }
   prepare(entries);
-  if (found !== 1) throw new Error("exactly one raw roster row is required for a selected preset");
+  if (found !== 1) {
+    revokePresetReceipt(receipt);
+    throw new Error("exactly one raw roster row is required for a selected preset");
+  }
   const source = JSON.stringify([{ insert: entries }]);
-  const top = await mountReviewedComposition(ctx, baseUrl, { ...spec, layers: [{ path: "selected-preset.json", sha256: digest(source), source }] });
+  let top;
+  try {
+    top = await mountReviewedComposition(ctx, baseUrl, { ...spec, layers: [{ path: "selected-preset.json", sha256: digest(source), source }] });
+  } finally {
+    revokePresetReceipt(receipt);
+  }
   try {
     const entry = [...top.tree.entries()].find((entry2) => entry2.options.name === AGENT_PRESETS && !entry2.disabled);
     const roster = entry?.ctx.get("agentPresets");
@@ -12813,8 +14737,10 @@ var init_composition = __esm({
     init_skill_filesystem();
     init_shell_hooks();
     init_resolve_hooks();
+    init_missing_services();
     init_persona();
     init_agent_presets();
+    init_cot_translation();
     init_compatibility();
     MAX_LAYERS = 64;
     MAX_SOURCE_BYTES = 1024 * 1024;
@@ -12843,7 +14769,7 @@ var init_composition = __esm({
         this.base = base;
         this.spec = spec;
         const modules = /* @__PURE__ */ new Map();
-        if (!Array.isArray(spec.modules) || spec.modules.length > MAX_ROWS || !spec.files || Object.keys(spec.files).length > 4096) throw new Error("invalid reviewed module closure");
+        if (!Array.isArray(spec.modules) || spec.modules.length > MAX_ROWS || !spec.files || Object.keys(spec.files).length > 16384) throw new Error("invalid reviewed module closure");
         for (const module of spec.modules) {
           if (!module || typeof module.name !== "string" || module.name.length === 0 || module.name.length > 4096 || modules.has(module.name) || !plainRelative(module.path) || !SHA256.test(module.sha256) || spec.files[module.path] !== module.sha256) throw new Error("module map differs from reviewed closure");
           modules.set(module.name, module);
@@ -12851,9 +14777,26 @@ var init_composition = __esm({
         this.modules = modules;
       }
       /** A reviewed composition is input; teardown and self-disposal never rewrite it. */
-      write() {
+      commit() {
+      }
+      importFailures = /* @__PURE__ */ new Map();
+      importFailure(name) {
+        return this.importFailures.has(name) ? { error: this.importFailures.get(name) } : void 0;
       }
       import(name) {
+        this.importFailures.delete(name);
+        const record3 = (error) => {
+          this.importFailures.set(name, error);
+          throw error;
+        };
+        try {
+          const imported = this.importRow(name);
+          return imported instanceof Promise ? imported.catch(record3) : imported;
+        } catch (error) {
+          return record3(error);
+        }
+      }
+      importRow(name) {
         if (name === PERSONA) return reviewedPersonaModule;
         if (name === AGENT_PRESETS) return defineReviewedAgentPresets(mountReviewedComposition);
         if (name === "cordis:group" || name === "@deepseek-ai/cordis-plugin-group") return ReviewedGroup;
@@ -12861,6 +14804,10 @@ var init_composition = __esm({
         if (name === "@deepseek-ai/dsh-skill-filesystem") return reviewedSkillModule();
         if (name === "@deepseek-ai/dsh-hooks-claude-code") return reviewedHookModule("claude-code", fileURLToPath3(this.base), this.spec.files);
         if (name === "@deepseek-ai/dsh-hooks-codex") return reviewedHookModule("codex", fileURLToPath3(this.base), this.spec.files);
+        const rowBridge = Object.hasOwn(compatibility_default.row_bridges, name) ? compatibility_default.row_bridges[name] : void 0;
+        if (rowBridge === "host-spine") return Object.freeze({ name, apply() {
+        } });
+        if (rowBridge === "cot-translation") return reviewedCotTranslationModule();
         if (UNSUPPORTED_ROWS.has(name)) throw new Error(`${name}: ${UNSUPPORTED_ROWS.get(name)}`);
         const module = this.modules.get(name);
         if (!module) throw new Error(`row requires ${JSON.stringify(name)}, absent from the reviewed module closure`);
@@ -12868,10 +14815,10 @@ var init_composition = __esm({
       }
       async importReviewed(module) {
         const root = fileURLToPath3(this.base);
-        const path = resolve3(root, module.path);
-        const inside = relative2(root, path);
+        const path2 = resolve4(root, module.path);
+        const inside = relative2(root, path2);
         if (inside.startsWith(`..${sep2}`) || inside === ".." || isAbsolute3(inside)) throw new Error("module escapes reviewed bundle");
-        if (this.spec.files[module.path] !== module.sha256 || digest(await readFile2(path)) !== module.sha256) throw new Error("module changed after review");
+        if (this.spec.files[module.path] !== module.sha256 || digest(await readFile2(path2)) !== module.sha256) throw new Error("module changed after review");
         return importReviewedModule(this.base, module.path);
       }
     };
@@ -12919,10 +14866,15 @@ var init_composition = __esm({
         validateInventory(this.tree.root);
         for (const entry of this.tree.entries()) {
           if (entry.disabled) continue;
-          if (!entry.fiber || entry.fiber.uid === null) throw new Error(`composition row ${JSON.stringify(entry.options.id ?? entry.options.name)} failed activation`);
+          const row = `composition row ${JSON.stringify(entry.options.id ?? entry.options.name)}`;
+          if (!entry.fiber || entry.fiber.uid === null) {
+            const failure = this.tree.importFailure(entry.options.name);
+            throw new Error(failure !== void 0 ? `${row} failed activation: ${describeCause(explainImportError(failure.error))}` : `${row} failed activation (${entry.fiber ? `fiber ${fiberStateName(entry.fiber.state)}` : "no fiber"}); see the logged error above`, failure !== void 0 ? { cause: failure.error } : void 0);
+          }
           await entry.fiber.await();
           const missing = Object.keys(entry.fiber.inject).filter((name) => entry.fiber.ctx.get(name) === void 0);
-          if (missing.length || entry.fiber.state !== FiberState.ACTIVE) throw new Error(`composition row ${JSON.stringify(entry.options.id ?? entry.options.name)} is not active`);
+          if (missing.length) throw new Error(`${row} requires ${describeMissingServices(missing)}`);
+          if (entry.fiber.state !== FiberState.ACTIVE) throw new Error(`${row} is not active (fiber ${fiberStateName(entry.fiber.state)})`);
         }
         const leaked = leakedServices(this.ctx, this.ctx.fiber);
         if (leaked.length) throw new Error(`composition published shared-root services: ${leaked.join(", ")}`);
@@ -12932,11 +14884,23 @@ var init_composition = __esm({
 });
 
 // src/protocol.generated.ts
-var MAGIC_ASCII;
+var MAGIC_ASCII, ErrorCode;
 var init_protocol_generated = __esm({
   "src/protocol.generated.ts"() {
     "use strict";
     MAGIC_ASCII = "CWX1";
+    ErrorCode = {
+      ParseError: -32700,
+      InvalidRequest: -32600,
+      MethodNotFound: -32601,
+      InvalidParams: -32602,
+      Internal: -32603,
+      ExecutionFailed: -32e3,
+      NotAvailable: -32001,
+      Refused: -32002,
+      Denied: -32003,
+      Cancelled: -32800
+    };
   }
 });
 
@@ -12952,10 +14916,88 @@ var init_protocol = __esm({
 });
 
 // src/rpc.ts
+var RpcError;
 var init_rpc = __esm({
   "src/rpc.ts"() {
     "use strict";
     init_protocol();
+    RpcError = class extends Error {
+      constructor(code, message, data2) {
+        super(message);
+        this.code = code;
+        this.data = data2;
+        this.name = "RpcError";
+      }
+      code;
+      data;
+      toWire() {
+        return this.data === void 0 ? { code: this.code, message: this.message } : { code: this.code, message: this.message, data: this.data };
+      }
+    };
+  }
+});
+
+// src/dsh/session-prompt.ts
+function checkpointCall(host, ctx, session2) {
+  const invocation = host.liveInvocation(ctx);
+  const ticket = invocation?.ticket;
+  return invocation !== void 0 && typeof ticket === "string" && ticket.length > 0 && session2 !== void 0 && session2 === invocation.session ? invocation : void 0;
+}
+var CHILD_ONLY, sessionsAdapter, systemPromptAdapter;
+var init_session_prompt = __esm({
+  "src/dsh/session-prompt.ts"() {
+    "use strict";
+    init_lib2();
+    init_protocol();
+    init_rpc();
+    CHILD_ONLY = "system prompt sections are only available on a child agent's agent/created context";
+    sessionsAdapter = {
+      service: "sessions",
+      define(host) {
+        class SessionsService extends Service {
+          constructor(ctx) {
+            super(ctx, "sessions");
+          }
+          async flush(session2) {
+            const ctx = this.ctx;
+            const call = checkpointCall(host, ctx, session2);
+            if (call === void 0) throw new RpcError(ErrorCode.NotAvailable, "sessions.flush requires this live tool invocation’s session");
+            const owner = call.owner;
+            const live = () => checkpointCall(host, ctx, session2) === call && !call.signal.aborted;
+            const run = async () => {
+              if (!live()) throw new RpcError(ErrorCode.NotAvailable, "session checkpoint invocation ended");
+              const result2 = await host.rpc.request("session/checkpoint", { owner: owner.ref, ticket: call.ticket }, call.signal);
+              if (!live()) throw new RpcError(ErrorCode.NotAvailable, "session checkpoint invocation ended");
+              if (typeof result2 !== "boolean") throw new RpcError(ErrorCode.Internal, "invalid session checkpoint receipt");
+              return result2;
+            };
+            const result = call.pending.then(run);
+            call.pending = result.then(() => void 0, () => void 0);
+            return result;
+          }
+        }
+        Object.freeze(SessionsService.prototype);
+        return SessionsService;
+      }
+    };
+    systemPromptAdapter = {
+      service: "systemPrompt",
+      define() {
+        class SystemPromptService extends Service {
+          constructor(ctx) {
+            super(ctx, "systemPrompt");
+          }
+          section() {
+            throw new RpcError(ErrorCode.NotAvailable, CHILD_ONLY);
+          }
+          getSectionOrder() {
+            throw new RpcError(ErrorCode.NotAvailable, CHILD_ONLY);
+          }
+        }
+        Object.freeze(SystemPromptService.prototype);
+        return SystemPromptService;
+      }
+    };
   }
 });
 
@@ -12971,7 +15013,7 @@ function assertNever(value, context) {
   throw new Error(`unreachable variant${context ? ` in ${context}` : ""}: ${rendered}`);
 }
 var SIMPLE_ESCAPES, CONTENT_ESCAPE, PartialArguments;
-var init_lib3 = __esm({
+var init_lib4 = __esm({
   "node_modules/@deepseek-ai/dsh-util-values/lib/index.js"() {
     SIMPLE_ESCAPES = {
       '"': '"',
@@ -12992,9 +15034,9 @@ var init_lib3 = __esm({
       * @param text - the complete argument JSON text.
       * @returns a sealed view.
       */
-      static fromText(text2) {
+      static fromText(text4) {
         const view = new PartialArguments2();
-        view.append(text2);
+        view.append(text4);
         view.sealed = true;
         return view;
       }
@@ -13058,15 +15100,15 @@ var init_lib3 = __esm({
       * @param text - the final argument text, which replaces missing or conflicting deltas.
       * @returns this view sealed with its caches retained when every character matches; otherwise a new sealed view.
       */
-      settle(text2) {
-        if (this.object !== void 0 || text2.length !== this.#size) return PartialArguments2.fromText(text2);
+      settle(text4) {
+        if (this.object !== void 0 || text4.length !== this.#size) return PartialArguments2.fromText(text4);
         let offset2 = 0;
         for (const chunk of this.chunks) {
-          if (!text2.startsWith(chunk, offset2)) return PartialArguments2.fromText(text2);
+          if (!text4.startsWith(chunk, offset2)) return PartialArguments2.fromText(text4);
           offset2 += chunk.length;
         }
-        this.chunks = text2.length === 0 ? [] : [text2];
-        this.#ends = text2.length === 0 ? [] : [text2.length];
+        this.chunks = text4.length === 0 ? [] : [text4];
+        this.#ends = text4.length === 0 ? [] : [text4.length];
         this.sealed = true;
         return this;
       }
@@ -13227,15 +15269,15 @@ var init_lib3 = __esm({
         const entry = this.#entries.get(key);
         if (entry?.kind !== "string") return void 0;
         if (entry.text === void 0 && entry.end >= 0 && entry.needsDecoding && entry.invalidAt === void 0) {
-          let text2;
+          let text4;
           try {
-            text2 = JSON.parse(`"${this.slice(entry.start, entry.end)}"`);
+            text4 = JSON.parse(`"${this.slice(entry.start, entry.end)}"`);
           } catch (_error) {
           }
-          if (text2 !== void 0) entry.text = {
+          if (text4 !== void 0) entry.text = {
             at: entry.end,
-            length: text2.length,
-            text: text2
+            length: text4.length,
+            text: text4
           };
         }
         const read = entry.text ??= {
@@ -13587,11 +15629,12 @@ var init_lib3 = __esm({
 });
 
 // src/dsh/dsh-message-compat.js
-var HarnessError, UserQuestionError;
+var PERSONA_PREFIX_SECTION, HarnessError, UserQuestionError;
 var init_dsh_message_compat = __esm({
   "src/dsh/dsh-message-compat.js"() {
     "use strict";
-    init_lib3();
+    init_lib4();
+    PERSONA_PREFIX_SECTION = "deployment:persona-prefix";
     HarnessError = class extends Error {
       code;
       constructor(message, code, options) {
@@ -13611,11 +15654,891 @@ var init_dsh_message_compat = __esm({
   }
 });
 
+// src/dsh/agents.ts
+function plain(value, allowed, what) {
+  if (value === null || typeof value !== "object" || Array.isArray(value) || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) throw new RpcError(ErrorCode.InvalidParams, `expected a plain ${what} object`);
+  const result = /* @__PURE__ */ Object.create(null);
+  for (const key of Reflect.ownKeys(value)) {
+    const descriptor2 = Object.getOwnPropertyDescriptor(value, key);
+    if (typeof key !== "string" || !allowed.includes(key) || !("value" in descriptor2)) throw new RpcError(ErrorCode.NotAvailable, `unsupported ${what} property ${String(key)}`);
+    if (descriptor2.value !== void 0) result[key] = descriptor2.value;
+  }
+  return result;
+}
+function defineSubagents(host) {
+  class SubagentsShim extends Service {
+    constructor(ctx) {
+      super(ctx, "subagents");
+    }
+    getProvider(name) {
+      return name === "spawn" ? SPAWN_PROVIDER : void 0;
+    }
+    async startActivation(request) {
+      const owner = host.ownerOf(this.ctx);
+      const input = plain(request, ["provider", "label", "childId", "request", "signal", "delivery"], "activation");
+      if (input.provider !== "spawn") throw new RpcError(ErrorCode.NotAvailable, "only the spawn provider is available");
+      const spawn = plain(input.request, ["parent", "prompt", "agentOptions"], "spawn request");
+      const options = spawn.agentOptions === void 0 ? {} : plain(spawn.agentOptions, ["model"], "agentOptions");
+      if (options.model !== void 0 && typeof options.model !== "string") throw new RpcError(ErrorCode.InvalidParams, "agentOptions.model must be a string");
+      const delivery = input.delivery === void 0 ? "parent" : input.delivery;
+      if (delivery !== "caller" && delivery !== "parent") throw new RpcError(ErrorCode.InvalidParams, "delivery must be caller or parent");
+      const childId = input.childId;
+      if (typeof childId !== "string" || !/^[A-Za-z0-9_.:-]{1,128}$/.test(childId)) throw new RpcError(ErrorCode.InvalidParams, "childId must be 1-128 letters, digits, or _.:-");
+      if (!Array.isArray(spawn.prompt) || spawn.prompt.length === 0) throw new RpcError(ErrorCode.InvalidParams, "prompt must be a non-empty content array");
+      const prompt = spawn.prompt.map((block) => {
+        const item = plain(block, ["type", "text"], "prompt block");
+        if (item.type !== "text" || typeof item.text !== "string") throw new RpcError(ErrorCode.NotAvailable, "only text prompt blocks are supported");
+        return item.text;
+      }).join("");
+      if (input.signal !== void 0 && !(input.signal instanceof AbortSignal)) throw new RpcError(ErrorCode.InvalidParams, "signal must be an AbortSignal");
+      const invocation = host.liveInvocation(this.ctx);
+      if (!invocation || invocation.agent === void 0 || spawn.parent !== invocation.agent) {
+        throw new RpcError(ErrorCode.NotAvailable, "startActivation requires the exact live calling agent as parent");
+      }
+      if (invocation.owner !== owner) throw new RpcError(ErrorCode.NotAvailable, "subagents service owner is no longer current");
+      if (invocation.delegated || invocation.subagentTicket === void 0) throw new RpcError(ErrorCode.NotAvailable, "child agents are only available to a root tool invocation");
+      const signal = input.signal === void 0 ? invocation.signal : AbortSignal.any([invocation.signal, input.signal]);
+      signal.throwIfAborted();
+      let persona;
+      const denied = /* @__PURE__ */ new Set();
+      let open = true;
+      const sealed = () => {
+        if (!open) throw new RpcError(ErrorCode.NotAvailable, "the child creation window has closed");
+      };
+      const child = Object.freeze({
+        id: childId,
+        ctx: Object.freeze({
+          systemPrompt: Object.freeze({
+            getSectionOrder(name) {
+              sealed();
+              if (name !== "DEPLOYMENT_PERSONA_PREFIX") throw new RpcError(ErrorCode.NotAvailable, "only the deployment persona slot is available");
+              return PERSONA_ORDER;
+            },
+            section(section) {
+              sealed();
+              const value = plain(section, ["name", "order", "text"], "system prompt section");
+              if (value.name !== PERSONA_PREFIX_SECTION || value.order !== PERSONA_ORDER || typeof value.text !== "string") {
+                throw new RpcError(ErrorCode.NotAvailable, "only the child deployment persona section is supported");
+              }
+              if (persona !== void 0) throw new RpcError(ErrorCode.InvalidParams, "the child persona is already set");
+              if (Buffer.byteLength(value.text) > 32 * 1024) throw new RpcError(ErrorCode.InvalidParams, "child persona exceeds 32768 bytes");
+              persona = value.text;
+              return () => void 0;
+            }
+          }),
+          tools: Object.freeze({
+            restrict(filter) {
+              sealed();
+              const value = plain(filter, ["deny"], "tool filter");
+              if (!Array.isArray(value.deny) || value.deny.some((name) => typeof name !== "string" || name === "")) throw new RpcError(ErrorCode.InvalidParams, "deny must be a list of tool names");
+              for (const name of value.deny) denied.add(name);
+              return () => void 0;
+            }
+          })
+        })
+      });
+      const listeners = (this.ctx.root?.events?._hooks?.["agent/created"] ?? []).filter((hook) => !hook.global && hook.ctx !== void 0 && host.ownerOf(hook.ctx) === owner).map((hook) => hook.callback);
+      try {
+        await Promise.all(listeners.map(async (callback) => callback({ agent: child })));
+      } finally {
+        open = false;
+      }
+      signal.throwIfAborted();
+      const call = invocation;
+      const rpc = (method, params, abort) => host.rpc.request(method, { owner: call.owner.ref, ticket: call.subagentTicket, child_id: childId, ...params }, abort);
+      const started = await rpc("subagent/start", {
+        prompt,
+        ...options.model === void 0 ? {} : { model: options.model },
+        ...persona === void 0 ? {} : { persona },
+        denied_tools: [...denied],
+        delivery
+      }, signal);
+      if (started === null || typeof started !== "object" || started.child_id !== childId || typeof started.message_id !== "string") {
+        throw new RpcError(ErrorCode.Internal, "invalid child activation receipt");
+      }
+      let result;
+      let disposed;
+      return Object.freeze({
+        childId,
+        messageId: started.message_id,
+        get result() {
+          result ??= rpc("subagent/result", {}, call.signal).then((value) => {
+            if (value === null || typeof value !== "object" || typeof value.stop_reason !== "string" || !Array.isArray(value.output)) {
+              throw new RpcError(ErrorCode.Internal, "invalid child result receipt");
+            }
+            return Object.freeze({
+              stopReason: value.stop_reason,
+              output: Object.freeze(value.output.map((block) => Object.freeze({ type: "text", text: String(block.text) }))),
+              ...value.omitted_blocks > 0 ? { diagnostic: `${value.omitted_blocks} non-text output block(s) are not supported` } : {}
+            });
+          });
+          return result;
+        },
+        dispose() {
+          disposed ??= rpc("subagent/dispose", {}, call.signal).then(() => void 0);
+          return disposed;
+        }
+      });
+    }
+  }
+  Object.freeze(SubagentsShim.prototype);
+  return SubagentsShim;
+}
+function defineAgents() {
+  class AgentsShim extends Service {
+    constructor(ctx) {
+      super(ctx, "agents");
+    }
+  }
+  Object.freeze(AgentsShim.prototype);
+  return AgentsShim;
+}
+var SPAWN_PROVIDER, PERSONA_ORDER, DSH_AGENT_ADAPTERS;
+var init_agents = __esm({
+  "src/dsh/agents.ts"() {
+    "use strict";
+    init_lib2();
+    init_protocol();
+    init_rpc();
+    init_dsh_message_compat();
+    SPAWN_PROVIDER = Object.freeze({
+      name: "spawn",
+      inheritsParentContext: false,
+      capabilities: Object.freeze({ persona: true, toolFilter: true, agentOptions: true })
+    });
+    PERSONA_ORDER = 0;
+    DSH_AGENT_ADAPTERS = Object.freeze([
+      { service: "subagents", define: defineSubagents },
+      { service: "agents", define: defineAgents }
+    ]);
+  }
+});
+
+// src/dsh/remote.ts
+function label(value) {
+  if (value === void 0) return void 0;
+  if (typeof value !== "string") throw new RpcError(ErrorCode.InvalidParams, "remote.pair label must be a string");
+  return value;
+}
+function grant(value) {
+  if (typeof value !== "string" || value.length === 0 || value.length > 128) throw new RpcError(ErrorCode.InvalidParams, "remote.revoke needs the grant id remote.pair returned");
+  return value;
+}
+var remoteAdapter;
+var init_remote = __esm({
+  "src/dsh/remote.ts"() {
+    "use strict";
+    init_lib2();
+    init_protocol();
+    init_rpc();
+    remoteAdapter = {
+      service: "remote",
+      define(host) {
+        class RemoteService extends Service {
+          constructor(ctx) {
+            super(ctx, "remote");
+          }
+          status() {
+            return host.broker(this.ctx, "remote", "status", {});
+          }
+          pair(options) {
+            const value = label(options?.label);
+            return host.broker(this.ctx, "remote", "pair", value === void 0 ? {} : { label: value });
+          }
+          clients() {
+            return host.broker(this.ctx, "remote", "clients", {});
+          }
+          revoke(id) {
+            return host.broker(this.ctx, "remote", "revoke", { grant: grant(id) });
+          }
+        }
+        Object.freeze(RemoteService.prototype);
+        return RemoteService;
+      }
+    };
+  }
+});
+
+// src/dsh/workspace.ts
+function invalid(message) {
+  throw new RpcError(ErrorCode.InvalidParams, message);
+}
+function path(value) {
+  if (typeof value !== "string" || value.length === 0 || value.length > MAX_PATH || value.trim() !== value || /[\x00-\x1f\x7f]/.test(value)) {
+    invalid(`a path is 1 to ${MAX_PATH} characters on one line with no surrounding spaces`);
+  }
+  return value;
+}
+function bounded(value, what, min, max) {
+  if (value === void 0) return void 0;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < min || value > max) invalid(`${what} is an integer between ${min} and ${max}`);
+  return value;
+}
+function argv(value) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_ARGV || value.some((arg) => typeof arg !== "string" || arg.length > MAX_ARG || /[\x00-\x1f\x7f]/.test(arg))) {
+    invalid(`argv is 1 to ${MAX_ARGV} strings of at most ${MAX_ARG} characters`);
+  }
+  return [...value];
+}
+function compact(input) {
+  return Object.fromEntries(Object.entries(input).filter(([, value]) => value !== void 0));
+}
+var MAX_PATH, MAX_WRITE, MAX_ARGV, MAX_ARG, workspaceAdapter;
+var init_workspace = __esm({
+  "src/dsh/workspace.ts"() {
+    "use strict";
+    init_lib2();
+    init_protocol();
+    init_rpc();
+    MAX_PATH = 512;
+    MAX_WRITE = 1024 * 1024;
+    MAX_ARGV = 9;
+    MAX_ARG = 1024;
+    workspaceAdapter = {
+      service: "workspace",
+      define(host) {
+        class WorkspaceService extends Service {
+          constructor(ctx) {
+            super(ctx, "workspace");
+          }
+          read(file, options) {
+            return host.broker(this.ctx, "workspace", "read", compact({
+              path: path(file),
+              start_line: bounded(options?.startLine, "startLine", 1, Number.MAX_SAFE_INTEGER),
+              max_lines: bounded(options?.maxLines, "maxLines", 1, 1e4)
+            }));
+          }
+          list(dir) {
+            return host.broker(this.ctx, "workspace", "list", compact({ path: dir === void 0 ? void 0 : path(dir) }));
+          }
+          write(file, content, options) {
+            if (typeof content !== "string" || Buffer.byteLength(content) > MAX_WRITE) invalid(`content is a string of at most ${MAX_WRITE} bytes`);
+            const hash2 = options?.expectedHash;
+            if (hash2 !== void 0 && (typeof hash2 !== "string" || hash2.length === 0 || hash2.length > 128)) invalid("expectedHash is 1 to 128 characters");
+            return host.broker(this.ctx, "workspace", "write", compact({ path: path(file), content, expected_hash: hash2 }));
+          }
+          exec(command, options) {
+            return host.broker(this.ctx, "workspace", "exec", compact({
+              argv: argv(command),
+              cwd: options?.cwd === void 0 ? void 0 : path(options.cwd)
+            }));
+          }
+        }
+        Object.freeze(WorkspaceService.prototype);
+        return WorkspaceService;
+      }
+    };
+  }
+});
+
+// src/dsh/llm.ts
+function catalogOf(value) {
+  const catalog = value;
+  if (catalog === null || typeof catalog !== "object" || !Array.isArray(catalog.providers) || !Array.isArray(catalog.models) || catalog.models.some((model) => model === null || typeof model !== "object" || typeof model.id !== "string" || typeof model.provider !== "string")) {
+    throw new RpcError(ErrorCode.Internal, "invalid llm broker catalog");
+  }
+  return catalog;
+}
+function completionOf(value) {
+  const completion = value;
+  if (completion === null || typeof completion !== "object" || typeof completion.text !== "string" || typeof completion.finish !== "string" || completion.finish.length === 0 || completion.usage === null || typeof completion.usage !== "object" || typeof completion.usage.coverage !== "string") {
+    throw new RpcError(ErrorCode.Internal, "invalid llm broker completion");
+  }
+  return completion;
+}
+function textOf(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) throw invalid2("the llm broker takes text message content");
+  return content.map((block) => {
+    if (block === null || typeof block !== "object" || block.type !== "text" || typeof block.text !== "string") {
+      throw invalid2("the llm broker takes text blocks only; images, files and tool calls are not brokered");
+    }
+    return block.text;
+  }).join("");
+}
+function promptOf(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) throw invalid2("the llm broker needs at least one message");
+  const turns = messages.map((message) => {
+    if (message === null || typeof message !== "object" || typeof message.role !== "string") throw invalid2("each message has a role and content");
+    if (message.role === "tool") throw invalid2("tool results are not brokered");
+    return { role: message.role, text: textOf(message.content) };
+  });
+  const only = turns.length === 1 ? turns[0] : void 0;
+  if (only !== void 0 && only.role === "user") return only.text;
+  return turns.map((turn) => `${turn.role}: ${turn.text}`).join("\n\n");
+}
+function modelInfo(model) {
+  return {
+    provider: model.provider,
+    id: model.id,
+    name: model.name,
+    inputModalities: ["text"],
+    ...typeof model.context_window === "number" ? { context: { contextWindow: model.context_window } } : {},
+    defaultMaxTokens: model.default_max_output_tokens
+  };
+}
+function usageChunk(usage) {
+  if (usage.coverage !== "reported" || typeof usage.input_tokens !== "number" || typeof usage.output_tokens !== "number") return void 0;
+  return {
+    type: "usage",
+    usage: {
+      inputTokens: usage.input_tokens,
+      outputTokens: usage.output_tokens,
+      totalTokens: usage.input_tokens + usage.output_tokens,
+      ...typeof usage.cache_read_tokens === "number" ? { cacheReadTokens: usage.cache_read_tokens } : {},
+      ...typeof usage.cache_write_tokens === "number" ? { cacheWriteTokens: usage.cache_write_tokens } : {},
+      ...typeof usage.reasoning_tokens === "number" ? { reasoningTokens: usage.reasoning_tokens } : {}
+    }
+  };
+}
+var invalid2, notBrokered, llmAdapter;
+var init_llm = __esm({
+  "src/dsh/llm.ts"() {
+    "use strict";
+    init_lib2();
+    init_protocol();
+    init_rpc();
+    invalid2 = (message) => new RpcError(ErrorCode.InvalidParams, message);
+    notBrokered = (method) => {
+      throw new RpcError(ErrorCode.NotAvailable, `llm.${method} is not available: Codewhale brokers model calls on the session's approved route and registers no plugin adapters, providers or keys`);
+    };
+    llmAdapter = {
+      service: "llm",
+      define(host) {
+        class LlmService extends Service {
+          constructor(ctx) {
+            super(ctx, "llm");
+          }
+          async catalog() {
+            return catalogOf(await host.broker(this.ctx, "llm", "catalog", {}));
+          }
+          async complete(input) {
+            if (input === null || typeof input !== "object" || typeof input.prompt !== "string") throw invalid2("llm.complete takes { prompt }");
+            if (input.system !== void 0 && typeof input.system !== "string") throw invalid2("system must be a string");
+            if (input.provider !== void 0 && typeof input.provider !== "string") throw invalid2("provider must be a string");
+            if (input.model !== void 0 && typeof input.model !== "string") throw invalid2("model must be a string");
+            if (input.maxTokens !== void 0 && (typeof input.maxTokens !== "number" || !Number.isInteger(input.maxTokens) || input.maxTokens <= 0 || input.maxTokens > 4294967295)) {
+              throw invalid2("maxTokens must be a positive integer");
+            }
+            if (input.timeoutMs !== void 0 && (typeof input.timeoutMs !== "number" || !Number.isSafeInteger(input.timeoutMs) || input.timeoutMs <= 0)) {
+              throw invalid2("timeoutMs must be a positive integer");
+            }
+            return completionOf(await host.broker(this.ctx, "llm", "complete", {
+              prompt: input.prompt,
+              ...input.system !== void 0 ? { system: input.system } : {},
+              ...input.provider !== void 0 ? { provider: input.provider } : {},
+              ...input.model !== void 0 ? { model: input.model } : {},
+              ...input.maxTokens !== void 0 ? { max_output_tokens: input.maxTokens } : {},
+              ...input.timeoutMs !== void 0 ? { timeout_ms: input.timeoutMs } : {}
+            }));
+          }
+          async listModels(provider) {
+            const catalog = await this.catalog();
+            return catalog.models.filter((model) => model.provider === provider).map(modelInfo);
+          }
+          async resolveModelInfo(provider, model) {
+            const found = (await this.catalog()).models.find((candidate) => candidate.provider === provider && candidate.id === model);
+            if (found === void 0) throw new RpcError(ErrorCode.NotAvailable, "the llm broker serves only the models in its catalog");
+            return modelInfo(found);
+          }
+          async *stream(options) {
+            if (options === null || typeof options !== "object") throw invalid2("llm.stream takes generate options");
+            if (options.tools !== void 0 && (!Array.isArray(options.tools) || options.tools.length > 0) || options.toolHistory !== void 0) throw invalid2("the llm broker runs text completions without tools");
+            const prompt = promptOf(options.messages);
+            if (options.system !== void 0 && typeof options.system !== "string") throw invalid2("system must be a string");
+            if (options.provider !== void 0 && typeof options.provider !== "string") throw invalid2("provider must be a string");
+            if (options.model !== void 0 && typeof options.model !== "string") throw invalid2("model must be a string");
+            if (options.maxTokens !== void 0 && (typeof options.maxTokens !== "number" || !Number.isInteger(options.maxTokens) || options.maxTokens <= 0 || options.maxTokens > 4294967295)) {
+              throw invalid2("maxTokens must be a positive integer");
+            }
+            const isAborted = () => options.signal?.aborted === true;
+            const aborted = () => ({ type: "finish", reason: { kind: "aborted", failure: { message: "the model call was aborted", code: "ABORTED" } } });
+            if (isAborted()) {
+              yield aborted();
+              return;
+            }
+            let completion;
+            try {
+              completion = await this.complete({
+                prompt,
+                ...options.system !== void 0 ? { system: options.system } : {},
+                ...options.provider !== void 0 ? { provider: options.provider } : {},
+                ...options.model !== void 0 ? { model: options.model } : {},
+                ...options.maxTokens !== void 0 ? { maxTokens: options.maxTokens } : {}
+              });
+            } catch (error) {
+              if (isAborted()) {
+                yield aborted();
+                return;
+              }
+              const message = error instanceof Error ? error.message : "the model call did not complete";
+              yield { type: "finish", reason: { kind: "error", failure: { message, code: "BROKER_REFUSED" } } };
+              return;
+            }
+            if (isAborted()) {
+              yield aborted();
+              return;
+            }
+            yield { type: "block-start", index: 0, blockType: "text" };
+            yield { type: "text-delta", index: 0, text: completion.text };
+            yield { type: "block-end", index: 0, block: { type: "text", text: completion.text } };
+            const usage = usageChunk(completion.usage);
+            if (usage !== void 0) yield usage;
+            yield { type: "finish", reason: { kind: "stop" } };
+          }
+          listProviders() {
+            return notBrokered("listProviders");
+          }
+          registerAdapter() {
+            return notBrokered("registerAdapter");
+          }
+          registerConfigurableProviders() {
+            return notBrokered("registerConfigurableProviders");
+          }
+          listConfigurableProviders() {
+            return notBrokered("listConfigurableProviders");
+          }
+          registerModelDiscovery() {
+            return notBrokered("registerModelDiscovery");
+          }
+          discoverModels() {
+            return notBrokered("discoverModels");
+          }
+          prepareCall() {
+            return notBrokered("prepareCall");
+          }
+          resolveCallConfig() {
+            return notBrokered("resolveCallConfig");
+          }
+        }
+        Object.freeze(LlmService.prototype);
+        return LlmService;
+      }
+    };
+  }
+});
+
+// src/dsh/network.ts
+function credentialRef(ref2) {
+  if (typeof ref2 !== "string" || ref2.length === 0) throw new RpcError(ErrorCode.InvalidParams, "a credential ref is a non-empty string");
+  return ref2;
+}
+function credentialSite(site) {
+  let url;
+  try {
+    url = new URL(String(site));
+  } catch {
+    throw new RpcError(ErrorCode.InvalidParams, "a credential is stored for one https site, such as https://api.example.com");
+  }
+  if (typeof site !== "string" || url.protocol !== "https:" || url.username !== "" || url.password !== "" || url.pathname !== "/" || url.search !== "" || url.hash !== "") {
+    throw new RpcError(ErrorCode.InvalidParams, "a credential is stored for one https site, such as https://api.example.com");
+  }
+  return url.origin;
+}
+function brokered(value) {
+  const response = value;
+  if (response === null || typeof response !== "object" || typeof response.status !== "number" || typeof response.url !== "string" || typeof response.body_base64 !== "string" || !Array.isArray(response.headers)) {
+    throw new RpcError(ErrorCode.Internal, "invalid network broker response");
+  }
+  return response;
+}
+async function requestBody(body) {
+  if (body === void 0 || body === null) return void 0;
+  if (typeof body === "string") return Buffer.from(body, "utf8").toString("base64");
+  if (body instanceof ArrayBuffer) return Buffer.from(body).toString("base64");
+  if (ArrayBuffer.isView(body)) return Buffer.from(body.buffer, body.byteOffset, body.byteLength).toString("base64");
+  if (body instanceof URLSearchParams) return Buffer.from(body.toString(), "utf8").toString("base64");
+  if (body instanceof Blob) return Buffer.from(await body.arrayBuffer()).toString("base64");
+  throw new RpcError(ErrorCode.InvalidParams, "the network broker sends string, binary, URLSearchParams or Blob bodies");
+}
+async function brokeredFetch(host, ctx, input, init = {}) {
+  const request = input instanceof Request ? input : void 0;
+  const url = request?.url ?? String(input);
+  const headers = new Headers(request?.headers);
+  new Headers(init.headers).forEach((value, name) => headers.set(name, value));
+  const body = init.body !== void 0 ? init.body : request !== void 0 && request.body !== null ? await request.arrayBuffer() : void 0;
+  const result = brokered(await host.broker(ctx, "network", "fetch", {
+    url,
+    method: init.method ?? request?.method ?? "GET",
+    headers: [...headers.entries()],
+    body_base64: await requestBody(body)
+  }));
+  const bytes = Buffer.from(result.body_base64, "base64");
+  const nullBody = [101, 204, 205, 304].includes(result.status);
+  const response = new Response(nullBody ? null : bytes, { status: result.status, headers: result.headers });
+  Object.defineProperty(response, "url", { value: result.url });
+  Object.defineProperty(response, "redirected", { value: result.redirected === true });
+  return response;
+}
+var CREDENTIAL_HANDLE_PREFIX, credentialsAdapter;
+var init_network = __esm({
+  "src/dsh/network.ts"() {
+    "use strict";
+    init_lib2();
+    init_protocol();
+    init_rpc();
+    CREDENTIAL_HANDLE_PREFIX = "codewhale-credential:";
+    credentialsAdapter = {
+      service: "credentials",
+      define(host) {
+        class CredentialsService extends Service {
+          constructor(ctx) {
+            super(ctx, "credentials");
+          }
+          async resolve(ref2) {
+            const result = await host.broker(this.ctx, "network", "credentials.resolve", { ref: credentialRef(ref2) });
+            const value = result?.value;
+            if (value === null || value === void 0) return void 0;
+            if (typeof value !== "string" || !value.startsWith(CREDENTIAL_HANDLE_PREFIX)) throw new RpcError(ErrorCode.Internal, "invalid credential handle");
+            return { value };
+          }
+          async describe(ref2) {
+            const result = await host.broker(this.ctx, "network", "credentials.describe", { ref: credentialRef(ref2) });
+            if (result === null || typeof result !== "object" || typeof result.set !== "boolean") throw new RpcError(ErrorCode.Internal, "invalid credential description");
+            return typeof result.site === "string" ? { ref: credentialRef(ref2), set: result.set, site: result.site } : { ref: credentialRef(ref2), set: result.set };
+          }
+          async set(ref2, value, site) {
+            if (typeof value !== "string" || value.length === 0) throw new RpcError(ErrorCode.InvalidParams, "a credential value is a non-empty string");
+            await host.broker(this.ctx, "network", "credentials.set", { ref: credentialRef(ref2), value, site: credentialSite(site) });
+          }
+          fetch(input, init) {
+            return brokeredFetch(host, this.ctx, input, init);
+          }
+        }
+        Object.freeze(CredentialsService.prototype);
+        return CredentialsService;
+      }
+    };
+  }
+});
+
+// src/dsh/settings.ts
+function plain2(value, what) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new RpcError(ErrorCode.InvalidParams, `${what} is a plain object`);
+  return value;
+}
+function revision(value) {
+  if (value === void 0) return void 0;
+  if (typeof value !== "string" || value.length === 0) throw new RpcError(ErrorCode.InvalidParams, "an expected revision is the revision string describe returned");
+  return value;
+}
+function descriptor(value) {
+  const row = value;
+  if (row === null || typeof row !== "object" || typeof row.ns !== "string" || typeof row.revision !== "string" || typeof row.writable !== "boolean" || !Array.isArray(row.roots) || typeof row.value !== "object" || row.value === null || row.applies !== "reload") {
+    throw new RpcError(ErrorCode.Internal, "invalid settings broker response");
+  }
+  return { ns: row.ns, writable: row.writable, roots: row.roots.map(String), value: row.value, revision: row.revision, applied: typeof row.applied === "boolean" ? row.applied : null, applies: "reload" };
+}
+var SettingsConflictError, settingsAdapter;
+var init_settings = __esm({
+  "src/dsh/settings.ts"() {
+    "use strict";
+    init_lib2();
+    init_protocol();
+    init_rpc();
+    SettingsConflictError = class extends Error {
+      constructor(ns, expected, actual) {
+        super(`settings namespace "${ns}" changed since it was read`);
+        this.ns = ns;
+        this.expected = expected;
+        this.actual = actual;
+        this.name = "SettingsConflictError";
+      }
+      ns;
+      expected;
+      actual;
+      code = "SETTINGS_CONFLICT";
+    };
+    settingsAdapter = {
+      service: "settings",
+      define(host) {
+        class SettingsService extends Service {
+          constructor(ctx) {
+            super(ctx, "settings");
+          }
+          describe() {
+            host.brokerTicket(this.ctx, "settings");
+            return host.broker(this.ctx, "settings", "describe", {}).then((row) => [descriptor(row)]);
+          }
+          async update(ns, patch, expectedRevision) {
+            return this.write(ns, "update", { patch: plain2(patch, "a settings patch") }, expectedRevision);
+          }
+          async replace(ns, section, expectedRevision) {
+            return this.write(ns, "replace", { value: plain2(section, "a settings section") }, expectedRevision);
+          }
+          async mutate(ns, ops, expectedRevision) {
+            if (!Array.isArray(ops)) throw new RpcError(ErrorCode.InvalidParams, "settings edits are an array of path operations");
+            return this.write(ns, "mutate", { ops }, expectedRevision);
+          }
+          async write(ns, method, input, expectedRevision) {
+            if (typeof ns !== "string" || ns.length === 0) throw new RpcError(ErrorCode.InvalidParams, "a settings namespace is a non-empty string");
+            const owner = host.ownerOf(this.ctx);
+            if (owner === void 0 || ns !== owner.pluginName) throw new RpcError(ErrorCode.Refused, "a plugin may edit only its own settings namespace");
+            const expected = revision(expectedRevision);
+            const result = await host.broker(this.ctx, "settings", method, expected === void 0 ? input : { ...input, expected_revision: expected });
+            if (result === null || typeof result !== "object" || typeof result.written !== "boolean" || typeof result.revision !== "string") throw new RpcError(ErrorCode.Internal, "invalid settings broker response");
+            if (result.conflict === true) throw new SettingsConflictError(ns, expected, result.revision);
+            return { written: result.written, revision: result.revision, applies: "reload" };
+          }
+        }
+        Object.freeze(SettingsService.prototype);
+        return SettingsService;
+      }
+    };
+  }
+});
+
+// src/dsh/catalog.ts
+function invalid3(what) {
+  return new RpcError(ErrorCode.Internal, `invalid catalog broker ${what}`);
+}
+function record2(value, what) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) throw invalid3(what);
+  return value;
+}
+function text(value, what) {
+  if (typeof value !== "string" || value.length === 0) throw invalid3(what);
+  return value;
+}
+function named(value, what) {
+  if (typeof value !== "string" || value.length === 0) throw new RpcError(ErrorCode.InvalidParams, `${what} is a non-empty string`);
+  return value;
+}
+async function accountBalance(host, ctx) {
+  const answer = record2(await host.broker(ctx, "catalog", "balance", {}), "balance");
+  const status = answer.status;
+  if (status === "unknown" || status === "absent") return { status };
+  const toppedUp = answer.topped_up;
+  const granted = answer.granted;
+  if (status !== "known" || typeof toppedUp !== "string" || typeof granted !== "string") throw invalid3("balance");
+  return { status, currency: text(answer.currency, "balance"), total: text(answer.total, "balance"), topped_up: toppedUp, granted };
+}
+async function planInstall(host, ctx, spec, registry) {
+  const exact = typeof spec === "string" ? spec.lastIndexOf("@") : -1;
+  if (typeof spec !== "string" || exact <= 0 || exact === spec.length - 1) throw new RpcError(ErrorCode.InvalidParams, EXACT_VERSION_ONLY);
+  const request = { package: spec.slice(0, exact), version: spec.slice(exact + 1) };
+  const input = registry === void 0 || registry === null ? request : { ...request, registry: named(registry, "a registry URL") };
+  const plan = record2(await host.broker(ctx, "catalog", "install.plan", input), "install plan");
+  const status = plan.status;
+  const planned = plan.spec;
+  if (status !== "review_required" && status !== "already_present" || planned !== void 0 && typeof planned !== "string") throw invalid3("install plan");
+  return {
+    status,
+    package: text(plan.package, "install plan"),
+    version: text(plan.version, "install plan"),
+    plugin: text(plan.plugin, "install plan"),
+    ...planned === void 0 ? {} : { spec: planned },
+    command: text(plan.command, "install plan"),
+    message: text(plan.message, "install plan")
+  };
+}
+function notChanged(stage, target, code, diagnostic) {
+  return { changed: false, application: "failed", stage, target: typeof target === "string" ? target : "", error: { code, diagnostic, message: diagnostic } };
+}
+function declined(error) {
+  if (!(error instanceof Error)) return void 0;
+  if (error instanceof RpcError && error.code === ErrorCode.InvalidParams && error.data === void 0) return error.message;
+  const refusal = error.data?.dsh_refusal;
+  return refusal === "refused" || refusal === "invalid_input" ? error.message : void 0;
+}
+var EXACT_VERSION_ONLY, REMOVE_IN_CODEWHALE, WITHHELD_ACCOUNT_METHODS, pluginManagerAdapter, deepseekAccountAdapter;
+var init_catalog = __esm({
+  "src/dsh/catalog.ts"() {
+    "use strict";
+    init_lib2();
+    init_protocol();
+    init_rpc();
+    EXACT_VERSION_ONLY = "Codewhale plans a plugin install only for one exact npm version, written name@1.2.3";
+    REMOVE_IN_CODEWHALE = "Codewhale removes a plugin only from its own plugin manager, after you disable it: /plugin uninstall";
+    WITHHELD_ACCOUNT_METHODS = [
+      "getState",
+      "getProfile",
+      "getUnnotifiedBonuses",
+      "ackBonusNotified",
+      "startSignIn",
+      "cancelSignIn",
+      "signOut",
+      "watch",
+      "resolveToken",
+      "rejectToken",
+      "getPlatformSession",
+      "getDeviceIdentity"
+    ];
+    pluginManagerAdapter = {
+      service: "pluginManager",
+      define(host) {
+        class PluginManagerService extends Service {
+          constructor(ctx) {
+            super(ctx, "pluginManager");
+          }
+          async installBundle(spec, options) {
+            try {
+              const plan = await planInstall(host, this.ctx, spec, options?.registry);
+              return notChanged("install", spec, plan.status === "already_present" ? "already-installed" : "management-required", plan.message);
+            } catch (error) {
+              const diagnostic = declined(error);
+              if (diagnostic === void 0) throw error;
+              return notChanged("install", spec, "invalid-spec", diagnostic);
+            }
+          }
+          async removeBundle(target) {
+            return notChanged("remove", target, "management-required", REMOVE_IN_CODEWHALE);
+          }
+          async cancelInstall() {
+            return { status: "not-running" };
+          }
+        }
+        Object.freeze(PluginManagerService.prototype);
+        return PluginManagerService;
+      }
+    };
+    deepseekAccountAdapter = {
+      service: "deepseekAccount",
+      define(host) {
+        class DeepSeekAccountService extends Service {
+          constructor(ctx) {
+            super(ctx, "deepseekAccount");
+          }
+          async getBalance() {
+            const answer = await accountBalance(host, this.ctx);
+            if (answer.status === "absent") return null;
+            if (answer.status === "unknown") return { status: "failed" };
+            const { currency, total, topped_up: toppedUp, granted } = answer;
+            const wallet = (balance) => balance.length > 0 ? [{ currency, balance }] : [];
+            return { status: "ready", value: wallet(toppedUp.length > 0 ? toppedUp : total), bonusWallets: wallet(granted) };
+          }
+        }
+        for (const method of WITHHELD_ACCOUNT_METHODS) {
+          Object.defineProperty(DeepSeekAccountService.prototype, method, {
+            value() {
+              throw new RpcError(ErrorCode.NotAvailable, `deepseekAccount.${method} is not provided: Codewhale answers a read-only balance and never gives a plugin an account credential or a sign-in`);
+            }
+          });
+        }
+        Object.freeze(DeepSeekAccountService.prototype);
+        return DeepSeekAccountService;
+      }
+    };
+  }
+});
+
+// src/dsh/terminal.ts
+function invalid4(message) {
+  throw new RpcError(ErrorCode.InvalidParams, message);
+}
+function session(value) {
+  if (typeof value !== "string" || !SESSION.test(value)) invalid4("a terminal name is 1 to 64 letters, digits, `_`, `-` or `.`");
+  return value;
+}
+function text2(value, what) {
+  if (typeof value !== "string" || value.length === 0) invalid4(`${what} is a non-empty string`);
+  return value;
+}
+function bounded2(value, what, min, max) {
+  if (value === void 0) return void 0;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < min || value > max) invalid4(`${what} is an integer between ${min} and ${max}`);
+  return value;
+}
+function compact2(input) {
+  return Object.fromEntries(Object.entries(input).filter(([, value]) => value !== void 0));
+}
+var SESSION, terminalAdapter;
+var init_terminal = __esm({
+  "src/dsh/terminal.ts"() {
+    "use strict";
+    init_lib2();
+    init_protocol();
+    init_rpc();
+    SESSION = /^[A-Za-z0-9._-]{1,64}$/;
+    terminalAdapter = {
+      service: "terminal",
+      define(host) {
+        class TerminalService extends Service {
+          constructor(ctx) {
+            super(ctx, "terminal");
+          }
+          list() {
+            return host.broker(this.ctx, "terminal", "list", {});
+          }
+          run(command, options) {
+            return host.broker(this.ctx, "terminal", "run", compact2({
+              command: text2(command, "a command"),
+              session: options?.session === void 0 ? void 0 : session(options.session),
+              timeout_secs: bounded2(options?.timeoutSecs, "timeoutSecs", 1, 600)
+            }));
+          }
+          send(name, input, options) {
+            return host.broker(this.ctx, "terminal", "send", compact2({
+              session: session(name),
+              text: text2(input, "terminal input"),
+              wait_ms: bounded2(options?.waitMs, "waitMs", 0, 6e4)
+            }));
+          }
+          wait(name, options) {
+            return host.broker(this.ctx, "terminal", "wait", compact2({
+              session: session(name),
+              timeout_secs: bounded2(options?.timeoutSecs, "timeoutSecs", 1, 600)
+            }));
+          }
+          cancel(name) {
+            return host.broker(this.ctx, "terminal", "cancel", { session: session(name) });
+          }
+          reset(name) {
+            return host.broker(this.ctx, "terminal", "reset", { session: session(name) });
+          }
+        }
+        Object.freeze(TerminalService.prototype);
+        return TerminalService;
+      }
+    };
+  }
+});
+
+// src/dsh/plugin-manager.ts
+var init_plugin_manager = __esm({
+  "src/dsh/plugin-manager.ts"() {
+    "use strict";
+    init_protocol();
+    init_rpc();
+  }
+});
+
+// src/dsh/adapters.ts
+var DSH_ADAPTERS;
+var init_adapters = __esm({
+  "src/dsh/adapters.ts"() {
+    "use strict";
+    init_session_prompt();
+    init_agents();
+    init_remote();
+    init_workspace();
+    init_llm();
+    init_network();
+    init_settings();
+    init_catalog();
+    init_terminal();
+    init_plugin_manager();
+    DSH_ADAPTERS = [
+      sessionsAdapter,
+      systemPromptAdapter,
+      ...DSH_AGENT_ADAPTERS,
+      remoteAdapter,
+      workspaceAdapter,
+      llmAdapter,
+      credentialsAdapter,
+      settingsAdapter,
+      pluginManagerAdapter,
+      deepseekAccountAdapter,
+      terminalAdapter
+    ];
+  }
+});
+
 // src/dsh/dsh-tools-compat.js
 var init_dsh_tools_compat = __esm({
   "src/dsh/dsh-tools-compat.js"() {
     "use strict";
-    init_lib3();
+    init_lib4();
   }
 });
 
@@ -13659,6 +16582,7 @@ var STORAGE_LIMITS, MAX_RECORD_BYTES;
 var init_storage = __esm({
   "src/shims/storage.ts"() {
     "use strict";
+    init_canonical_path();
     init_json();
     STORAGE_LIMITS = Object.freeze({ keyBytes: 128, valueBytes: 128 * 1024, totalBytes: 4 * 1024 * 1024, keys: 1024 });
     MAX_RECORD_BYTES = STORAGE_LIMITS.valueBytes + STORAGE_LIMITS.keyBytes * 6 + 128;
@@ -13692,15 +16616,17 @@ var init_commands = __esm({
 
 // src/root.ts
 import { AsyncLocalStorage as AsyncLocalStorage2 } from "node:async_hooks";
-var REFUSED_SERVICES, PROVIDED_SERVICES, ownerStorage;
+var CORDIS_SERVICES, ownerStorage;
 var init_root = __esm({
   "src/root.ts"() {
     "use strict";
     init_composition();
+    init_adapters();
     init_protocol();
     init_rpc();
     init_dsh_message_compat();
     init_resolve_hooks();
+    init_missing_services();
     init_compatibility();
     init_dsh_tools_compat();
     init_json();
@@ -13716,8 +16642,7 @@ var init_root = __esm({
     init_skills();
     init_tier();
     init_commands();
-    REFUSED_SERVICES = new Set(compatibility_default.refused_services);
-    PROVIDED_SERVICES = new Set(Object.values(compatibility_default.provided_services).flat());
+    CORDIS_SERVICES = new Set(compatibility_default.provided_services.cordis);
     ownerStorage = new AsyncLocalStorage2();
   }
 });
@@ -13731,11 +16656,11 @@ function normalizePersonaConfig(value) {
   if (config.includeRuntimeContext !== void 0 && config.includeRuntimeContext !== true) throw new TypeError("persona runtime-context suppression belongs to the Core prompt and cannot be imported");
   if (typeof config.prefix !== "string" || config.suffix !== void 0 && typeof config.suffix !== "string") throw new TypeError("persona prefix and suffix must be text");
   const result = { prefix: config.prefix, suffix: config.suffix ?? "" };
-  for (const [position, text2] of Object.entries(result)) {
-    if (Buffer.byteLength(text2, "utf8") > MAX_PROMPT_SECTION_BYTES) throw new RangeError("persona text exceeds 4096 UTF-8 bytes");
-    if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(text2)) throw new TypeError("persona text contains control characters");
-    validatePromptTemplate(text2);
-    if (text2.trim().length > 0) normalizePromptSection({ id: `persona-${position}`, text: text2, interpolate: "model-cwd" });
+  for (const [position, text4] of Object.entries(result)) {
+    if (Buffer.byteLength(text4, "utf8") > MAX_PROMPT_SECTION_BYTES) throw new RangeError("persona text exceeds 4096 UTF-8 bytes");
+    if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(text4)) throw new TypeError("persona text contains control characters");
+    validatePromptTemplate(text4);
+    if (text4.trim().length > 0) normalizePromptSection({ id: `persona-${position}`, text: text4, interpolate: "model-cwd" });
   }
   return Object.freeze(result);
 }
@@ -13752,8 +16677,8 @@ var init_persona = __esm({
       apply(ctx, value) {
         if (!ownerStorage.getStore()?.scope) throw new Error("persona requires an exact Core-selected entry scope");
         const config = normalizePersonaConfig(value);
-        for (const [position, text2] of Object.entries(config)) {
-          if (text2.trim().length > 0) ctx.prompt.registerSection({ id: `persona-${position}`, text: text2, interpolate: "model-cwd" });
+        for (const [position, text4] of Object.entries(config)) {
+          if (text4.trim().length > 0) ctx.prompt.registerSection({ id: `persona-${position}`, text: text4, interpolate: "model-cwd" });
         }
       }
     });
@@ -13761,8 +16686,8 @@ var init_persona = __esm({
 });
 
 // src/dsh/upstream/agent-presets/metadata.ts
-import { join } from "node:path";
-function text(value) {
+import { join as join2 } from "node:path";
+function text3(value) {
   if (typeof value !== "string") return void 0;
   const trimmed = value.trim();
   return trimmed === "" ? void 0 : trimmed;
@@ -13770,7 +16695,7 @@ function text(value) {
 async function readPresetMetadata(directory, readFile3) {
   let raw;
   try {
-    raw = await readFile3(join(directory, METADATA_FILE), "utf8");
+    raw = await readFile3(join2(directory, METADATA_FILE), "utf8");
   } catch {
     return {};
   }
@@ -13781,10 +16706,10 @@ async function readPresetMetadata(directory, readFile3) {
     return {};
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
-  const record = parsed;
-  const name = text(record.name);
-  const description = text(record.description);
-  const order = typeof record.order === "number" && Number.isFinite(record.order) ? record.order : void 0;
+  const record3 = parsed;
+  const name = text3(record3.name);
+  const description = text3(record3.description);
+  const order = typeof record3.order === "number" && Number.isFinite(record3.order) ? record3.order : void 0;
   return {
     ...name === void 0 ? {} : { name },
     ...description === void 0 ? {} : { description },
@@ -13827,23 +16752,23 @@ var init_specifier = __esm({
 
 // src/dsh/upstream/agent-presets/discovery.ts
 import { isBuiltin as isBuiltin2 } from "node:module";
-import { join as join2, resolve as resolve4 } from "node:path";
+import { join as join3, resolve as resolve5 } from "node:path";
 import { fileURLToPath as fileURLToPath4, pathToFileURL as pathToFileURL4 } from "node:url";
 function entryListProblem(rows, at2 = "") {
   if (!Array.isArray(rows)) {
     return at2 === "" ? "the composition must be a top-level list of plugin rows" : `group ${at2} must hold a list of plugin rows`;
   }
   for (const [index, row] of rows.entries()) {
-    const label = at2 === "" ? `row ${String(index + 1)}` : `${at2} row ${String(index + 1)}`;
+    const label2 = at2 === "" ? `row ${String(index + 1)}` : `${at2} row ${String(index + 1)}`;
     if (typeof row !== "object" || row === null || Array.isArray(row)) {
-      return `${label} is not a plugin row (expected a map with a "name")`;
+      return `${label2} is not a plugin row (expected a map with a "name")`;
     }
     const { name, group, config } = row;
     if (typeof name !== "string" || name === "") {
-      return `${label} names no plugin (a "name" string is required)`;
+      return `${label2} names no plugin (a "name" string is required)`;
     }
     if (group === true) {
-      const nested = entryListProblem(config, label);
+      const nested = entryListProblem(config, label2);
       if (nested !== void 0) return nested;
     }
   }
@@ -13866,15 +16791,15 @@ async function unresolvableRows(rows, presetBase, harnessBase, resolves, io, at2
       continue;
     }
     if (await rowResolves(classifyRowSpecifier(row.name), presetBase, harnessBase, resolves, io)) continue;
-    const label = typeof row.id === "string" && row.id !== "" ? `row "${row.id}"` : positional;
-    found.push({ label, name: row.name });
+    const label2 = typeof row.id === "string" && row.id !== "" ? `row "${row.id}"` : positional;
+    found.push({ label: label2, name: row.name });
   }
   return found;
 }
-async function compositionProblem(path, harnessBase, resolves, io) {
+async function compositionProblem(path2, harnessBase, resolves, io) {
   let content;
   try {
-    content = await io.readFile(path, "utf8");
+    content = await io.readFile(path2, "utf8");
   } catch {
     return `the composition file ${COMPOSITION_FILE} cannot be read`;
   }
@@ -13887,7 +16812,7 @@ async function compositionProblem(path, harnessBase, resolves, io) {
   }
   const shape = entryListProblem(rows);
   if (shape !== void 0) return shape;
-  const presetBase = new URL(".", pathToFileURL4(path)).href;
+  const presetBase = new URL(".", pathToFileURL4(path2)).href;
   let unresolvable;
   try {
     unresolvable = await unresolvableRows(rows, presetBase, harnessBase, resolves, io);
@@ -13903,15 +16828,15 @@ async function compositionProblem(path, harnessBase, resolves, io) {
   return `${String(unresolvable.length)} rows name plugins that cannot be resolved:
 ` + unresolvable.map((row) => `- ${row.label}: ${row.name}`).join("\n");
 }
-async function isFile(path, io) {
+async function isFile(path2, io) {
   try {
-    return (await io.stat(path)).isFile();
+    return (await io.stat(path2)).isFile();
   } catch {
     return false;
   }
 }
 async function scanRoot(root, harnessBase, resolves, io) {
-  const dir = resolve4(root.path);
+  const dir = resolve5(root.path);
   let children;
   try {
     children = await io.readdir(dir, { withFileTypes: true });
@@ -13922,14 +16847,14 @@ async function scanRoot(root, harnessBase, resolves, io) {
   const found = [];
   for (const child of children) {
     if (!child.isDirectory() || !PRESET_ID.test(child.name)) continue;
-    const directory = join2(dir, child.name);
-    const path = join2(directory, COMPOSITION_FILE);
-    const broken = await isFile(path, io) ? await compositionProblem(path, harnessBase, resolves, io) : `the composition file ${COMPOSITION_FILE} is missing — the directory still occupies the id; delete it or restore the file`;
+    const directory = join3(dir, child.name);
+    const path2 = join3(directory, COMPOSITION_FILE);
+    const broken = await isFile(path2, io) ? await compositionProblem(path2, harnessBase, resolves, io) : `the composition file ${COMPOSITION_FILE} is missing — the directory still occupies the id; delete it or restore the file`;
     const metadata = await readPresetMetadata(directory, io.readFile);
     found.push({
       id: child.name,
       trust: root.trust,
-      path,
+      path: path2,
       ...metadata,
       ...broken === void 0 ? {} : { broken }
     });
@@ -13997,10 +16922,10 @@ function flattenRows(rows, outerDisabled, evaluateExpression, found) {
     });
   }
 }
-async function fileComposition(path, evaluateExpression, readFile3) {
+async function fileComposition(path2, evaluateExpression, readFile3) {
   let rows;
   try {
-    rows = load(await readFile3(path, "utf8"), { schema: entryListSchema });
+    rows = load(await readFile3(path2, "utf8"), { schema: entryListSchema });
   } catch (error) {
     return { broken: error instanceof Error ? error.message : String(error) };
   }
@@ -14035,11 +16960,11 @@ var init_composition_inventory = __esm({
 });
 
 // src/dsh/agent-presets.ts
-import { createHash as createHash3 } from "node:crypto";
-import { resolve as resolve5, relative as relative3, dirname as dirname3, sep as sep3 } from "node:path";
+import { createHash as createHash3, randomBytes } from "node:crypto";
+import { resolve as resolve6, relative as relative3, dirname as dirname4, sep as sep3 } from "node:path";
 import { fileURLToPath as fileURLToPath5, pathToFileURL as pathToFileURL5 } from "node:url";
-function plain(path) {
-  return typeof path === "string" && path.length > 0 && path.length <= 4096 && !/[\\:\u0000-\u001f\u007f]/u.test(path) && !path.startsWith("/") && path.split("/").every((p) => p !== "" && p !== "." && p !== "..");
+function plain3(path2) {
+  return typeof path2 === "string" && path2.length > 0 && path2.length <= 4096 && !/[\\:\u0000-\u001f\u007f]/u.test(path2) && !path2.startsWith("/") && path2.split("/").every((p) => p !== "" && p !== "." && p !== "..");
 }
 function fail(message) {
   throw new Error(`agent-presets: ${message}`);
@@ -14078,48 +17003,48 @@ function containedPackageModule(name, documents, files) {
     entry = value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).some((k) => k.startsWith(".")) ? target(value[subpath]) : subpath === "." ? target(value) : void 0;
   } else if (subpath === ".") entry = typeof data2.main === "string" ? data2.main : "./index.js";
   else entry = subpath;
-  if (typeof entry !== "string" || !entry.startsWith("./") || !plain(entry.slice(2))) return;
-  const path = `${packageRoot}/${entry.slice(2)}`;
-  if (!/\.(mjs|js|mts)$/.test(path) || !SHA.test(files[path] ?? "")) return;
-  return { name, path, sha256: files[path] };
+  if (typeof entry !== "string" || !entry.startsWith("./") || !plain3(entry.slice(2))) return;
+  const path2 = `${packageRoot}/${entry.slice(2)}`;
+  if (!/\.(mjs|js|mts)$/.test(path2) || !SHA.test(files[path2] ?? "")) return;
+  return { name, path: path2, sha256: files[path2] };
 }
 async function reviewAgentPresets(input) {
   const { composition } = input;
   const files = composition.files;
-  if (!files || Object.keys(files).length > 4096 || !Array.isArray(input.directories) || input.directories.length > 4096) fail("invalid source inventory");
-  const base = resolve5("codewhale-reviewed-agent-presets");
+  if (!files || Object.keys(files).length > 16384 || !Array.isArray(input.directories) || input.directories.length > 16384) fail("invalid source inventory");
+  const base = resolve6("codewhale-reviewed-agent-presets");
   const baseUrl = pathToFileURL5(`${base}${sep3}`).href;
-  function key(path) {
-    const inside = relative3(base, path).split(sep3).join("/");
-    if (!plain(inside)) fail("path escapes the admitted source root");
+  function key(path2) {
+    const inside = relative3(base, path2).split(sep3).join("/");
+    if (!plain3(inside)) fail("path escapes the admitted source root");
     return inside;
   }
   const documents = /* @__PURE__ */ new Map();
   let bytes = 0;
   for (const doc of input.documents) {
-    if (!plain(doc.path) || !SHA.test(doc.sha256) || files[doc.path] !== doc.sha256 || hash(doc.source) !== doc.sha256 || documents.has(doc.path)) fail("document changed or is outside the source receipt");
+    if (!plain3(doc.path) || !SHA.test(doc.sha256) || files[doc.path] !== doc.sha256 || hash(doc.source) !== doc.sha256 || documents.has(doc.path)) fail("document changed or is outside the source receipt");
     bytes += Buffer.byteLength(doc.source);
     if (Buffer.byteLength(doc.source) > 1024 * 1024 || bytes > 4 * 1024 * 1024) fail("documents exceed their bound");
     documents.set(doc.path, doc.source);
   }
   const directories = new Set(input.directories);
-  for (const path of directories) if (!plain(path)) fail("invalid source directory");
-  for (const path of Object.keys(files)) if (!plain(path) || !SHA.test(files[path])) fail("invalid source file receipt");
-  const invalid = /* @__PURE__ */ new Set();
+  for (const path2 of directories) if (!plain3(path2)) fail("invalid source directory");
+  for (const path2 of Object.keys(files)) if (!plain3(path2) || !SHA.test(files[path2])) fail("invalid source file receipt");
+  const invalid5 = /* @__PURE__ */ new Set();
   const parsed = /* @__PURE__ */ new Map();
   const io = {
-    async readFile(path) {
-      const relative4 = key(path);
-      if (invalid.has(relative4)) throw new Error("composition exceeds its data/shape bound");
-      const text2 = documents.get(relative4);
-      if (text2 === void 0) throw new Error("document not admitted");
-      return text2;
+    async readFile(path2) {
+      const relative4 = key(path2);
+      if (invalid5.has(relative4)) throw new Error("composition exceeds its data/shape bound");
+      const text4 = documents.get(relative4);
+      if (text4 === void 0) throw new Error("document not admitted");
+      return text4;
     },
-    async stat(path) {
-      return { isFile: () => Object.hasOwn(files, key(path)) };
+    async stat(path2) {
+      return { isFile: () => Object.hasOwn(files, key(path2)) };
     },
-    async readdir(path) {
-      const prefix = `${key(path)}/`;
+    async readdir(path2) {
+      const prefix = `${key(path2)}/`;
       if (!directories.has(prefix.slice(0, -1))) {
         const e = new Error("missing root");
         Object.assign(e, { code: "ENOENT" });
@@ -14129,12 +17054,12 @@ async function reviewAgentPresets(input) {
     }
   };
   const { reviewComposition: reviewComposition2, parsePresetComposition: parsePresetComposition2, compositionRowProblem: compositionRowProblem2, hasReviewedRowBridge: hasReviewedRowBridge2 } = await Promise.resolve().then(() => (init_composition(), composition_exports));
-  for (const [path, source] of documents) {
-    if (!path.endsWith("/agent.cordis.yml")) continue;
+  for (const [path2, source] of documents) {
+    if (!path2.endsWith("/agent.cordis.yml")) continue;
     try {
-      parsed.set(path, parsePresetComposition2(source));
+      parsed.set(path2, parsePresetComposition2(source));
     } catch {
-      invalid.add(path);
+      invalid5.add(path2);
     }
   }
   const top = reviewComposition2(composition);
@@ -14153,29 +17078,29 @@ async function reviewAgentPresets(input) {
   if (config.default !== void 0 && (typeof config.default !== "string" || !PRESET_ID.test(config.default) || config.default.length > 64)) fail("invalid default id");
   const roots = [];
   if (config.includeShippedRoot !== false) {
-    const candidates = [...documents.entries()].filter(([p, text2]) => {
+    const candidates = [...documents.entries()].filter(([p, text4]) => {
       if (p !== "package.json" && !p.endsWith("/package.json")) return false;
       try {
-        return JSON.parse(text2).name === AGENT_PRESETS;
+        return JSON.parse(text4).name === AGENT_PRESETS;
       } catch {
         return false;
       }
     });
     if (candidates.length !== 1) fail("shipped root requires exactly one admitted agent-presets package");
-    const folder = dirname3(candidates[0][0]).split(sep3).join("/");
+    const folder = dirname4(candidates[0][0]).split(sep3).join("/");
     const root = folder === "." ? "presets" : `${folder}/presets`;
     if (!directories.has(root)) fail("shipped preset root was not admitted");
-    roots.push({ path: resolve5(base, root), trust: "system" });
+    roots.push({ path: resolve6(base, root), trust: "system" });
   }
   if (config.roots !== void 0 && !Array.isArray(config.roots)) fail("roots must be a literal list");
   for (const root of config.roots ?? []) {
-    if (!root || Object.keys(root).some((k) => !["path", "trust"].includes(k)) || !plain(root.path) || !["system", "user"].includes(root.trust)) fail("configured roots must stay inside the admitted package");
+    if (!root || Object.keys(root).some((k) => !["path", "trust"].includes(k)) || !plain3(root.path) || !["system", "user"].includes(root.trust)) fail("configured roots must stay inside the admitted package");
     if (!directories.has(root.path)) fail("configured preset root was not admitted");
-    roots.push({ path: resolve5(base, root.path), trust: root.trust });
+    roots.push({ path: resolve6(base, root.path), trust: root.trust });
   }
   if (config.includeUserRoot !== false) {
     if (!directories.has(".agent-presets")) fail("user root requires an admitted .agent-presets tree; ambient home discovery is refused");
-    roots.push({ path: resolve5(base, ".agent-presets"), trust: "user" });
+    roots.push({ path: resolve6(base, ".agent-presets"), trust: "user" });
   }
   if (roots.length > 64) fail("too many roots");
   const declared = new Map(composition.modules.map((m) => [m.name, m]));
@@ -14203,8 +17128,8 @@ async function reviewAgentPresets(input) {
         if (specifier.kind === "package") receipt = declared.get(row.name) ?? containedPackageModule(row.name, documents, files);
         else {
           const url = specifier.kind === "file" ? new URL(specifier.specifier) : new URL(specifier.specifier, pathToFileURL5(preset.path).href);
-          const path2 = key(fileURLToPath5(url));
-          if (files[path2] !== void 0) receipt = { name: row.name, path: path2, sha256: files[path2] };
+          const path3 = key(fileURLToPath5(url));
+          if (files[path3] !== void 0) receipt = { name: row.name, path: path3, sha256: files[path3] };
         }
         if (!receipt || files[receipt.path] !== receipt.sha256) {
           if (isJsExpr(row.disabled)) continue;
@@ -14225,8 +17150,8 @@ async function reviewAgentPresets(input) {
       ...preset.broken === void 0 ? {} : { broken: preset.broken }
     };
     rows.push(metadata);
-    const path = key(preset.path);
-    inventory[preset.id] = { path, ...preset.broken !== void 0 ? { broken: preset.broken } : await fileComposition(preset.path, () => {
+    const path2 = key(preset.path);
+    inventory[preset.id] = { path: path2, ...preset.broken !== void 0 ? { broken: preset.broken } : await fileComposition(preset.path, () => {
       throw new Error("conditional until mounted");
     }, io.readFile) };
     if (preset.broken !== void 0) continue;
@@ -14249,6 +17174,15 @@ async function reviewAgentPresets(input) {
   if (Buffer.byteLength(JSON.stringify(inventory)) > 4 * 1024 * 1024) fail("composition inventory exceeds its bound");
   return { catalog: { version: 1, ...config.default === void 0 ? {} : { default: config.default }, mode_selection_enabled: true, presets: rows, inventory }, presets: prepared };
 }
+function issuePresetReceipt(snapshot2) {
+  const payload = JSON.stringify(snapshot2);
+  const receipt = createHash3("sha256").update(randomBytes(32)).update(payload).digest("hex");
+  activePresetReceipts.set(receipt, payload);
+  return receipt;
+}
+function revokePresetReceipt(receipt) {
+  activePresetReceipts.delete(receipt);
+}
 function defineReviewedAgentPresets(mount) {
   return class ReviewedAgentPresets extends Service {
     static inject = ["loader"];
@@ -14257,23 +17191,34 @@ function defineReviewedAgentPresets(mount) {
     constructor(ctx, config) {
       super(ctx, "agentPresets");
       this.selfCtx = ctx;
-      const snapshot = config?.codewhale_reviewed;
-      if (!snapshot || snapshot.catalog?.version !== 1 || !snapshot.catalog.presets.some((p) => p.id === snapshot.selected?.metadata.id && !p.broken)) fail("raw roster needs an installer-minted preset receipt");
-      this.snapshot = structuredClone(snapshot);
+      if (config?.codewhale_reviewed !== void 0 || config?.codewhale_receipt !== void 0) {
+        const snapshot2 = config.codewhale_reviewed;
+        const receipt = typeof config.codewhale_receipt === "string" ? config.codewhale_receipt : "";
+        const expected = receipt ? activePresetReceipts.get(receipt) : void 0;
+        activePresetReceipts.delete(receipt);
+        if (!snapshot2 || !expected || expected !== JSON.stringify(snapshot2) || snapshot2.catalog?.version !== 1 || !snapshot2.catalog.presets.some((p) => p.id === snapshot2.selected?.metadata.id && !p.broken)) fail("raw roster needs an installer-minted preset receipt");
+        this.snapshot = structuredClone(snapshot2);
+      }
     }
     mounting;
     mounted;
     mountSelected() {
-      return this.mounting ??= mount(this.selfCtx, this.snapshot.base_url, this.snapshot.selected.composition).then((result) => this.mounted = result);
+      const snapshot2 = this.snapshot;
+      if (!snapshot2) return Promise.resolve(void 0);
+      return this.mounting ??= mount(this.selfCtx, snapshot2.base_url, snapshot2.selected.composition).then((result) => this.mounted = result);
     }
     async list() {
-      return this.snapshot.catalog.presets.map((row) => ({ ...structuredClone(row), path: fileURLToPath5(new URL(this.snapshot.catalog.inventory[row.id].path, this.snapshot.base_url)) }));
+      const snapshot2 = this.snapshot;
+      if (!snapshot2) return [];
+      return snapshot2.catalog.presets.map((row) => ({ ...structuredClone(row), path: fileURLToPath5(new URL(snapshot2.catalog.inventory[row.id].path, snapshot2.base_url)) }));
     }
     async remoteExportList() {
-      return { presets: this.snapshot.catalog.presets.map(({ is_default, entry, ...row }) => ({ ...structuredClone(row), isDefault: is_default })), authorable: false, defaultId: this.defaultId, modeSelectionEnabled: this.snapshot.catalog.mode_selection_enabled };
+      const snapshot2 = this.snapshot;
+      if (!snapshot2) return { presets: [], authorable: false, defaultId: void 0, modeSelectionEnabled: false };
+      return { presets: snapshot2.catalog.presets.map(({ is_default, entry, ...row }) => ({ ...structuredClone(row), isDefault: is_default })), authorable: false, defaultId: this.defaultId, modeSelectionEnabled: snapshot2.catalog.mode_selection_enabled };
     }
     get defaultId() {
-      return this.snapshot.catalog.default;
+      return this.snapshot?.catalog.default;
     }
     get authorable() {
       return false;
@@ -14284,20 +17229,23 @@ function defineReviewedAgentPresets(mount) {
       return row;
     }
     composedPreset() {
-      return this.snapshot.selected.metadata.id;
+      return this.snapshot?.selected.metadata.id;
     }
     async compositionInventory() {
-      return this.snapshot.catalog.presets.map((row) => {
+      const snapshot2 = this.snapshot;
+      if (!snapshot2) return [];
+      return snapshot2.catalog.presets.map((row) => {
         const identity = { id: row.id, trust: row.trust, ...row.name === void 0 ? {} : { name: row.name }, isDefault: row.id === this.defaultId };
         if (row.id === this.composedPreset() && this.mounted) return { ...identity, rows: mountedCompositionRows(this.mounted.tree) };
-        const read = this.snapshot.catalog.inventory[row.id];
+        const read = snapshot2.catalog.inventory[row.id];
         if (row.broken || "broken" in read) return { ...identity, broken: row.broken ?? ("broken" in read ? read.broken : void 0), rows: [] };
         return { ...identity, rows: structuredClone(read.rows) };
       });
     }
     async readDocument(id) {
-      if (id !== this.composedPreset()) fail("read another preset through Core file authority");
-      return { agentPreset: id, trust: this.snapshot.selected.metadata.trust, content: this.snapshot.selected.source };
+      const snapshot2 = this.snapshot;
+      if (!snapshot2 || id !== this.composedPreset()) fail("read another preset through Core file authority");
+      return { agentPreset: id, trust: snapshot2.selected.metadata.trust, content: snapshot2.selected.source };
     }
     select() {
       fail("select through Core AgentProfile/native preset selection before a turn");
@@ -14313,7 +17261,7 @@ function defineReviewedAgentPresets(mount) {
     }
   };
 }
-var AGENT_PRESETS, MAX_PRESETS, hash, SHA;
+var AGENT_PRESETS, MAX_PRESETS, hash, SHA, activePresetReceipts;
 var init_agent_presets = __esm({
   "src/dsh/agent-presets.ts"() {
     init_persona();
@@ -14327,6 +17275,7 @@ var init_agent_presets = __esm({
     MAX_PRESETS = 64;
     hash = (bytes) => createHash3("sha256").update(bytes).digest("hex");
     SHA = /^[a-f0-9]{64}$/;
+    activePresetReceipts = /* @__PURE__ */ new Map();
   }
 });
 init_agent_presets();
@@ -14334,5 +17283,7 @@ export {
   AGENT_PRESETS,
   containedPackageModule,
   defineReviewedAgentPresets,
-  reviewAgentPresets
+  issuePresetReceipt,
+  reviewAgentPresets,
+  revokePresetReceipt
 };

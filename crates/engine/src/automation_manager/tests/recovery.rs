@@ -269,3 +269,373 @@ async fn damaged_run_receipt_quarantines_only_its_own_automation() -> Result<()>
     tasks.shutdown_and_wait().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn missed_occurrences_wait_for_an_answer_across_reopen() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let receipts = root.path().join("executions");
+    let tasks = fixture_tasks(&root.path().join("tasks"), &receipts).await?;
+    let store = root.path().join("automations");
+    let grace = Duration::minutes(2);
+    let closed_at = Utc::now() - Duration::hours(6);
+    let reopened_at = Utc::now() - Duration::minutes(10);
+    let manager = AutomationManager::open_for_test(store.clone())?;
+    let earlier_session = closed_at - Duration::hours(1);
+    assert_eq!(
+        manager.note_scheduler_presence(earlier_session, grace)?,
+        earlier_session
+    );
+    assert_eq!(
+        manager.note_scheduler_presence(closed_at, Duration::hours(2))?,
+        earlier_session,
+        "a continuously ticking scheduler keeps its presence"
+    );
+
+    let save = |id: &str, due: DateTime<Utc>| -> Result<DateTime<Utc>> {
+        let mut automation = automation_record_with_settings(None, None, None, None);
+        automation.id = id.into();
+        automation.name = format!("{id} automation");
+        automation.created_at = closed_at - Duration::days(1);
+        automation.next_run_at = Some(due);
+        manager.save_automation(&automation)?;
+        Ok(due)
+    };
+    let asked_due = save("asked", closed_at + Duration::hours(2))?;
+    let declined_due = save("declined", closed_at + Duration::hours(1))?;
+    let stopped_due = save("stopped", closed_at + Duration::minutes(30))?;
+    let skipped_due = save("skipped", closed_at + Duration::hours(3))?;
+    let once_due = save("once", closed_at + Duration::hours(4))?;
+    let current_due = save("current", reopened_at + Duration::minutes(5))?;
+    manager.set_missed_policy("skipped", Some(AutomationMissedPolicy::Skip))?;
+    manager.set_missed_policy("once", Some(AutomationMissedPolicy::RunOnce))?;
+
+    assert_eq!(
+        manager.note_scheduler_presence(reopened_at, grace)?,
+        reopened_at,
+        "a gap longer than the grace window starts a new presence"
+    );
+    assert_eq!(
+        manager.note_scheduler_presence(Utc::now(), Duration::minutes(15))?,
+        reopened_at
+    );
+    let shared = Arc::new(Mutex::new(manager));
+    scheduler_tick_shared(&shared, &tasks).await?;
+
+    let settle = |id: &'static str, due: DateTime<Utc>| {
+        let shared = shared.clone();
+        let tasks = tasks.clone();
+        async move {
+            let task_id = {
+                let manager = shared.lock().await;
+                let runs = manager.list_runs(id, None)?;
+                assert_eq!(runs.len(), 1, "{id} ran exactly once");
+                assert_eq!(runs[0].scheduled_for, due, "{id} owns its due slot");
+                runs[0].task_id.clone().context("bound task id")?
+            };
+            let task = crate::task_manager::wait_for_terminal_state(
+                &tasks,
+                &task_id,
+                std::time::Duration::from_secs(10),
+            )
+            .await?;
+            assert_eq!(task.status, TaskStatus::Completed);
+            Ok::<_, anyhow::Error>(task_id)
+        }
+    };
+    let once_task = settle("once", once_due).await?;
+    let current_task = settle("current", current_due).await?;
+    {
+        let manager = shared.lock().await;
+        for id in ["asked", "declined", "stopped", "skipped"] {
+            assert!(manager.list_runs(id, None)?.is_empty(), "{id} did not run");
+        }
+        let skipped = manager.missed_status("skipped")?;
+        assert_eq!(skipped.owed, None);
+        assert_eq!(skipped.outcomes.len(), 1);
+        assert_eq!(skipped.outcomes[0].due_at, skipped_due);
+        assert_eq!(skipped.outcomes[0].outcome, MissedRunOutcomeKind::Skipped);
+        assert_eq!(skipped.outcomes[0].decided_by, MissedRunDecider::Policy);
+        assert!(
+            manager
+                .get_automation("skipped")?
+                .next_run_at
+                .is_some_and(|next| next > Utc::now())
+        );
+        let owed: Vec<_> = manager
+            .list_missed()?
+            .into_iter()
+            .map(|status| {
+                assert_eq!(status.policy, AutomationMissedPolicy::Ask);
+                assert!(status.policy_is_default);
+                (status.automation_id, status.owed.map(|owed| owed.due_at))
+            })
+            .collect();
+        assert_eq!(
+            owed,
+            vec![
+                ("stopped".to_string(), Some(stopped_due)),
+                ("declined".to_string(), Some(declined_due)),
+                ("asked".to_string(), Some(asked_due)),
+            ]
+        );
+    }
+
+    scheduler_tick_shared(&shared, &tasks).await?;
+    assert!(
+        shared.lock().await.list_runs("asked", None)?.is_empty(),
+        "nothing runs until the person answers"
+    );
+    drop(shared);
+
+    let reopened = AutomationManager::open_for_test(store)?;
+    assert_eq!(
+        reopened.list_missed()?.len(),
+        3,
+        "owed occurrences are durable"
+    );
+    reopened.pause_automation("stopped")?;
+    reopened.resume_automation("stopped")?;
+    let mut overlapping = new_run_record("asked", Utc::now(), Utc::now());
+    reopened.save_run(&overlapping)?;
+    let shared = Arc::new(Mutex::new(reopened));
+    assert!(
+        shared
+            .lock()
+            .await
+            .list_missed()?
+            .iter()
+            .all(|status| status.automation_id != "stopped"),
+        "stopping the automation withdraws its owed occurrence"
+    );
+
+    let refused =
+        resolve_missed_run_shared(&shared, "asked", MissedRunDecision::RunNow, &tasks).await;
+    assert!(
+        refused
+            .unwrap_err()
+            .to_string()
+            .contains("still in progress"),
+        "run now never overlaps an earlier run"
+    );
+    overlapping.status = AutomationRunStatus::Completed;
+    shared.lock().await.save_run(&overlapping)?;
+
+    let ran =
+        resolve_missed_run_shared(&shared, "asked", MissedRunDecision::RunNow, &tasks).await?;
+    let run = ran.run.context("run now admits the owed occurrence")?;
+    assert_eq!(run.scheduled_for, asked_due);
+    assert_eq!(ran.status.owed, None);
+    let outcome = ran.status.outcomes.last().context("ran outcome")?;
+    assert_eq!(outcome.outcome, MissedRunOutcomeKind::Ran);
+    assert_eq!(outcome.decided_by, MissedRunDecider::Person);
+    assert_eq!(outcome.run_id.as_deref(), Some(run.id.as_str()));
+    let asked_task = run.task_id.clone().context("bound task id")?;
+    let task = crate::task_manager::wait_for_terminal_state(
+        &tasks,
+        &asked_task,
+        std::time::Duration::from_secs(10),
+    )
+    .await?;
+    assert_eq!(task.status, TaskStatus::Completed);
+
+    let declined =
+        resolve_missed_run_shared(&shared, "declined", MissedRunDecision::Skip, &tasks).await?;
+    assert!(declined.run.is_none());
+    let outcome = declined.status.outcomes.last().context("skip outcome")?;
+    assert_eq!(outcome.due_at, declined_due);
+    assert_eq!(outcome.outcome, MissedRunOutcomeKind::Skipped);
+    assert_eq!(outcome.decided_by, MissedRunDecider::Person);
+    assert!(
+        resolve_missed_run_shared(&shared, "declined", MissedRunDecision::Skip, &tasks)
+            .await
+            .is_err(),
+        "an answered occurrence cannot be answered twice"
+    );
+
+    reconcile_run_statuses_shared(&shared, &tasks).await?;
+    scheduler_tick_shared(&shared, &tasks).await?;
+    let manager = shared.lock().await;
+    assert!(manager.list_missed()?.is_empty());
+    for id in ["asked", "declined", "stopped", "skipped", "once", "current"] {
+        let automation = manager.get_automation(id)?;
+        assert!(
+            automation.next_run_at.is_some_and(|next| next > Utc::now()),
+            "{id} resumed on a future slot"
+        );
+    }
+    assert!(manager.list_runs("declined", None)?.is_empty());
+    assert!(manager.list_runs("stopped", None)?.is_empty());
+    let mut executed = fixture_executions(&receipts);
+    executed.sort();
+    let mut expected = vec![once_task, current_task, asked_task];
+    expected.sort();
+    assert_eq!(
+        executed, expected,
+        "exactly the answered and on-time runs executed"
+    );
+    drop(manager);
+    tasks.shutdown_and_wait().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn foreign_scope_reports_unscheduled_until_adopted_and_owned_past_slots_stay_truthful()
+-> Result<()> {
+    let root = tempfile::tempdir()?;
+    let receipts = root.path().join("executions");
+    let tasks = fixture_tasks(&root.path().join("tasks"), &receipts).await?;
+    let mut manager = AutomationManager::open(root.path().join("automations"))?;
+    manager.bind_task_manager(&tasks)?;
+
+    let stale = Utc::now() - Duration::days(8);
+    let mut owned_ask = automation_record_with_settings(None, None, None, None);
+    owned_ask.id = "owned-ask".into();
+    owned_ask.execution_scope = Some(tasks.execution_scope().to_string());
+    owned_ask.rrule = "FREQ=WEEKLY;BYDAY=MO;BYHOUR=9;BYMINUTE=0".into();
+    owned_ask.next_run_at = Some(stale);
+    manager.save_automation(&owned_ask)?;
+
+    let mut owned_held = owned_ask.clone();
+    owned_held.id = "owned-held".into();
+    manager.save_automation(&owned_held)?;
+    manager.set_missed_policy("owned-held", Some(AutomationMissedPolicy::RunOnce))?;
+    let mut live_run = queued_run_for(&owned_held);
+    bind_run_dispatch(&mut live_run, &owned_held, &tasks.data_dir(), true)?;
+    manager.save_run(&live_run)?;
+
+    let mut foreign = owned_ask.clone();
+    foreign.id = "foreign-weekly".into();
+    foreign.execution_scope = Some(crate::task_manager::test_execution_scope("gone-scope"));
+    manager.save_automation(&foreign)?;
+
+    let listed_before = manager.list_automation_views()?;
+    let view_for = |views: &[AutomationRecordView], id: &str| {
+        views
+            .iter()
+            .find(|view| view.record.id == id)
+            .cloned()
+            .expect("listed automation")
+    };
+    let foreign_list = view_for(&listed_before, "foreign-weekly");
+    let foreign_read = manager.get_automation_view("foreign-weekly")?;
+    assert!(!foreign_list.scheduled_here);
+    assert_eq!(
+        foreign_list.execution_ownership,
+        AutomationExecutionOwnership::OtherRuntime
+    );
+    assert_eq!(foreign_list.record.next_run_at, Some(stale));
+    assert_eq!(foreign_read.scheduled_here, foreign_list.scheduled_here);
+    assert_eq!(
+        foreign_read.execution_ownership,
+        foreign_list.execution_ownership
+    );
+    assert_eq!(foreign_read.record.next_run_at, Some(stale));
+
+    let ask_before = view_for(&listed_before, "owned-ask");
+    assert!(ask_before.scheduled_here);
+    assert_eq!(
+        ask_before.execution_ownership,
+        AutomationExecutionOwnership::Owned
+    );
+    assert_eq!(ask_before.record.next_run_at, Some(stale));
+
+    let shared = Arc::new(Mutex::new(manager));
+    with_manager_blocking(&shared, |manager| {
+        manager.note_scheduler_presence(Utc::now(), Duration::seconds(120))
+    })
+    .await?;
+    scheduler_tick_shared(&shared, &tasks).await?;
+
+    {
+        let guard = shared.lock().await;
+        assert_eq!(guard.get_automation("owned-ask")?.next_run_at, Some(stale));
+        assert_eq!(guard.get_automation("owned-held")?.next_run_at, Some(stale));
+        assert_eq!(
+            guard.get_automation("foreign-weekly")?.next_run_at,
+            Some(stale)
+        );
+        let missed = guard.list_missed()?;
+        assert_eq!(missed.len(), 1);
+        assert_eq!(missed[0].automation_id, "owned-ask");
+
+        guard.adopt_automation("foreign-weekly")?;
+        let adopted_view = guard.get_automation_view("foreign-weekly")?;
+        assert!(adopted_view.scheduled_here);
+        assert_eq!(
+            adopted_view.execution_ownership,
+            AutomationExecutionOwnership::Owned
+        );
+        assert_eq!(adopted_view.record.next_run_at, Some(stale));
+    }
+
+    scheduler_tick_shared(&shared, &tasks).await?;
+    {
+        let guard = shared.lock().await;
+        let missed = guard.list_missed()?;
+        assert!(
+            missed
+                .iter()
+                .any(|item| item.automation_id == "foreign-weekly"),
+            "adopted overdue automation asks per section 77: {missed:?}"
+        );
+    }
+
+    let resolved =
+        resolve_missed_run_shared(&shared, "foreign-weekly", MissedRunDecision::Skip, &tasks)
+            .await?;
+    assert!(resolved.status.owed.is_none());
+    {
+        let guard = shared.lock().await;
+        let after = guard.get_automation_view("foreign-weekly")?;
+        assert!(after.scheduled_here);
+        assert!(
+            after.record.next_run_at.is_some_and(|at| at > Utc::now()),
+            "resolved missed run advances next_run_at past now: {:?}",
+            after.record.next_run_at
+        );
+
+        let mut foreign_continuous = owned_ask.clone();
+        foreign_continuous.id = "foreign-continuous-ask".into();
+        foreign_continuous.execution_scope =
+            Some(crate::task_manager::test_execution_scope("gone-scope"));
+        foreign_continuous.next_run_at = Some(stale);
+        guard.save_automation(&foreign_continuous)?;
+
+        let mut foreign_skip = owned_ask.clone();
+        foreign_skip.id = "foreign-continuous-skip".into();
+        foreign_skip.execution_scope =
+            Some(crate::task_manager::test_execution_scope("gone-scope"));
+        foreign_skip.next_run_at = Some(stale);
+        guard.save_automation(&foreign_skip)?;
+        guard.set_missed_policy(
+            "foreign-continuous-skip",
+            Some(AutomationMissedPolicy::Skip),
+        )?;
+
+        guard.note_scheduler_presence(Utc::now() - Duration::days(9), Duration::days(10))?;
+        guard.adopt_automation("foreign-continuous-ask")?;
+        let missed = guard.list_missed()?;
+        assert!(
+            missed
+                .iter()
+                .any(|item| item.automation_id == "foreign-continuous-ask"),
+            "continuous awake_since < stale < now must ask immediately on adopt: {missed:?}"
+        );
+        guard.adopt_automation("foreign-continuous-skip")?;
+        let skipped = guard.get_automation("foreign-continuous-skip")?;
+        assert!(
+            skipped.next_run_at.is_some_and(|at| at > Utc::now()),
+            "Skip policy must advance past stale slot on adopt: {:?}",
+            skipped.next_run_at
+        );
+    }
+
+    scheduler_tick_shared(&shared, &tasks).await?;
+    {
+        let guard = shared.lock().await;
+        assert!(guard.list_runs("foreign-continuous-ask", None)?.is_empty());
+        assert!(guard.list_runs("foreign-continuous-skip", None)?.is_empty());
+    }
+    tasks.shutdown_and_wait().await?;
+    Ok(())
+}

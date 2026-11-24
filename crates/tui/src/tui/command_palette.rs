@@ -281,7 +281,14 @@ fn palette_description_for_unshadowed_aliases(
     if aliases.is_empty() {
         desc.to_string()
     } else {
-        format!("{}  aliases: {}", desc, aliases.join(", "))
+        format!(
+            "{}  {}",
+            desc,
+            tr(locale, MessageId::PaletteAliasesSuffix).replace(
+                "{aliases}",
+                &aliases.join(&tr(locale, MessageId::ListSeparator))
+            )
+        )
     }
 }
 
@@ -919,14 +926,12 @@ impl ModalView for CommandPaletteView {
             Style::default().fg(palette::TEXT_MUTED),
         )));
         let match_count = if self.query.is_empty() {
-            format!(
-                "{} shown / {} entries",
-                self.filtered.len(),
-                self.entries.len()
-            )
+            tr(self.locale, MessageId::PaletteShownCount)
         } else {
-            format!("{} / {} matches", self.filtered.len(), self.entries.len())
-        };
+            tr(self.locale, MessageId::HelpMatchCount)
+        }
+        .replace("{shown}", &self.filtered.len().to_string())
+        .replace("{total}", &self.entries.len().to_string());
         lines.push(Line::from(Span::styled(
             match_count,
             Style::default().fg(palette::TEXT_DIM).italic(),
@@ -1007,7 +1012,10 @@ impl ModalView for CommandPaletteView {
                 // the description column stays on one axis.
                 let label =
                     codewhale_tui_kit::ui_text::truncate_line_to_width(&entry.label, label_width);
-                let mut line = format!("{pointer} {label:<label_width$}");
+                let mut line = format!(
+                    "{pointer} {}",
+                    codewhale_tui_kit::ui_text::pad_to_display_width(&label, label_width)
+                );
                 // The rows are drawn into `content`, which is the popup less its
                 // borders and padding — measuring against `popup_width` overstated
                 // the room by four columns.
@@ -2286,6 +2294,44 @@ mod tests {
     }
 
     #[test]
+    fn zh_hans_palette_localizes_aliases_and_the_entry_count() {
+        let attach = commands::command_infos()
+            .into_iter()
+            .find(|info| info.name == "attach")
+            .expect("/attach");
+        assert!(
+            attach
+                .palette_description_for(Locale::En)
+                .ends_with("  aliases: image, media, fujian")
+        );
+        assert!(
+            attach
+                .palette_description_for(Locale::ZhHans)
+                .ends_with("  别名：image、media、fujian")
+        );
+
+        let view = CommandPaletteView::new_for_locale(
+            Locale::ZhHans,
+            vec![palette_entry(
+                PaletteSection::Command,
+                "/config",
+                "open config",
+                "/config",
+            )],
+        );
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buf = Buffer::empty(area);
+        view.render(area, &mut buf);
+        let dump: String = buf
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .filter(|symbol| *symbol != " ")
+            .collect();
+        assert!(dump.contains("显示1个/共1个条目"), "{dump}");
+    }
+
+    #[test]
     fn command_palette_hover_tints_entry_without_moving_selection() {
         let mut view = sample_palette_view();
         let area = Rect::new(0, 0, 100, 30);
@@ -2316,6 +2362,32 @@ mod tests {
             codewhale_palette::SURFACE_ELEVATED,
             "hovered palette entry must show the shared hover band"
         );
+    }
+
+    #[test]
+    fn command_palette_description_column_pads_by_display_width() {
+        let view = CommandPaletteView::new(vec![
+            palette_entry(PaletteSection::Command, "/plain", "DESC_A", "/plain"),
+            palette_entry(PaletteSection::Command, "/中文命令", "DESC_B", "/zh"),
+        ]);
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buf = Buffer::empty(area);
+        view.render(area, &mut buf);
+
+        let column_of = |needle: &str| {
+            (0..area.height).find_map(|y| {
+                let row: String = (0..area.width)
+                    .map(|x| match buf[(x, y)].symbol() {
+                        "" => " ",
+                        symbol => symbol,
+                    })
+                    .collect();
+                row.find(needle).map(|byte| row[..byte].chars().count())
+            })
+        };
+        let plain = column_of("DESC_A").expect("plain row renders");
+        let wide = column_of("DESC_B").expect("wide row renders");
+        assert_eq!(plain, wide, "description columns must line up");
     }
 
     /// The four terminal sizes the v0.8.66 modal blocker (#3732) requires every

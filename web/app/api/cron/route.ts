@@ -1,28 +1,21 @@
 import { NextResponse } from "next/server";
 import { getEnv } from "@/lib/kv";
-import {
-  runCurate,
-  runTriage,
-  runPrReview,
-  runStale,
-  runDupes,
-  runDigest,
-  type AgentEnv,
-} from "@/lib/community-agent-tasks";
+import type { AgentEnv } from "@/lib/community-agent-tasks";
 import { runFactsDrift } from "@/lib/facts-drift";
 import { runLinkCheck, runSemanticDrift } from "@/lib/content-watch";
 import { safeEqual } from "@/lib/community-agent";
+import { CRON_SECRET_UNAVAILABLE, secretStrongEnough } from "@/lib/maintainer-token";
 
 export const dynamic = "force-dynamic";
 
-const TASKS = ["curate", "triage", "pr-review", "stale", "dupes", "digest", "facts-drift", "linkcheck", "semantic-drift"] as const;
+const TASKS = ["facts-drift", "linkcheck", "semantic-drift"] as const;
 type Task = (typeof TASKS)[number];
 
 /**
  * Manual trigger surface for community-agent tasks.
  *
  * Usage:
- *   GET /api/cron?task=curate
+ *   GET /api/cron?task=facts-drift
  *   Header: x-cron-secret: <CRON_SECRET>
  *
  * Real cron scheduling is handled by worker.ts's scheduled() handler.
@@ -38,9 +31,33 @@ export async function GET(req: Request) {
     );
   }
 
+  if (!secretStrongEnough(env.CRON_SECRET)) {
+    console.warn(CRON_SECRET_UNAVAILABLE);
+    return NextResponse.json(
+      { error: CRON_SECRET_UNAVAILABLE },
+      { status: 503, headers: { "Cache-Control": "no-store" } }
+    );
+  }
+
+  try {
+    if (!env.ADMIN_LOGIN_LIMITER) throw new Error("Missing cron limiter");
+    const { success } = await env.ADMIN_LOGIN_LIMITER.limit({ key: "codewhale-web:cron-secret" });
+    if (!success) {
+      return NextResponse.json(
+        { error: "too many attempts" },
+        { status: 429, headers: { "Cache-Control": "no-store", "Retry-After": "60" } }
+      );
+    }
+  } catch {
+    return NextResponse.json(
+      { error: "manual trigger temporarily unavailable" },
+      { status: 503, headers: { "Cache-Control": "no-store", "Retry-After": "60" } }
+    );
+  }
+
   const auth = req.headers.get("x-cron-secret") ?? "";
   if (!(await safeEqual(auth, env.CRON_SECRET))) {
-    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+    return NextResponse.json({ error: "unauthorized" }, { status: 401, headers: { "Cache-Control": "no-store" } });
   }
 
   const { searchParams } = new URL(req.url);
@@ -71,24 +88,6 @@ export async function GET(req: Request) {
   try {
     let result: Record<string, unknown>;
     switch (task) {
-      case "curate":
-        result = await runCurate(agentEnv);
-        break;
-      case "triage":
-        result = await runTriage(agentEnv);
-        break;
-      case "pr-review":
-        result = await runPrReview(agentEnv);
-        break;
-      case "stale":
-        result = await runStale(agentEnv);
-        break;
-      case "dupes":
-        result = await runDupes(agentEnv);
-        break;
-      case "digest":
-        result = await runDigest(agentEnv);
-        break;
       case "facts-drift":
         result = await runFactsDrift(watchEnv) as unknown as Record<string, unknown>;
         break;

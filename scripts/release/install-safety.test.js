@@ -11,7 +11,7 @@ const path = require("node:path");
 const test = require("node:test");
 
 const repo = path.resolve(__dirname, "../..");
-const bytes = '#!/bin/sh\necho "executed $*" >> "$INSTALL_TEST_EXECUTED"\necho "codewhale 0.9.11"\n';
+const bytes = '#!/bin/sh\necho "executed $*" >> "$INSTALL_TEST_EXECUTED"\n[ "$1" = doctor ] && echo "telemetry=${CODEWHALE_TELEMETRY-unset} update_check=${CODEWHALE_NO_UPDATE_CHECK-unset}" >> "$INSTALL_TEST_DOCTOR_ENV"\ncase "$1" in --help) printf \'%s\\n\' "${INSTALL_TEST_HELP:-}" ;; *) echo "codewhale 0.9.11" ;; esac\n';
 
 function executable(file, body) {
   fs.writeFileSync(file, body, { mode: 0o755 });
@@ -56,19 +56,52 @@ cp "$INSTALL_TEST_ASSETS/$asset" "$output"
     CODEWHALE_VERSION: "v0.9.11", CODEWHALE_INSTALL_DIR: destination,
     PREFIX: path.dirname(destination), INSTALL_TEST_ASSETS: assets,
     INSTALL_TEST_EXECUTED: path.join(root, "executed"),
+    INSTALL_TEST_DOCTOR_ENV: path.join(root, "doctor-env"),
     INSTALL_TEST_DOWNLOADS: path.join(root, "downloads") };
   for (const key of ["CODEWHALE_RELEASE_BASE_URL", "DEEPSEEK_TUI_RELEASE_BASE_URL", "CODEWHALE_SKIP_GLIBC_CHECK", "DEEPSEEK_TUI_SKIP_GLIBC_CHECK", "DEEPSEEK_SKIP_GLIBC_CHECK", "TERMUX_VERSION", "CODEWHALE_HOME", "CODEWHALE_FORCE_REINSTALL", "CODEWHALE_INSTALL_COMPILED_HOST", "SHELL", "ZDOTDIR"]) delete env[key];
-  function run() {
+  function run(args = []) {
     const script = kind === "website" ? path.join(repo, "web/public/install.sh") : path.join(archive, "install.sh");
-    return spawnSync(kind === "website" ? "sh" : "bash", [script], { env, encoding: "utf8", timeout: 10000 });
+    return spawnSync(kind === "website" ? "sh" : "bash", [script, ...args], { env, encoding: "utf8", timeout: 10000 });
   }
   function prepare() { fs.mkdirSync(env.CODEWHALE_INSTALL_DIR, { recursive: true }); }
   function untouched() {
     const runs = fs.existsSync(env.INSTALL_TEST_EXECUTED) ? fs.readFileSync(env.INSTALL_TEST_EXECUTED, "utf8").trim().split("\n") : [];
-    assert.ok(runs.every(line => line === "executed doctor --installs --brief"), `installers must not execute existing files or sudo: ${runs.join(", ")}`);
+    assert.ok(runs.every(line => line === "executed doctor --installs --brief" || line === "executed --help"), `installers must not execute existing files or sudo: ${runs.join(", ")}`);
   }
   return { root, home, bin, archive, assets, destination, env, run, prepare, untouched };
 }
+
+function flakyCurl(f, failures) {
+  const counter = path.join(f.root, "curl-calls");
+  const real = fs.readFileSync(path.join(f.bin, "curl"), "utf8");
+  executable(path.join(f.bin, "curl"), `#!/bin/sh
+n=$(cat "${counter}" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > "${counter}"
+if [ "$n" -le ${failures} ]; then echo "curl: (35) SSL_connect: SSL_ERROR_SYSCALL" >&2; exit 35; fi
+${real.replace("#!/bin/sh\n", "")}`);
+  f.env.CODEWHALE_INSTALL_RETRY_DELAY = "0";
+  return counter;
+}
+
+test("website: a download that fails twice with a connection error is retried and the install succeeds", t => {
+  const f = fixture(t, "website");
+  const counter = flakyCurl(f, 2);
+  const result = f.run();
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.readFileSync(counter, "utf8").trim(), "4");
+  assert.equal(fs.readFileSync(path.join(f.destination, "codewhale"), "utf8"), bytes);
+});
+
+test("website: three failed attempts end with the retry hint and install nothing", t => {
+  const f = fixture(t, "website");
+  const counter = flakyCurl(f, 99);
+  const result = f.run();
+  assert.notEqual(result.status, 0);
+  assert.equal(fs.readFileSync(counter, "utf8").trim(), "3");
+  assert.ok(result.stderr.includes("Download failed. This is usually a network blip; run the same command again."), result.stderr);
+  assert.equal(fs.existsSync(path.join(f.destination, "codewhale")), false);
+});
 
 for (const kind of ["website", "archive"]) {
   test(`${kind}: fresh installation verifies bytes, executable modes, and PATH shadowing`, t => {
@@ -80,6 +113,11 @@ for (const kind of ["website", "archive"]) {
       assert.equal(fs.readFileSync(installed, "utf8"), bytes);
       assert.ok(fs.statSync(installed).mode & 0o111);
     }
+    assert.equal(
+      fs.statSync(path.join(f.destination, "codewhale")).ino,
+      fs.statSync(path.join(f.destination, "codew")).ino,
+      "codew should be hard-linked to codewhale"
+    );
     const receipt = fs.readFileSync(path.join(f.destination, ".codewhale-install.sha256"), "utf8");
     const hash = crypto.createHash("sha256").update(bytes).digest("hex");
     assert.equal(receipt, `${hash}  codewhale
@@ -97,15 +135,101 @@ ${hash}  codew
     f.untouched();
   });
 
+  test(`${kind}: the installer's own doctor run is made with usage reporting forced off`, t => {
+    for (const inherited of [undefined, "1"]) {
+      const f = fixture(t, kind);
+      if (inherited !== undefined) f.env.CODEWHALE_TELEMETRY = inherited;
+      else delete f.env.CODEWHALE_TELEMETRY;
+      const result = f.run();
+      assert.equal(result.status, 0, result.stderr);
+      const seen = fs.readFileSync(f.env.INSTALL_TEST_DOCTOR_ENV, "utf8").trim().split("\n");
+      assert.deepEqual(seen, ["telemetry=0 update_check=1"], `inherited=${inherited}`);
+      assert.ok(result.stdout.includes("config set telemetry false"), result.stdout);
+      assert.ok(!result.stdout.includes("telemetry=0"), result.stdout);
+    }
+  });
+
+  test(`${kind}: the output ends with the PATH command and the verify command`, t => {
+    const f = fixture(t, kind);
+    const result = f.run();
+    assert.equal(result.status, 0, result.stderr);
+    const lines = result.stdout.split("\n").map(line => line.trim()).filter(Boolean);
+    assert.equal(lines.at(-1), "codewhale --version", result.stdout);
+    assert.equal(lines.at(-2), "Then check it:", result.stdout);
+    assert.ok(lines.at(-3).startsWith("export PATH="), result.stdout);
+    assert.ok(lines.at(-3).endsWith("hash -r"), result.stdout);
+    f.untouched();
+  });
+
+  test(`${kind}: install output never mentions Computer Use or Node.js 20`, t => {
+    const f = fixture(t, kind);
+    const noNode = ["/usr/bin", "/bin"].every(dir => !fs.existsSync(path.join(dir, "node")));
+    if (noNode) f.env.PATH = `${f.bin}:/usr/bin:/bin`;
+    const result = f.run();
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(!result.stdout.includes("Computer Use"), result.stdout);
+    assert.ok(!result.stdout.includes("Node.js 20"), result.stdout);
+    f.untouched();
+  });
+
   test(`${kind}: rerunning an identical installation preserves its files`, t => {
     const f = fixture(t, kind);
     assert.equal(f.run().status, 0);
     const file = path.join(f.destination, "codewhale");
+    const alias = path.join(f.destination, "codew");
     const before = fs.statSync(file);
+    assert.equal(fs.statSync(alias).ino, before.ino);
     const result = f.run();
     assert.equal(result.status, 0, result.stderr);
     assert.equal(fs.statSync(file).ino, before.ino);
+    assert.equal(fs.statSync(alias).ino, before.ino);
     assert.equal(fs.readFileSync(file, "utf8"), bytes);
+    f.untouched();
+  });
+
+  test(`${kind}: hard-link fallback copies codew when staging link from codewhale fails`, t => {
+    const f = fixture(t, kind);
+    executable(path.join(f.bin, "ln"), `#!/bin/sh
+case "$1:$2" in
+  */codewhale:*/.codewhale-install.*/codew) exit 1 ;;
+esac
+exec /bin/ln "$@"
+`);
+    const result = f.run();
+    assert.equal(result.status, 0, result.stderr);
+    const primary = path.join(f.destination, "codewhale");
+    const alias = path.join(f.destination, "codew");
+    assert.equal(fs.readFileSync(primary, "utf8"), bytes);
+    assert.equal(fs.readFileSync(alias, "utf8"), bytes);
+    assert.notEqual(fs.statSync(primary).ino, fs.statSync(alias).ino);
+    assert.ok(fs.statSync(alias).mode & 0o111);
+    f.untouched();
+  });
+
+  test(`${kind}: upgrading a hard-linked Codewhale binary moves old entries to recovery and links the new pair`, t => {
+    const f = fixture(t, kind);
+    f.prepare();
+    const olderBytes = `${bytes}# codewhale-updater old-build\n`;
+    const primary = path.join(f.destination, "codewhale");
+    const alias = path.join(f.destination, "codew");
+    executable(primary, olderBytes);
+    fs.linkSync(primary, alias);
+    const oldIno = fs.statSync(primary).ino;
+    assert.equal(fs.statSync(alias).ino, oldIno);
+
+    const result = f.run();
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.readFileSync(primary, "utf8"), bytes);
+    assert.equal(fs.readFileSync(alias, "utf8"), bytes);
+    const newIno = fs.statSync(primary).ino;
+    assert.notEqual(newIno, oldIno);
+    assert.equal(fs.statSync(alias).ino, newIno);
+    const recoveryRoot = path.join(f.home, ".codewhale", "recovery");
+    const batches = fs.readdirSync(recoveryRoot);
+    assert.equal(batches.length, 1);
+    const manifest = fs.readFileSync(path.join(recoveryRoot, batches[0], "manifest.tsv"), "utf8");
+    assert.ok(manifest.includes("001-codewhale"), manifest);
+    assert.ok(manifest.includes("002-codew"), manifest);
     f.untouched();
   });
 
@@ -165,6 +289,34 @@ ${hash}  codew
     assert.equal(fs.existsSync(path.join(f.env.CODEWHALE_INSTALL_DIR, "codewhale")), false);
     f.untouched();
   });
+
+  for (const [label, file, record, accepted] of [
+    ["an unrelated Cargo record", ".crates.toml", '[v1]\n"ripgrep 14.1.0 (registry+https://github.com/rust-lang/crates.io-index)" = ["rg"]\n"codewhale-tui 0.10.3 (registry+https://github.com/rust-lang/crates.io-index)" = ["codewhale-tui"]\n', true],
+    ["a Cargo record listing codewhale", ".crates.toml", '[v1]\n"codewhale-cli 0.10.3 (registry+https://github.com/rust-lang/crates.io-index)" = ["codewhale"]\n', false],
+    ["a Cargo record listing codew", ".crates2.json", '{"installs":{"codewhale-cli 0.10.3":{"bins":["codew"]}}}\n', false],
+    ["an unreadable Cargo record", ".crates.toml", null, false],
+  ]) {
+    test(`${kind}: ${label} beside the install directory is ${accepted ? "accepted" : "refused"}`, t => {
+      const f = fixture(t, kind); f.prepare();
+      const receipt = path.join(path.dirname(f.destination), file);
+      if (record === null) {
+        if (process.getuid && process.getuid() === 0) return t.skip("root can read any file");
+        fs.writeFileSync(receipt, '"codewhale" ', { mode: 0o000 });
+      } else {
+        fs.writeFileSync(receipt, record);
+      }
+      const result = f.run();
+      if (accepted) {
+        assert.equal(result.status, 0, result.stderr);
+        assert.equal(fs.readFileSync(path.join(f.destination, "codewhale"), "utf8"), bytes);
+      } else {
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /cargo uninstall/);
+        assert.equal(fs.existsSync(path.join(f.destination, "codewhale")), false);
+      }
+      f.untouched();
+    });
+  }
 
   test(`${kind}: a destination created during publication is never overwritten`, t => {
     const f = fixture(t, kind);
@@ -237,6 +389,176 @@ exec /bin/ln "$@"
     });
   }
 }
+
+const blockOf = dir => `# >>> codewhale PATH >>>\nexport PATH="${dir}:$PATH"\n# <<< codewhale PATH <<<\n`;
+const shownDir = f => (fs.realpathSync(f.destination) === fs.realpathSync(path.join(f.home, ".local", "bin")) ? "$HOME/.local/bin" : fs.realpathSync(f.destination));
+for (const kind of ["website", "archive"]) {
+  for (const [shell, profile] of [["/bin/zsh", ".zshrc"], ["/bin/bash", ".bash_profile"], ["/bin/sh", ".profile"]]) {
+    test(`${kind}: ${shell} gets the marked PATH block in ~/${profile} by default and the output says so`, t => {
+      const f = fixture(t, kind);
+      f.env.SHELL = shell;
+      fs.writeFileSync(path.join(f.home, profile), "# mine\nalias a=b");
+      const result = f.run();
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(fs.readFileSync(path.join(f.home, profile), "utf8"), `# mine\nalias a=b\n${blockOf(shownDir(f))}`);
+      assert.ok(result.stdout.includes(`Added to ~/${profile}`), result.stdout);
+      assert.ok(result.stdout.includes("--no-modify-path"), result.stdout);
+      const lines = result.stdout.split("\n").map(line => line.trim()).filter(Boolean);
+      assert.equal(lines.at(-1), "codewhale --version", result.stdout);
+      assert.ok(lines.at(-3).startsWith("export PATH=") && lines.at(-3).endsWith("hash -r"), result.stdout);
+      f.untouched();
+    });
+  }
+
+  test(`${kind}: a fresh profile is created with only the block`, t => {
+    const f = fixture(t, kind);
+    f.env.SHELL = "/bin/zsh";
+    assert.equal(f.run().status, 0);
+    assert.equal(fs.readFileSync(path.join(f.home, ".zshrc"), "utf8"), blockOf(shownDir(f)));
+  });
+
+  test(`${kind}: the printed undo command removes exactly the block`, t => {
+    const f = fixture(t, kind);
+    f.env.SHELL = "/bin/zsh";
+    const before = "# top\nexport A=1\n";
+    const after = "export B=2\n";
+    fs.writeFileSync(path.join(f.home, ".zshrc"), before + after);
+    const result = f.run();
+    assert.equal(result.status, 0, result.stderr);
+    const undo = result.stdout.split("\n").map(line => line.trim()).find(line => line.startsWith("cw_tmp="));
+    assert.ok(undo, result.stdout);
+    const profile = path.join(f.home, ".zshrc");
+    fs.writeFileSync(profile, before + blockOf(shownDir(f)) + after);
+    const ran = spawnSync("sh", ["-c", undo], { env: { ...f.env }, encoding: "utf8" });
+    assert.equal(ran.status, 0, ran.stderr);
+    assert.equal(fs.readFileSync(profile, "utf8"), before + after);
+  });
+
+  for (const tail of ["a\n# >>> codewhale PATH >>>\nlast\n", "a\n# >>> codewhale PATH >>>\n", "a\n# >>> codewhale PATH >>>"]) {
+    test(`${kind}: the printed undo command leaves a lone start marker near end of file untouched (${JSON.stringify(tail)})`, t => {
+      const f = fixture(t, kind);
+      f.env.SHELL = "/bin/zsh";
+      const result = f.run();
+      assert.equal(result.status, 0, result.stderr);
+      const undo = result.stdout.split("\n").map(line => line.trim()).find(line => line.startsWith("cw_tmp="));
+      const profile = path.join(f.home, ".zshrc");
+      fs.writeFileSync(profile, tail);
+      const ran = spawnSync("sh", ["-c", undo], { env: { ...f.env }, encoding: "utf8" });
+      assert.equal(ran.status, 0, ran.stderr);
+      assert.equal(fs.readFileSync(profile, "utf8"), tail);
+    });
+  }
+
+  test(`${kind}: --no-modify-path and CODEWHALE_NO_MODIFY_PATH leave every profile alone and print the command`, t => {
+    for (const mode of ["flag", "env"]) {
+      const f = fixture(t, kind);
+      f.env.SHELL = "/bin/zsh";
+      if (mode === "env") f.env.CODEWHALE_NO_MODIFY_PATH = "1";
+      const result = f.run(mode === "flag" ? ["--no-modify-path"] : []);
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(fs.existsSync(path.join(f.home, ".zshrc")), false);
+      assert.ok(result.stdout.includes("Not editing your shell profile"), result.stdout);
+      assert.ok(result.stdout.includes(">> ~/.zshrc"), result.stdout);
+      assert.equal(result.stdout.trim().split("\n").at(-1).trim(), "codewhale --version");
+    }
+  });
+
+  test(`${kind}: an unknown option fails before installing`, t => {
+    const f = fixture(t, kind);
+    const result = f.run(["--no-modify-pth"]);
+    assert.equal(result.status, 2);
+    assert.equal(fs.existsSync(path.join(f.destination, "codewhale")), false);
+  });
+
+  test(`${kind}: no edit when the install directory is already on PATH`, t => {
+    const f = fixture(t, kind);
+    f.env.SHELL = "/bin/zsh";
+    const dir = fs.realpathSync(f.destination);
+    f.env.PATH = `${dir}:${f.env.PATH}`;
+    const result = f.run();
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.existsSync(path.join(f.home, ".zshrc")), false);
+    assert.ok(!result.stdout.includes("Added to"), result.stdout);
+  });
+
+  test(`${kind}: reinstalling never duplicates the block`, t => {
+    const f = fixture(t, kind);
+    f.env.SHELL = "/bin/zsh";
+    assert.equal(f.run().status, 0);
+    const first = fs.readFileSync(path.join(f.home, ".zshrc"), "utf8");
+    const again = f.run();
+    assert.equal(again.status, 0, again.stderr);
+    assert.equal(fs.readFileSync(path.join(f.home, ".zshrc"), "utf8"), first);
+    assert.ok(again.stdout.includes("already has the codewhale PATH block"), again.stdout);
+  });
+
+  test(`${kind}: a symlinked profile is refused, left alone, and the command is printed`, t => {
+    const f = fixture(t, kind);
+    f.env.SHELL = "/bin/zsh";
+    const target = path.join(f.root, "dotfiles-zshrc");
+    fs.writeFileSync(target, "# managed\n");
+    fs.symlinkSync(target, path.join(f.home, ".zshrc"));
+    const result = f.run();
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.readFileSync(target, "utf8"), "# managed\n");
+    assert.ok(result.stdout.includes("is a symlink"), result.stdout);
+    assert.ok(result.stdout.includes(">> ~/.zshrc"), result.stdout);
+    assert.equal(result.stdout.trim().split("\n").at(-1).trim(), "codewhale --version");
+  });
+
+  test(`${kind}: an unwritable profile is refused and left alone`, t => {
+    if (process.getuid && process.getuid() === 0) return t.skip("root can write read-only files");
+    const f = fixture(t, kind);
+    f.env.SHELL = "/bin/zsh";
+    const profile = path.join(f.home, ".zshrc");
+    fs.writeFileSync(profile, "# ro\n", { mode: 0o444 });
+    const result = f.run();
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.readFileSync(profile, "utf8"), "# ro\n");
+    assert.ok(result.stdout.includes("not a writable regular file"), result.stdout);
+  });
+
+  test(`${kind}: no profile is chosen or edited when the shell cannot be determined`, t => {
+    for (const shell of ["", "/usr/bin/fish", "/bin/tcsh"]) {
+      const f = fixture(t, kind);
+      f.env.SHELL = shell;
+      const result = f.run();
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(fs.readdirSync(f.home).filter(name => name !== ".local"), [], `${shell}: ${result.stdout}`);
+      assert.ok(!result.stdout.includes("Added to"), result.stdout);
+    }
+  });
+}
+
+const helpWithout = "Usage: codewhale [OPTIONS] [PROMPT]...\n\nCommands:\n  update   Update\n  doctor   Diagnose";
+const helpWith = `${helpWithout}\n  uninstall   Remove this receipt-owned release install`;
+for (const kind of ["website", "archive"]) {
+  for (const [label, help, supported] of [["without", helpWithout, false], ["with", helpWith, true]]) {
+    test(`${kind}: a binary ${label} an uninstall command ${supported ? "gets" : "never gets"} the uninstall line, and the update mode comes from the binary`, t => {
+      const f = fixture(t, kind);
+      f.env.INSTALL_TEST_HELP = help;
+      f.env.SHELL = "/bin/bash";
+      const result = f.run();
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(result.stdout.includes("uninstall --yes"), supported, result.stdout);
+      assert.equal(result.stdout.includes("update.mode"), false, result.stdout);
+      assert.equal(/codewhale uninstall/.test(result.stdout), supported, result.stdout);
+      assert.equal(result.stdout.includes("this release has no uninstall command"), !supported, result.stdout);
+      if (!supported) {
+        assert.ok(result.stdout.includes(`rm "${fs.realpathSync(f.destination)}/codewhale" "${fs.realpathSync(f.destination)}/codew" "${fs.realpathSync(f.destination)}/.codewhale-install.sha256"`), result.stdout);
+      }
+      f.untouched();
+    });
+  }
+}
+
+test("archive: install.bat forwards its arguments so -NoModifyPath reaches install.ps1", () => {
+  const bat = fs.readFileSync(path.join(repo, "scripts/release/install.bat"), "utf8");
+  const ps1 = fs.readFileSync(path.join(repo, "scripts/release/install.ps1"), "utf8");
+  assert.match(ps1, /param\(\[switch\]\$NoModifyPath\)/);
+  const call = bat.split(/\r?\n/).find(line => /powershell\.exe/i.test(line));
+  assert.match(call, /-File "%~dp0install\.ps1" %\*\s*$/);
+});
 
 test("website: a checksum mismatch stops before any installation", t => {
   const f = fixture(t, "website");
@@ -317,3 +639,34 @@ for (const kind of ['website', 'archive']) {
     f.untouched();
   });
 }
+
+test('website: downloaders require HTTPS and TLS 1.2+', t => {
+  const f = fixture(t, 'website');
+  const argsFile = path.join(f.root, 'curl-args');
+  f.env.INSTALL_TEST_CURL_ARGS = argsFile;
+  executable(path.join(f.bin, 'curl'), `#!/bin/sh
+printf '%s\n' "$*" >> "$INSTALL_TEST_CURL_ARGS"
+url=""; output=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) shift; output="$1" ;;
+    http*) url="$1" ;;
+  esac
+  shift
+done
+printf '%s\n' "$url" >> "$INSTALL_TEST_DOWNLOADS"
+asset="$(basename "$url")"
+cp "$INSTALL_TEST_ASSETS/$asset" "$output"
+`);
+  const result = f.run();
+  assert.equal(result.status, 0, result.stderr);
+  const invocations = fs.readFileSync(argsFile, 'utf8').trim().split('\n');
+  assert.ok(invocations.length >= 2);
+  for (const line of invocations) {
+    assert.ok(line.includes('--proto =https'), `expected --proto =https in: ${line}`);
+    assert.ok(line.includes('--tlsv1.2'), `expected --tlsv1.2 in: ${line}`);
+  }
+  const websiteScript = fs.readFileSync(path.join(repo, 'web/public/install.sh'), 'utf8');
+  assert.match(websiteScript, /curl --proto '=https' --tlsv1\.2 -fsSL/);
+  assert.match(websiteScript, /wget --https-only -q/);
+});

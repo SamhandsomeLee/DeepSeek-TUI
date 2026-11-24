@@ -89,9 +89,9 @@ The embedded extension host bundle
 (`crates/engine/extension-host/dist/codewhale-extension-host.mjs`) contains these
 packages, as published by DeepSeek Harness:
 
-- `@deepseek-ai/cordis` 4.0.5
-- `@deepseek-ai/schemastery` 3.18.5
-- `@deepseek-ai/cosmokit` 1.8.6
+- `@deepseek-ai/cordis` 4.1.0
+- `@deepseek-ai/schemastery` 3.19.0
+- `@deepseek-ai/cosmokit` 1.9.0
 
 Upstream: <https://github.com/deepseek-ai/deepseek-harness> (`vendor/cordis`,
 `vendor/schemastery`, `vendor/cosmokit`)
@@ -122,15 +122,16 @@ SOFTWARE.
 
 ## DeepSeek Harness utility packages (`dsh-util-values`, `dsh-tools`, message compatibility) — MIT
 
-The same bundle contains `@deepseek-ai/dsh-util-values` 0.2.1-rc.5, and
+The same bundle contains `@deepseek-ai/dsh-util-values` 0.2.2-rc.1, and
 `crates/engine/extension-host/src/dsh/dsh-tools-compat.js` contains verbatim
-excerpts of `@deepseek-ai/dsh-tools` 0.2.1-rc.5 (`lib/index.js`), under the
-same licence text. `crates/engine/extension-host/src/dsh/dsh-message-compat.js`
-contains verbatim excerpts of `@deepseek-ai/dsh-brand` 0.2.1-rc.5,
-`@deepseek-ai/dsh-llm` 0.2.1-rc.5, `@deepseek-ai/dsh-session` 0.2.1-rc.5,
-`@deepseek-ai/dsh-system-prompt` 0.2.1-rc.5,
-`@deepseek-ai/dsh-user-questions` 0.2.1-rc.5 and
-`@deepseek-ai/dsh-util-crypto` 0.2.1-rc.5, under the same licence text.
+excerpts of `@deepseek-ai/dsh-tools` 0.2.2-rc.1 (`lib/index.js` and its shared
+`lib/shared-DTdn5dXO.js` chunk), under the same licence text.
+`crates/engine/extension-host/src/dsh/dsh-message-compat.js` contains verbatim
+excerpts of `@deepseek-ai/dsh-brand` 0.2.2-rc.1,
+`@deepseek-ai/dsh-llm` 0.2.2-rc.1, `@deepseek-ai/dsh-session` 0.2.2-rc.1,
+`@deepseek-ai/dsh-system-prompt` 0.2.2-rc.1,
+`@deepseek-ai/dsh-user-questions` 0.2.2-rc.1 and
+`@deepseek-ai/dsh-util-crypto` 0.2.2-rc.1, under the same licence text.
 
 Upstream: <https://github.com/deepseek-ai/deepseek-harness>
 (`dsh-util-values` is published from `packages/util/values`)
@@ -162,6 +163,44 @@ SOFTWARE.
 The host bundle's own copy of these notices is `dist/LICENSES.txt`, generated
 from the bundler's metafile; Codewhale writes it beside the bundle it
 materialises (`~/.codewhale/extension-host/<sha256>/LICENSES.txt`).
+
+## DeepSeek Harness Creator files (`dsh-agent-preset` skills, `dsh-plugin-manager`, `dsh-tool-cordis`, `dsh-sandbox`) — MIT
+
+Codewhale ships, unmodified, the four authoring skills of
+`@deepseek-ai/dsh-agent-preset` 0.2.2-rc.1
+(`crates/skills/assets/dsh-creator/`), and keeps byte-for-byte copies of
+`@deepseek-ai/dsh-plugin-manager` 0.2.2-rc.1 `lib/types/tools.js` and
+`@deepseek-ai/dsh-tool-cordis` 0.2.2-rc.1 `lib/index.js`
+(`crates/engine/extension-host/src/dsh/upstream/creator/`).
+`@deepseek-ai/dsh-sandbox` 0.2.2-rc.1 is named for the approval excerpt that
+slice will add. Each package is published under the licence text below, and
+each pin's `UPSTREAM.json` records the SHA-256 of every file.
+
+Upstream: <https://github.com/deepseek-ai/deepseek-harness>
+
+```
+MIT License
+
+Copyright (c) 2026 DeepSeek
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
 
 ## Model Context Protocol SDK and bundled dependencies
 
@@ -750,7 +789,7 @@ The host and its offline composition reviewer also contain these packages.
 Vendored composition adaptations are recorded in
 `crates/engine/extension-host/src/dsh/upstream/UPSTREAM.json`.
 
-### `@deepseek-ai/cordis-plugin-group` 1.0.5
+### `@deepseek-ai/cordis-plugin-group` 1.1.0
 
 ```text
 MIT License
@@ -776,7 +815,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### `@deepseek-ai/cordis-plugin-include` 1.0.10
+### `@deepseek-ai/cordis-plugin-include` 1.1.0
 
 ```text
 MIT License
@@ -802,7 +841,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### `@deepseek-ai/cordis-plugin-loader` 1.0.6
+### `@deepseek-ai/cordis-plugin-loader` 1.1.0
 
 ```text
 MIT License
@@ -888,19 +927,19 @@ THE SOFTWARE.
 The embedded extension host includes these pinned DeepSeek Harness packages:
 
 - `@deepseek-ai/dsh-agent-presets` 0.1.6-alpha.1
-- `@deepseek-ai/dsh-hook-protocol` 0.2.1-rc.5
-- `@deepseek-ai/dsh-hooks-claude-code` 0.2.1-rc.5
-- `@deepseek-ai/dsh-hooks-codex` 0.2.1-rc.5
-- `@deepseek-ai/dsh-persona` 0.2.1-rc.5
-- `@deepseek-ai/dsh-system-prompt` 0.2.1-rc.5
+- `@deepseek-ai/dsh-hook-protocol` 0.2.2-rc.1
+- `@deepseek-ai/dsh-hooks-claude-code` 0.2.2-rc.1
+- `@deepseek-ai/dsh-hooks-codex` 0.2.2-rc.1
+- `@deepseek-ai/dsh-persona` 0.2.2-rc.1
+- `@deepseek-ai/dsh-system-prompt` 0.2.2-rc.1
 
 Upstream: <https://github.com/deepseek-ai/deepseek-harness>, tag
-`dsh-v0.2.1-rc.5`, commit `b830ec950faba0a46dda564be3e2d854afed94f1`.
+`dsh-v0.2.2-rc.1`, commit `66491b05e3f05ad35bcdd4f6cd7ed26041d9e3db`.
 The legacy `dsh-agent-presets` adapter alone retains commit
 `0d1f50007f9bca3f52b06e1c3074fa14d5fb0720`; the newer preset runtime packages
-are not bundled. The reviewed composition loader is refreshed to the rc.5
-source: `cordis-plugin-loader` 1.0.6, `cordis-plugin-include` 1.0.10 and
-`cordis-plugin-group` 1.0.5 (MIT, Shigma).
+are not bundled. The reviewed composition loader is refreshed to the rc.1
+source: `cordis-plugin-loader` 1.1.0, `cordis-plugin-include` 1.1.0 and
+`cordis-plugin-group` 1.1.0 (MIT, Shigma).
 
 Preset discovery and metadata, hook matching and dialect codecs, and additive
 persona templates run through receipt-backed inputs. Core retains selection,

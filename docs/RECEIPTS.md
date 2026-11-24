@@ -1,10 +1,15 @@
 # Receipts
 
+> 阅读简体中文版：[zh_hans/RECEIPTS.md](zh_hans/RECEIPTS.md)。
+
 A receipt answers "what did this session do?" from the records Codewhale
 already keeps. It lists, in order, the files changed, commands run, web and
 MCP calls, agents started, approvals (and who decided each one), and
 failures, with totals on top. It also counts what ran without asking, and
-names the permission posture that let it.
+names the permission posture that let it. Below the totals it carries the
+provider's token counts; a terminal session's receipt also carries the cost
+line `/cost` prints, and a Runtime thread's receipt carries token counts only
+(see [Tokens and cost](#tokens-and-cost)).
 
 ```text
 # Receipt: Fix the parser
@@ -20,8 +25,14 @@ Changed 1 file (+2 −1) · ran 1 command · made 1 MCP call · 1 approved by yo
 6. turn failed — failed: provider returned 500
 
 Not recorded:
+- Cost: a Runtime thread receipt carries token counts only; GET /v1/threads/{id}/usage reports the thread's cost and what it covers.
 - Shell file changes: a Runtime thread's workspace snapshots are not tagged with the thread, so files a command changed are not itemized; only file tools are.
 ```
+
+This sample is the Runtime-thread form. A terminal session's receipt has no
+line counts for whole-file writes, shows pass or fail rather than an exit
+code for a call that passed, and has no per-call timestamps; its "Not
+recorded" list says so (see [Not recorded](#not-recorded)).
 
 A terminal session's receipt also lists the files a command changed, from
 the turn's own workspace snapshots:
@@ -68,7 +79,7 @@ the API reads whatever store its server owns.
 | --- | --- | --- |
 | Terminal session | `sessions/<id>.json` | Every tool call and its result text, in order; each prompt's `<turn_meta>` names the posture the turn ran under; `turn_outcomes` records terminal turn status and errors |
 | Terminal session | `sessions/<id>/approval_receipts.jsonl` | Every approval ask and decision, with time and who decided |
-| Runtime thread | `tasks/runtime/turns`, `items` | Every tool call with its input, status, start and end time, and structured result (exit code, diff, agent status); each turn's `permission_posture` |
+| Runtime thread | `tasks/runtime/turns`, `items` | Every tool call with its input, status, start and end time, and structured result (exit code, diff, agent status, and `core_calls.broker_acts` on `plugin_manager` steps); each turn's `permission_posture` |
 | Runtime thread | `tasks/runtime/events/<thread>.jsonl` | `approval.required` / `approval.decided`, with the flags that say who decided |
 
 The saved-session CLI and live `/receipts` read terminal turn failures,
@@ -146,6 +157,57 @@ approval, so a receipt reads the result itself:
 Terminal sessions started before 0.9.10 (2026-08-20) have no approval log,
 so their receipts do not count this and say why.
 
+### Tokens and cost
+
+A terminal session's receipt has a `usage` section for the whole session:
+
+```text
+Tokens: 1200 in · 90 out · 1290 total · 2 provider calls (800 cache read)
+Cost, as /cost reports it:
+  Session Cost:
+  ─────────────────────────────
+  Estimated total: unknown
+  No turn has an authoritative price in the selected currency.
+  This is an estimate, not a bill: it is computed locally from provider-reported token usage and published rates, and can differ from your invoice.
+  Covered: 0 of 2 money-metered turn(s) priced.
+  Excluded: 2 money-metered turn(s) had no authoritative price (billing basis unknown); their spend is missing from the total above.
+```
+
+In JSON, the same section is `usage`, with the cost as an object:
+
+```json
+"usage": {
+  "tokens": { "input": 1200, "output": 90, "total": 1290, "cache_read": 800, "calls": 2 },
+  "cost": {
+    "state": "unknown", "currency": "USD",
+    "priced_turns": 0, "unpriced_turns": 2,
+    "report": "Session Cost: …"
+  }
+}
+```
+
+- **Tokens** are what the provider reported, summed over the session's
+  recorded provider calls (parent turns and sub-agents). When a session saved
+  only a combined total, the receipt shows that total alone. When it saved
+  none, the receipt says so: that is not zero usage.
+- **Cost** is the report `/cost` prints, built by the same formatter from the
+  same saved coverage, so the wording and the numbers cannot drift. When the
+  route has no known price the receipt says "unknown" and why; it never
+  estimates one. JSON `usage.cost.state` is `priced`, `partial` (a subtotal:
+  some turns had no price) or `unknown`; `amount` is present only when at
+  least one turn was priced.
+- A receipt for one turn (`/receipts 2`, `--turn 2`) leaves `usage` out and
+  says so, because tokens and cost are kept for the whole session.
+- A Runtime thread's receipt carries token counts from its turn records and
+  no cost; `GET /v1/threads/{id}/usage` reports a thread's cost and what it
+  covers.
+- `codewhale metrics` counts the same usage from saved terminal sessions on
+  its own line, apart from Runtime `turn.usage` events, because a
+  session-scoped Runtime store can describe the same call from its side.
+
+Receipts written by a build before 0.10.3 have no `usage` section; readers
+treat the field as optional.
+
 ### Not recorded
 
 The receipt says so instead of guessing:
@@ -182,6 +244,16 @@ The receipt says so instead of guessing:
 - **Why a call ran without asking** beyond the turn's posture: the record
   does not say whether the posture, an allow rule, or a remembered grant let
   it through.
+- **Plugin changes (`plugin_change`) in terminal sessions, or when a broker
+  act record is incomplete.** A Runtime thread reads `plugin_change` actions
+  only from structured `core_calls.broker_acts` metadata written by the host
+  on `plugin_manager` steps, never from tool input or tool result text. Missing
+  fields print `"not recorded"`, overflow past retained acts adds `"Plugin
+  changes: more plugin acts than this receipt lists."`, and a `cut` act without
+  an outcome adds `"Plugin changes: a plugin act was cut before details were
+  recorded (not recorded)."`. Terminal sessions do not persist structured
+  plugin broker metadata yet, so their `not_recorded` list emits `"Plugin
+  changes are not itemized for a terminal session yet"`.
 
 ## Non-Goals
 
@@ -214,7 +286,7 @@ totals always cover every action, and `omitted_actions` counts the rest.
     "files_created": 0, "files_deleted": 0,
     "lines_added": 2, "lines_removed": 1, "line_counts_complete": true,
     "commands": 1, "commands_failed": 0, "code_runs": 0, "network": 0,
-    "mcp_calls": 1, "plugin_calls": 0, "subagents": 0,
+    "mcp_calls": 1, "plugin_calls": 0, "plugin_changes": 0, "subagents": 0,
     "approvals": {
       "total": 3, "approved": 2, "denied": 1, "timed_out": 0,
       "not_answered": 0, "pending": 0,
@@ -223,6 +295,9 @@ totals always cover every action, and `omitted_actions` counts the rest.
     },
     "ran_without_asking": 1, "failures": 1, "blocked": 1,
     "other_tool_calls": 0
+  },
+  "usage": {
+    "tokens": { "input": 1200, "output": 90, "total": 1290, "cache_read": 800 }
   },
   "actions": [
     {
@@ -238,7 +313,7 @@ totals always cover every action, and `omitted_actions` counts the rest.
     }
   ],
   "omitted_actions": 0,
-  "not_recorded": ["Shell file changes: …"],
+  "not_recorded": ["Cost: …", "Shell file changes: …"],
   "claim_ceiling": [
     "local_record_only",
     "not_safety_certification",
@@ -252,7 +327,7 @@ totals always cover every action, and `omitted_actions` counts the rest.
 `workspace_change` (`files[]` a turn's snapshots show changed that no file
 tool names, and `truncated` when more than 50 did), `command` (`command`, `cwd`, `exit_code`), `code` (`exit_code`, `nested[]`
 tool calls an `execute_tools` program made), `network` (`action`, `host`,
-`query`), `mcp` (`server`, `plugin`), `subagent` (`name`, `agent_id`,
+`query`), `mcp` (`server`, `plugin`), `plugin_change` (`method`, `plugin`, optional `hash`, `approver`, optional `services[]`), `subagent` (`name`, `agent_id`,
 `outcome`), `approval` (an approval with no matching call), `tool` (any other
 call, listed only when it failed), or `turn_failed`. `status` is `ok`,
 `failed` (ran and failed), `not_run` (held at approval), `blocked`

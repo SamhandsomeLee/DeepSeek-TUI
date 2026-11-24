@@ -1,19 +1,20 @@
+import { DocsArticleSearch } from "@/components/docs-search";
+import { EnglishRegion } from "@/components/fallback-region";
 import { DocsBreadcrumb } from "@/components/docs-breadcrumb";
 import { DocsHelp } from "@/components/docs-help";
+import { DocsLanguageRegion } from "@/components/docs-language-region";
 import { DocsSidebar } from "@/components/docs-sidebar";
 import { ReleaseTruth } from "@/components/release-truth";
-import { WhalePose } from "@/components/whale-pose";
 import { BUILD_FACTS, getFactsWithProvenance } from "@/lib/facts";
-import { getDocsShell } from "@/lib/i18n/dictionaries";
+import { docsChromeFallsBackToEnglish, docsEnglishTopics } from "@/lib/i18n/fallback";
 
 /* ------------------------------------------------------------------ */
 /*  Layout (Next.js App Router)                                        */
 /* ------------------------------------------------------------------ */
 
 /**
- * The docs shell every documentation URL shares: the portal hero with the
- * version-aware release-truth line, the breadcrumb + content + sidebar
- * grid, and the contextual help band that closes each page. All copy is
+ * The docs shell every documentation URL shares: the breadcrumb, the
+ * version-aware release-truth line, the content + sidebar grid, and the contextual help band that closes each page. All copy is
  * dictionary-driven; the release line reads the facts layer.
  */
 export default async function DocsLayout({
@@ -24,7 +25,6 @@ export default async function DocsLayout({
   params: Promise<{ locale: string }>;
 }) {
   const { locale } = await params;
-  const t = getDocsShell(locale);
   // These pages describe THIS build: pin the documented facts to the build
   // snapshot even when the KV snapshot was written by a newer source (a
   // rollback, or any deployment sharing it). Only the latest published
@@ -35,25 +35,27 @@ export default async function DocsLayout({
     latestPublishedRelease: resolution.facts.latestPublishedRelease,
   };
 
+  const chromeEnglish = docsChromeFallsBackToEnglish(locale);
+
   return (
     <div className="docs-theme docs-portal min-h-screen">
-      <section className="hero">
-        <div className="portal-container docs-portal-band">
-          <div className="portal-mark">
-            <WhalePose pose="read" className="portal-mark-pose" priority />
-            <span>{t.portalMark}</span>
-          </div>
-          <ReleaseTruth locale={locale} facts={facts} />
-        </div>
-      </section>
-
       <div className="portal-container docs-shell min-w-0">
         <article className="docs-content min-w-0">
-          <DocsBreadcrumb locale={locale} />
-          {children}
-          <DocsHelp locale={locale} />
+          <EnglishRegion when={chromeEnglish}>
+            <DocsBreadcrumb locale={locale} />
+            <ReleaseTruth locale={locale} facts={facts} />
+            <DocsArticleSearch locale={locale} />
+          </EnglishRegion>
+          <DocsLanguageRegion locale={locale} englishTopics={docsEnglishTopics(locale)}>
+            {children}
+          </DocsLanguageRegion>
+          <EnglishRegion when={chromeEnglish}>
+            <DocsHelp locale={locale} />
+          </EnglishRegion>
         </article>
-        <DocsSidebar locale={locale} />
+        <EnglishRegion when={chromeEnglish}>
+          <DocsSidebar locale={locale} />
+        </EnglishRegion>
       </div>
     </div>
   );

@@ -30,9 +30,10 @@ Stage 5 of the loop: [cw-orient](../cw-orient/SKILL.md) →
    Several agents share the checkout, so partition by file, check
    `git status` before staging, stage only your paths (never `git add -A`),
    and retry a commit that fails on `index.lock`. Push verified `main`
-   directly. A push is not a CI request: hosted CI runs once, at the final
-   release step (`docs/RELEASE_CHECKLIST.md`), and routine slice commits carry
-   `[skip ci]`. PRs are for contributors.
+   directly. Every push to `main` starts full hosted CI on that commit through
+   the landing gate (`main-landing.yml`) unless that exact commit already has
+   a green full `ci.yml` run, usually from its `ci/*` branch: never add
+   `[skip ci]`, watch the run and repair what it finds. PRs are for contributors.
 
 2. **Commit narrow and build-green.** One coherent change per commit; the tree
    builds at every commit. Put the real verification in the message — actual
@@ -54,7 +55,11 @@ Stage 5 of the loop: [cw-orient](../cw-orient/SKILL.md) →
    `check-blocking-calls-budget.py` (async code),
    `check-readme-translations.py` and `check-readme-locales.sh` (READMEs),
    `node web/scripts/derive-facts.mjs && node web/scripts/check-facts.mjs`
-   (public facts). Put a new CHANGELOG entry at the **top** of
+   (public facts and agent docs, which embed the docs), and
+   `node web/scripts/check-runtime-routes.mjs --write` (a Runtime API route
+   added or removed). Regenerate those two files after every rebase or
+   cherry-pick, even a clean one: git can merge `docs/RUNTIME_ROUTES.md`
+   wrongly with no conflict marker. Put a new CHANGELOG entry at the **top** of
    `[Unreleased]`. Open contributor PRs append at its end, and an entry of
    ours there conflicts with every one of them.
 
@@ -93,8 +98,13 @@ Stage 5 of the loop: [cw-orient](../cw-orient/SKILL.md) →
 
    Co-authored-by: <maintainer or agent identity>
    ```
-   GitHub's contributor list counts authors only, and
-   `check-contributor-credit.py` flags a harvested handle who is not credited.
+   GitHub's contributor count takes authors and `Co-authored-by` trailers in
+   the final trailer block (no blank line between trailers) whose address is
+   linked to the account, and `check-contributor-credit.py` flags a harvested
+   handle who is not credited, a trailer GitHub cannot parse, and a noreply id
+   that belongs to someone else. It accepts credit only from a noreply address
+   whose id matches `.github/AUTHOR_MAP`, or from a raw email listed there, so
+   add the contributor's line to `AUTHOR_MAP` when it is missing.
    Resolve the address from `.github/AUTHOR_MAP`, else
    `gh api users/<handle> --jq '"\(.id)+\(.login)@users.noreply.github.com"'`.
    A clean cherry-pick keeps the author by itself. This step is the single

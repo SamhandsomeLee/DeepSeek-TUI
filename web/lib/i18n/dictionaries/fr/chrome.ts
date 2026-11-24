@@ -19,14 +19,11 @@ import type { ChromeDict } from "../types";
  */
 export const chrome: ChromeDict = {
   navDocs: "Documentation",
-  navStart: "Premiers pas",
-  navInstall: "Installer",
-  navFaq: "FAQ",
-  navCommunity: "Communauté",
   navContribute: "Contribuer",
+  navSignIn: "Se connecter",
+  navDesktop: "Bureau",
 
   navFeatures: "Capacités",
-  navProduct: "Produit",
   navModels: "Modèles",
   navPlugins: "Plugins",
 
@@ -41,6 +38,7 @@ export const chrome: ChromeDict = {
 
   menuOpen: "Ouvrir le menu",
   menuClose: "Fermer le menu",
+  translationMachineDraft: "Cette traduction est un brouillon automatique qui n'a pas encore été relu par un locuteur natif.",
 
   themeAuto: "auto",
   themeLight: "clair",
@@ -48,19 +46,17 @@ export const chrome: ChromeDict = {
   themeAria: "Thème : {mode} (cliquer pour changer)",
   themeTitle: "Thème · auto / clair / sombre",
 
-  footerTagline:
-    "L’agent de programmation open source pour votre terminal et les modèles de votre choix.",
   footerProduct: "Produit",
   footerProject: "Projet",
   footerDocs: "Documentation",
   footerGuide: "Premiers pas",
   footerInstall: "Installation",
   footerModels: "Modèles",
-  footerRuntime: "Runtime",
   footerFaq: "FAQ",
-  footerIssues: "Issues",
   footerContribute: "Contribuer",
+  footerRoadmap: "Feuille de route",
   footerLicense: "Licence MIT",
+  footerMerch: "Boutique",
   footerTerms: "Conditions d’utilisation",
   footerPrivacy: "Confidentialité",
   footerChangelog: "Journal des modifications",
@@ -68,8 +64,25 @@ export const chrome: ChromeDict = {
   footerReleases: " · Versions : ",
   footerReleasesLink: "Versions GitHub",
   footerSecurity: "Sécurité",
+  footerLegal: "Mentions légales",
 
   switcherLabel: "Langue",
   switcherSwitchTo: "Passer en {label}",
   partialBadge: "(partiel)",
+
+  stateReleased: "Publié",
+  stateAvailable: "Disponible",
+  stateBeta: "Bêta",
+  stateDev: "Version de développement",
+  stateOpen: "Ouvert",
+  stateInviteOnly: "Sur invitation uniquement",
+  stateNotOpen: "Pas encore ouvert",
+  stateNotPublic: "Non public",
+  stateInSource: "Dans le code source, pas encore publié",
+  numbersAsOf: "Au {date}",
+  downloadMacos: "Télécharger pour macOS",
+  downloadVersion: "Version {version}",
+  downloadSize: "Taille {size}",
+  downloadChecksum: "Somme de contrôle SHA-256",
+  downloadSigned: "Signé et notarisé",
 };

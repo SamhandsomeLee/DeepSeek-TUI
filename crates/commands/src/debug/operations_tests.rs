@@ -263,6 +263,7 @@ fn empty_receipt() -> Receipt {
         turn: None,
         postures: vec![],
         totals: ReceiptTotals::default(),
+        usage: None,
         actions: vec![],
         omitted_actions: 0,
         not_recorded: vec![],
@@ -416,6 +417,7 @@ fn synced_conversation() -> SessionSyncPayload {
         model: "model".to_string(),
         workspace: std::path::PathBuf::from("/tmp/undo-workspace"),
         mode: codewhale_command_contract::CommandMode::Agent,
+        agent_preset: None,
     }
 }
 struct UndoFacet {

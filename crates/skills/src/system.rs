@@ -2,7 +2,7 @@
 //! on first launch.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use codewhale_runtime::config::{BundledSkillsConfig, BundledSkillsInstall, SkillsConfig};
 use codewhale_skill_install::skill_parse::{self, normalize_skill_name_for_lookup};
@@ -42,7 +42,26 @@ use sha2::{Digest, Sha256};
 /// person; the exact generation-16 body allows a safe upgrade.
 /// Generation 18 recognizes previously shipped bodies by SHA-256 as well as by
 /// retained bytes, so an untouched copy from any earlier generation upgrades.
-const BUNDLED_SKILL_VERSION: &str = "20";
+const BUNDLED_SKILL_VERSION: &str = "22";
+
+mod dsh_creator;
+use dsh_creator::{BundledFile, CREATOR_SKILLS};
+
+pub const CREATOR_SKILL_NAMES: [&str; 4] = [
+    "agent-experience",
+    "cordis-composition-reference",
+    "cordis-plugin-development",
+    "editing-cordis-compositions",
+];
+
+const AGENT_EXPERIENCE_BODY: &str =
+    include_str!("../assets/dsh-creator/skills/agent-experience/SKILL.md");
+const CORDIS_COMPOSITION_REFERENCE_BODY: &str =
+    include_str!("../assets/dsh-creator/skills/cordis-composition-reference/SKILL.md");
+const CORDIS_PLUGIN_DEVELOPMENT_BODY: &str =
+    include_str!("../assets/dsh-creator/skills/cordis-plugin-development/SKILL.md");
+const EDITING_CORDIS_COMPOSITIONS_BODY: &str =
+    include_str!("../assets/dsh-creator/skills/editing-cordis-compositions/SKILL.md");
 
 // ── system & extension (meta) ───────────────────────────────────────────────
 const SKILL_CREATOR_BODY: &str = include_str!("../assets/skills/skill-creator/SKILL.md");
@@ -107,7 +126,6 @@ const FEISHU_BODY: &str = include_str!("../assets/skills/feishu/SKILL.md");
 const MCP_DISCOVERY_BODY: &str = include_str!("../assets/skills/mcp-discovery/SKILL.md");
 
 // Legacy v4 body retained for migration fixtures; installed copies stay on disk.
-#[cfg(test)]
 const V4_BEST_PRACTICES_BODY: &str = include_str!("../assets/skills/v4-best-practices/SKILL.md");
 
 // Generation-10 `mcp-discovery` body, retained solely so an unmodified copy of
@@ -156,6 +174,10 @@ const SUPERSEDED_BODIES: &[(&str, &str)] = &[
     (
         "plugin-creator",
         include_str!("../assets/skills/plugin-creator/SKILL.generation-16.md"),
+    ),
+    (
+        "plugin-creator",
+        include_str!("../assets/skills/plugin-creator/SKILL.generation-19.md"),
     ),
     (
         "help",
@@ -404,6 +426,26 @@ const BUNDLED_SKILLS: &[BundledSkill] = &[
         body: MCP_DISCOVERY_BODY,
         introduced_in: 10,
     },
+    BundledSkill {
+        name: "cordis-plugin-development",
+        body: CORDIS_PLUGIN_DEVELOPMENT_BODY,
+        introduced_in: 21,
+    },
+    BundledSkill {
+        name: "editing-cordis-compositions",
+        body: EDITING_CORDIS_COMPOSITIONS_BODY,
+        introduced_in: 21,
+    },
+    BundledSkill {
+        name: "cordis-composition-reference",
+        body: CORDIS_COMPOSITION_REFERENCE_BODY,
+        introduced_in: 21,
+    },
+    BundledSkill {
+        name: "agent-experience",
+        body: AGENT_EXPERIENCE_BODY,
+        introduced_in: 21,
+    },
     // Everyday (generation 12)
     BundledSkill {
         name: "github",
@@ -500,11 +542,26 @@ pub fn bundled_skill_tier(name: &str) -> Option<BundledSkillTier> {
         return None;
     }
     let tier = match name {
-        "skill-creator" | "plugin-creator" | "skill-installer" | "mcp-builder" | "help"
-        | "frontend-design" | "webapp-testing" | "document" | "dataviz" | "docx" | "pdf"
-        | "pptx" | "xlsx" | "documents" | "presentations" | "spreadsheets" => {
-            BundledSkillTier::FormatTooling
-        }
+        "skill-creator"
+        | "plugin-creator"
+        | "skill-installer"
+        | "mcp-builder"
+        | "cordis-plugin-development"
+        | "editing-cordis-compositions"
+        | "cordis-composition-reference"
+        | "agent-experience"
+        | "help"
+        | "frontend-design"
+        | "webapp-testing"
+        | "document"
+        | "dataviz"
+        | "docx"
+        | "pdf"
+        | "pptx"
+        | "xlsx"
+        | "documents"
+        | "presentations"
+        | "spreadsheets" => BundledSkillTier::FormatTooling,
         _ => BundledSkillTier::CoreAgentic,
     };
     Some(tier)
@@ -529,7 +586,7 @@ pub fn bundled_skill_generation() -> &'static str {
     BUNDLED_SKILL_VERSION
 }
 
-fn feishu_body() -> &'static str {
+pub(super) fn feishu_body() -> &'static str {
     FEISHU_BODY
 }
 
@@ -545,6 +602,71 @@ fn contributor_onboarding_body() -> &'static str {
 /// recognizable and is left in place, never deleted by name.
 fn feedback_body() -> &'static str {
     FEEDBACK_BODY
+}
+
+const RETIRED_BUNDLED_SKILL_NAMES: &[&str] = &[
+    "contributor-onboarding",
+    "feedback",
+    "feishu",
+    "health",
+    "social-media",
+    "v4-best-practices",
+];
+
+pub(super) fn retired_bundled_skill_name(name: &str) -> Option<&'static str> {
+    let name = normalize_skill_name_for_lookup(name);
+    RETIRED_BUNDLED_SKILL_NAMES
+        .iter()
+        .copied()
+        .find(|retired| *retired == name)
+}
+
+fn retired_bundled_body_matches(retired: &str, body: &str) -> bool {
+    let exact = match retired {
+        "feedback" => Some(FEEDBACK_BODY),
+        "contributor-onboarding" => Some(CONTRIBUTOR_ONBOARDING_BODY),
+        "feishu" => Some(FEISHU_BODY),
+        "v4-best-practices" => Some(V4_BEST_PRACTICES_BODY),
+        _ => None,
+    };
+    exact == Some(body) || is_superseded_shipped_body(retired, body)
+}
+
+fn retired_bundled_copy_matches_shipped(owned: &Path, copy: &Path, retired: &str) -> bool {
+    let Ok(body) = codewhale_util::fs_confined::read_to_string(owned, copy) else {
+        return false;
+    };
+    if !retired_bundled_body_matches(retired, &body) {
+        return false;
+    }
+    let Ok((parsed, _)) = skill_parse::parse_verified_content(copy, &body) else {
+        return false;
+    };
+    retired_bundled_skill_name(&parsed.name) == Some(retired)
+}
+
+fn retired_listed(names: &Option<Vec<String>>, retired: &str) -> bool {
+    names
+        .iter()
+        .flatten()
+        .any(|entry| retired_bundled_skill_name(entry) == Some(retired))
+}
+
+#[must_use]
+pub fn retired_bundled_copy_disabled(
+    policy: &BundledSkillsConfig,
+    path: &Path,
+    name: &str,
+    owned: &Path,
+) -> bool {
+    retired_bundled_skill_name(name).is_some_and(|retired| {
+        let expected = owned.join(retired).join("SKILL.md");
+        retired_listed(&policy.disabled, retired)
+            && fs::symlink_metadata(owned.join(retired).join(".installed-from")).is_err()
+            && super::roots::paths_refer_to_same_dir(path, &expected)
+            && codewhale_util::fs_confined::read_to_string(owned, &expected)
+                .is_ok_and(|body| retired_bundled_body_matches(retired, &body))
+    })
 }
 
 /// Whether a skill name matches one of the bundled first-party skills.
@@ -614,6 +736,7 @@ fn install_one(
                 return Ok(false);
             }
             Ok(existing) if existing == skill.body => {
+                install_companion_files(skills_dir, skill.name)?;
                 return Ok(installed_version != Some(BUNDLED_SKILL_VERSION));
             }
             Ok(_) => {}
@@ -627,8 +750,90 @@ fn install_one(
             true,
         )?
         .replace(skill.body.as_bytes())?;
+        install_companion_files(skills_dir, skill.name)?;
     }
     Ok(should_install)
+}
+
+fn companion_files(name: &str) -> &'static [BundledFile] {
+    CREATOR_SKILLS
+        .iter()
+        .find(|skill| skill.name == name)
+        .map_or(&[], |skill| skill.files)
+}
+
+fn install_companion_files(skills_dir: &Path, name: &str) -> std::io::Result<()> {
+    for file in companion_files(name) {
+        let relative = Path::new(name).join(file.path);
+        if fs::symlink_metadata(skills_dir.join(&relative)).is_ok() {
+            continue;
+        }
+        codewhale_util::files::WorkspaceFile::open(skills_dir, &relative, true)?
+            .replace(file.bytes)?;
+    }
+    Ok(())
+}
+
+#[must_use]
+pub(super) fn effective_bundled_policy(
+    policy: &BundledSkillsConfig,
+    creator: bool,
+) -> BundledSkillsConfig {
+    if creator {
+        return policy.clone();
+    }
+    let mut effective = policy.clone();
+    let disabled = effective.disabled.get_or_insert_with(Vec::new);
+    disabled.extend(CREATOR_SKILL_NAMES.iter().map(|name| (*name).to_string()));
+    effective
+}
+
+#[must_use]
+pub fn bundled_creator_skill_dirs() -> Vec<PathBuf> {
+    let Some(owned) = codewhale_runtime::config::owned_skills_dir() else {
+        return Vec::new();
+    };
+    CREATOR_SKILL_NAMES
+        .iter()
+        .filter(|name| is_bundled_copy(&owned.join(name).join("SKILL.md"), name, &owned))
+        .filter_map(|name| fs::canonicalize(owned.join(name)).ok())
+        .collect()
+}
+
+#[must_use]
+pub fn bundled_creator_skill(name: &str) -> Option<super::Skill> {
+    if !CREATOR_SKILL_NAMES.contains(&name) {
+        return None;
+    }
+    let owned = codewhale_runtime::config::owned_skills_dir()?;
+    let path = owned.join(name).join("SKILL.md");
+    let body = read_bundled_copy_body(&path, name, &owned)?;
+    let (skill, _) = super::SkillRegistry::parse_verified_content(&path, &body).ok()?;
+    Some(skill)
+}
+
+pub struct BundledSkillLoadContext {
+    pub base_dir: PathBuf,
+    pub host_notes: Option<&'static str>,
+}
+
+#[must_use]
+pub fn bundled_skill_load_context(
+    name: &str,
+    skill_path: &Path,
+) -> Option<BundledSkillLoadContext> {
+    let owned = codewhale_runtime::config::owned_skills_dir()?;
+    let creator = CREATOR_SKILLS.iter().find(|skill| skill.name == name)?;
+    if creator.files.is_empty() && creator.host_notes.is_none() {
+        return None;
+    }
+    if !is_bundled_copy(skill_path, name, &owned) {
+        return None;
+    }
+    Some(BundledSkillLoadContext {
+        base_dir: skill_path.parent()?.to_path_buf(),
+        host_notes: creator.host_notes,
+    })
 }
 
 /// Install bundled system skills into `skills_dir`.
@@ -751,17 +956,20 @@ pub(super) fn bundled_explicit_only(policy: &BundledSkillsConfig, name: &str) ->
     bundled_enabled(policy, name) && listed(&policy.explicit_only, name)
 }
 
-pub fn is_bundled_copy(path: &Path, name: &str, owned: &Path) -> bool {
+fn read_bundled_copy_body(path: &Path, name: &str, owned: &Path) -> Option<String> {
     let expected = owned.join(name).join("SKILL.md");
     if !is_bundled_skill_name(name)
         || !super::roots::paths_refer_to_same_dir(path, &expected)
         || fs::symlink_metadata(owned.join(name).join(".installed-from")).is_ok()
     {
-        return false;
+        return None;
     }
-    codewhale_util::fs_confined::read_to_string(owned, &expected).is_ok_and(|body| {
-        is_exact_bundled_skill(name, &body) || is_superseded_shipped_body(name, &body)
-    })
+    let body = codewhale_util::fs_confined::read_to_string(owned, &expected).ok()?;
+    (is_exact_bundled_skill(name, &body) || is_superseded_shipped_body(name, &body)).then_some(body)
+}
+
+pub fn is_bundled_copy(path: &Path, name: &str, owned: &Path) -> bool {
+    read_bundled_copy_body(path, name, owned).is_some()
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -781,6 +989,7 @@ pub struct BundledSkillsStatus {
     pub explicit_only: Vec<&'static str>,
     pub shadowed: Vec<&'static str>,
     pub unknown: Vec<String>,
+    pub retired: Vec<String>,
     pub ignored: Vec<String>,
     pub skills: Vec<BundledSkillStatus>,
 }
@@ -813,6 +1022,9 @@ impl BundledSkillsStatus {
                 self.unknown.join(", ")
             ));
         }
+        if !self.retired.is_empty() {
+            lines.push(format!("No longer bundled: {}", self.retired.join(", ")));
+        }
         if !self.ignored.is_empty() {
             lines.push(format!(
                 "Ignored explicit_only entries: {}",
@@ -833,7 +1045,7 @@ pub fn bundled_skills_status(
     registry: &super::SkillRegistry,
 ) -> Option<BundledSkillsStatus> {
     let owned = codewhale_runtime::config::owned_skills_dir()?;
-    let policy = &config.bundled;
+    let policy = &effective_bundled_policy(&config.bundled, config.creator_skills);
     let marker_generation = codewhale_util::fs_confined::read_to_string(
         &owned,
         &owned.join(".system-installed-version"),
@@ -855,6 +1067,7 @@ pub fn bundled_skills_status(
         explicit_only: vec![],
         shadowed: vec![],
         unknown: vec![],
+        retired: vec![],
         ignored: vec![],
         skills: vec![],
     };
@@ -864,7 +1077,39 @@ pub fn bundled_skills_status(
         ("explicit_only", &policy.explicit_only),
     ] {
         for name in names.iter().flatten() {
-            if canonical_bundled_skill_name(name).is_none() {
+            if let Some(retired) = retired_bundled_skill_name(name) {
+                let copy = owned.join(retired).join("SKILL.md");
+                let installed = fs::metadata(&copy).is_ok_and(|meta| meta.is_file());
+                let has_marker =
+                    fs::symlink_metadata(owned.join(retired).join(".installed-from")).is_ok();
+                let matches_shipped =
+                    installed && retired_bundled_copy_matches_shipped(&owned, &copy, retired);
+                let hidden = retired_listed(&policy.disabled, retired)
+                    && installed
+                    && !has_marker
+                    && matches_shipped;
+                let state = match (field, installed) {
+                    ("disabled", true) if has_marker => format!(
+                        "installed copy at {} has .installed-from and stays active",
+                        copy.display()
+                    ),
+                    ("disabled", true) if !matches_shipped => format!(
+                        "copy at {} was customized or renamed and stays active",
+                        copy.display()
+                    ),
+                    ("disabled", true) => format!("installed copy at {} is hidden", copy.display()),
+                    ("disabled", false) => {
+                        "no copy installed; this entry can be removed".to_string()
+                    }
+                    (_, true) if hidden => "hidden by disabled".to_string(),
+                    (_, true) => format!(
+                        "this entry has no effect; the copy at {} loads as a user skill",
+                        copy.display()
+                    ),
+                    (_, false) => "no copy installed; this entry can be removed".to_string(),
+                };
+                status.retired.push(format!("{field}={retired} ({state})"));
+            } else if canonical_bundled_skill_name(name).is_none() {
                 status
                     .unknown
                     .push(format!("{field}={}", name.escape_debug()));
@@ -885,7 +1130,12 @@ pub fn bundled_skills_status(
             selected.filter(|entry| !super::roots::paths_refer_to_same_dir(&entry.path, &path));
         let reason = if !bundled_enabled(policy, skill.name) {
             status.disabled.push(skill.name);
-            let reason = if listed(&policy.disabled, skill.name) {
+            let reason = if CREATOR_SKILL_NAMES.contains(&skill.name)
+                && !config.creator_skills
+                && !listed(&config.bundled.disabled, skill.name)
+            {
+                "Creator mode only"
+            } else if listed(&policy.disabled, skill.name) {
                 "disabled by config"
             } else {
                 "not selected by config"

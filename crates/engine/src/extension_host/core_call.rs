@@ -40,10 +40,15 @@
 //! (`approval_cache::extension_origin_approval_keys`), so a grant the user gave
 //! the model never covers an extension's call and the reverse. Shell and
 //! network calls force a prompt: a session grant is not consulted, and
-//! Full Access still opens their card. Auto-Review and Never refuse them
-//! (`resolve_approval_request_disposition`); explicit denials always win.
+//! Full Access still opens their card. Never refuses them
+//! (`resolve_approval_request_disposition`), while Auto-Review sends held calls
+//! to its reviewer; explicit denials always win.
+//! The broker's own gate tools ([`dsh_broker::GATE_TOOLS`]) are the exception:
+//! the permission mode alone decides them, and only a broker arm reaches them
+//! (a plugin's own `core/call` of one is refused by name).
 //!
-//! **Caps.** Per invocation: 50 `core/call`s in all (the ticket's uses), 4 at
+//! **Caps.** Per invocation: 50 core tool calls in all, counted together
+//! across `core/call` and the nested calls of broker arms, 4 at
 //! once (code mode's own cap), and one approval card at a time (the turn
 //! loop serves one request at a time). Per host: the channel's 256 in-flight
 //! host requests. A burst of invalid tickets ends the host (`ticket`).
@@ -67,6 +72,7 @@
 //!   tool's `core/call`s run beside it, not through the lock.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -75,13 +81,14 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::ManagerShared;
+use super::dsh_broker::{self, Arm, BrokerCall, BrokerEffect, BrokerRefusal, OpenAct};
 use super::protocol::{
-    ContentBlockWire, CoreCallParams, RpcErrorWire, SessionCheckpointParams, ToolResultWire,
-    UserQuestionParams, error_code,
+    ContentBlockWire, CoreCallParams, DshBrokerParams, DshBrokerTicketWire, DshService,
+    RpcErrorWire, SessionCheckpointParams, ToolResultWire, UserQuestionParams, error_code,
 };
 use super::supervisor::HostRequestContext;
 use super::ticket::{Grant, Presented, Ticket, TicketKind};
-use super::tier::HostTier;
+use super::tier::{HostCohort, HostTier};
 use crate::core::authority::{ToolCategory, get_tool_category_for_call};
 use crate::core::events::SessionCheckpointCaller;
 use crate::tools::codemode::{
@@ -100,8 +107,10 @@ pub const MAX_CALLS_PER_INVOCATION: u32 = 50;
 /// A backstop only: an invocation ends (and revokes its ticket) long before
 /// this, and its own deadline pauses while a person decides.
 const TICKET_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const GRANT_PROBE: Duration = Duration::from_millis(50);
 /// Receipts attached to an extension tool's result metadata.
 pub const RECEIPTS_ATTACHED: usize = 50;
+pub const MAX_ACT_RECORD_BYTES: usize = 1024;
 
 /// Tools an extension may never reach through `core/call`, by lower-case
 /// name, checked on the spelling the host sent and on the canonical action
@@ -123,6 +132,7 @@ const REFUSED_NAMES: &[&str] = &[
     "send_later",
     "start_mcp_server",
     "start_registry_mcp_server",
+    "plugin_manager",
 ];
 
 /// Read-only, workspace-local tools an extension's call may run without a
@@ -200,7 +210,8 @@ pub fn refusal(specs: &[Arc<dyn ToolSpec>], name: &str, input: &Value) -> Option
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OriginApproval {
     /// Planning's decision stands (the tool is in [`EXT_AUTO_ELIGIBLE`] and
-    /// nothing asked for approval).
+    /// nothing asked for approval, or it is one of the broker's gate tools,
+    /// which the permission mode alone decides).
     Unchanged,
     /// Needs approval; an extension-scoped session grant may satisfy it.
     Prompt,
@@ -222,6 +233,9 @@ pub fn origin_approval(
 
     let lower = name.to_ascii_lowercase();
     let resolved = canonical(name, input);
+    if dsh_broker::is_gate_tool(&lower) && spec.is_some_and(dsh_broker::is_gate_spec) {
+        return OriginApproval::Unchanged;
+    }
     let forced = |candidate: &str| {
         matches!(
             get_tool_category_for_call(candidate, input),
@@ -250,11 +264,41 @@ pub fn origin_approval(
     }
 }
 
+#[must_use]
+pub fn auto_review_held(
+    name: &str,
+    input: &Value,
+    planned_requires_approval: bool,
+    spec: Option<&dyn ToolSpec>,
+) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if dsh_broker::is_gate_tool(&lower) && spec.is_some_and(dsh_broker::is_gate_spec) {
+        return planned_requires_approval;
+    }
+    !matches!(
+        origin_approval(name, input, planned_requires_approval, spec),
+        OriginApproval::Unchanged
+    )
+}
+
 /// One extension tool call's standing to ask the core for things: its ticket
 /// and the machinery the asks run on. Lives from the `tool/call`'s start to
 /// its end.
+static NEXT_INVOCATION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PluginChangeMark {
+    pub plugin: String,
+    pub action: String,
+    pub content_hash: Option<String>,
+    pub decided_by: Option<String>,
+    pub services: Vec<String>,
+    pub tools_added: Vec<String>,
+    pub tools_removed: Vec<String>,
+}
+
 pub struct Invocation {
-    tier: HostTier,
+    pub cohort: HostCohort,
     host_generation: u64,
     owner: OwnerRef,
     scope: Option<codewhale_config::EntryRef>,
@@ -263,8 +307,17 @@ pub struct Invocation {
     calls: CodemodeInvoker,
     gate: NestedCallGate,
     root_caller: Option<SessionCheckpointCaller>,
+    broker: Option<BrokerScope>,
+    nested_calls: AtomicU32,
+    next_broker_token: AtomicU64,
+    id: u64,
+    broker_acts: Mutex<(usize, Vec<Value>, bool)>,
+    plugin_change: Mutex<(Option<PluginChangeMark>, bool)>,
+    held_image: Mutex<(Option<(u64, HeldImage)>, bool)>,
     tickets: Vec<Ticket>,
     caller_tools: Vec<String>,
+    gates: Vec<&'static str>,
+    act_slots: tokio::sync::Semaphore,
     activations: Mutex<
         HashMap<
             String,
@@ -278,6 +331,420 @@ pub struct Invocation {
     /// Fires when the invocation ends or is revoked: withdraws every
     /// `core/call` still waiting or running for it.
     cancel: CancellationToken,
+}
+
+impl Invocation {
+    pub fn tier(&self) -> HostTier {
+        self.cohort.tier()
+    }
+}
+
+struct BrokerScope {
+    session_id: String,
+    context: Arc<ToolContext>,
+}
+
+#[derive(Clone)]
+pub(super) struct HeldImage {
+    pub(super) attachment_id: String,
+    pub(super) media_type: String,
+    pub(super) bytes: usize,
+    pub(super) width: u32,
+    pub(super) height: u32,
+    pub(super) data_base64: String,
+}
+
+impl Invocation {
+    fn push_act_record(&self, service: &str, entry: Value) -> bool {
+        let mut entry = match entry {
+            Value::Object(fields) => fields,
+            other => {
+                let mut fields = serde_json::Map::new();
+                fields.insert("detail".to_string(), other);
+                fields
+            }
+        };
+        entry.insert("service".to_string(), Value::String(service.to_string()));
+        let mut entry = Value::Object(entry);
+        if entry.to_string().len() > MAX_ACT_RECORD_BYTES {
+            let cut = |key: &str| {
+                entry
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .map_or(Value::Null, |text| {
+                        Value::String(text.chars().take(dsh_broker::MAX_ACT_TARGET).collect())
+                    })
+            };
+            entry = json!({
+                "service": service,
+                "method": cut("method"),
+                "outcome": cut("outcome"),
+                "cut": true,
+            });
+        }
+        let mut acts = self
+            .broker_acts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if acts.2 {
+            return false;
+        }
+        acts.0 += 1;
+        if acts.1.len() < RECEIPTS_ATTACHED {
+            acts.1.push(entry);
+        }
+        true
+    }
+
+    fn rollback_held_image(&self, broker_token: u64, reason: &str) -> bool {
+        let rolled = {
+            let mut guard = self
+                .held_image
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if guard.1 {
+                return false;
+            }
+            if !guard
+                .0
+                .as_ref()
+                .is_some_and(|(token, _)| *token == broker_token)
+            {
+                return false;
+            }
+            guard.0.take().map(|(_, held)| held)
+        };
+        if let Some(held) = rolled {
+            let _ = self.push_act_record(
+                DshService::Attachments.name(),
+                json!({
+                    "method": "save",
+                    "outcome": "refused_after_hold",
+                    "reason": reason,
+                    "attachment_id": held.attachment_id,
+                    "media_type": held.media_type,
+                    "bytes": held.bytes,
+                    "width": held.width,
+                    "height": held.height,
+                }),
+            );
+            true
+        } else {
+            false
+        }
+    }
+}
+
+pub struct BrokerContext {
+    invocation: Arc<Invocation>,
+    tool: Arc<ToolContext>,
+    service: DshService,
+    cancel: CancellationToken,
+    broker_token: u64,
+}
+
+impl BrokerContext {
+    #[must_use]
+    pub fn tool(&self) -> &ToolContext {
+        &self.tool
+    }
+
+    #[must_use]
+    pub fn cancel(&self) -> &CancellationToken {
+        &self.cancel
+    }
+
+    #[must_use]
+    pub fn caller_tools(&self) -> &[String] {
+        &self.invocation.caller_tools
+    }
+
+    #[must_use]
+    pub fn mcp_pool(&self) -> Option<Arc<tokio::sync::Mutex<crate::mcp::McpPool>>> {
+        self.invocation.gate.mcp_pool()
+    }
+
+    #[must_use]
+    pub fn invocation_id(&self) -> u64 {
+        self.invocation.id
+    }
+
+    pub fn record_plugin_change(&self, mark: PluginChangeMark) {
+        let mut guard = self
+            .invocation
+            .plugin_change
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !guard.1 {
+            guard.0 = Some(mark);
+        }
+    }
+
+    pub fn record(&self, entry: Value) -> bool {
+        self.invocation.push_act_record(self.service.name(), entry)
+    }
+
+    pub(super) fn can_hold_image(&self) -> Result<(), bool> {
+        let guard = self
+            .invocation
+            .held_image
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.1 {
+            return Err(true);
+        }
+        if guard.0.is_some() {
+            return Err(false);
+        }
+        Ok(())
+    }
+
+    pub(super) fn hold_image(&self, image: HeldImage) -> Result<(), bool> {
+        let mut guard = self
+            .invocation
+            .held_image
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.1 {
+            return Err(true);
+        }
+        if guard.0.is_some() {
+            return Err(false);
+        }
+        guard.0 = Some((self.broker_token, image));
+        Ok(())
+    }
+
+    pub(super) fn held_image(&self, attachment_id: &str) -> Option<HeldImage> {
+        self.invocation
+            .held_image
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0
+            .as_ref()
+            .map(|(_, held)| held)
+            .filter(|held| held.attachment_id == attachment_id)
+            .cloned()
+    }
+
+    pub async fn act(
+        &self,
+        method: &str,
+        effect: BrokerEffect,
+        target: Option<&str>,
+    ) -> Result<(), BrokerRefusal> {
+        let raw_target = target;
+        let target: Option<String> =
+            raw_target.map(|target| target.chars().take(dsh_broker::MAX_ACT_TARGET).collect());
+        let record = |outcome: &str| -> bool {
+            let mut entry =
+                json!({ "method": method, "effect": effect.name(), "outcome": outcome });
+            if let Some(target) = &target {
+                entry["target"] = json!(target);
+            }
+            self.record(entry)
+        };
+        if self.cancel.is_cancelled() {
+            return Err(self.withdrawn());
+        }
+        if effect == BrokerEffect::Read {
+            if let Err(refusal) = self.count() {
+                record(refusal.code());
+                return Err(refusal);
+            }
+            if !record("read") {
+                return Err(self.withdrawn());
+            }
+            return Ok(());
+        }
+        if self.service == DshService::Plugins {
+            if let Err(refusal) = self.count() {
+                record(refusal.code());
+                return Err(refusal);
+            }
+            let mut live_tool = (*self.tool).clone();
+            let live_authority = live_tool.refresh_live_posture();
+            match super::creator_policy::admit_broker_act(
+                &live_tool,
+                live_authority.as_ref(),
+                method,
+                effect,
+                raw_target,
+            ) {
+                Ok((decider, posture)) => {
+                    let mut entry = json!({
+                        "method": method,
+                        "effect": effect.name(),
+                        "outcome": "allowed",
+                        "decider": decider,
+                        "posture": posture,
+                    });
+                    if let Some(target) = &target {
+                        entry["target"] = json!(target);
+                    }
+                    if !self.record(entry) {
+                        return Err(self.withdrawn());
+                    }
+                    return Ok(());
+                }
+                Err(message) => {
+                    record("refused");
+                    return Err(BrokerRefusal::Refused {
+                        service: self.service,
+                        message,
+                    });
+                }
+            }
+        }
+        let gate_tool = effect.gate_tool();
+        if !self.invocation.gates.contains(&gate_tool) {
+            record("refused");
+            return Err(BrokerRefusal::Refused {
+                service: self.service,
+                message: "the permission gate is not available in this turn".to_string(),
+            });
+        }
+        let slot = tokio::select! {
+            slot = self.invocation.act_slots.acquire() => slot.ok(),
+            () = self.cancel.cancelled() => None,
+            () = self.invocation.cancel.cancelled() => None,
+        };
+        if slot.is_none() {
+            return Err(self.withdrawn());
+        }
+        if let Err(refusal) = self.count() {
+            record(refusal.code());
+            return Err(refusal);
+        }
+        let mut input = json!({
+            "plugin": self.invocation.owner.plugin_id,
+            "service": self.service.name(),
+            "method": method,
+            "effect": effect.name(),
+        });
+        if let Some(target) = &target {
+            input["target"] = json!(target);
+        }
+        let Some(_open) = OpenAct::open(&input, Arc::as_ptr(&self.invocation) as usize) else {
+            record("refused");
+            return Err(BrokerRefusal::Refused {
+                service: self.service,
+                message: "too many broker acts are waiting on the permission gate".to_string(),
+            });
+        };
+        match self.call_counted(gate_tool, input.clone()).await {
+            Ok(response) if response.ok && dsh_broker::answered_for(&input, &response.result) => {
+                if !record("allowed") {
+                    return Err(self.withdrawn());
+                }
+                Ok(())
+            }
+            Ok(_) => {
+                record("refused");
+                Err(BrokerRefusal::Refused {
+                    service: self.service,
+                    message: "the permission gate refused this act".to_string(),
+                })
+            }
+            Err(refusal) => {
+                record(refusal.code());
+                Err(refusal)
+            }
+        }
+    }
+
+    fn withdrawn(&self) -> BrokerRefusal {
+        BrokerRefusal::nested(
+            self.service,
+            NestedFailure::Unavailable("the broker call was withdrawn".to_string()),
+        )
+    }
+
+    fn count(&self) -> Result<(), BrokerRefusal> {
+        if self.invocation.nested_calls.fetch_add(1, Ordering::SeqCst) >= MAX_CALLS_PER_INVOCATION {
+            return Err(BrokerRefusal::nested(
+                self.service,
+                NestedFailure::Rejected {
+                    decision: NestedDecision::Refused,
+                    message: format!(
+                        "a tool call may make at most {MAX_CALLS_PER_INVOCATION} core tool calls"
+                    ),
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn core_call(
+        &self,
+        name: &str,
+        input: Value,
+    ) -> Result<ToolCallResponse, BrokerRefusal> {
+        if self.cancel.is_cancelled() {
+            return Err(self.withdrawn());
+        }
+        self.count()?;
+        self.call_counted(name, input).await
+    }
+
+    async fn call_counted(
+        &self,
+        name: &str,
+        input: Value,
+    ) -> Result<ToolCallResponse, BrokerRefusal> {
+        self.invocation
+            .calls
+            .call(name.to_string(), input, Some(&self.cancel))
+            .await
+            .map_err(|failure| BrokerRefusal::nested(self.service, failure))
+    }
+}
+
+#[cfg(test)]
+impl BrokerContext {
+    pub fn detached_for_test(owner: &OwnerRef, service: DshService) -> Self {
+        let tool = ToolContext::new(std::path::PathBuf::from("."));
+        let gate = NestedCallGate::admitting_for_test();
+        let calls = CodemodeInvoker::for_extension(
+            dsh_broker::BrokerActTool::all().to_vec(),
+            tool.clone(),
+            gate.clone(),
+            String::new(),
+            |_, _, _| None,
+        );
+        let invocation = Arc::new(Invocation {
+            cohort: HostCohort::reviewed(),
+            host_generation: 0,
+            owner: owner.clone(),
+            scope: None,
+            plugins: None,
+            content_hash: String::new(),
+            calls,
+            gate,
+            root_caller: None,
+            broker: None,
+            nested_calls: AtomicU32::new(0),
+            next_broker_token: AtomicU64::new(1),
+            id: NEXT_INVOCATION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            broker_acts: Mutex::new((0, Vec::new(), false)),
+            plugin_change: Mutex::new((None, false)),
+            held_image: Mutex::new((None, false)),
+            tickets: Vec::new(),
+            caller_tools: Vec::new(),
+            gates: dsh_broker::GATE_TOOLS.to_vec(),
+            act_slots: tokio::sync::Semaphore::new(dsh_broker::MAX_OPEN_ACTS_PER_INVOCATION),
+            activations: Mutex::new(HashMap::new()),
+            session_call_lock: tokio::sync::Mutex::new(()),
+            cancel: CancellationToken::new(),
+        });
+        Self {
+            invocation,
+            tool: Arc::new(tool),
+            service,
+            cancel: CancellationToken::new(),
+            broker_token: 0,
+        }
+    }
 }
 
 /// The tickets and invocations of one manager.
@@ -295,7 +762,7 @@ impl CoreCalls {
     #[cfg(any(test, feature = "test-support"))]
     pub fn begin(
         self: &Arc<Self>,
-        tier: HostTier,
+        cohort: impl Into<HostCohort>,
         host_generation: u64,
         owner: &OwnerRef,
         call_id: &str,
@@ -304,7 +771,7 @@ impl CoreCalls {
         gate: &NestedCallGate,
     ) -> Option<InvocationGuard> {
         self.begin_scoped(
-            tier,
+            cohort,
             host_generation,
             owner,
             call_id,
@@ -313,12 +780,13 @@ impl CoreCalls {
             gate,
             None,
             String::new(),
+            &dsh_broker::test_grants().unwrap_or_default(),
         )
     }
     #[allow(clippy::too_many_arguments)]
     pub fn begin_scoped(
         self: &Arc<Self>,
-        tier: HostTier,
+        cohort: impl Into<HostCohort>,
         host_generation: u64,
         owner: &OwnerRef,
         call_id: &str,
@@ -327,7 +795,10 @@ impl CoreCalls {
         gate: &NestedCallGate,
         scope: Option<codewhale_config::EntryRef>,
         content_hash: String,
+        broker_services: &[DshService],
     ) -> Option<InvocationGuard> {
+        let cohort = cohort.into();
+        let tier = cohort.tier();
         let (caller, specs) = gate.extension()?;
         if caller != expected {
             return None;
@@ -341,7 +812,7 @@ impl CoreCalls {
         );
         let ticket = self.tickets.mint(Grant {
             kind: TicketKind::Invocation,
-            tier,
+            cohort: cohort.clone(),
             host_generation,
             owner: owner.clone(),
             method: METHOD,
@@ -372,7 +843,7 @@ impl CoreCalls {
         let checkpoint_ticket = root_caller.as_ref().map(|_| {
             self.tickets.mint(Grant {
                 kind: TicketKind::Invocation,
-                tier,
+                cohort: cohort.clone(),
                 host_generation,
                 owner: owner.clone(),
                 method: CHECKPOINT_METHOD,
@@ -384,7 +855,7 @@ impl CoreCalls {
         let question_ticket = root_caller.as_ref().map(|_| {
             self.tickets.mint(Grant {
                 kind: TicketKind::Invocation,
-                tier,
+                cohort: cohort.clone(),
                 host_generation,
                 owner: owner.clone(),
                 method: QUESTION_METHOD,
@@ -396,7 +867,7 @@ impl CoreCalls {
         let subagent_ticket = root_caller.as_ref().map(|_| {
             self.tickets.mint(Grant {
                 kind: TicketKind::Invocation,
-                tier,
+                cohort: cohort.clone(),
                 host_generation,
                 owner: owner.clone(),
                 method: SUBAGENT_METHOD,
@@ -405,9 +876,63 @@ impl CoreCalls {
                 uses: MAX_CALLS_PER_INVOCATION,
             })
         });
+        let broker_session = context
+            .execution
+            .session_objects
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .filter(|id| !id.is_empty());
+        let root_agent = context.execution.owner_agent_id.is_none();
+        let broker_tickets: Vec<(DshService, Ticket)> = broker_session
+            .iter()
+            .flat_map(|session| {
+                let ticket_cohort = cohort.clone();
+                DshService::EVERY
+                    .into_iter()
+                    .filter(|service| {
+                        broker_services.contains(service)
+                            && dsh_broker::mintable(tier, owner, *service, root_agent)
+                    })
+                    .map(move |service| {
+                        (
+                            service,
+                            self.tickets.mint(Grant {
+                                kind: TicketKind::Invocation,
+                                cohort: ticket_cohort.clone(),
+                                host_generation,
+                                owner: owner.clone(),
+                                method: dsh_broker::ticket_method(service),
+                                target: json!({ "call_id": call_id, "session_id": session }),
+                                ttl: TICKET_TTL,
+                                uses: MAX_CALLS_PER_INVOCATION,
+                            }),
+                        )
+                    })
+            })
+            .collect();
+        let broker = broker_session
+            .filter(|_| !broker_tickets.is_empty())
+            .map(|session_id| {
+                let mut context = context.clone();
+                context.execution.nested_call_gate = None;
+                BrokerScope {
+                    session_id,
+                    context: Arc::new(context),
+                }
+            });
+        let gates: Vec<&'static str> = dsh_broker::GATE_TOOLS
+            .into_iter()
+            .filter(|gate| {
+                specs.iter().any(|spec| {
+                    spec.name().eq_ignore_ascii_case(gate)
+                        && dsh_broker::is_gate_spec(spec.as_ref())
+                })
+            })
+            .collect();
         let caller_tools = specs
             .iter()
             .map(|spec| spec.name().to_string())
+            .filter(|name| !dsh_broker::is_gate_tool(name))
             .filter(|name| {
                 !context
                     .disallowed_tools
@@ -416,7 +941,7 @@ impl CoreCalls {
             })
             .collect();
         let invocation = Arc::new(Invocation {
-            tier,
+            cohort,
             host_generation,
             owner: owner.clone(),
             scope,
@@ -425,12 +950,22 @@ impl CoreCalls {
             calls,
             gate: gate.clone(),
             root_caller,
+            broker,
+            nested_calls: AtomicU32::new(0),
+            next_broker_token: AtomicU64::new(1),
+            id: NEXT_INVOCATION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            broker_acts: Mutex::new((0, Vec::new(), false)),
+            plugin_change: Mutex::new((None, false)),
+            held_image: Mutex::new((None, false)),
             tickets: std::iter::once(ticket.clone())
                 .chain(checkpoint_ticket.iter().cloned())
                 .chain(question_ticket.iter().cloned())
                 .chain(subagent_ticket.iter().cloned())
+                .chain(broker_tickets.iter().map(|(_, ticket)| ticket.clone()))
                 .collect(),
             caller_tools,
+            gates,
+            act_slots: tokio::sync::Semaphore::new(dsh_broker::MAX_OPEN_ACTS_PER_INVOCATION),
             activations: Mutex::new(HashMap::new()),
             session_call_lock: tokio::sync::Mutex::new(()),
             cancel: CancellationToken::new(),
@@ -457,7 +992,14 @@ impl CoreCalls {
                 Arc::clone(&invocation),
             );
         }
+        for (_, broker_ticket) in &broker_tickets {
+            self.invocations
+                .lock()
+                .expect("invocations lock")
+                .insert(broker_ticket.expose().to_string(), Arc::clone(&invocation));
+        }
         Some(InvocationGuard {
+            broker_tickets,
             question_ticket,
             subagent_ticket,
             checkpoint_ticket,
@@ -511,20 +1053,26 @@ impl CoreCalls {
     }
 
     pub fn revoke_attachment(&self, id: u64) {
+        self.revoke_attachment_except(id, None);
+    }
+
+    pub fn revoke_attachment_except(&self, id: u64, exempt_invocation_id: Option<u64>) {
         self.revoke_where(|invocation| {
-            invocation
-                .plugins
-                .as_ref()
-                .and_then(|plugins| plugins.caller_selection())
-                .is_some_and(|selection| selection.attachment_id == id)
+            exempt_invocation_id != Some(invocation.id)
+                && invocation
+                    .plugins
+                    .as_ref()
+                    .and_then(|plugins| plugins.caller_selection())
+                    .is_some_and(|selection| selection.attachment_id == id)
         });
     }
 
     /// One host process exited.
-    pub fn revoke_host(&self, tier: HostTier, host_generation: u64) {
-        self.tickets.revoke_host(tier, host_generation);
+    pub fn revoke_host(&self, cohort: impl Into<HostCohort>, host_generation: u64) {
+        let cohort = cohort.into();
+        self.tickets.revoke_host(&cohort, host_generation);
         self.revoke_where(|invocation| {
-            invocation.tier == tier && invocation.host_generation == host_generation
+            invocation.cohort == cohort && invocation.host_generation == host_generation
         });
     }
 
@@ -546,22 +1094,42 @@ impl CoreCalls {
     fn redeem_invocation(
         &self,
         shared: &ManagerShared,
-        tier: HostTier,
+        cohort: &HostCohort,
         host_generation: u64,
         owner: &OwnerRef,
         ticket: &str,
         method: &str,
         cx: &HostRequestContext,
     ) -> Result<Arc<Invocation>, RpcErrorWire> {
-        let refuse = |code, message| RpcErrorWire {
-            code,
-            message,
-            data: None,
+        self.redeem_invocation_or_limit(shared, cohort, host_generation, owner, ticket, method, cx)
+            .map_err(|(_, error)| error)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn redeem_invocation_or_limit(
+        &self,
+        shared: &ManagerShared,
+        cohort: &HostCohort,
+        host_generation: u64,
+        owner: &OwnerRef,
+        ticket: &str,
+        method: &str,
+        cx: &HostRequestContext,
+    ) -> Result<Arc<Invocation>, (bool, RpcErrorWire)> {
+        let refuse = |code, message| {
+            (
+                false,
+                RpcErrorWire {
+                    code,
+                    message,
+                    data: None,
+                },
+            )
         };
         let redeemed = self.tickets.redeem(&Presented {
             ticket,
             kind: TicketKind::Invocation,
-            tier,
+            cohort: cohort.clone(),
             host_generation,
             owner,
             method,
@@ -573,19 +1141,16 @@ impl CoreCalls {
                     "too many invalid {method} tickets from one host process"
                 ));
             }
-            return Err(refuse(
-                error_code::REFUSED,
-                refused.reason.describe().to_string(),
-            ));
+            let (_, error) = refuse(error_code::REFUSED, refused.reason.describe().to_string());
+            return Err((refused.reason == super::ticket::Refusal::Exhausted, error));
         }
-        // The redemption proved the ticket is live and ours; the owner must
-        // still be the current one of this tier.
         let live = shared
             .registry
             .lock()
             .expect("registry lock")
-            .tier_of(owner)
-            == Some(tier);
+            .cohort_of(owner)
+            .as_ref()
+            == Some(cohort);
         let Some(invocation) = self.invocation(ticket).filter(|_| live) else {
             return Err(refuse(
                 error_code::REFUSED,
@@ -616,11 +1181,12 @@ impl CoreCalls {
     pub async fn serve_checkpoint(
         &self,
         shared: &ManagerShared,
-        tier: HostTier,
+        cohort: impl Into<HostCohort>,
         host_generation: u64,
         params: SessionCheckpointParams,
         cx: HostRequestContext,
     ) -> Result<Value, RpcErrorWire> {
+        let cohort = cohort.into();
         let refuse = |code, message| RpcErrorWire {
             code,
             message,
@@ -628,7 +1194,7 @@ impl CoreCalls {
         };
         let invocation = self.redeem_invocation(
             shared,
-            tier,
+            &cohort,
             host_generation,
             &params.owner,
             &params.ticket,
@@ -662,8 +1228,9 @@ impl CoreCalls {
             .registry
             .lock()
             .expect("registry lock")
-            .tier_of(&params.owner)
-            != Some(tier)
+            .cohort_of(&params.owner)
+            .as_ref()
+            != Some(&cohort)
         {
             return Err(refuse(
                 error_code::REFUSED,
@@ -695,11 +1262,12 @@ impl CoreCalls {
     pub async fn serve_question(
         &self,
         shared: &ManagerShared,
-        tier: HostTier,
+        cohort: impl Into<HostCohort>,
         host_generation: u64,
         params: UserQuestionParams,
         cx: HostRequestContext,
     ) -> Result<Value, RpcErrorWire> {
+        let cohort = cohort.into();
         let refuse = |code, message| RpcErrorWire {
             code,
             message,
@@ -707,7 +1275,7 @@ impl CoreCalls {
         };
         let invocation = self.redeem_invocation(
             shared,
-            tier,
+            &cohort,
             host_generation,
             &params.owner,
             &params.ticket,
@@ -755,8 +1323,9 @@ impl CoreCalls {
             .registry
             .lock()
             .expect("registry lock")
-            .tier_of(&params.owner)
-            != Some(tier)
+            .cohort_of(&params.owner)
+            .as_ref()
+            != Some(&cohort)
         {
             return Err(refuse(
                 error_code::REFUSED,
@@ -802,11 +1371,12 @@ impl CoreCalls {
     pub async fn serve_subagent(
         &self,
         shared: &ManagerShared,
-        tier: HostTier,
+        cohort: impl Into<HostCohort>,
         host_generation: u64,
         request: super::protocol::HostRequest,
         cx: HostRequestContext,
     ) -> Result<Value, RpcErrorWire> {
+        let cohort = cohort.into();
         use super::protocol::HostRequest;
         use crate::tools::subagent::{
             ChildActivationRequest, dispose_child_activation, resolve_child_activation_output,
@@ -834,7 +1404,7 @@ impl CoreCalls {
         let (owner, child_id) = (owner.clone(), child_id.clone());
         let invocation = self.redeem_invocation(
             shared,
-            tier,
+            &cohort,
             host_generation,
             &owner,
             ticket,
@@ -1063,17 +1633,226 @@ impl CoreCalls {
         result
     }
 
+    pub async fn serve_broker(
+        &self,
+        shared: &ManagerShared,
+        cohort: impl Into<HostCohort>,
+        host_generation: u64,
+        params: DshBrokerParams,
+        cx: HostRequestContext,
+    ) -> Result<Value, RpcErrorWire> {
+        self.serve_broker_in(
+            dsh_broker::TABLE,
+            shared,
+            cohort,
+            host_generation,
+            params,
+            cx,
+        )
+        .await
+    }
+
+    pub(super) async fn serve_broker_in(
+        &self,
+        table: &[(DshService, Arm)],
+        shared: &ManagerShared,
+        cohort: impl Into<HostCohort>,
+        host_generation: u64,
+        params: DshBrokerParams,
+        cx: HostRequestContext,
+    ) -> Result<Value, RpcErrorWire> {
+        let cohort = cohort.into();
+        let refused = |message: String| {
+            dsh_broker::coded(
+                RpcErrorWire {
+                    code: error_code::REFUSED,
+                    message,
+                    data: None,
+                },
+                dsh_broker::TICKET_REFUSED,
+            )
+        };
+        let cancelled = |message: &str| {
+            dsh_broker::coded(
+                RpcErrorWire {
+                    code: error_code::CANCELLED,
+                    message: message.to_string(),
+                    data: None,
+                },
+                dsh_broker::CANCELLED,
+            )
+        };
+        let service = DshService::parse(&params.service)
+            .ok_or_else(|| BrokerRefusal::UnknownService(params.service.clone()).wire())?;
+        let invocation = self
+            .redeem_invocation_or_limit(
+                shared,
+                &cohort,
+                host_generation,
+                &params.owner,
+                &params.ticket,
+                dsh_broker::ticket_method(service),
+                &cx,
+            )
+            .map_err(|(limit, mut error)| {
+                if limit {
+                    error.message = format!(
+                        "this tool call's limit for the {} service is used up",
+                        service.name()
+                    );
+                    dsh_broker::coded(error, dsh_broker::LIMIT)
+                } else {
+                    dsh_broker::coded(error, dsh_broker::TICKET_REFUSED)
+                }
+            })?;
+        let (session_id, tool) = invocation
+            .broker
+            .as_ref()
+            .map(|scope| (scope.session_id.clone(), Arc::clone(&scope.context)))
+            .ok_or_else(|| refused("dsh/broker requires an invocation in a session".into()))?;
+        if service.builtin_only() && tool.execution.owner_agent_id.is_some() {
+            return Err(BrokerRefusal::NotGranted(service).wire());
+        }
+        if !shared.broker_granted(&params.owner, service).await {
+            return Err(BrokerRefusal::NotGranted(service).wire());
+        }
+        let arm = dsh_broker::arm_in(table, service)
+            .ok_or_else(|| BrokerRefusal::NotAvailable(service).wire())?;
+        let withdraw = invocation.cancel.child_token();
+        let _withdraw_guard = withdraw.clone().drop_guard();
+        let broker_token = invocation.next_broker_token.fetch_add(1, Ordering::Relaxed);
+        struct HeldImageRollback {
+            invocation: Arc<Invocation>,
+            broker_token: u64,
+            armed: bool,
+        }
+        impl HeldImageRollback {
+            fn commit(&mut self) {
+                self.armed = false;
+            }
+            fn rollback(&mut self, reason: &str) {
+                if self.armed {
+                    self.armed = false;
+                    self.invocation
+                        .rollback_held_image(self.broker_token, reason);
+                }
+            }
+        }
+        impl Drop for HeldImageRollback {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.invocation
+                        .rollback_held_image(self.broker_token, "aborted");
+                }
+            }
+        }
+        let mut rollback = HeldImageRollback {
+            invocation: Arc::clone(&invocation),
+            broker_token,
+            armed: true,
+        };
+        let arm_cancel = withdraw.child_token();
+        let call = BrokerCall {
+            owner: params.owner.clone(),
+            session_id,
+            service,
+            method: params.method,
+            input: params.input,
+            context: BrokerContext {
+                invocation: Arc::clone(&invocation),
+                tool,
+                service,
+                cancel: arm_cancel.clone(),
+                broker_token,
+            },
+        };
+        let withdrawn = async {
+            loop {
+                tokio::time::sleep(GRANT_PROBE).await;
+                if !shared.broker_granted(&params.owner, service).await {
+                    break;
+                }
+            }
+        };
+        let arm_future = arm(call);
+        tokio::pin!(arm_future);
+        let outcome = match tokio::select! {
+            biased;
+            () = cx.cancel.cancelled() => Err(("cancelled", cancelled("dsh/broker was cancelled by its host"))),
+            () = withdraw.cancelled() => Err(("invocation_ended", cancelled("dsh/broker invocation ended"))),
+            () = withdrawn => Err(("grant_revoked", BrokerRefusal::NotGranted(service).wire())),
+            outcome = &mut arm_future => Ok(outcome),
+        } {
+            Ok(outcome) => outcome,
+            Err((reason, wire)) => {
+                if matches!(service, DshService::Plugins) {
+                    arm_cancel.cancel();
+                    let _ = tokio::time::timeout(Duration::from_secs(5), &mut arm_future).await;
+                }
+                rollback.rollback(reason);
+                return Err(wire);
+            }
+        };
+        if cx.cancel.is_cancelled() {
+            rollback.rollback("cancelled");
+            return Err(cancelled("dsh/broker was cancelled by its host"));
+        }
+        if withdraw.is_cancelled() {
+            rollback.rollback("invocation_ended");
+            return Err(cancelled("dsh/broker invocation ended"));
+        }
+        if shared
+            .registry
+            .lock()
+            .expect("registry lock")
+            .cohort_of(&params.owner)
+            .as_ref()
+            != Some(&cohort)
+        {
+            rollback.rollback("owner_stale");
+            return Err(refused("dsh/broker owner is no longer current".into()));
+        }
+        if let Err(err) = shared.check_selection(
+            invocation
+                .plugins
+                .as_ref()
+                .and_then(|plugins| plugins.caller_selection()),
+            invocation.plugins.as_deref(),
+            &params.owner.plugin_id,
+            &invocation.content_hash,
+            invocation.scope.as_ref(),
+        ) {
+            rollback.rollback("selection_changed");
+            return Err(refused(err));
+        }
+        if !shared.broker_granted(&params.owner, service).await {
+            rollback.rollback("grant_revoked");
+            return Err(BrokerRefusal::NotGranted(service).wire());
+        }
+        match outcome {
+            Ok(value) => {
+                rollback.commit();
+                Ok(value)
+            }
+            Err(err) => {
+                rollback.rollback("refused");
+                Err(err.wire())
+            }
+        }
+    }
+
     /// Redeem `params` presented by `tier`'s host process `host_generation`
     /// and run the call. An invalid presentation is a refusal, and a burst of
     /// them a violation `cx` reports.
     pub async fn serve(
         &self,
         shared: &ManagerShared,
-        tier: HostTier,
+        cohort: impl Into<HostCohort>,
         host_generation: u64,
         params: CoreCallParams,
         cx: HostRequestContext,
     ) -> Result<Value, RpcErrorWire> {
+        let cohort = cohort.into();
         let refuse = |code: i64, message: String| RpcErrorWire {
             code,
             message,
@@ -1081,13 +1860,28 @@ impl CoreCalls {
         };
         let invocation = self.redeem_invocation(
             shared,
-            tier,
+            &cohort,
             host_generation,
             &params.owner,
             &params.ticket,
             METHOD,
             &cx,
         )?;
+        if dsh_broker::is_gate_tool(&params.name) {
+            return Err(refuse(
+                error_code::REFUSED,
+                format!(
+                    "`{}` is the host broker's permission gate; only the broker reaches it",
+                    params.name
+                ),
+            ));
+        }
+        if invocation.nested_calls.fetch_add(1, Ordering::SeqCst) >= MAX_CALLS_PER_INVOCATION {
+            return Err(refuse(
+                error_code::REFUSED,
+                super::ticket::Refusal::Exhausted.describe().to_string(),
+            ));
+        }
         // Withdrawn when the host cancels this request, its owner is revoked,
         // the host exits (`cx.cancel`), or the invocation ends.
         let withdraw = invocation.cancel.child_token();
@@ -1191,6 +1985,7 @@ pub struct InvocationGuard {
     checkpoint_ticket: Option<Ticket>,
     question_ticket: Option<Ticket>,
     subagent_ticket: Option<Ticket>,
+    broker_tickets: Vec<(DshService, Ticket)>,
     invocation: Arc<Invocation>,
 }
 
@@ -1212,6 +2007,18 @@ impl InvocationGuard {
         self.subagent_ticket.as_ref().map(Ticket::expose)
     }
 
+    pub fn broker_tickets(&self) -> Option<Vec<DshBrokerTicketWire>> {
+        (!self.broker_tickets.is_empty()).then(|| {
+            self.broker_tickets
+                .iter()
+                .map(|(service, ticket)| DshBrokerTicketWire {
+                    service: service.name().to_string(),
+                    ticket: ticket.expose().to_string(),
+                })
+                .collect()
+        })
+    }
+
     pub fn caller_tools(&self) -> Option<Vec<String>> {
         self.subagent_ticket
             .as_ref()
@@ -1227,13 +2034,149 @@ impl InvocationGuard {
     /// The receipts of the core calls made so far, bounded, for the tool's
     /// result metadata; `None` when it made none.
     pub fn receipts(&self) -> Option<Value> {
-        let receipts = self.invocation.calls.receipts_json(RECEIPTS_ATTACHED);
-        (receipts["total"].as_u64().unwrap_or(0) > 0).then_some(receipts)
+        self.snapshot(false)
+    }
+
+    pub(super) fn seal_held_image(&self) -> Option<HeldImage> {
+        let mut guard = self
+            .invocation
+            .held_image
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.1 = true;
+        let held = guard.0.take().map(|(_, held)| held);
+        self.invocation.cancel.cancel();
+        held
+    }
+
+    pub(super) fn record_service_act(&self, service: DshService, entry: Value) -> bool {
+        self.invocation.push_act_record(service.name(), entry)
+    }
+
+    pub fn seal_receipts(&self) -> Option<Value> {
+        let _ = self.seal_held_image();
+        self.snapshot(true)
+    }
+
+    pub fn seal_plugin_change(&self) -> Option<PluginChangeMark> {
+        let mut guard = self
+            .invocation
+            .plugin_change
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.1 = true;
+        guard.0.clone()
+    }
+
+    fn snapshot(&self, seal: bool) -> Option<Value> {
+        let (total, acts) = {
+            let mut guard = self
+                .invocation
+                .broker_acts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if seal {
+                guard.2 = true;
+            }
+            (guard.0, guard.1.clone())
+        };
+        if seal {
+            self.invocation.cancel.cancel();
+        }
+        let mut receipts = self.invocation.calls.receipts_json(RECEIPTS_ATTACHED);
+        if total > 0 {
+            receipts["broker_acts"] = json!({ "total": total, "acts": acts });
+        }
+        (receipts["total"].as_u64().unwrap_or(0) > 0 || total > 0).then_some(receipts)
     }
 }
 
 impl Drop for InvocationGuard {
     fn drop(&mut self) {
         self.core_calls.end(&self.ticket);
+    }
+}
+
+#[cfg(test)]
+mod seal_tests {
+    use super::*;
+    use crate::tools::codemode::{NestedCallRequest, NestedCallVerdict};
+    use crate::tools::spec::ToolResult;
+
+    #[tokio::test]
+    async fn a_successful_gate_answer_after_sealing_cannot_record_or_perform_an_act() {
+        let owner = OwnerRef {
+            plugin_id: "sealed-gate".into(),
+            generation: 1,
+            owner_token: "fixture".into(),
+        };
+        let caller = ExtensionCaller {
+            origin: "extension:sealed-gate".into(),
+            tool: "sealed_tool".into(),
+            scope: "ext:sealed-gate@hash".into(),
+        };
+        let context = ToolContext::new(std::path::PathBuf::from("."));
+        let (events, _events) = tokio::sync::mpsc::channel(8);
+        let (gate, mut requests) = NestedCallGate::new(None, events, Duration::from_secs(5));
+        let gate = gate.for_extension(caller.clone(), dsh_broker::BrokerActTool::all().to_vec());
+        let calls = Arc::new(CoreCalls::default());
+        let guard = calls
+            .begin(
+                HostCohort::reviewed(),
+                1,
+                &owner,
+                "call",
+                &caller,
+                &context,
+                &gate,
+            )
+            .expect("invocation");
+        let broker = BrokerContext {
+            invocation: Arc::clone(&guard.invocation),
+            tool: Arc::new(context),
+            service: DshService::Remote,
+            cancel: CancellationToken::new(),
+            broker_token: 0,
+        };
+        assert!(broker.record(json!({"method": "before", "outcome": "read"})));
+        let performed = std::sync::atomic::AtomicBool::new(false);
+        let (result, sealed) = tokio::join!(
+            async {
+                broker
+                    .act("write", BrokerEffect::Write, Some("late"))
+                    .await?;
+                performed.store(true, Ordering::SeqCst);
+                Ok::<(), BrokerRefusal>(())
+            },
+            async {
+                let Some(NestedCallRequest::Tool(request)) = requests.recv().await else {
+                    panic!("the act must reach its gate before sealing");
+                };
+                let sealed = guard.seal_receipts().expect("the earlier record survives");
+                assert!(!broker.cancel.is_cancelled());
+                assert!(
+                    request
+                        .reply
+                        .send(NestedCallVerdict::Answered {
+                            result: ToolResult::success(request.input.to_string()),
+                            hook_context: None,
+                        })
+                        .is_ok(),
+                    "the gate response is still delivered"
+                );
+                sealed
+            }
+        );
+        assert!(
+            result.is_err(),
+            "a successful late answer must be refused: {result:?}"
+        );
+        assert!(!performed.load(Ordering::SeqCst));
+        assert!(!broker.record(json!({"method": "late", "outcome": "allowed"})));
+        assert_eq!(sealed["broker_acts"]["total"], 1);
+        assert_eq!(
+            guard.receipts().unwrap()["broker_acts"],
+            sealed["broker_acts"]
+        );
     }
 }

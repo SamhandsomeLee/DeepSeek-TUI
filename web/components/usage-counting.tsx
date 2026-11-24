@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * Anonymous usage counting on the website — the recorder owner and the
+ * Usage counting on the website — the recorder owner and the
  * privacy-page control.
  *
  *   <UsageCounting>          Mounted once in the locale layout. Renders
@@ -26,11 +26,14 @@ import { usePathname } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import { USAGE_COUNTING_COPY } from "@/lib/content/usage-counting";
 import { pickText } from "@/lib/i18n/dictionaries";
-import { isDocsPath } from "@/lib/i18n/path";
+import { funnelExit, funnelPath } from "@/lib/telemetry/funnel";
 import {
   PREFERENCE_STORAGE_KEY,
   PRODUCT_COUNTER_FIELDS,
+  FUNNEL_COUNTER_FIELDS,
+  type FunnelCounter,
   createUsageRecorder,
+  privacySignalActive,
   type ProductCounter,
   type UsagePreference,
   type UsageRecorder,
@@ -55,6 +58,7 @@ function getRecorder(appVersion: string): UsageRecorder | null {
       appVersion,
       endpoint: ENDPOINT,
       storage,
+      blocked: () => privacySignalActive(),
     });
   }
   return recorder;
@@ -63,6 +67,10 @@ function getRecorder(appVersion: string): UsageRecorder | null {
 /** Count one interaction. A no-op while counting is turned off. */
 export function recordUsage(counter: ProductCounter): void {
   recorder?.record(counter);
+}
+
+export function recordFunnel(counter: FunnelCounter): void {
+  recorder?.recordFunnel(counter);
 }
 
 function isCounter(value: string | undefined): value is ProductCounter {
@@ -80,10 +88,15 @@ export function UsageCounting({ appVersion }: { appVersion: string }) {
       current.sync();
     };
     const onClick = (event: MouseEvent) => {
-      const target = event.target as HTMLElement | null;
+      const target = event.target instanceof Element ? event.target : null;
       const marked = target?.closest<HTMLElement>("[data-usage]");
       const counter = marked?.dataset.usage;
       if (isCounter(counter)) current.record(counter);
+      const explicit = target?.closest<HTMLElement>("[data-funnel]")?.dataset.funnel;
+      const link = target?.closest<HTMLAnchorElement>("a[href]");
+      const funnel = explicit && (FUNNEL_COUNTER_FIELDS as readonly string[]).includes(explicit)
+        ? explicit as FunnelCounter : link ? funnelExit(link.href) : null;
+      if (funnel) current.recordFunnel(funnel);
     };
     const onPageHide = () => {
       void current.flush();
@@ -98,12 +111,14 @@ export function UsageCounting({ appVersion }: { appVersion: string }) {
     };
   }, [appVersion]);
 
-  // Every route change is one page view; docs routes are also a docs view.
+  // Every route change is one page view; registered docs destinations are also a docs view.
   useEffect(() => {
     const current = getRecorder(appVersion);
     if (!current || !pathname) return;
     current.record("page_view");
-    if (isDocsPath(pathname)) current.record("docs_view");
+    const route = funnelPath(pathname);
+    if (route.documentation) current.record("docs_view");
+    if (route.view) current.recordFunnel(route.view);
   }, [appVersion, pathname]);
 
   return null;
@@ -112,10 +127,14 @@ export function UsageCounting({ appVersion }: { appVersion: string }) {
 /** The privacy page's status line and opt-out control. */
 export function UsagePreferenceControl({ locale, appVersion }: { locale: string; appVersion: string }) {
   // `null` until mounted; `"unavailable"` when the browser offers no storage.
-  const [preference, setPreference] = useState<UsagePreference | "unavailable" | null>(null);
+  const [preference, setPreference] = useState<UsagePreference | "unavailable" | "unsaved" | "signal" | null>(null);
   const t = (text: { en: string; zh: string }) => pickText(text, locale);
 
   useEffect(() => {
+    if (privacySignalActive()) {
+      setPreference("signal");
+      return;
+    }
     const current = getRecorder(appVersion);
     if (!current) {
       setPreference("unavailable");
@@ -133,12 +152,11 @@ export function UsagePreferenceControl({ locale, appVersion }: { locale: string;
   const toggle = useCallback(() => {
     const current = getRecorder(appVersion);
     if (!current) return;
-    if (current.preference() === "off") current.enable();
-    else current.disable();
-    setPreference(current.preference());
+    const saved = current.preference() === "off" ? current.enable() : current.disable();
+    setPreference(saved ? current.preference() : "unsaved");
   }, [appVersion]);
 
-  const off = preference === "off";
+  const off = preference === "off" || preference === "unsaved";
   return (
     <div className="usage-counting" data-state={preference ?? "loading"}>
       <p>{t(USAGE_COUNTING_COPY.summary)}</p>
@@ -148,7 +166,7 @@ export function UsagePreferenceControl({ locale, appVersion }: { locale: string;
           {t(USAGE_COUNTING_COPY.status[preference])}
         </p>
       )}
-      {preference !== null && preference !== "unavailable" && (
+      {preference !== null && preference !== "unavailable" && preference !== "signal" && (
         <button type="button" className="usage-counting-button" onClick={toggle} aria-pressed={!off}>
           {off ? t(USAGE_COUNTING_COPY.turnOn) : t(USAGE_COUNTING_COPY.turnOff)}
         </button>

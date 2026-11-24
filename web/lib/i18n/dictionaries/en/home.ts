@@ -2,139 +2,85 @@ import type { HomeDict } from "../types";
 
 /** English reference home copy: useful work with chosen models and connected tools. */
 export const home: HomeDict = {
-  metaTitle: "Codewhale · An open-source agent for your computer",
-  metaDescription: "Build apps, fix code and automate work with an open-source agent in your terminal. Choose hosted or local models. Help build Codewhale with code, docs and feedback.",
+  metaTitle: "Codewhale · The model can be anyone's. The agent should be yours.",
+  metaDescription: "Codewhale is an open-source coding agent for your terminal, written in Rust. It works with any model, can split one task across several agents, and every line of it is yours to read.",
 
-  heroTitle: "An open-source agent for your computer",
-  heroIntro: "Build software and run repeatable workflows with {brand} in your terminal. Add Computer Use to work in Mac apps.",
+  heroTitle: "The model can be anyone's. The agent should be yours.",
+  heroTitleLead: "The model can be anyone's.",
+  heroIntro: "{brand} is an open-source coding agent for your terminal, written in Rust. It works with any model, can split one task across several agents, and every line of it is yours to read.",
+  readTheCode: "Read the code",
+  installNote: "Version {version} is released, and it needs no account.",
+  captionReleased: "A real session with a live model, deepseek-flash through DeepSeek’s API: the model wrote the edit, and the edit and the test run happened as shown. Recorded on a 0.10.3 development build.",
+  captureFrameNoPosture: "The Prompt and Result frames show the model name and the approval mode.",
+  frameLabelPrompt: "Prompt",
+  frameLabelEdit: "Edit",
+  frameLabelApproval: "Approval",
+  frameLabelResult: "Result",
+  frameSummaryPrompt: "Codewhale in a terminal. The request “Add a --json flag to ls.py so the tests pass, then run the tests.” has been sent, and the status line shows Accept edits and the model deepseek-flash.",
+  frameSummaryEdit: "Codewhale in a terminal, scrolled back while a command waits. It read ls.py and test_ls.py, then updated ls.py: the diff adds a --json flag to the script.",
+  frameSummaryApproval: "Codewhale in a terminal. The change to ls.py is shown, and the command python3 -m unittest -v test_ls.py waits for approval. The card says it is waiting for approval and offers Allow and Deny.",
+  frameSummaryResult: "Codewhale in a terminal. After approval the command ran 2 tests and printed OK. The model, deepseek-flash, says it added --json to ls.py and that both tests passed.",
+  frameSummaryProvider: "Codewhale in a terminal. The model picker, searched for “deepseek-flash”, lists deepseek-flash from DeepSeek, Fireworks AI and OpenRouter, with DeepSeek selected.",
+  frameSummaryReceipt: "Codewhale in a terminal. The receipt of the session: the file it changed and the command it ran, approved by you; the token totals and the session’s estimated cost; then the edit and the approved command.",
   getCodewhale: "Install Codewhale",
   heroInstallAria: "Install command",
-  exploreProduct: "Explore Codewhale",
+  shotPreview: "Terminal session recording",
 
-  shotPreview: "Local terminal demo",
-  screenshotAlt:
-    "Codewhale v{version}: a captured terminal view with the conversation, message composer and session controls.",
+  sectionModelHeading: "Any model can work through your agent.",
+  sectionModelBody: "Use a built-in provider, any OpenAI-compatible endpoint or a model on your own machine, and change models between turns. Codewhale runs in your repository with no account, and `codewhale web` lets you work with it in your browser on your own machine.",
+  sectionControlHeading: "Your agent answers to you.",
+  sectionControlBody: "You decide what Codewhale may do without asking, and its commands can run in a sandbox on macOS and Linux. Every session leaves a receipt of the files it changed, the commands it ran and who approved each step.",
+  sectionAgentsHeading: "Several agents can share one task with you.",
+  sectionAgentsBody: "Codewhale splits a job across agents with roles such as explorer, implementer and reviewer, and you can watch, inspect and stop each one. A Fleet keeps a ledger, so a run can pick up again after a restart.",
+  agentsRolesLabel: "Three of the roles a sub-agent can take",
+  agentRoleExplore: "Reads the code and maps what matters, without changing files.",
+  agentRoleImplement: "Makes one specific change with the smallest edit.",
+  agentRoleReviewer: "Reads a change and grades what it finds by severity, without changing files.",
+  agentsLink: "Read how sub-agents work",
+  directionShotAlt: "The Codewhale desktop app. On the left is the session list; in the middle a task to fix a failing test waits for permission to run python3 -m pytest, with Allow and Deny.",
+  directionShotCaption: "The desktop app in development runs on the same engine. Here, running DeepSeek V4.1 Flash in Accept Edits, it asks before running the test command.",
+  directionShotLink: "See the desktop app",
+  sectionDirectionHeading: "Here is where your agent is going.",
+  sectionDirectionBody: "Codewhale is becoming one environment across your terminal, a desktop app, the browser and cloud computers, all run by one engine, so your work can move between them and stay yours. Each part below says where it stands today.",
+  sectionOpenHeading: "Codewhale is built in the open by the people who use it.",
+  sectionOpenBody: "It began as an open-source terminal tool for one model and became a project that hundreds of people in many languages build together. You can read its code, change it, or ask it to explain itself.",
+  sectionStartHeading: "Make your agent yours today.",
+  sectionStartBody: "Install Codewhale and run it in a repository with a model key you already have or a model on your own computer. You need no account, and `codewhale update` keeps it current.",
 
-  latestRelease: "Latest release {tag}",
-  releaseUnavailable: "Release status unavailable",
-  proofContributors: "{count} contributors",
-  currentSource: "Source",
-  sourceCandidate: "Unreleased",
-  publishedRelease: "released",
+  contributorsCount: {
+    one: "{n} contributor",
+    other: "{n} contributors",
+  },
+  factsLabel: "Codewhale at a glance",
+  factRust: "Written in Rust",
+  factLicense: "Open source, {license} license",
+  factProviders: {
+    one: "{n} provider route",
+    other: "{n} provider routes",
+  },
+  factModels: {
+    one: "{n} model",
+    other: "{n} models",
+  },
 
-  gainHeading: "Put your ideas to work",
-  gainLede:
-    "Start with a project and the result you need. Codewhale can read the files, make changes and run commands to check its work.",
-  gain: [
-    [
-      "Build and repair software",
-      "Add a feature, trace a bug or write a useful tool. Work through the changes with an agent that can edit the project and run its checks."
-    ],
-    [
-      "Automate work you repeat",
-      "Turn a repeated task into a script or run it with codewhale exec. For larger jobs, give parts of the work to a Fleet of agents with different models."
-    ],
-    [
-      "Connect the tools you use",
-      "Bring in tools through plugins and MCP servers. Connect the services your work needs, with access and authentication you configure."
-    ]
-  ],
+  mapHeading: "One engine",
+  mapStateReleased: "Released",
+  mapStateDeveloping: "In development, no download",
+  mapStateInviteOnly: "Invite-only",
+  mapStateBeingBuilt: "Being built",
+  mapTerminal: "Terminal app",
+  mapTerminalSentence: "Install it on macOS, Linux or Windows and run `codewhale` in any repository.",
+  mapLocalBrowser: "Local browser client",
+  mapLocalBrowserSentence: "Run `codewhale web` to read the conversation, send a task and answer approvals in your browser; it comes with the terminal and needs no account.",
+  mapManyAgents: "Many agents on one task",
+  mapManyAgentsSentence: "Sub-agents, Fleets and workflows let several agents share one task, each with its own role.",
+  mapDesktop: "Desktop app",
+  mapDesktopSentence: "We are building a desktop app on the same engine, and it has no public download yet.",
+  mapCloud: "Cloud computers",
+  mapCloudSentence: "Cloud computers are invite-only, and we are building them so a session can keep working on a machine in the cloud.",
+  mapOneSession: "One session across them",
+  mapOneSessionSentence: "We are building one session that goes with you from the terminal to the desktop, the browser and the cloud, and stays yours the whole way.",
 
-  chapterModels: "Your models",
-  modelsHeading: "Use the models you choose",
-  modelsBody:
-    "Use provider API keys, an OpenAI-compatible endpoint or local models.",
-  modelsFacts: [
-    [
-      "Your API accounts",
-      "Use your own API keys with providers such as DeepSeek, OpenAI, Anthropic and Google. Your provider bills the model usage."
-    ],
-    [
-      "Your gateway",
-      "Use an OpenAI-compatible endpoint and choose the models it serves."
-    ],
-    [
-      "Your inference",
-      "Connect Ollama on your machine, or a self-hosted endpoint such as vLLM or SGLang."
-    ],
-    [
-      "Your ChatGPT plan",
-      "Experimental: connect an eligible ChatGPT plan with codewhale auth chatgpt."
-    ]
-  ],
-  modelsLink: "Browse models and providers",
-
-  startHeading: "Start with one useful task",
-  startLede:
-    "Install Codewhale, connect a model and open a project folder. You can add plugins and more agents as you need them.",
-  startGuideLink: "Follow the getting-started guide",
-  startVocabularyLink: "Look up a term",
-
-  chapterAvailability: "Where it runs",
-  availabilityHeading: "Available now and in development",
-  availabilityLede:
-    "Install on macOS, Linux or Windows. Work in your terminal, or run codewhale web for a local browser view. Desktop and hosted web apps are in development.",
-  availability: [
-    [
-      "Terminal and local browser",
-      "Released",
-      "Install on Linux, macOS, or Windows, then run codewhale, or codewhale web for the local browser client. npm and Cargo also work; Android on Termux is a preview.",
-    ],
-    [
-      "CodeWhale GUI (VS Code)",
-      "Available",
-      "A separate, community-maintained project: chat, threads, and file changes in a VS Code sidebar over the same Codewhale Runtime. Install it from the VS Code Marketplace.",
-      "https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode",
-    ],
-    [
-      "Hosted web app",
-      "In development",
-      "Being rebuilt to match the desktop app, and not open yet. For a browser view today, run codewhale web on your machine.",
-    ],
-    [
-      "Desktop",
-      "Development build",
-      "A native app on the same engine. Review and commit changes, follow work across projects, and edit a message to resend it as a new branch. No public download yet.",
-    ],
-  ],
-  availabilityNote:
-    "The terminal, local browser, and GUI need no Codewhale account. When you use your own provider key, your provider bills that usage.",
-
-  surfacesHeading: "Work across files and tools",
-  surfaces: [
-    [
-      "Files and terminal",
-      "Create files, run commands, inspect data and test what you build. You set the working folder and permissions."
-    ],
-    [
-      "Plugins and connected apps",
-      "Add skills and tools through plugins and MCP. Review and enable the connections you want the agent to use."
-    ],
-    [
-      "Browser and computer · preview",
-      "Add browser tools or the Computer Use plugin to work in apps and websites. Computer Use on macOS needs system permissions; other platforms remain experimental."
-    ],
-    [
-      "Sessions you can return to",
-      "Keep the conversation, tool results and work history together. Resume the task in the terminal or its local browser client."
-    ],
-    [
-      "Teams of agents",
-      "Use Fleet to split a larger job between agents with different roles and models, and follow their progress in one place."
-    ]
-  ],
-  runtimeLink: "Explore tools and integrations",
-
-  installBandHeading: "Install on macOS or Linux",
   copy: "Copy",
   copied: "Copied ✓",
-  binaries: "Binaries",
-  chinaMirrors: "China mirrors",
-  installGuideLink: "Read the install guide",
-
-  communityHeading: "Contribute to Codewhale",
-  communityBody:
-    "{count} contributors. Code, docs, translations and skills all help.",
-  communityLinksAria: "Community links",
-  contribute: "Contribute",
 };

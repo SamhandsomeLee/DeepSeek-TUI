@@ -4,7 +4,7 @@
 //! exposure, worktree application, replay, and model execution are layered on
 //! top only after their cancellation and evidence semantics are proven.
 
-mod elevation;
+pub mod elevation;
 /// Setup-time Fleet composition: a suggestion schema with no runtime authority.
 ///
 /// Deliberately **not** re-exported from the crate root. The setup wizard uses
@@ -31,8 +31,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use elevation::{
-    DEFAULT_HIGH_BUDGET_THRESHOLD, ElevationOptions, PlanRiskHint, WorkflowPlanElevation,
-    assess_plan_risk_string, assess_workflow_elevation, is_shell_tool, is_write_tool,
+    DEFAULT_HIGH_BUDGET_THRESHOLD, ElevationOptions, PlanRiskHint, ToolAuthority,
+    WorkflowPlanElevation, assess_plan_risk_string, assess_workflow_elevation, is_shell_tool,
+    is_write_tool, tool_name_authority,
 };
 pub use fleet_exact::{
     EXACT_FLEET_SCHEMA_KIND, EXACT_FLEET_SCHEMA_REVISION, ExactFleet, ExactFleetError, ExactMember,
@@ -66,7 +67,7 @@ pub use js_authoring::{
 };
 pub use model_policy::*;
 pub use named_fleet::{
-    FleetDocument, FleetSchema, FleetSearchRoot, NamedFleet, NamedFleetError,
+    FleetDocument, FleetFileReader, FleetSchema, FleetSearchRoot, NamedFleet, NamedFleetError,
     STOPSHIP_REQUIRED_ROLES, exact_schema_revision, load_named_fleet, load_named_fleet_file,
     parse_named_fleet, split_qualified_fleet_name, validate_fleet_file_stem,
 };
@@ -469,8 +470,6 @@ impl WorkflowPlan {
     }
 }
 
-pub type WorkflowIr = WorkflowPlan;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhasePlan {
     pub name: String,
@@ -493,8 +492,6 @@ pub struct Phase {
     #[serde(default)]
     pub tasks: Vec<Task>,
 }
-
-pub type WorkflowPhase = Phase;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -523,9 +520,6 @@ pub struct Task {
     #[serde(default)]
     pub timeout_secs: Option<u64>,
 }
-
-pub type WorkflowTask = Task;
-pub type WorkflowRole = AgentType;
 
 /// The workflow wire's agent type. The serialized spellings are the canonical
 /// Codewhale role vocabulary (founder, 2026-09-02); the pre-rename JS
@@ -1727,6 +1721,12 @@ pub enum WorkflowExecutionError {
         field: &'static str,
         reference: String,
     },
+    #[error("workflow node `{node}` reads {field} `{reference}` before its result is available")]
+    UnavailableNodeReference {
+        node: String,
+        field: &'static str,
+        reference: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1896,7 +1896,8 @@ pub(crate) fn validate_workflow_nodes(
     }
     let mut seen = BTreeSet::new();
     validate_workflow_nodes_inner(nodes, &mut seen)?;
-    validate_workflow_references(nodes, &seen)
+    validate_workflow_references(nodes, &seen)?;
+    validate_reference_order(nodes, &mut BTreeSet::new())
 }
 
 pub(crate) fn validate_workflow_node_shapes(
@@ -2012,6 +2013,57 @@ fn validate_leaf_role(leaf: &str, role: &str) -> Result<(), WorkflowExecutionErr
             leaf: leaf.to_string(),
             role: role.to_string(),
         });
+    }
+    Ok(())
+}
+
+fn validate_reference_order(
+    nodes: &[WorkflowNode],
+    finished: &mut BTreeSet<String>,
+) -> Result<(), WorkflowExecutionError> {
+    for node in nodes {
+        let (field, references): (&'static str, &[String]) = match node {
+            WorkflowNode::Leaf(spec) => ("depends_on_results", &spec.depends_on_results),
+            WorkflowNode::Reduce(spec) => ("inputs", &spec.inputs),
+            WorkflowNode::TeacherReview(spec) => ("candidates", &spec.candidates),
+            _ => ("", &[]),
+        };
+        let id = node_id(node);
+        if let Some(reference) = references
+            .iter()
+            .find(|reference| !finished.contains(*reference))
+        {
+            return Err(WorkflowExecutionError::UnavailableNodeReference {
+                node: id,
+                field,
+                reference: reference.clone(),
+            });
+        }
+        match node {
+            WorkflowNode::BranchSet(spec) if spec.parallel => {
+                let before = finished.clone();
+                for child in &spec.children {
+                    let mut branch = before.clone();
+                    validate_reference_order(std::slice::from_ref(child), &mut branch)?;
+                    finished.extend(branch);
+                }
+            }
+            WorkflowNode::BranchSet(spec) => validate_reference_order(&spec.children, finished)?,
+            WorkflowNode::Sequence(spec) => validate_reference_order(&spec.children, finished)?,
+            WorkflowNode::LoopUntil(spec) => validate_reference_order(&spec.children, finished)?,
+            WorkflowNode::Cond(spec) => {
+                let mut then_arm = finished.clone();
+                validate_reference_order(&spec.then_nodes, &mut then_arm)?;
+                let mut else_arm = finished.clone();
+                validate_reference_order(&spec.else_nodes, &mut else_arm)?;
+                finished.extend(then_arm.intersection(&else_arm).cloned());
+            }
+            WorkflowNode::Leaf(_)
+            | WorkflowNode::Reduce(_)
+            | WorkflowNode::TeacherReview(_)
+            | WorkflowNode::Expand(_) => {}
+        }
+        finished.insert(id);
     }
     Ok(())
 }
@@ -3852,6 +3904,66 @@ mod tests {
                 reference: "missing-scan".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn workflow_spec_rejects_unavailable_result_references() {
+        let reduce = |id: &str, inputs: &[&str]| {
+            WorkflowNode::Reduce(ReduceSpec {
+                id: id.to_string(),
+                inputs: inputs.iter().map(|input| input.to_string()).collect(),
+                prompt: "combine".to_string(),
+                model_policy: ModelPolicy::default(),
+            })
+        };
+        let parallel = |children: Vec<WorkflowNode>| {
+            WorkflowNode::BranchSet(BranchSpec {
+                id: "fan".to_string(),
+                description: None,
+                parallel: true,
+                budget: BudgetSpec::default(),
+                permissions: PermissionSpec::default(),
+                model_policy: ModelPolicy::default(),
+                children,
+            })
+        };
+        let conditional = || {
+            WorkflowNode::Cond(CondSpec {
+                id: "choice".to_string(),
+                condition: "choose".to_string(),
+                then_nodes: vec![leaf_node("yes")],
+                else_nodes: vec![leaf_node("no")],
+            })
+        };
+        for (nodes, reference) in [
+            (vec![reduce("sum", &["later"]), leaf_node("later")], "later"),
+            (vec![reduce("sum", &["sum"])], "sum"),
+            (
+                vec![parallel(vec![leaf_node("a"), reduce("sum", &["a"])])],
+                "a",
+            ),
+            (vec![parallel(vec![reduce("sum", &["fan"])])], "fan"),
+            (vec![conditional(), reduce("sum", &["yes"])], "yes"),
+            (vec![conditional(), reduce("sum", &["no"])], "no"),
+        ] {
+            assert!(
+                matches!(
+                    workflow_spec(nodes).validate_for_fleet(),
+                    Err(WorkflowFleetLimitError::InvalidWorkflow {
+                        source: WorkflowExecutionError::UnavailableNodeReference { reference: found, .. }
+                    }) if found == reference
+                ),
+                "{reference} must already have completed"
+            );
+        }
+        workflow_spec(vec![
+            parallel(vec![leaf_node("a"), leaf_node("b")]),
+            reduce("sum", &["a", "b", "fan"]),
+            conditional(),
+            reduce("after_choice", &["sum", "choice"]),
+        ])
+        .validate_for_fleet()
+        .expect("completed results remain available");
     }
 
     #[test]

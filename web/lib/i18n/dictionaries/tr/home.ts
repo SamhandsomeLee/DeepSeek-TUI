@@ -3,130 +3,83 @@ import type { HomeDict } from "../types";
 /** Turkish home copy: useful work with chosen models and connected tools. */
 
 export const home: HomeDict = {
-  metaTitle: "Codewhale · Bilgisayarın için açık kaynaklı bir ajan",
-  metaDescription: "Codewhale, terminaliniz için açık kaynak bir kodlama ajanıdır. Kendi barındırılan veya yerel modellerinizle projeleri okuyun, düzenleyin ve test edin.",
-  heroTitle: "Bilgisayarın için açık kaynaklı bir ajan",
-  heroIntro: "Terminalinde {brand} ile yazılım geliştir ve tekrarlanabilir iş akışları çalıştır. Mac uygulamalarında çalışmak için Computer Use’u ekle.",
+  metaTitle: "Codewhale · Model herkesin olabilir. Ajan sizin olmalı.",
+  metaDescription: "Codewhale, terminaliniz için Rust ile yazılmış açık kaynaklı bir kodlama ajanıdır. Her modelle çalışır, bir görevi birkaç ajana bölebilir ve her satırını okuyabilirsiniz.",
+  heroTitle: "Model herkesin olabilir. Ajan sizin olmalı.",
+  heroTitleLead: "Model herkesin olabilir.",
+  heroIntro: "{brand}, terminaliniz için Rust ile yazılmış açık kaynaklı bir kodlama ajanıdır. Her modelle çalışır, bir görevi birkaç ajana bölebilir ve her satırını okuyabilirsiniz.",
+  readTheCode: "Kodu okuyun",
+  installNote: "{version} sürümü yayımlandı ve hesap gerektirmez.",
+  captionReleased: "Canlı bir modelle, DeepSeek API’si üzerinden deepseek-flash ile gerçek bir oturum: düzenlemeyi model yazdı, düzenleme ve test çalıştırması gösterildiği gibi gerçekleşti. 0.10.3 geliştirme derlemesiyle kaydedildi.",
+  captureFrameNoPosture: "İstem ve Sonuç kareleri model adını ve onay modunu gösterir.",
+  frameLabelPrompt: "İstem",
+  frameLabelEdit: "Düzenleme",
+  frameLabelApproval: "Onay",
+  frameLabelResult: "Sonuç",
+  frameSummaryPrompt: "Terminalde Codewhale. “Add a --json flag to ls.py so the tests pass, then run the tests.” isteği gönderildi ve durum satırı Accept edits ile deepseek-flash modelini gösteriyor.",
+  frameSummaryEdit: "Terminalde Codewhale, bir komut beklerken yukarı kaydırılmış. ls.py ve test_ls.py dosyalarını okudu, ardından ls.py’yi güncelledi: diff, betiğe --json seçeneğini ekliyor.",
+  frameSummaryApproval: "Bir terminalde Codewhale. ls.py dosyasındaki değişiklik gösteriliyor ve python3 -m unittest -v test_ls.py komutu onay bekliyor. Kart onay beklediğini gösteriyor ve Allow ile Deny seçeneklerini sunuyor.",
+  frameSummaryResult: "Terminalde Codewhale. Onaydan sonra komut 2 test çalıştırdı ve OK yazdı. Model deepseek-flash, ls.py’ye --json eklediğini ve iki testin de geçtiğini söylüyor.",
+  frameSummaryProvider: "Terminalde Codewhale. “deepseek-flash” araması yapılan model seçici, DeepSeek, Fireworks AI ve OpenRouter’dan deepseek-flash’i listeliyor; DeepSeek seçili.",
+  frameSummaryReceipt: "Terminalde Codewhale. Oturumun makbuzu: değiştirdiği dosya ve çalıştırdığı komut, sizin onayınızla; token toplamları ve oturumun tahmini maliyeti; ardından düzenleme ve onaylanan komut.",
   getCodewhale: "Codewhale'i kur",
   heroInstallAria: "Kurulum komutu",
-  exploreProduct: "Codewhale’i keşfet",
-  shotPreview: "Terminal önizlemesi",
-  screenshotAlt:
-    "Codewhale v{version}: sohbeti, mesaj alanını ve oturum kontrollerini gösteren terminal kaydı.",
-  latestRelease: "En yeni sürüm {tag}",
-  releaseUnavailable: "Sürüm durumu kullanılamıyor",
-  proofContributors: "{count} katkıda bulunan",
-  currentSource: "Kaynak",
-  sourceCandidate: "Yayımlanmadı",
-  publishedRelease: "yayımlandı",
-  gainHeading:
-    "Terminalinden geliştir ve otomatikleştir",
-  gainLede:
-    "Ne geliştirmek veya otomatikleştirmek istediğini anlat. Codewhale, erişimini senin belirlediğin sınırlar içinde dosyaları düzenleyebilir, komut çalıştırabilir ve sonucu kontrol edebilir.",
-  gain: [
-    [
-      "Uygulamalar ve araçlar geliştir",
-      "Bir uygulama geliştir, bir özellik ekle veya bir betik yaz. Codewhale proje dosyaları üzerinde çalışabilir, kodu çalıştırabilir ve geliştirdiği şeyi test edebilir."
-    ],
-    [
-      "Tekrarlanan işleri otomatikleştir",
-      "İş akışlarını terminalinden, betiklerden veya CI üzerinden çalıştır. Daha büyük görevlerde işin bölümlerini farklı modeller kullanan bir Fleet ajan ekibine devret."
-    ],
-    [
-      "Kullandığın araçları bağla",
-      "Eklentiler ve MCP sunucuları aracılığıyla araçlar ekle veya kendi betiklerinden API’leri kullan. Her hizmet kendi kurulumunu ve kimlik doğrulamasını gerektirir."
-    ]
-  ],
-  chapterModels: "Senin modellerin",
-  modelsHeading: "Seçtiğin modelleri kullan",
-  modelsBody:
-    "Sağlayıcı hesaplarını, OpenAI uyumlu bir uç noktayı veya yerel ve kendi barındırdığın modelleri bağla. Oturum ve Fleet içindeki her ajan için bir model seç.",
-  modelsFacts: [
-    [
-      "API hesapların",
-      "DeepSeek, OpenAI, Anthropic veya Google gibi sağlayıcıları kendi anahtarlarınla bağla. Varsayılan model deepseek-flash artık DeepSeek-V4.1-Flash kullanıyor."
-    ],
-    [
-      "Ağ geçidin",
-      "OpenAI uyumlu bir uç nokta kullan ve sunduğu modelleri seç."
-    ],
-    [
-      "Kendi çıkarımın",
-      "Ollama, vLLM veya SGLang ile yerel ya da kendi barındırdığın modelleri çalıştır."
-    ],
-    [
-      "ChatGPT planın",
-      "API anahtarı yerine ChatGPT planı kullanmak için codewhale auth chatgpt ile oturum aç. Deneysel."
-    ]
-  ],
-  modelsLink: "Modellere ve sağlayıcılara göz at",
-  startHeading: "Başlarken",
-  startLede:
-    "Codewhale’i yükle, bir model bağla ve bir proje klasörü aç. İhtiyaç duydukça eklentiler ve daha fazla ajan ekleyebilirsin.",
-  startGuideLink: "Başlangıç kılavuzunu takip et",
-  startVocabularyLink: "Ürün sözlüğünü gör",
-  chapterAvailability: "Nerede çalışır",
-  availabilityHeading: "Şimdi kullanılabilenler ve geliştirilmekte olanlar",
-  availabilityLede:
-    "Terminal ve yerel tarayıcı istemcisi hazır. Yerel masaüstü uygulaması ve yeniden kurulan barındırılmış web uygulaması geliştiriliyor.",
-  availability: [
-    [
-      "Terminal ve yerel tarayıcı",
-      "Yayınlandı",
-      "Linux, macOS veya Windows üzerine kur, ardından codewhale komutunu ya da yerel tarayıcı istemcisi için codewhale web komutunu çalıştır. npm ve Cargo da çalışır; Termux üzerinde Android önizleme aşamasında."
-    ],
-    [
-      "CodeWhale GUI (VS Code)",
-      "Kullanılabilir",
-      "Topluluk tarafından sürdürülen ayrı bir proje: aynı Codewhale Runtime üzerinde VS Code kenar çubuğunda sohbet, konular ve dosya değişiklikleri. VS Code Marketplace'ten kur.",
-      "https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode"
-    ],
-    [
-      "Web uygulaması",
-      "Geliştirme aşamasında",
-      "Masaüstü uygulamasına uyacak şekilde yeniden yapılıyor ve henüz açılmadı. Bugün tarayıcıda kullanmak için kendi bilgisayarında codewhale web komutunu çalıştır."
-    ],
-    [
-      "Masaüstü",
-      "Geliştirme sürümü",
-      "Aynı motoru kullanan yerel bir uygulama. Değişiklikleri inceleyip commit et, projeler arasındaki işleri takip et ve bir mesajı düzenleyerek yeni bir dal olarak yeniden gönder. Henüz herkese açık indirme yok."
-    ]
-  ],
-  availabilityNote:
-    "Terminal, yerel tarayıcı ve GUI için Codewhale hesabı gerekmez. Kendi sağlayıcı anahtarını kullanırsan, bu kullanımı sağlayıcın faturalandırır.",
-  surfacesHeading: "Dosyalar ve araçlarla çalış",
-  surfaces: [
-    [
-      "Dosyalar ve terminal",
-      "Dosya oluştur, komut çalıştır, verileri incele ve geliştirdiklerini test et. Çalışma klasörünü ve izinleri sen belirlersin."
-    ],
-    [
-      "Eklentiler ve bağlı uygulamalar",
-      "Eklentiler ve MCP ile beceriler ve araçlar ekle. Ajanın kullanmasını istediğin bağlantıları incele ve etkinleştir."
-    ],
-    [
-      "Tarayıcı ve bilgisayar · önizleme",
-      "Verdiğin erişim kapsamında uygulama ve sitelerde tarayıcı araçları ve Computer Use eklentisiyle çalış."
-    ],
-    [
-      "Devam edebileceğin oturumlar",
-      "Sohbeti, araç sonuçlarını ve çalışma geçmişini bir arada tut. Görevi terminalde veya yerel tarayıcı istemcisinde sürdür."
-    ],
-    [
-      "Ajan ekipleri",
-      "Büyük bir işi Fleet ile farklı rol ve modellerdeki ajanlara böl, ilerlemelerini tek yerde izle."
-    ]
-  ],
-  runtimeLink: "Araçları ve entegrasyonları keşfet",
-  installBandHeading: "macOS veya Linux üzerine kur",
+  shotPreview: "Terminal oturumu kaydı",
   copy: "Kopyala",
   copied: "Kopyalandı ✓",
-  binaries: "İkililer",
-  chinaMirrors: "Çin yansıları",
-  installGuideLink: "Kurulum kılavuzunu oku",
-  communityHeading: "Codewhale’e katkıda bulun",
-  communityBody:
-    "Codewhale'in geliştirilmesine {count} kişi katkıda bulundu. GitHub’da bir hata bildir, belgeleri iyileştir veya kod katkısı yap.",
-  communityLinksAria: "Topluluk bağlantıları",
-  contribute: "GitHub’da katkıda bulun",
+
+  sectionModelHeading: "Her model, ajanınız üzerinden çalışabilir.",
+  sectionModelBody: "Yerleşik bir sağlayıcı, OpenAI uyumlu herhangi bir uç nokta veya kendi makinenizdeki bir model kullanın ve turlar arasında model değiştirin. Codewhale hesap olmadan deponuzda çalışır ve `codewhale web` ile kendi makinenizde tarayıcınızda onunla çalışabilirsiniz.",
+  sectionControlHeading: "Ajanınız size hesap verir.",
+  sectionControlBody: "Codewhale'in sormadan neler yapabileceğine siz karar verirsiniz ve komutları macOS ve Linux'ta bir korumalı alanda çalışabilir. Her oturum; değiştirdiği dosyaların, çalıştırdığı komutların ve her adımı kimin onayladığının makbuzunu bırakır.",
+  sectionAgentsHeading: "Birden çok ajan bir görevi sizinle paylaşabilir.",
+  sectionAgentsBody: "Codewhale bir işi kaşif, uygulayıcı ve gözden geçirici gibi rollere sahip ajanlara böler; her birini izleyebilir, inceleyebilir ve durdurabilirsiniz. Bir Fleet defter tutar, böylece bir çalıştırma yeniden başlatmadan sonra kaldığı yerden sürebilir.",
+  agentsRolesLabel: "Bir alt ajanın üstlenebileceği rollerden üçü",
+  agentRoleExplore: "Kodu okur ve önemli kısımları çıkarır, dosyaları değiştirmez.",
+  agentRoleImplement: "Belirli bir değişikliği en küçük düzenlemeyle yapar.",
+  agentRoleReviewer: "Bir değişikliği okur ve bulduklarını önem derecesine göre puanlar, dosyaları değiştirmez.",
+  agentsLink: "Alt ajanların nasıl çalıştığını okuyun",
+  directionShotAlt: "Codewhale masaüstü uygulaması. Solda oturum listesi var; ortada başarısız bir testi düzeltme görevi python3 -m pytest çalıştırma izni bekliyor, Allow ve Deny düğmeleriyle.",
+  directionShotCaption: "Geliştirilmekte olan masaüstü uygulaması aynı motorla çalışır. Burada DeepSeek V4.1 Flash ile Accept Edits modunda, test komutunu çalıştırmadan önce soruyor.",
+  directionShotLink: "Masaüstü uygulamasını görün",
+  sectionDirectionHeading: "Ajanınız buraya gidiyor.",
+  sectionDirectionBody: "Codewhale; terminalinizi, bir masaüstü uygulamasını, tarayıcıyı ve bulut bilgisayarlarını kapsayan tek bir ortam hâline geliyor; hepsi tek bir motorla çalışıyor, böylece işiniz aralarında geçebiliyor ve sizin kalıyor. Aşağıdaki her bölüm, bugün nerede durduğunu söyler.",
+  sectionOpenHeading: "Codewhale, onu kullanan insanlar tarafından açıkta geliştirilir.",
+  sectionOpenBody: "Tek bir model için açık kaynaklı bir terminal aracı olarak başladı ve birçok dilden yüzlerce insanın birlikte geliştirdiği bir projeye dönüştü. Kodunu okuyabilir, değiştirebilir ya da kendini açıklamasını isteyebilirsiniz.",
+  sectionStartHeading: "Ajanınızı bugün kendinizin yapın.",
+  sectionStartBody: "Codewhale'i kurun ve zaten sahip olduğunuz bir model anahtarıyla ya da kendi bilgisayarınızdaki bir modelle bir depoda çalıştırın. Hesaba ihtiyacınız yok ve `codewhale update` onu güncel tutar.",
+
+  contributorsCount: {
+    one: "{n} katkıda bulunan",
+    other: "{n} katkıda bulunan",
+  },
+  factsLabel: "Bir bakışta Codewhale",
+  factRust: "Rust ile yazıldı",
+  factLicense: "Açık kaynak, {license} lisansı",
+  factProviders: {
+    one: "{n} sağlayıcı rotası",
+    other: "{n} sağlayıcı rotası",
+  },
+  factModels: {
+    one: "{n} model",
+    other: "{n} model",
+  },
+
+  mapHeading: "Tek bir motor",
+  mapStateReleased: "Yayımlandı",
+  mapStateDeveloping: "Geliştiriliyor, indirme yok",
+  mapStateInviteOnly: "Yalnızca davetle",
+  mapStateBeingBuilt: "Yapım aşamasında",
+  mapTerminal: "Terminal uygulaması",
+  mapTerminalSentence: "macOS, Linux veya Windows'a kurun ve herhangi bir depoda `codewhale` çalıştırın.",
+  mapLocalBrowser: "Yerel tarayıcı istemcisi",
+  mapLocalBrowserSentence: "Sohbeti okumak, görev göndermek ve onayları yanıtlamak için tarayıcınızda `codewhale web` çalıştırın; terminalle birlikte gelir ve hesap gerektirmez.",
+  mapManyAgents: "Bir görevde birçok ajan",
+  mapManyAgentsSentence: "Alt ajanlar, Fleet'ler ve iş akışları, birkaç ajanın her biri kendi rolüyle bir görevi paylaşmasını sağlar.",
+  mapDesktop: "Masaüstü uygulaması",
+  mapDesktopSentence: "Aynı motor üzerinde bir masaüstü uygulaması geliştiriyoruz ve henüz herkese açık bir indirmesi yok.",
+  mapCloud: "Bulut bilgisayarları",
+  mapCloudSentence: "Bulut bilgisayarları yalnızca davetle erişilebilir; bir oturum bulutta bir makinede çalışmaya devam edebilsin diye onları geliştiriyoruz.",
+  mapOneSession: "Hepsini kapsayan tek bir oturum",
+  mapOneSessionSentence: "Sizinle terminalden masaüstüne, tarayıcıya ve buluta giden ve yol boyunca sizin kalan tek bir oturum geliştiriyoruz.",
 };

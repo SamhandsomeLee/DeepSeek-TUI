@@ -17,14 +17,11 @@ import type { ChromeDict } from "../types";
  */
 export const chrome: ChromeDict = {
   navDocs: "दस्तावेज़ीकरण",
-  navStart: "शुरुआत",
-  navInstall: "इंस्टॉल",
-  navFaq: "सामान्य प्रश्न",
-  navCommunity: "समुदाय",
   navContribute: "योगदान",
+  navSignIn: "साइन इन",
+  navDesktop: "डेस्कटॉप",
 
   navFeatures: "क्षमताएँ",
-  navProduct: "उत्पाद",
   navModels: "मॉडल",
   navPlugins: "प्लगइन",
 
@@ -39,6 +36,7 @@ export const chrome: ChromeDict = {
 
   menuOpen: "मेनू खोलें",
   menuClose: "मेनू बंद करें",
+  translationMachineDraft: "यह अनुवाद मशीन द्वारा बनाया गया मसौदा है और इसकी अभी किसी मूल भाषी द्वारा समीक्षा नहीं हुई है।",
 
   themeAuto: "ऑटो",
   themeLight: "लाइट",
@@ -46,19 +44,17 @@ export const chrome: ChromeDict = {
   themeAria: "थीम: {mode} (बदलने के लिए क्लिक करें)",
   themeTitle: "थीम · ऑटो / लाइट / डार्क",
 
-  footerTagline:
-    "आपके टर्मिनल और आपकी पसंद के मॉडल के लिए ओपन-सोर्स कोडिंग एजेंट।",
   footerProduct: "उत्पाद",
   footerProject: "प्रोजेक्ट",
   footerDocs: "दस्तावेज़ीकरण",
   footerGuide: "शुरुआत कैसे करें",
   footerInstall: "इंस्टॉल",
   footerModels: "मॉडल",
-  footerRuntime: "Runtime",
   footerFaq: "सामान्य प्रश्न",
-  footerIssues: "Issues",
   footerContribute: "योगदान दें",
+  footerRoadmap: "रोडमैप",
   footerLicense: "MIT लाइसेंस",
+  footerMerch: "मर्चेंडाइज़",
   footerTerms: "सेवा की शर्तें",
   footerPrivacy: "गोपनीयता",
   footerChangelog: "परिवर्तन लॉग",
@@ -66,8 +62,25 @@ export const chrome: ChromeDict = {
   footerReleases: " · रिलीज़: ",
   footerReleasesLink: "GitHub रिलीज़",
   footerSecurity: "सुरक्षा",
+  footerLegal: "कानूनी",
 
   switcherLabel: "भाषा",
   switcherSwitchTo: "{label} पर स्विच करें",
   partialBadge: "(आंशिक)",
+
+  stateReleased: "जारी किया गया",
+  stateAvailable: "उपलब्ध",
+  stateBeta: "बीटा",
+  stateDev: "डेवलपमेंट बिल्ड",
+  stateOpen: "खुला",
+  stateInviteOnly: "केवल आमंत्रण से",
+  stateNotOpen: "अभी खुला नहीं है",
+  stateNotPublic: "सार्वजनिक नहीं",
+  stateInSource: "स्रोत में है, अभी जारी नहीं हुआ",
+  numbersAsOf: "{date} तक",
+  downloadMacos: "macOS के लिए डाउनलोड करें",
+  downloadVersion: "संस्करण {version}",
+  downloadSize: "आकार {size}",
+  downloadChecksum: "SHA-256 चेकसम",
+  downloadSigned: "हस्ताक्षरित और नोटराइज़्ड",
 };

@@ -605,7 +605,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
     def(
         "show_thinking",
         SettingKind::Bool(SHOW_THINKING),
-        "false",
+        "true",
         ui(
             TAB_APPEARANCE,
             "display",
@@ -1247,7 +1247,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
     def(
         "permission_posture",
         SettingKind::Enum(PERMISSION_POSTURE),
-        "ask",
+        "accept-edits",
         ui(
             TAB_TRUST,
             "permissions",
@@ -1313,7 +1313,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
     def(
         "telemetry",
         SettingKind::Bool(TELEMETRY),
-        "false",
+        "true",
         ui(
             TAB_TRUST,
             "network",
@@ -1415,7 +1415,8 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
     // A transport timeout; advanced networking, available through `/set` only.
     def("stream_chunk_timeout_secs", SettingKind::Int, "900", None),
     // Canonical transport keys. Runtime resolution stays in TUI Config.
-    def("stream.open_timeout_secs", SettingKind::Int, "45", None),
+    def("stream.open_timeout_secs", SettingKind::Int, "180", None),
+    def("stream.open_retries", SettingKind::Int, "1", None),
     def("stream.chunk_timeout_secs", SettingKind::Int, "900", None),
     def("stream.max_resumes", SettingKind::Int, "3", None),
     def(
@@ -1520,6 +1521,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
     // Trust posture with a `/set` entry point but no row; surfaced where
     // sandboxing acts, not as a settings sentence.
     def("sandbox_mode", SettingKind::String, "", None),
+    def("agents", SettingKind::String, "", None),
     // Route memory written by the pickers: per-provider defaults, enabled
     // chooser sets, and pinned routes. Structured values no row could edit.
     def("provider_models", SettingKind::String, "", None),
@@ -1543,6 +1545,12 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "operate_deprecation_shown",
         SettingKind::Bool(ON_OFF),
         "false",
+        None,
+    ),
+    def(
+        "account_preferences_notice_shown",
+        SettingKind::String,
+        "",
         None,
     ),
     // Round 3 work-bar placement migration ran once (`top` → `bottom`).

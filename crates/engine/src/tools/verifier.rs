@@ -214,6 +214,10 @@ struct GateResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stderr_log_ref: Option<String>,
     skipped_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    zero_tests_matched: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -515,6 +519,7 @@ impl ToolSpec for RunVerifiersTool {
 
 /// Run quick auto verifier gates after a successful workflow completion (#4013).
 pub async fn run_workflow_completion_gates(context: &ToolContext) -> Result<Value, ToolError> {
+    crate::tools::execution_envelope::enforce_tool_denial(context, "run_verifiers", &json!({}))?;
     let gates = build_gate_plan(
         context,
         VerifierProfile::Auto,
@@ -608,7 +613,8 @@ fn start_background_gates(
         };
 
         let command = render_gate_command(program, &gate.args)?;
-        let env: HashMap<String, String> = gate.env.into_iter().collect();
+        let mut env: HashMap<String, String> = gate.env.into_iter().collect();
+        crate::tools::shell::insert_agent_mark_env(&mut env, context);
         let spawn_result = {
             let mut manager = context
                 .shell_manager
@@ -1195,6 +1201,8 @@ async fn run_gate(gate: VerifierGate, context: &ToolContext) -> GateResult {
             stdout_log_ref: None,
             stderr_log_ref: None,
             skipped_reason: Some(reason),
+            zero_tests_matched: false,
+            warning: None,
         };
     }
 
@@ -1214,6 +1222,8 @@ async fn run_gate(gate: VerifierGate, context: &ToolContext) -> GateResult {
             stdout_log_ref: None,
             stderr_log_ref: None,
             skipped_reason: Some("verifier has no executable program".to_string()),
+            zero_tests_matched: false,
+            warning: None,
         };
     };
 
@@ -1242,6 +1252,8 @@ async fn run_gate(gate: VerifierGate, context: &ToolContext) -> GateResult {
                 stdout_log_ref: None,
                 stderr_log_ref: None,
                 skipped_reason: Some(error.to_string()),
+                zero_tests_matched: false,
+                warning: None,
             };
         }
     };
@@ -1279,6 +1291,8 @@ async fn run_gate(gate: VerifierGate, context: &ToolContext) -> GateResult {
                 stdout_log_ref: None,
                 stderr_log_ref: None,
                 skipped_reason: Some(format!("{program} is not installed or not in PATH")),
+                zero_tests_matched: false,
+                warning: None,
             };
         }
         Err(err) => {
@@ -1297,6 +1311,8 @@ async fn run_gate(gate: VerifierGate, context: &ToolContext) -> GateResult {
                 stdout_log_ref: None,
                 stderr_log_ref: None,
                 skipped_reason: None,
+                zero_tests_matched: false,
+                warning: None,
             };
         }
     };
@@ -1380,7 +1396,26 @@ async fn run_gate(gate: VerifierGate, context: &ToolContext) -> GateResult {
         }
         stderr_text.push_str(&note);
     }
-    let passed = !timed_out && exit_status.is_some_and(|status| status.success());
+    let mut passed = !timed_out && exit_status.is_some_and(|status| status.success());
+    let filtered = gate_has_test_filter(&program, &gate.ecosystem, &gate.args);
+    let zero_test = if passed {
+        super::test_runner::detect_zero_tests_matched(&stdout.text, &stderr_text, filtered)
+    } else {
+        super::test_runner::ZeroTestDetection::default()
+    };
+    let warning = if zero_test.zero_tests_matched {
+        passed = false;
+        let msg = zero_test.reason.unwrap_or_else(|| {
+            "0 tests matched; verify your test filter — a 0-test run proves nothing".to_string()
+        });
+        if !stderr_text.is_empty() && !stderr_text.ends_with('\n') {
+            stderr_text.push('\n');
+        }
+        stderr_text.push_str(&format!("[verifier gate matched 0 tests: {msg}]"));
+        Some(msg)
+    } else {
+        None
+    };
     GateResult {
         name: gate.name,
         ecosystem: gate.ecosystem,
@@ -1400,6 +1435,33 @@ async fn run_gate(gate: VerifierGate, context: &ToolContext) -> GateResult {
         stdout_log_ref: stdout.log_ref,
         stderr_log_ref: stderr.log_ref,
         skipped_reason: None,
+        zero_tests_matched: zero_test.zero_tests_matched,
+        warning,
+    }
+}
+
+fn gate_has_test_filter(program: &str, ecosystem: &str, args: &[String]) -> bool {
+    if ecosystem != "custom" {
+        return false;
+    }
+    let bin = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program);
+    match bin {
+        "cargo" | "cargo.exe" => match args.first().map(String::as_str) {
+            Some("test") => super::test_runner::has_test_filter_args(&args[1..]),
+            Some("nextest") => args.len() > 2,
+            _ => false,
+        },
+        "pytest" | "vitest" | "jest" => !args.is_empty(),
+        "go" | "go.exe" => {
+            args.first().map(String::as_str) == Some("test")
+                && args
+                    .iter()
+                    .any(|arg| arg == "-run" || arg.starts_with("-run="))
+        }
+        _ => false,
     }
 }
 
@@ -1415,8 +1477,14 @@ where
     let mut chunk = [0u8; 8192];
     loop {
         match pipe.read(&mut chunk).await {
-            Ok(0) | Err(_) => return,
+            Ok(0) => return,
             Ok(n) => capture.push(&chunk[..n]).await,
+            Err(error) => {
+                capture
+                    .push(format!("\n[gate output read failed: {error}]\n").as_bytes())
+                    .await;
+                return;
+            }
         }
     }
 }
@@ -1918,6 +1986,48 @@ mod tests {
         assert!(metadata.get("task_updates").is_none(), "{metadata}");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verifier_gates_carry_the_agent_project_in_the_foreground_and_background() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path());
+        let marked = format!("MARK={}", tmp.path().display());
+        let gate = json!({
+            "name": "agent-mark",
+            "program": "sh",
+            "args": ["-c", "printf 'MARK=%s' \"${CODEWHALE_AGENT_PROJECT-unset}\""]
+        });
+
+        let foreground = RunVerifiersTool
+            .execute(
+                json!({ "profile": "auto", "commands": [gate.clone()] }),
+                &ctx,
+            )
+            .await
+            .expect("foreground verifier");
+        assert!(
+            foreground.content.contains(&marked),
+            "{}",
+            foreground.content
+        );
+
+        let background = RunVerifiersTool
+            .execute(
+                json!({ "profile": "auto", "background": true, "commands": [gate] }),
+                &ctx,
+            )
+            .await
+            .expect("background verifier");
+        let parsed: RunVerifiersBackgroundOutput =
+            serde_json::from_str(&background.content).expect("background output json");
+        let task_id = parsed.jobs[0].task_id.as_deref().expect("task id");
+        let output = wait_for_completed_shell(
+            &mut ctx.shell_manager.lock().expect("shell manager"),
+            task_id,
+        );
+        assert!(output.stdout.contains(&marked), "{output:?}");
+    }
+
     #[tokio::test]
     async fn run_verifiers_background_starts_shell_jobs_and_returns_task_ids() {
         let tmp = tempdir().expect("tempdir");
@@ -2248,5 +2358,36 @@ mod tests {
         let context = ToolContext::new(tmp.path().to_path_buf());
         let result = run_gate(gate, &context).await;
         assert_eq!(result.stdout.trim(), "unset|declared", "{result:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_verifiers_flags_zero_test_filtered_gate_as_failed() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path());
+        let result = RunVerifiersTool
+            .execute(
+                json!({
+                    "profile": "auto",
+                    "commands": [{
+                        "name": "filtered-cargo",
+                        "program": "/bin/sh",
+                        "args": [
+                            "-c",
+                            "printf 'running 0 tests\\n\\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.00s\\n'"
+                        ]
+                    }]
+                }),
+                &ctx,
+            )
+            .await
+            .expect("execute");
+        let parsed: RunVerifiersOutput =
+            serde_json::from_str(&result.content).expect("verifier output json");
+        assert!(!parsed.success, "{}", result.content);
+        assert_eq!(parsed.verifier_verdict, VerifierVerdict::Fail);
+        assert_eq!(parsed.failed, 1);
+        assert!(parsed.gates[0].zero_tests_matched);
+        assert!(parsed.gates[0].warning.is_some());
     }
 }

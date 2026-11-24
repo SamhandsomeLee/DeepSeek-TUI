@@ -3,124 +3,80 @@ import type { HomeDict } from "../types";
 /** Korean home copy: useful work with chosen models and connected tools. */
 
 export const home: HomeDict = {
-  metaTitle: "Codewhale · 내 컴퓨터를 위한 오픈 소스 에이전트",
-  metaDescription: "Codewhale은 터미널에서 실행되는 오픈 소스 코딩 에이전트입니다. 선택한 클라우드 또는 로컬 모델로 프로젝트를 읽고, 수정하고, 테스트하세요.",
-  heroTitle: "내 컴퓨터를 위한 오픈 소스 에이전트",
-  heroIntro: "터미널에서 {brand}로 소프트웨어를 만들고 반복 가능한 워크플로를 실행하세요. Mac 앱에서 작업하려면 Computer Use를 추가하세요.",
+  metaTitle: "Codewhale · 모델은 누구의 것이어도 됩니다. 에이전트는 당신의 것이어야 합니다.",
+  metaDescription: "Codewhale는 터미널에서 쓰는 오픈 소스 코딩 에이전트이며 Rust로 작성되었습니다. 어떤 모델과도 함께 작동하고, 하나의 작업을 여러 에이전트에게 나눌 수 있으며, 코드 한 줄 한 줄을 직접 읽을 수 있습니다.",
+  heroTitle: "모델은 누구의 것이어도 됩니다. 에이전트는 당신의 것이어야 합니다.",
+  heroTitleLead: "모델은 누구의 것이어도 됩니다.",
+  heroIntro: "{brand}는 터미널에서 쓰는 오픈 소스 코딩 에이전트이며 Rust로 작성되었습니다. 어떤 모델과도 함께 작동하고, 하나의 작업을 여러 에이전트에게 나눌 수 있으며, 코드 한 줄 한 줄을 직접 읽을 수 있습니다.",
+  readTheCode: "코드 읽기",
+  installNote: "버전 {version}은(는) 릴리스되었으며 계정이 필요 없습니다.",
+  captionReleased: "실시간 모델, DeepSeek API를 통한 deepseek-flash과 함께한 실제 세션입니다. 수정은 모델이 작성했고, 수정과 테스트 실행은 보이는 그대로 일어났습니다. 0.10.3 개발 빌드로 녹화했습니다.",
+  captureFrameNoPosture: "프롬프트와 결과 프레임에는 모델 이름과 승인 모드가 표시됩니다.",
+  frameLabelPrompt: "프롬프트",
+  frameLabelEdit: "편집",
+  frameLabelApproval: "승인",
+  frameLabelResult: "결과",
+  frameSummaryPrompt: "터미널의 Codewhale. 요청 “Add a --json flag to ls.py so the tests pass, then run the tests.”이 전송되었고, 상태 줄에 Accept edits와 모델 deepseek-flash이 표시됩니다.",
+  frameSummaryEdit: "터미널의 Codewhale. 명령이 대기하는 동안 위로 스크롤한 화면입니다. ls.py와 test_ls.py를 읽은 뒤 ls.py를 수정했습니다. diff는 스크립트에 --json 플래그를 추가합니다.",
+  frameSummaryApproval: "터미널에서 실행 중인 Codewhale. ls.py의 변경 내용이 표시되고, 명령 python3 -m unittest -v test_ls.py가 승인을 기다립니다. 카드는 승인 대기 중임을 표시하고 Allow와 Deny를 제공합니다.",
+  frameSummaryResult: "터미널의 Codewhale. 승인 후 명령이 테스트 2개를 실행하고 OK를 출력했습니다. 모델 deepseek-flash은 ls.py에 --json을 추가했고 두 테스트가 통과했다고 말합니다.",
+  frameSummaryProvider: "터미널의 Codewhale. “deepseek-flash”로 검색한 모델 선택기에 DeepSeek, Fireworks AI, OpenRouter의 deepseek-flash가 나오고 DeepSeek가 선택되어 있습니다.",
+  frameSummaryReceipt: "터미널의 Codewhale. 세션 영수증: 변경한 파일과 실행한 명령(사용자 승인), 토큰 합계와 세션의 예상 비용. 이어서 수정과 승인된 명령.",
   getCodewhale: "Codewhale 설치",
   heroInstallAria: "설치 명령",
-  exploreProduct: "Codewhale 둘러보기",
-  shotPreview: "터미널 미리보기",
-  screenshotAlt:
-    "Codewhale v{version}: 대화, 메시지 입력창, 세션 제어를 보여 주는 실제 터미널 캡처.",
-  latestRelease: "최신 릴리스 {tag}",
-  releaseUnavailable: "릴리스 상태를 확인할 수 없음",
-  proofContributors: "기여자 {count}명",
-  currentSource: "소스",
-  sourceCandidate: "미공개",
-  publishedRelease: "공개됨",
-  gainHeading: "터미널에서 개발하고 자동화하세요",
-  gainLede: "만들거나 자동화하고 싶은 작업을 설명하세요. Codewhale은 사용자가 제어하는 접근 권한 안에서 파일을 편집하고, 명령을 실행하고, 결과를 확인할 수 있습니다.",
-  gain: [
-    [
-      "앱과 도구 만들기",
-      "앱을 만들거나, 기능을 추가하거나, 스크립트를 작성하세요. Codewhale은 프로젝트 파일을 다루고, 코드를 실행하고, 만든 결과물을 테스트할 수 있습니다."
-    ],
-    [
-      "반복하는 업무 자동화",
-      "터미널, 스크립트 또는 CI에서 워크플로를 실행하세요. 작업이 크다면 서로 다른 모델을 사용하는 Fleet 에이전트 팀에 일부 작업을 맡길 수 있습니다."
-    ],
-    [
-      "쓰고 있는 도구 연결",
-      "플러그인과 MCP 서버를 통해 도구를 추가하거나, 자신의 스크립트에서 API를 사용하세요. 각 서비스에는 개별 설정과 인증이 필요합니다."
-    ]
-  ],
-  chapterModels: "당신의 모델",
-  modelsHeading: "원하는 모델을 사용하세요",
-  modelsBody:
-    "제공업체 계정, OpenAI 호환 엔드포인트 또는 로컬 및 자체 호스팅 모델을 연결하세요. 세션과 Fleet의 각 에이전트에 사용할 모델을 선택하세요.",
-  modelsFacts: [
-    [
-      "내 API 계정",
-      "자신의 키로 DeepSeek, OpenAI, Anthropic, Google 등의 제공업체에 연결하세요. 기본 모델인 deepseek-flash는 이제 DeepSeek-V4.1-Flash로 실행됩니다."
-    ],
-    [
-      "내 게이트웨이",
-      "OpenAI 호환 엔드포인트를 연결하고 제공되는 모델을 선택하세요."
-    ],
-    [
-      "내 추론 환경",
-      "Ollama, vLLM, SGLang으로 로컬 또는 자체 호스팅 모델을 실행하세요."
-    ],
-    [
-      "내 ChatGPT 요금제",
-      "codewhale auth chatgpt로 로그인하여 API 키 대신 ChatGPT 요금제를 사용하세요. 실험 기능입니다."
-    ]
-  ],
-  modelsLink: "모델과 제공업체 둘러보기",
-  startHeading: "시작하기",
-  startLede: "Codewhale을 설치하고, 모델을 연결하고, 프로젝트 폴더를 여세요. 필요에 따라 플러그인과 더 많은 에이전트를 추가할 수 있습니다.",
-  startGuideLink: "시작 가이드 따라 하기",
-  startVocabularyLink: "제품 용어 보기",
-  chapterAvailability: "실행 환경",
-  availabilityHeading: "현재 제공되는 기능과 개발 중인 기능",
-  availabilityLede: "터미널과 로컬 브라우저 클라이언트는 지금 사용할 수 있습니다. 네이티브 데스크톱 앱과 새로 구축하는 호스팅 웹 앱은 개발 중입니다.",
-  availability: [
-    [
-      "터미널과 로컬 브라우저",
-      "출시됨",
-      "Linux, macOS, Windows에 설치한 뒤 codewhale을 실행하거나, 로컬 브라우저 클라이언트를 쓰려면 codewhale web을 실행하세요. npm과 Cargo로도 설치할 수 있으며, Android의 Termux 버전은 미리보기입니다."
-    ],
-    [
-      "CodeWhale GUI (VS Code)",
-      "사용 가능",
-      "커뮤니티가 관리하는 별도 프로젝트입니다. 같은 Codewhale Runtime 위에서 VS Code 사이드바로 대화, 스레드, 파일 변경을 다룹니다. VS Code Marketplace에서 설치하세요.",
-      "https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode"
-    ],
-    [
-      "호스팅 웹 앱",
-      "개발 중",
-      "데스크톱 앱에 맞춰 다시 만드는 중이며 아직 공개되지 않았습니다. 지금 브라우저에서 사용하려면 자신의 컴퓨터에서 codewhale web을 실행하세요."
-    ],
-    [
-      "데스크톱",
-      "개발 빌드",
-      "같은 엔진으로 실행되는 네이티브 앱입니다. 변경 사항을 검토하고 커밋하며, 여러 프로젝트의 작업을 확인하고, 메시지를 편집해 새 분기로 다시 보낼 수 있습니다. 아직 공개 다운로드는 없습니다."
-    ]
-  ],
-  availabilityNote: "터미널, 로컬 브라우저, GUI는 Codewhale 계정이 필요 없습니다. 본인의 제공업체 키를 사용하는 경우, 해당 사용 요금은 그 제공업체가 청구합니다.",
-  surfacesHeading: "파일과 도구로 작업하세요",
-  surfaces: [
-    [
-      "파일과 터미널",
-      "파일을 만들고, 명령을 실행하고, 데이터를 살펴보고, 만든 것을 테스트하세요. 작업 폴더와 권한은 직접 설정합니다."
-    ],
-    [
-      "플러그인과 연결된 앱",
-      "플러그인과 MCP로 스킬과 도구를 추가하세요. 에이전트가 사용할 연결을 검토하고 활성화합니다."
-    ],
-    [
-      "브라우저와 컴퓨터 사용 · 미리보기",
-      "허용한 접근 범위에서 브라우저 도구와 Computer Use 플러그인으로 앱과 웹사이트에서 작업하세요."
-    ],
-    [
-      "이어서 할 수 있는 세션",
-      "대화, 도구 결과, 작업 기록을 함께 보관하세요. 터미널이나 로컬 브라우저 클라이언트에서 작업을 다시 이어 갑니다."
-    ],
-    [
-      "에이전트 팀",
-      "Fleet으로 큰 일을 역할과 모델이 다른 에이전트에게 나누고, 한곳에서 진행 상황을 확인하세요."
-    ]
-  ],
-  runtimeLink: "도구와 통합 살펴보기",
-  installBandHeading: "macOS 또는 Linux에 설치하세요",
+  shotPreview: "터미널 세션 녹화",
   copy: "복사",
   copied: "복사됨 ✓",
-  binaries: "바이너리",
-  chinaMirrors: "중국 미러",
-  installGuideLink: "설치 가이드 읽기",
-  communityHeading: "Codewhale에 기여하세요",
-  communityBody: "{count}명이 Codewhale 개발에 참여했습니다. GitHub에서 버그를 신고하거나, 문서를 개선하거나, 코드를 기여하세요.",
-  communityLinksAria: "커뮤니티 링크",
-  contribute: "GitHub에서 기여하기",
+
+  sectionModelHeading: "어떤 모델이든 당신의 에이전트를 통해 일할 수 있습니다.",
+  sectionModelBody: "내장 제공업체, OpenAI 호환 엔드포인트, 또는 내 컴퓨터의 모델을 사용할 수 있고, 턴 사이에 모델을 바꿀 수 있습니다. Codewhale은 계정 없이 당신의 저장소에서 실행되며, `codewhale web`으로 내 컴퓨터의 브라우저에서 함께 작업할 수 있습니다.",
+  sectionControlHeading: "당신의 에이전트는 당신에게 응답합니다.",
+  sectionControlBody: "묻지 않고 Codewhale이 무엇을 해도 되는지는 당신이 정하며, 명령은 macOS와 Linux에서 샌드박스 안에서 실행될 수 있습니다. 모든 세션은 변경한 파일, 실행한 명령, 각 단계를 누가 승인했는지를 담은 영수증을 남깁니다.",
+  sectionAgentsHeading: "여러 에이전트가 당신과 하나의 작업을 나눌 수 있습니다.",
+  sectionAgentsBody: "Codewhale은 탐색자, 구현자, 검토자 같은 역할을 가진 에이전트들에게 작업을 나누고, 당신은 각각을 지켜보고, 살펴보고, 멈출 수 있습니다. Fleet은 원장을 유지하므로 재시작 후에도 실행을 이어갈 수 있습니다.",
+  agentsRolesLabel: "서브에이전트가 맡을 수 있는 역할 세 가지",
+  agentRoleExplore: "코드를 읽고 중요한 부분을 정리합니다. 파일은 바꾸지 않습니다.",
+  agentRoleImplement: "하나의 구체적인 변경을 가장 작은 수정으로 해냅니다.",
+  agentRoleReviewer: "변경을 읽고 발견한 문제를 심각도별로 평가합니다. 파일은 바꾸지 않습니다.",
+  agentsLink: "서브에이전트 작동 방식 읽기",
+  directionShotAlt: "Codewhale 데스크톱 앱. 왼쪽은 세션 목록이고, 가운데에서는 실패하는 테스트를 고치는 작업이 python3 -m pytest 실행 허락을 기다리며 Allow와 Deny 버튼을 보여 줍니다.",
+  directionShotCaption: "개발 중인 데스크톱 앱은 같은 엔진에서 실행됩니다. 여기서는 Accept Edits에서 DeepSeek V4.1 Flash를 사용하며 테스트 명령을 실행하기 전에 허락을 구합니다.",
+  directionShotLink: "데스크톱 앱 보기",
+  sectionDirectionHeading: "당신의 에이전트가 가는 곳은 여기입니다.",
+  sectionDirectionBody: "Codewhale은 터미널, 데스크톱 앱, 브라우저, 클라우드 컴퓨터를 아우르는 하나의 환경이 되어 가고 있으며, 모두 하나의 엔진으로 돌아갑니다. 그래서 작업이 그 사이를 오가면서도 당신의 것으로 남습니다. 아래의 각 부분은 오늘 어느 단계에 있는지 알려 줍니다.",
+  sectionOpenHeading: "Codewhale은 쓰는 사람들이 공개적으로 만듭니다.",
+  sectionOpenBody: "하나의 모델을 위한 오픈 소스 터미널 도구로 시작해, 여러 언어를 쓰는 수백 명이 함께 만드는 프로젝트가 되었습니다. 코드를 읽고, 바꾸고, 스스로 설명해 달라고 할 수 있습니다.",
+  sectionStartHeading: "오늘 당신의 에이전트를 당신의 것으로 만드세요.",
+  sectionStartBody: "Codewhale을 설치하고, 이미 가진 모델 키나 내 컴퓨터의 모델로 저장소에서 실행하세요. 계정은 필요 없고, `codewhale update`로 최신 상태를 유지합니다.",
+
+  contributorsCount: {
+    other: "기여자 {n}명",
+  },
+  factsLabel: "한눈에 보는 Codewhale",
+  factRust: "Rust로 작성",
+  factLicense: "오픈 소스, {license} 라이선스",
+  factProviders: {
+    other: "제공자 경로 {n}개",
+  },
+  factModels: {
+    other: "모델 {n}개",
+  },
+
+  mapHeading: "하나의 엔진",
+  mapStateReleased: "릴리스됨",
+  mapStateDeveloping: "개발 중, 다운로드 없음",
+  mapStateInviteOnly: "초대 전용",
+  mapStateBeingBuilt: "구축 중",
+  mapTerminal: "터미널 앱",
+  mapTerminalSentence: "macOS, Linux 또는 Windows에 설치하고 아무 저장소에서나 `codewhale`을 실행하세요.",
+  mapLocalBrowser: "로컬 브라우저 클라이언트",
+  mapLocalBrowserSentence: "`codewhale web`을 실행하면 브라우저에서 대화를 읽고, 작업을 보내고, 승인에 응답할 수 있습니다. 터미널과 함께 제공되며 계정이 필요 없습니다.",
+  mapManyAgents: "하나의 작업에 여러 에이전트",
+  mapManyAgentsSentence: "서브 에이전트, Fleet, 워크플로를 통해 여러 에이전트가 각자의 역할로 하나의 작업을 나눕니다.",
+  mapDesktop: "데스크톱 앱",
+  mapDesktopSentence: "같은 엔진 위에 데스크톱 앱을 만들고 있으며, 아직 공개 다운로드는 없습니다.",
+  mapCloud: "클라우드 컴퓨터",
+  mapCloudSentence: "클라우드 컴퓨터는 초대 전용이며, 세션이 클라우드의 컴퓨터에서 계속 작업할 수 있도록 만들고 있습니다.",
+  mapOneSession: "이 모두를 잇는 하나의 세션",
+  mapOneSessionSentence: "터미널에서 데스크톱, 브라우저, 클라우드까지 당신과 함께 이동하며 끝까지 당신의 것으로 남는 하나의 세션을 만들고 있습니다.",
 };

@@ -54,10 +54,8 @@ pub fn format_context_window(tokens: u64) -> String {
         if tokens.is_multiple_of(1_000_000) {
             format!("{}M", tokens / 1_000_000)
         } else {
-            format!("{:.2}M", tokens as f64 / 1_000_000.0)
-                .trim_end_matches('0')
-                .trim_end_matches('.')
-                .to_string()
+            let millions = format!("{:.2}", tokens as f64 / 1_000_000.0);
+            format!("{}M", millions.trim_end_matches('0').trim_end_matches('.'))
         }
     } else if tokens >= 1_000 {
         format!("{}K", tokens / 1_000)
@@ -392,7 +390,7 @@ pub fn windows_publish_retry_delay(
     error: &std::io::Error,
     attempt: usize,
 ) -> Option<std::time::Duration> {
-    const MAX_PERSIST_ATTEMPTS: usize = 8;
+    const MAX_PERSIST_ATTEMPTS: usize = 12;
     // 5 ERROR_ACCESS_DENIED, 32 ERROR_SHARING_VIOLATION, 33 ERROR_LOCK_VIOLATION.
     let transient = error.kind() == std::io::ErrorKind::PermissionDenied
         || matches!(error.raw_os_error(), Some(5 | 32 | 33));
@@ -400,7 +398,7 @@ pub fn windows_publish_retry_delay(
         return None;
     }
     Some(std::time::Duration::from_millis(
-        10u64.saturating_mul(1u64 << attempt),
+        10u64.saturating_mul(1u64 << attempt.min(6)),
     ))
 }
 
@@ -1006,6 +1004,11 @@ pub fn estimate_message_chars(messages: &[Message]) -> usize {
                 ContentBlock::ServerToolUse { .. }
                 | ContentBlock::ToolSearchToolResult { .. }
                 | ContentBlock::CodeExecutionToolResult { .. }
+                | ContentBlock::WebSearchToolResult { .. }
+                | ContentBlock::WebFetchToolResult { .. }
+                | ContentBlock::WebSearchCall { .. }
+                | ContentBlock::ServerToolCalls { .. }
+                | ContentBlock::File { .. }
                 | ContentBlock::ImageUrl { .. } => {}
             }
         }
@@ -1021,11 +1024,21 @@ pub fn estimate_message_chars(messages: &[Message]) -> usize {
 // without additional platform scaffolding.
 #[cfg(test)]
 mod tests {
-    use super::{display_path_with_home, redacted_identifier_for_log};
+    use super::{display_path_with_home, format_context_window, redacted_identifier_for_log};
     use std::path::PathBuf;
 
     fn home(s: &str) -> Option<PathBuf> {
         Some(PathBuf::from(s))
+    }
+
+    #[test]
+    fn format_context_window_drops_trailing_zeros() {
+        assert_eq!(format_context_window(1_500_000), "1.5M");
+        assert_eq!(format_context_window(2_100_000), "2.1M");
+        assert_eq!(format_context_window(1_050_000), "1.05M");
+        assert_eq!(format_context_window(1_000_000), "1M");
+        assert_eq!(format_context_window(262_144), "262K");
+        assert_eq!(format_context_window(500), "500");
     }
 
     #[test]

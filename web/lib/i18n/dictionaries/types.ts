@@ -21,21 +21,15 @@
  * package-manager proper nouns, mirror names, and captured media paths.
  */
 
+import type { PluralForms } from "../plural";
+
 export interface ChromeDict {
   // --- primary nav labels (components/nav.tsx via lib/i18n/links.ts) ---
   navDocs: string;
-  navStart: string;
-  navInstall: string;
-  navFaq: string;
-  navCommunity: string;
   navContribute: string;
+  navSignIn: string;
+  navDesktop: string;
 
-  /**
-   * The primary strip: Product / Models / Plugins / Docs. The
-   * older six (Start, Install, FAQ, Community, Contribute) stay in the
-   * dictionary for the compact sheet's second group and the footer.
-   */
-  navProduct: string;
   navFeatures: string;
   navModels: string;
   navPlugins: string;
@@ -65,6 +59,7 @@ export interface ChromeDict {
   /** Mobile-menu toggle labels. */
   menuOpen: string;
   menuClose: string;
+  translationMachineDraft: string;
 
   /** Docs theme toggle: the three cycle states. */
   themeAuto: string;
@@ -76,18 +71,17 @@ export interface ChromeDict {
   themeTitle: string;
 
   // --- footer ---
-  footerTagline: string;
   footerProduct: string;
   footerProject: string;
   footerDocs: string;
   footerGuide: string;
   footerInstall: string;
   footerModels: string;
-  footerRuntime: string;
   footerFaq: string;
-  footerIssues: string;
   footerContribute: string;
+  footerRoadmap: string;
   footerLicense: string;
+  footerMerch: string;
   /** Footer link to the terms route, e.g. "Terms". */
   footerTerms: string;
   /** Footer link to the privacy route, e.g. "Privacy". */
@@ -102,6 +96,7 @@ export interface ChromeDict {
   footerReleasesLink: string;
   /** Link text for the security-contact mailto. */
   footerSecurity: string;
+  footerLegal: string;
 
   /** aria-label for the locale switcher control. */
   switcherLabel: string;
@@ -114,6 +109,22 @@ export interface ChromeDict {
    * the heading of the group that lists partial packs.
    */
   partialBadge: string;
+
+  stateReleased: string;
+  stateAvailable: string;
+  stateBeta: string;
+  stateDev: string;
+  stateOpen: string;
+  stateInviteOnly: string;
+  stateNotOpen: string;
+  stateNotPublic: string;
+  stateInSource: string;
+  numbersAsOf: string;
+  downloadMacos: string;
+  downloadVersion: string;
+  downloadSize: string;
+  downloadChecksum: string;
+  downloadSigned: string;
 }
 
 export interface FeaturesDict {
@@ -141,75 +152,88 @@ export interface HomeDict {
 
   /** A complete headline that wraps naturally in each locale. */
   heroTitle: string;
+  heroTitleLead: string;
   /**
    * Hero lede. Carries a `{brand}` token so the brand can be typeset in its
    * own span wherever the sentence needs it — the page splits on the token
    * instead of concatenating fragments around it.
    */
   heroIntro: string;
+  readTheCode: string;
+  installNote: string;
+  captionReleased: string;
+  captureFrameNoPosture: string;
+  frameLabelPrompt: string;
+  frameLabelEdit: string;
+  frameLabelApproval: string;
+  frameLabelResult: string;
+  /** One accessible summary for each terminal frame the home shows. */
+  frameSummaryPrompt: string;
+  frameSummaryEdit: string;
+  frameSummaryApproval: string;
+  frameSummaryResult: string;
+  frameSummaryProvider: string;
+  frameSummaryReceipt: string;
   /** Primary action → /install, e.g. "Get Codewhale". */
   getCodewhale: string;
   /** Accessible name for the hero install command and its platform choice. */
   heroInstallAria: string;
-  /** Secondary action → /product, e.g. "Explore the product". */
-  exploreProduct: string;
-
-  /** Screenshot caption, first item of the dot chain, e.g. "Terminal preview". */
+  /** Accessible name for a terminal capture's region and for the frame tabs. */
   shotPreview: string;
-  /** Screenshot alt text for the current media manifest capture. */
-  screenshotAlt: string;
 
-  /** "Latest release {tag}" */
-  latestRelease: string;
-  releaseUnavailable: string;
-  proofContributors: string;
-  /** "Source" / "Unreleased" — prepended to `v{version}`. */
-  currentSource: string;
-  sourceCandidate: string;
-  /** "released" / "unreleased" — the machine-readable source-state label. */
-  publishedRelease: string;
-
-  /** What a person gains: heading, lede, and three [title, body] rows. */
-  gainHeading: string;
-  gainLede: string;
-  gain: [string, string][];
-
-  /** Running head of the models chapter ("02 / Your models"). */
-  chapterModels: string;
-  modelsHeading: string;
-  modelsBody: string;
-  /** Three [route kind, description] rows. */
-  modelsFacts: [string, string][];
-  modelsLink: string;
-
-  startHeading: string;
-  startLede: string;
-  startGuideLink: string;
-  startVocabularyLink: string;
-
-  /** Running head of the availability chapter ("04 / Where it runs"). */
-  chapterAvailability: string;
-  availabilityHeading: string;
-  availabilityLede: string;
-  availability: [string, string, string, string?][];
-  availabilityNote: string;
-
-  surfacesHeading: string;
-  /** Five [name, description] surfaces. */
-  surfaces: [string, string][];
-  runtimeLink: string;
-
-  installBandHeading: string;
   copy: string;
   copied: string;
-  binaries: string;
-  chinaMirrors: string;
-  installGuideLink: string;
 
-  communityHeading: string;
-  communityBody: string;
-  communityLinksAria: string;
-  contribute: string;
+  /** `{n}` is the contributor count; pick the form with `pluralText`. */
+  contributorsCount: PluralForms;
+  /** Accessible name for the home's short list of facts. */
+  factsLabel: string;
+  factRust: string;
+  /** `{license}` is the licence name from the generated facts. */
+  factLicense: string;
+  /** `{n}` is the provider route count of the published release. */
+  factProviders: PluralForms;
+  /** `{n}` is the catalog model count of the published release. */
+  factModels: PluralForms;
+
+  sectionModelHeading: string;
+  sectionModelBody: string;
+  sectionControlHeading: string;
+  sectionControlBody: string;
+  sectionAgentsHeading: string;
+  sectionAgentsBody: string;
+  agentsRolesLabel: string;
+  agentRoleExplore: string;
+  agentRoleImplement: string;
+  agentRoleReviewer: string;
+  agentsLink: string;
+  directionShotAlt: string;
+  directionShotCaption: string;
+  directionShotLink: string;
+  sectionDirectionHeading: string;
+  sectionDirectionBody: string;
+  sectionOpenHeading: string;
+  sectionOpenBody: string;
+  sectionStartHeading: string;
+  sectionStartBody: string;
+
+  mapHeading: string;
+  mapStateReleased: string;
+  mapStateDeveloping: string;
+  mapStateInviteOnly: string;
+  mapStateBeingBuilt: string;
+  mapTerminal: string;
+  mapTerminalSentence: string;
+  mapLocalBrowser: string;
+  mapLocalBrowserSentence: string;
+  mapManyAgents: string;
+  mapManyAgentsSentence: string;
+  mapDesktop: string;
+  mapDesktopSentence: string;
+  mapCloud: string;
+  mapCloudSentence: string;
+  mapOneSession: string;
+  mapOneSessionSentence: string;
 }
 
 /**
@@ -246,7 +270,6 @@ export interface DocsGuideDict {
 export interface DocsShellDict {
   metaTitle: string;
   metaDescription: string;
-  portalMark: string;
   heroTitle: string;
   heroLead: string;
   installCta: string;
@@ -256,16 +279,17 @@ export interface DocsShellDict {
   releaseLabel: string;
   /** "Latest release {tag} · {date}" — date already formatted per locale. */
   releasePublished: string;
-  /** Shown while the source candidate is ahead of the published release. */
-  releaseCandidate: string;
-  /** Shown when the pages describe exactly the published release. */
-  releaseMatches: string;
+  releaseDescribes: string;
+  sourceLead: string;
   /** Link to the /changelog route. */
   releaseChangelog: string;
 
   // --- task/topic search (components/docs-search.tsx) ---
   searchLabel: string;
   searchPlaceholder: string;
+  searchLoading: string;
+  searchUnavailable: string;
+  searchRetry: string;
   searchClear: string;
   /** "{matched} of {total} entries match “{query}”". */
   searchMatches: string;
@@ -391,6 +415,12 @@ export interface DocsSection {
   id: string;
   title: string;
   blocks: readonly DocsBlock[];
+  until?: { feature: string; describesCurrentRow?: boolean };
+}
+
+export interface DocsSourceGroup {
+  claim: { feature: string; describesCurrentRow?: boolean };
+  sections: readonly DocsSection[];
 }
 
 /**
@@ -410,6 +440,7 @@ export interface DocsPageDict {
   next: readonly { href: string; label: string; note: string }[];
   /** Maintainer pointer, kept out of the rendered copy. */
   sourceNote: string;
+  sourceGroups?: readonly DocsSourceGroup[];
 }
 
 export type DocsReviewDict = DocsPageDict;
@@ -417,6 +448,8 @@ export type DocsReviewDict = DocsPageDict;
 export type DocsAuthDict = DocsPageDict;
 
 export type DocsTrustDict = DocsPageDict;
+
+export type DocsFirstTimeDict = DocsPageDict;
 
 /** `app/[locale]/changelog/page.tsx` — version-aware release record. */
 export interface ChangelogDict {
@@ -477,66 +510,6 @@ export interface LegalPrivacyDict {
   homeLink: string;
 }
 
-export interface DigestDict {
-  metaTitle: string;
-  metaDescription: string;
-  /** Heading shown with the empty state. */
-  emptyTitle: string;
-  emptyBody: string;
-  title: string;
-  lead: string;
-}
-
-/** `app/[locale]/feed/page.tsx`. */
-export interface FeedDict {
-  metaTitle: string;
-  metaDescription: string;
-  /** Page H1. */
-  title: string;
-  /** The H1 again in the other script, set beside it (the bilingual Han title). */
-  titleAside: string;
-  /** BCP 47 language of `titleAside`. */
-  titleAsideLang: string;
-  /** `{repo}` is where the page typesets the repository link. */
-  lede: string;
-  pulls: string;
-  issues: string;
-  /** Items in a column; `{count}` is filled at render time. */
-  shownCount: string;
-  openIssue: string;
-  openPull: string;
-  startDiscussion: string;
-}
-
-/** `app/[locale]/community/page.tsx`. */
-export interface CommunityDict {
-  metaTitle: string;
-  metaDescription: string;
-  kicker: string;
-  /** Page H1. */
-  title: string;
-  lede: string;
-  fileIssue: string;
-  browsePulls: string;
-  readGuide: string;
-  pathsTitle: string;
-  pathsScope: string;
-  recordTitle: string;
-  recordScope: string;
-  creditTitle: string;
-  /** Credit scope once the source version is the published release. */
-  creditScope: string;
-  /** Credit scope while the source version is ahead of the published release. */
-  creditScopeUnreleased: string;
-  /** Credit heading for the published release; `{version}` is filled at render time. */
-  creditLabel: string;
-  /** Credit heading while the source version is unreleased; `{version}` is filled at render time. */
-  creditLabelUnreleased: string;
-  mergedTitle: string;
-  helpersTitle: string;
-  fullRecord: string;
-}
-
 /** `app/[locale]/faq/page.tsx` and its `components/faq-search.tsx`. */
 export interface FaqDict {
   metaTitle: string;
@@ -565,27 +538,6 @@ export interface FaqDict {
   noResultsBody: string;
 }
 
-/** `app/[locale]/roadmap/page.tsx`. */
-export interface RoadmapDict {
-  metaTitle: string;
-  metaDescription: string;
-  eyebrow: string;
-  /** Page H1. */
-  title: string;
-  introduction: string;
-  sectionTitle: string;
-  browseIssues: string;
-  /** Track size; `{count}` is filled at render time. */
-  trackCount: string;
-  /** Track size when it is exactly one. */
-  trackCountOne: string;
-  contributeTitle: string;
-  contributeBody: string;
-  issuesDetail: string;
-  discussionsDetail: string;
-  pullsDetail: string;
-}
-
 /** `app/[locale]/docs/vocabulary/page.tsx`. */
 export interface DocsVocabularyDict {
   metaTitle: string;
@@ -598,6 +550,7 @@ export interface DocsVocabularyDict {
   executionHeading: string;
   controlHeading: string;
   controlLead: string;
+  sourceControlHeading: string;
   routeHeading: string;
   advisoryHeading: string;
   measurementHeading: string;
@@ -623,6 +576,10 @@ export interface ContributeDict {
   reviewScope: string;
   devTitle: string;
   devScope: string;
+  /** `{n}` is the number of GitHub accounts; pick the form with `pluralText`. */
+  mergedAccountsCount: PluralForms;
+  /** `{n}` is the number of people; used once the exclusion list is confirmed. */
+  mergedPeopleCount: PluralForms;
 }
 
 /** `app/[locale]/constitution/page.tsx` and its `components/thinking-trace.tsx`. */
@@ -650,34 +607,6 @@ export interface ConstitutionDict {
   illustration: string;
   install: string;
   configuration: string;
-}
-
-/** `app/[locale]/runtime/page.tsx`. */
-export interface RuntimeDict {
-  metaTitle: string;
-  metaDescription: string;
-  kicker: string;
-  /** Page H1. */
-  title: string;
-  /** The H1 again in the other script, set beside it (the bilingual Han title). */
-  titleAside: string;
-  /** BCP 47 language of `titleAside`. */
-  titleAsideLang: string;
-  lede: string;
-  integrationsTitle: string;
-  /** Status label on an experimental integration. */
-  experimental: string;
-  trustTitle: string;
-  factsTitle: string;
-  version: string;
-  toolCount: string;
-  sandboxBackends: string;
-  /** Summary of the maintainer-facing disclosure (crates, source revision). */
-  details: string;
-  sourceRevision: string;
-  docsLead: string;
-  runtimeApiDoc: string;
-  mcpDoc: string;
 }
 
 export type DocsHooksDict = DocsPageDict;
@@ -748,3 +677,5 @@ export interface ComputerUseDict {
   contributeGuide: string;
   contributeIssue: string;
 }
+
+export type ProjectDict = typeof import("./en/project").project;

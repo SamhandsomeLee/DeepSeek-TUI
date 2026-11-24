@@ -3,124 +3,80 @@ import type { HomeDict } from "../types";
 /** Simplified Chinese home copy: useful work with chosen models and connected tools. */
 
 export const home: HomeDict = {
-  metaTitle: "Codewhale · 你电脑上的开源智能体",
-  metaDescription: "在终端里用开源智能体构建应用、修复代码并自动完成工作。选择托管或本地模型，通过代码、文档和反馈一起改进 Codewhale。",
-  heroTitle: "你电脑上的开源智能体",
-  heroIntro: "在终端中用 {brand} 开发软件、运行可复用的工作流。添加 Computer Use，即可在 Mac 应用中执行任务。",
+  metaTitle: "Codewhale · 模型可以是任何人的。智能体应当属于你。",
+  metaDescription: "Codewhale 是一个运行在终端里的开源编程智能体，用 Rust 编写。它支持任意模型，可以把一项任务分给多个智能体，而且它的每一行代码都任你阅读。",
+  heroTitle: "模型可以是任何人的。智能体应当属于你。",
+  heroTitleLead: "模型可以是任何人的。",
+  heroIntro: "{brand} 是一个运行在终端里的开源编程智能体，用 Rust 编写。它支持任意模型，可以把一项任务分给多个智能体，而且它的每一行代码都任你阅读。",
+  readTheCode: "阅读代码",
+  installNote: "版本 {version} 已发布，无需账号。",
+  captionReleased: "与实时模型的真实会话：通过 DeepSeek API 调用 deepseek-flash。修改由模型写出，修改和测试运行都如画面所示真实发生。录制于 0.10.3 开发版构建。",
+  captureFrameNoPosture: "“提示”和“结果”两帧显示了模型名称和审批模式。",
+  frameLabelPrompt: "提示",
+  frameLabelEdit: "编辑",
+  frameLabelApproval: "审批",
+  frameLabelResult: "结果",
+  frameSummaryPrompt: "终端中的 Codewhale。请求“Add a --json flag to ls.py so the tests pass, then run the tests.”已发送，状态栏显示 Accept edits 和模型 deepseek-flash。",
+  frameSummaryEdit: "终端中的 Codewhale，在命令等待时向上回看。它读取了 ls.py 和 test_ls.py，然后更新了 ls.py：差异为脚本添加了 --json 标志。",
+  frameSummaryApproval: "终端中的 Codewhale。画面显示了对 ls.py 的修改，命令 python3 -m unittest -v test_ls.py 正在等待批准。卡片显示正在等待批准，并提供 Allow 和 Deny 两个选项。",
+  frameSummaryResult: "终端中的 Codewhale。批准后命令运行了 2 个测试并输出 OK。模型 deepseek-flash 表示它为 ls.py 添加了 --json，两个测试都通过了。",
+  frameSummaryProvider: "终端中的 Codewhale。模型选择器搜索“deepseek-flash”后，列出了来自 DeepSeek、Fireworks AI 和 OpenRouter 的 deepseek-flash，并选中了 DeepSeek。",
+  frameSummaryReceipt: "终端中的 Codewhale。本次会话的回执：它修改的文件和运行的命令（由你批准）、token 总量和本次会话的预估费用；随后是这次修改和获批的命令。",
   getCodewhale: "安装 Codewhale",
   heroInstallAria: "安装命令",
-  exploreProduct: "探索 Codewhale",
-  shotPreview: "本地终端演示",
-  screenshotAlt:
-    "Codewhale v{version} 的终端实录画面，包含对话、消息输入框与会话控制。",
-  latestRelease: "最新发布 {tag}",
-  releaseUnavailable: "发布状态暂不可用",
-  proofContributors: "{count} 位贡献者",
-  currentSource: "源码",
-  sourceCandidate: "未发布",
-  publishedRelease: "已发布",
-  gainHeading: "把想法变成成果",
-  gainLede: "打开项目，说出你需要的结果。Codewhale 可以读取文件、修改内容，并运行命令检查自己的工作。",
-  gain: [
-    [
-      "构建与修复软件",
-      "添加功能、排查问题，或编写实用工具。与能修改项目并运行检查的智能体一起完成工作。"
-    ],
-    [
-      "让重复工作自动完成",
-      "从终端、脚本或 CI 中运行工作流。任务较大时，可以把部分工作交给使用不同模型的 Fleet 智能体团队。"
-    ],
-    [
-      "连接你常用的工具",
-      "通过插件和 MCP 服务器接入工作所需的工具与服务。访问范围和身份验证由你配置。"
-    ]
-  ],
-  chapterModels: "你的模型",
-  modelsHeading: "使用你选择的模型",
-  modelsBody:
-    "使用提供商 API 密钥、OpenAI 兼容端点或本地模型。",
-  modelsFacts: [
-    [
-      "你的 API 账户",
-      "使用自己的 API 密钥连接 DeepSeek、OpenAI、Anthropic、Google 等提供商。模型用量由提供商计费。"
-    ],
-    [
-      "你的网关",
-      "连接 OpenAI 兼容端点，选择它提供的模型。"
-    ],
-    [
-      "你的推理服务",
-      "通过 Ollama、vLLM 或 SGLang 运行本地或自托管模型。"
-    ],
-    [
-      "你的 ChatGPT 套餐",
-      "实验功能：运行 codewhale auth chatgpt，连接符合条件的 ChatGPT 套餐。"
-    ]
-  ],
-  modelsLink: "浏览模型与提供商",
-  startHeading: "从一件有用的任务开始",
-  startLede: "安装 Codewhale，连接模型，然后打开项目文件夹。需要时，再添加插件或更多智能体。",
-  startGuideLink: "按照新手指引操作",
-  startVocabularyLink: "查名词",
-  chapterAvailability: "在哪里运行",
-  availabilityHeading: "当前可用与开发中的功能",
-  availabilityLede: "在 macOS、Linux 或 Windows 上安装。在终端里工作，或运行 codewhale web 打开本地浏览器界面。桌面应用和托管网页应用仍在开发。",
-  availability: [
-    [
-      "终端与本地浏览器",
-      "已发布",
-      "在 Linux、macOS 或 Windows 上安装，然后运行 codewhale，或运行 codewhale web 打开本地浏览器客户端。也可以用 npm 或 Cargo 安装；Android 上的 Termux 版本为预览版。"
-    ],
-    [
-      "CodeWhale GUI（VS Code）",
-      "可用",
-      "由社区维护的独立项目：在 VS Code 侧边栏中连接同一个 Codewhale Runtime，进行对话、管理线程并查看文件变更。可从 VS Code Marketplace 安装。",
-      "https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode"
-    ],
-    [
-      "托管网页应用",
-      "开发中",
-      "正在重建，以与桌面应用保持一致，暂未开放。如需现在在浏览器中使用，请在本机运行 codewhale web。"
-    ],
-    [
-      "桌面端",
-      "开发版本",
-      "基于同一引擎的原生应用。审阅并提交改动、跨项目跟进工作，还能编辑一条消息并作为新分支重新发送。暂无公开下载。"
-    ]
-  ],
-  availabilityNote: "终端、本地浏览器和 GUI 无需 Codewhale 账户。使用你自己的提供商密钥时，相应用量由该提供商计费。",
-  surfacesHeading: "使用文件和工具开展工作",
-  surfaces: [
-    [
-      "文件与终端",
-      "创建文件、运行命令、分析数据，并测试你构建的成果。工作目录和权限由你设定。"
-    ],
-    [
-      "插件与已连接的应用",
-      "通过插件和 MCP 添加技能与工具。审核并启用你希望智能体使用的连接。"
-    ],
-    [
-      "浏览器与电脑操作 · 预览",
-      "添加浏览器工具或 Computer Use 插件，操作应用与网站。macOS 上的 Computer Use 需要系统权限；其他平台仍为实验支持。"
-    ],
-    [
-      "随时接着做的会话",
-      "将对话、工具结果和工作记录保存在一起。在终端或本地浏览器客户端中继续之前的任务。"
-    ],
-    [
-      "智能体团队",
-      "用 Fleet 将大任务分配给不同角色和模型的智能体，在一处查看它们的进度。"
-    ]
-  ],
-  runtimeLink: "探索工具与集成",
-  installBandHeading: "在 macOS 或 Linux 上安装",
+  shotPreview: "终端会话录像",
   copy: "复制",
   copied: "已复制 ✓",
-  binaries: "预编译包",
-  chinaMirrors: "中国镜像",
-  installGuideLink: "阅读安装指南",
-  communityHeading: "参与 Codewhale",
-  communityBody: "已有 {count} 位贡献者。代码、文档、翻译和技能都欢迎。",
-  communityLinksAria: "社区链接",
-  contribute: "参与贡献",
+
+  sectionModelHeading: "任何模型都可以通过你的智能体工作。",
+  sectionModelBody: "使用内置提供商、任意 OpenAI 兼容端点，或你自己机器上的模型，并且可以在两轮对话之间更换模型。Codewhale 在你的仓库中运行，无需账号，而 `codewhale web` 让你在自己机器上的浏览器里使用它。",
+  sectionControlHeading: "你的智能体对你负责。",
+  sectionControlBody: "由你决定 Codewhale 可以在不询问的情况下做什么，它的命令可以在 macOS 和 Linux 上的沙箱中运行。每次会话都会留下一份回执，记录它修改的文件、运行的命令，以及每一步由谁批准。",
+  sectionAgentsHeading: "多个智能体可以与你共同完成一项任务。",
+  sectionAgentsBody: "Codewhale 把一项工作分给多个智能体，各有探索者、实施者和审查者等角色，你可以查看、检查并停止其中每一个。Fleet 会保存一份账本，所以重启之后，运行可以接着继续。",
+  agentsRolesLabel: "子智能体可以承担的三种角色",
+  agentRoleExplore: "阅读代码并梳理关键部分，不修改文件。",
+  agentRoleImplement: "用最小的改动完成一项具体修改。",
+  agentRoleReviewer: "阅读一处修改，并按严重程度评定发现的问题，不修改文件。",
+  agentsLink: "了解子智能体如何工作",
+  directionShotAlt: "Codewhale 桌面应用。左侧是会话列表；中间一项修复失败测试的任务正在等待运行 python3 -m pytest 的许可，提供 Allow 和 Deny。",
+  directionShotCaption: "开发中的桌面应用运行在同一个引擎上。这里它在 Accept Edits 模式下使用 DeepSeek V4.1 Flash，并在运行测试命令前先询问你的意见。",
+  directionShotLink: "查看桌面应用",
+  sectionDirectionHeading: "这是你的智能体将要去的地方。",
+  sectionDirectionBody: "Codewhale 正在成为横跨你的终端、桌面应用、浏览器和云端计算机的统一环境，全部由同一个引擎驱动，所以你的工作可以在它们之间转移，并始终属于你。下面每个部分都说明了它今天所处的状态。",
+  sectionOpenHeading: "Codewhale 由使用它的人公开构建。",
+  sectionOpenBody: "它起初是一个只支持一种模型的开源终端工具，后来成为数以百计、使用多种语言的人共同构建的项目。你可以阅读它的代码、修改它，或让它自己解释自己。",
+  sectionStartHeading: "今天就让你的智能体属于你。",
+  sectionStartBody: "安装 Codewhale，并在一个仓库中使用你已有的模型密钥，或你自己电脑上的模型来运行它。你无需账号，`codewhale update` 会让它保持最新。",
+
+  contributorsCount: {
+    other: "{n} 位贡献者",
+  },
+  factsLabel: "Codewhale 一览",
+  factRust: "用 Rust 编写",
+  factLicense: "开源，{license} 许可证",
+  factProviders: {
+    other: "{n} 条提供商路由",
+  },
+  factModels: {
+    other: "{n} 个模型",
+  },
+
+  mapHeading: "一个引擎",
+  mapStateReleased: "已发布",
+  mapStateDeveloping: "开发中，暂无下载",
+  mapStateInviteOnly: "仅限邀请",
+  mapStateBeingBuilt: "建设中",
+  mapTerminal: "终端应用",
+  mapTerminalSentence: "在 macOS、Linux 或 Windows 上安装，然后在任意仓库中运行 `codewhale`。",
+  mapLocalBrowser: "本地浏览器客户端",
+  mapLocalBrowserSentence: "运行 `codewhale web`，即可在浏览器中阅读对话、发送任务并回应审批；它随终端一起提供，无需账号。",
+  mapManyAgents: "多个智能体共同完成一项任务",
+  mapManyAgentsSentence: "子智能体、Fleet 和工作流让多个智能体各司其职，共同完成一项任务。",
+  mapDesktop: "桌面应用",
+  mapDesktopSentence: "我们正在基于同一个引擎构建桌面应用，目前还没有公开下载。",
+  mapCloud: "云端计算机",
+  mapCloudSentence: "云端计算机仅限邀请，我们正在构建它们，让会话可以在云端的一台机器上持续工作。",
+  mapOneSession: "跨越它们的同一个会话",
+  mapOneSessionSentence: "我们正在构建同一个会话，它会随你从终端到桌面、浏览器和云端，并且自始至终都属于你。",
 };

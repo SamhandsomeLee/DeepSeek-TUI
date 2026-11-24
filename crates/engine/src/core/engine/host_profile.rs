@@ -5,12 +5,17 @@ pub enum EngineHostProfile {
     #[default]
     Normal,
     Acp,
+    Headless,
     Rlm,
     Child,
 }
 impl EngineHostProfile {
     pub fn is_acp(self) -> bool {
         self == Self::Acp
+    }
+
+    pub fn is_headless(self) -> bool {
+        self == Self::Headless
     }
 }
 /// Additional local narrowing on one exact admitted control. Neither request
@@ -40,11 +45,77 @@ impl Engine {
         self.host_profile.is_acp() || self.turn_narrowing.is_acp()
     }
 
+    pub(super) async fn acp_turn_tool_build(
+        &mut self,
+        authority: &TurnAuthority,
+        route: &TurnRouteContext,
+        allowed: Option<Vec<String>>,
+        mcp_access: McpAccess,
+    ) -> TurnToolBuild {
+        let ext_enabled = self.config.features.enabled(Feature::ExtensionHost);
+        let creator_eligible = self.creator_eligible();
+        let is_creator =
+            crate::conversation_modes::is_creator(self.session.agent_preset.as_deref());
+        if let Some(attachment) = self
+            .extension_host
+            .as_ref()
+            .filter(|_| ext_enabled || creator_eligible)
+        {
+            if ext_enabled {
+                if attachment.selection_settled()
+                    && (!creator_eligible || !is_creator || attachment.creator_ready())
+                {
+                    attachment.sync_in_background();
+                } else {
+                    attachment.sync_within(EXTENSION_FIRST_SYNC_WAIT).await;
+                }
+            } else if creator_eligible {
+                if is_creator && !attachment.creator_ready() {
+                    attachment
+                        .sync_creator_within(EXTENSION_FIRST_SYNC_WAIT)
+                        .await;
+                } else {
+                    attachment.sync_creator_in_background();
+                }
+            }
+        }
+        let mcp = if self.config.features.enabled(Feature::Mcp) {
+            if mcp_access.may_connect() {
+                self.wait_for_mcp_boot().await;
+                let tools = self.mcp_tools().await;
+                let server_count = match self.mcp_pool.as_ref() {
+                    Some(pool) => pool.lock().await.connected_servers().len(),
+                    None => 0,
+                };
+                McpToolState::Live {
+                    tools,
+                    server_count,
+                }
+            } else {
+                self.passive_mcp_snapshot().await
+            }
+        } else {
+            McpToolState::Disabled
+        };
+        self.acp_tool_build_with_mcp(authority, route, allowed, mcp)
+    }
+
+    #[cfg(test)]
     pub(super) fn acp_tool_build(
         &self,
         authority: &TurnAuthority,
         route: &TurnRouteContext,
         allowed: Option<Vec<String>>,
+    ) -> TurnToolBuild {
+        self.acp_tool_build_with_mcp(authority, route, allowed, McpToolState::Disabled)
+    }
+
+    pub(super) fn acp_tool_build_with_mcp(
+        &self,
+        authority: &TurnAuthority,
+        route: &TurnRouteContext,
+        allowed: Option<Vec<String>>,
+        mcp: McpToolState,
     ) -> TurnToolBuild {
         let mut context = self.build_tool_context_for_turn(authority, route);
         let requested = self
@@ -85,25 +156,89 @@ impl Engine {
             builder = builder.with_foreground_shell_tools();
         }
         let mut registry = builder.build(context);
+        let ext_enabled = self.config.features.enabled(Feature::ExtensionHost);
+        let creator_eligible = self.creator_eligible();
+        let extension_host = self.extension_host.as_ref().filter(|_| ext_enabled);
+        if let Some(attachment) = self
+            .extension_host
+            .as_ref()
+            .filter(|_| ext_enabled || creator_eligible)
+        {
+            attachment.manager().note_native_names(registry.names());
+        }
+        let creator_tools =
+            if creator_eligible && let Some(attachment) = self.extension_host.as_ref() {
+                attachment.install_creator_tools(&mut registry)
+            } else {
+                Vec::new()
+            };
         if let Some(overrides) = self
             .api_config
             .tools
             .as_ref()
             .and_then(|tools| tools.overrides.as_ref())
         {
-            for name in overrides.keys() {
-                remove_acp_overridden_builtin(&mut registry, name);
+            for (name, override_cfg) in overrides {
+                let is_disabled = matches!(
+                    override_cfg,
+                    codewhale_runtime::config::ToolOverride::Disabled
+                );
+                let is_protected_creator = creator_tools
+                    .iter()
+                    .any(|tool| tool.eq_ignore_ascii_case(name))
+                    || crate::conversation_modes::CREATOR_TOOL_NAMES
+                        .iter()
+                        .any(|tool| tool.eq_ignore_ascii_case(name))
+                    || name.eq_ignore_ascii_case(crate::extension_host::dsh_broker::ACT_TOOL);
+                if is_disabled || !is_protected_creator {
+                    let target = creator_tools
+                        .iter()
+                        .map(String::as_str)
+                        .find(|tool| tool.eq_ignore_ascii_case(name))
+                        .unwrap_or(name);
+                    remove_acp_overridden_builtin(&mut registry, target);
+                }
             }
         }
+        let plugin_tool_names: HashSet<String> = extension_host
+            .map(|attachment| attachment.install_tools(&mut registry))
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let extension_tool_names = plugin_tool_names.clone();
+        if let Some(overrides) = self
+            .api_config
+            .tools
+            .as_ref()
+            .and_then(|tools| tools.overrides.as_ref())
+        {
+            for (name, override_cfg) in overrides {
+                if matches!(
+                    override_cfg,
+                    codewhale_runtime::config::ToolOverride::Disabled
+                ) && name.eq_ignore_ascii_case(crate::extension_host::dsh_broker::ACT_TOOL)
+                {
+                    remove_acp_overridden_builtin(&mut registry, name);
+                }
+            }
+        }
+        let mut mcp_tools = if self.child_host.is_none() {
+            mcp.tools().to_vec()
+        } else {
+            Vec::new()
+        };
+        mcp_tools.sort_by(|a, b| a.name.cmp(&b.name));
+        let mcp_tool_names: Vec<String> = mcp_tools.iter().map(|tool| tool.name.clone()).collect();
         let allowed = Some(
             registry
                 .names()
                 .into_iter()
-                .filter(|name| tool_catalog::tool_allowed(allowed.as_deref(), name))
                 .map(str::to_string)
+                .chain(mcp_tool_names.iter().cloned())
+                .filter(|name| tool_catalog::tool_allowed(allowed.as_deref(), name))
                 .collect(),
         );
-        let catalog = self.child_host.as_ref().map_or_else(
+        let mut catalog = self.child_host.as_ref().map_or_else(
             || registry.to_api_tools_with_cache(true),
             |child| {
                 child
@@ -111,6 +246,15 @@ impl Engine {
                     .tools_for_model(&registry, &child.authority.agent_type)
             },
         );
+        for tool in &mut catalog {
+            if plugin_tool_names.contains(&tool.name) {
+                tool.defer_loading = Some(false);
+            }
+        }
+        catalog.extend(mcp_tools.into_iter().map(|mut tool| {
+            tool.defer_loading = Some(false);
+            tool
+        }));
         let always_load = catalog.iter().map(|tool| tool.name.clone()).collect();
         TurnToolBuild {
             surface: ToolSurfacePolicy::new(
@@ -124,12 +268,13 @@ impl Engine {
                 self.config.disallowed_tools.clone(),
                 self.config.max_tool_calls,
                 tool_catalog::ToolMode::Direct,
-            ),
-            mcp_tool_names: Vec::new(),
-            mcp: McpToolState::Disabled,
+            )
+            .with_extension_tool_names(extension_tool_names),
+            mcp_tool_names,
+            mcp,
             subagent_runtime_model: None,
             mailbox: None,
-            plugin_tool_names: HashSet::new(),
+            plugin_tool_names,
         }
     }
 }
@@ -146,7 +291,18 @@ fn remove_acp_overridden_builtin(registry: &mut crate::tools::ToolRegistry, tool
             "edit_file",
         ],
         "apply_patch" => &["apply_patch"],
-        _ => std::slice::from_ref(&tool_name),
+        other => {
+            if let Some(canonical) = crate::conversation_modes::CREATOR_TOOL_NAMES
+                .iter()
+                .copied()
+                .find(|name| name.eq_ignore_ascii_case(other))
+            {
+                registry.remove_tool(canonical);
+            } else if other.eq_ignore_ascii_case(crate::extension_host::dsh_broker::ACT_TOOL) {
+                registry.remove_tool(crate::extension_host::dsh_broker::ACT_TOOL);
+            }
+            std::slice::from_ref(&tool_name)
+        }
     };
     for alias in aliases {
         registry.remove_tool(alias);
@@ -525,6 +681,7 @@ mod tests {
                 hook_executor: None,
                 verbosity: None,
                 provenance: UserInputProvenance::ExternalUser,
+                input_authorship: crate::core::ops::TurnInputAuthorship::NotPerson,
                 submission_id: None,
             })
         };
@@ -582,5 +739,126 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn acp_override_disables_but_non_disable_keeps_creator_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::SealedHome::at(dir.path());
+        let (mut engine, _handle, route) = fixture(dir.path());
+        let manager = Arc::new(crate::extension_host::ExtensionHostManager::new(
+            crate::extension_host::ExtensionHostOptions {
+                root: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            },
+        ));
+        manager.register_test_creator_tool("plugin_manager");
+        let attachment = manager.attach(Arc::new(codewhale_plugins::PluginRegistry::empty(
+            dir.path(),
+        )));
+        assert!(attachment.set_creator_demand(true));
+        engine.extension_host = Some(attachment);
+        engine.creator_available = true;
+        engine.config.features.enable(Feature::PluginCreator);
+
+        let assert_creator_tools_active = |build: &TurnToolBuild, label: &str| {
+            let act_tool = crate::extension_host::dsh_broker::ACT_TOOL;
+            assert!(
+                build.surface.registry.get("plugin_manager").is_some(),
+                "{label}: plugin_manager missing from registry"
+            );
+            assert!(
+                build
+                    .surface
+                    .catalog
+                    .iter()
+                    .any(|tool| tool.name == "plugin_manager"),
+                "{label}: plugin_manager missing from catalog"
+            );
+            assert!(
+                build.surface.registry.get(act_tool).is_some(),
+                "{label}: {act_tool} missing from registry"
+            );
+            assert!(
+                !build
+                    .surface
+                    .catalog
+                    .iter()
+                    .any(|tool| tool.name == act_tool),
+                "{label}: hidden {act_tool} must stay out of catalog"
+            );
+        };
+
+        let default_build = engine.acp_tool_build(&authority(AppMode::Agent, false), &route, None);
+        assert_creator_tools_active(&default_build, "default");
+
+        engine.api_config.tools = Some(codewhale_runtime::config::ToolsConfig {
+            overrides: Some(HashMap::from([
+                (
+                    "plugin_manager".into(),
+                    codewhale_runtime::config::ToolOverride::Script {
+                        path: "never.sh".into(),
+                        args: None,
+                    },
+                ),
+                (
+                    crate::extension_host::dsh_broker::ACT_TOOL.into(),
+                    codewhale_runtime::config::ToolOverride::Command {
+                        command: "never".into(),
+                        args: None,
+                    },
+                ),
+            ])),
+            ..Default::default()
+        });
+        let protected_build =
+            engine.acp_tool_build(&authority(AppMode::Agent, false), &route, None);
+        assert_creator_tools_active(&protected_build, "protected");
+
+        for overrides in [
+            HashMap::from([
+                (
+                    "plugin_manager".into(),
+                    codewhale_runtime::config::ToolOverride::Disabled,
+                ),
+                (
+                    crate::extension_host::dsh_broker::ACT_TOOL.into(),
+                    codewhale_runtime::config::ToolOverride::Disabled,
+                ),
+            ]),
+            HashMap::from([
+                (
+                    "PLUGIN_MANAGER".into(),
+                    codewhale_runtime::config::ToolOverride::Disabled,
+                ),
+                (
+                    "DSH_BROKER_ACT".into(),
+                    codewhale_runtime::config::ToolOverride::Disabled,
+                ),
+            ]),
+        ] {
+            engine.api_config.tools = Some(codewhale_runtime::config::ToolsConfig {
+                overrides: Some(overrides),
+                ..Default::default()
+            });
+            let disabled_build =
+                engine.acp_tool_build(&authority(AppMode::Agent, false), &route, None);
+            for name in [
+                "plugin_manager",
+                crate::extension_host::dsh_broker::ACT_TOOL,
+            ] {
+                assert!(
+                    disabled_build.surface.registry.get(name).is_none(),
+                    "{name}"
+                );
+                assert!(
+                    !disabled_build
+                        .surface
+                        .catalog
+                        .iter()
+                        .any(|tool| tool.name == name),
+                    "{name}"
+                );
+            }
+        }
     }
 }

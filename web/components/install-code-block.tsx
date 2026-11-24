@@ -2,13 +2,15 @@
 
 import { useState } from "react";
 import { Icon } from "./icon";
-import { recordUsage } from "./usage-counting";
+import { recordFunnel, recordUsage } from "./usage-counting";
 
 interface Props {
   cmd: string;
   copyLabel?: string;
   copiedLabel?: string;
   copyLocale?: string;
+  installIntent?: boolean;
+  html?: string;
 }
 
 /**
@@ -17,7 +19,7 @@ interface Props {
  * mark, "Copied" and its announcement appear only after the clipboard write
  * succeeds; a failed write never shows a false confirmation.
  */
-export function InstallCodeBlock({ cmd, copyLabel = "Copy", copiedLabel = "Copied", copyLocale }: Props) {
+export function InstallCodeBlock({ cmd, copyLabel = "Copy", copiedLabel = "Copied", copyLocale, installIntent = false, html }: Props) {
   const [copied, setCopied] = useState(false);
 
   const copy = async () => {
@@ -25,7 +27,10 @@ export function InstallCodeBlock({ cmd, copyLabel = "Copy", copiedLabel = "Copie
     try {
       await navigator.clipboard.writeText(cmd);
       setCopied(true);
-      recordUsage("install_copy");
+      if (installIntent) {
+        recordUsage("install_copy");
+        recordFunnel("install_intent");
+      }
       setTimeout(() => setCopied(false), 1400);
     } catch {
       // Clipboard write failed (permissions, non-secure context, or a focused
@@ -33,11 +38,17 @@ export function InstallCodeBlock({ cmd, copyLabel = "Copy", copiedLabel = "Copie
     }
   };
 
+  const multiline = cmd.includes("\n");
+  const pipeAt = multiline ? -1 : cmd.indexOf(" | ");
   const copiedWord = copiedLabel.replace(/\s*✓\s*$/u, "");
 
   return (
     <div className="code">
-      <pre tabIndex={0} className="code-block">{cmd}</pre>
+      {html ? (
+        <pre tabIndex={0} className={multiline ? "code-block" : "code-block code-block-single"} dangerouslySetInnerHTML={{ __html: html }} />
+      ) : (
+        <pre tabIndex={0} className={multiline ? "code-block" : "code-block code-block-single"}>{pipeAt < 0 ? cmd : (<><span className="code-seg">{cmd.slice(0, pipeAt + 1)}</span><span className="code-seg code-seg-pipe">{cmd.slice(pipeAt + 1)}</span></>)}</pre>
+      )}
       <button
         type="button"
         lang={copyLocale}

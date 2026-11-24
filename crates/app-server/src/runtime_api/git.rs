@@ -21,7 +21,8 @@
 //!   POST /v1/git/unstage   — `{ "paths": [...] }` or `{ "all": true }`
 //!   POST /v1/git/discard   — `{ "paths": [...] }` (tracked only; no `all`)
 //!   POST /v1/git/commit    — `{ "message": "…", "all": false }`
-//!   POST /v1/git/push      — `{ "remote"?, "set_upstream"?: bool }`
+//!   POST /v1/git/push      — `{ "branch"?, "expect"?: { "head" }, "remote"?,
+//!                            "set_upstream"?: bool }`
 //!   POST /v1/git/branch    — `{ "name": "…", "create"?: bool }`
 //!   GET  /v1/worktrees     — the repository's worktrees
 //!   POST /v1/worktrees     — `{ "branch", "base"? }` new branch + worktree
@@ -112,8 +113,31 @@ struct GitRun {
 /// content filters, hooks, lazy fetches and replace-objects cannot run inside
 /// an HTTP read either.
 async fn git_read(workspace: &FsPath, args: &[&str]) -> Result<GitRun, ApiError> {
+    run_prepared_read(Git::review_command, workspace, args).await
+}
+
+async fn git_status_read(workspace: &FsPath, args: &[&str]) -> Result<GitRun, ApiError> {
+    run_prepared_read(Git::status_command, workspace, args).await
+}
+
+async fn git_status_read_ok(workspace: &FsPath, args: &[&str]) -> Result<String, ApiError> {
+    let run = git_status_read(workspace, args).await?;
+    if !run.status_success {
+        return Err(ApiError::internal(format!(
+            "git status failed: {}",
+            run.stderr.trim()
+        )));
+    }
+    Ok(run.stdout)
+}
+
+async fn run_prepared_read(
+    prepare: fn(&FsPath) -> anyhow::Result<std::process::Command>,
+    workspace: &FsPath,
+    args: &[&str],
+) -> Result<GitRun, ApiError> {
     let workspace = workspace.to_path_buf();
-    let command = tokio::task::spawn_blocking(move || Git::review_command(&workspace))
+    let command = tokio::task::spawn_blocking(move || prepare(&workspace))
         .await
         .map_err(|_| ApiError::internal("git read setup failed"))?
         .map_err(|error| ApiError::internal(format!("git is unavailable: {error}")))?;
@@ -231,8 +255,7 @@ fn status_sync(workspace: &FsPath, args: &[&str]) -> Result<String, ApiError> {
         .map_err(|error| ApiError::internal(format!("failed to run git: {error}")))?;
     if !output.status.success() {
         return Err(ApiError::internal(format!(
-            "git {} failed: {}",
-            args.first().copied().unwrap_or(""),
+            "git status failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
@@ -253,7 +276,7 @@ struct GitFileEntry {
     /// True when the index column records a change.
     staged: bool,
     /// Leading human state: modified / added / deleted / renamed /
-    /// typechange / untracked / conflicted / ignored / unknown (unreadable submodule).
+    /// typechange / untracked / conflicted / ignored / unknown.
     status: &'static str,
     /// Rename/copy source, when it lies inside the workspace.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -291,6 +314,7 @@ pub(super) struct GitStatusDetailResponse {
     remote_repositories: Vec<Value>,
     branch_preconditions: bool,
     diff_options: bool,
+    named_push: bool,
 }
 
 pub(super) async fn git_status_detail(
@@ -327,6 +351,7 @@ fn collect_git_status_detail(workspace: &FsPath) -> Result<GitStatusDetailRespon
         remote_repositories: Vec::new(),
         branch_preconditions: true,
         diff_options: true,
+        named_push: true,
     };
     if !status.git_repo {
         return Ok(detail);
@@ -406,61 +431,50 @@ fn collect_git_status_detail(workspace: &FsPath) -> Result<GitStatusDetailRespon
     Ok(detail)
 }
 
-/// Preserve normal filters and untracked mode. Only a collapsed row naming
-/// the workspace itself needs expansion to give clients addressable paths.
+/// Preserve the user's own filters and untracked mode; submodules compare by
+/// commit. Only a collapsed row naming the workspace itself needs expansion
+/// to give clients addressable paths.
 fn status_rows(
     workspace: &FsPath,
     frame: &RepoFrame,
 ) -> Result<(Vec<GitFileEntry>, bool), ApiError> {
     let mut complete = true;
-    let mut rows = match status_sync(workspace, &["status", "--porcelain=v1", "-z"]) {
-        Ok(porcelain) => parse_porcelain(&porcelain),
-        Err(_) => {
-            // One broken submodule can abort all of Git's porcelain output.
-            // Recover ordinary rows, then inspect gitlinks individually so
-            // only the unreadable submodule is shown as unknown/unguardable.
-            let porcelain = status_sync(
-                workspace,
-                &["status", "--porcelain=v1", "-z", "--ignore-submodules=all"],
-            )?;
-            let mut rows = parse_porcelain(&porcelain);
-            for (path, records) in IndexSnapshot::read(frame)?.by_path {
-                if !records
-                    .split(|byte| *byte == 0)
-                    .any(|record| record.starts_with(b"160000 "))
-                {
-                    continue;
-                }
-                rows.retain(|row| normalized_row_path(&row.path) != path);
-                match status_sync(
-                    &frame.toplevel,
-                    &[
-                        "--literal-pathspecs",
-                        "status",
-                        "--porcelain=v1",
-                        "-z",
-                        "--",
-                        &path,
-                    ],
-                ) {
-                    Ok(porcelain) => rows.extend(parse_porcelain(&porcelain)),
-                    Err(_) => {
-                        complete = false;
-                        rows.push(GitFileEntry {
-                            path,
-                            index: " ".to_string(),
-                            worktree: "?".to_string(),
-                            staged: false,
-                            status: "unknown",
-                            old_path: None,
-                            rev: None,
-                        });
-                    }
-                }
-            }
-            rows
+    let mut rows = parse_porcelain(&status_sync(workspace, &["--porcelain=v1", "-z"])?);
+    for (path, records) in IndexSnapshot::read(frame)?.by_path {
+        if !records
+            .split(|byte| *byte == 0)
+            .any(|record| record.starts_with(b"160000 "))
+        {
+            continue;
         }
-    };
+        if rows
+            .iter()
+            .any(|row| normalized_row_path(&row.path) == path)
+        {
+            continue;
+        }
+        let sub = frame.toplevel.join(&path);
+        let git_entry = sub.join(".git");
+        let unreadable = !has_linked_ancestor(&frame.toplevel, &path)
+            && std::fs::symlink_metadata(&sub).is_ok_and(|metadata| metadata.is_dir())
+            && if git_entry.exists() {
+                submodule_head_oid(&sub).is_err()
+            } else {
+                std::fs::symlink_metadata(&git_entry).is_ok()
+            };
+        if unreadable {
+            complete = false;
+            rows.push(GitFileEntry {
+                path,
+                index: " ".to_string(),
+                worktree: "?".to_string(),
+                staged: false,
+                status: "unknown",
+                old_path: None,
+                rev: None,
+            });
+        }
+    }
     if let Some(position) = rows
         .iter()
         .position(|row| row.status == "untracked" && row.path == frame.prefix)
@@ -512,9 +526,11 @@ fn parse_porcelain(porcelain: &str) -> Vec<GitFileEntry> {
         }
         let index = record.as_bytes()[0] as char;
         let worktree = record.as_bytes()[1] as char;
-        let path = record[3..].to_string();
+        let Some(path) = record.get(3..).map(str::to_string) else {
+            continue;
+        };
         let mut old_path = None;
-        if matches!(index, 'R' | 'C') {
+        if matches!(index, 'R' | 'C') || matches!(worktree, 'R' | 'C') {
             old_path = records.next().map(str::to_string);
         }
         entries.push(GitFileEntry {
@@ -554,14 +570,22 @@ fn split_by_workspace(
                 inside.push(row);
             }
             None => {
-                if row.index == "R"
-                    && let Some(path) = old_path
-                {
+                let renamed = row.index == "R" || row.worktree == "R";
+                if renamed && let Some(path) = old_path {
+                    let worktree_side = row.worktree == "R";
                     inside.push(GitFileEntry {
                         path,
-                        index: "D".to_string(),
-                        worktree: " ".to_string(),
-                        staged: true,
+                        index: if worktree_side {
+                            " ".to_string()
+                        } else {
+                            "D".to_string()
+                        },
+                        worktree: if worktree_side {
+                            "D".to_string()
+                        } else {
+                            " ".to_string()
+                        },
+                        staged: !worktree_side,
                         status: "deleted",
                         old_path: None,
                         rev: None,
@@ -649,6 +673,13 @@ impl RepoFrame {
                 .to_string(),
         })
     }
+}
+
+/// Resolve HEAD inside `sub` only after verifying `sub/.git` itself resolves
+/// without walking up to a parent repository.
+fn submodule_head_oid(sub: &FsPath) -> Result<Option<String>, ApiError> {
+    review_sync_ok(sub, &["rev-parse", "--resolve-git-dir", ".git"])?;
+    head_oid(sub)
 }
 
 /// Full HEAD commit id, `None` on an unborn branch.
@@ -882,15 +913,12 @@ fn worktree_fingerprint(workspace: &FsPath, path: &str, mode: RevMode) -> Result
         // Dirty submodule contents are summarized by status, not recursively
         // hashed: ordinary add/checkout do not write those contents.
         if full.join(".git").exists() {
-            let head = head_oid(&full)?;
-            let status = review_sync_ok(
-                &full,
-                &["status", "--porcelain=v1", "-z", "--ignore-submodules=none"],
-            )?;
+            let head = submodule_head_oid(&full)?;
+            let status = status_sync(&full, &["--porcelain=v1", "-z"])?;
             return Ok(format!(
                 "gitlink:{}:{}",
                 head.as_deref().unwrap_or("unborn"),
-                content_revision(&status)
+                content_revision(status.as_bytes())
             ));
         }
         return Ok("dir".into());
@@ -1479,6 +1507,10 @@ pub(super) struct GitPushRequest {
     remote: Option<String>,
     #[serde(default)]
     set_upstream: bool,
+    #[serde(default)]
+    branch: Option<String>,
+    #[serde(default)]
+    expect: Option<GitExpect>,
 }
 
 #[derive(Deserialize)]
@@ -2174,52 +2206,229 @@ async fn git_read_ok(workspace: &FsPath, args: &[&str]) -> Result<String, ApiErr
     Ok(run.stdout)
 }
 
-/// `git push` arguments for a request. The remote that will be pushed to —
-/// the requested one, or `origin` when only `set_upstream` is asked — must be
-/// a configured remote, and `--` keeps it from ever parsing as an option.
-async fn push_args(
+#[derive(Debug, PartialEq, Eq)]
+struct NamedPush {
+    branch: String,
+    head: String,
+}
+
+fn named_push(
+    branch: Option<&str>,
+    expect: Option<GitExpect>,
+) -> Result<Option<NamedPush>, ApiError> {
+    let branch = branch.map(str::trim);
+    let (branch, expect) = match (branch, expect) {
+        (None, None) => return Ok(None),
+        (None, Some(_)) => {
+            return Err(ApiError::bad_request(
+                "expect on push requires the branch it was read for",
+            ));
+        }
+        (Some(_), None) => {
+            return Err(ApiError::bad_request(
+                "branch requires expect.head read from GET /v1/git",
+            ));
+        }
+        (Some(branch), Some(expect)) => (branch, expect),
+    };
+    let shaped = !branch.is_empty()
+        && branch.len() <= MAX_BRANCH_NAME_BYTES
+        && !branch.starts_with('-')
+        && branch
+            .bytes()
+            .all(|byte| byte > b' ' && byte != 0x7f && byte != b':');
+    if !shaped {
+        return Err(ApiError::bad_request("branch must be a local branch name"));
+    }
+    if expect.index.is_some() || expect.revision.is_some() || expect.files.is_some() {
+        return Err(ApiError::bad_request("push takes only expect.head"));
+    }
+    let head = match expect.head {
+        Some(Some(raw)) => normalized_hex(&raw, &[40, 64], "head")?,
+        Some(None) => {
+            return Err(ApiError::bad_request(
+                "an unborn branch has no commit to push",
+            ));
+        }
+        None => {
+            return Err(ApiError::bad_request(
+                "branch requires expect.head read from GET /v1/git",
+            ));
+        }
+    };
+    Ok(Some(NamedPush {
+        branch: branch.to_string(),
+        head,
+    }))
+}
+
+async fn git_config_value(workspace: &FsPath, key: &str) -> Result<Option<String>, ApiError> {
+    let run = git_read(workspace, &["config", "--get", key]).await?;
+    let value = run.stdout.trim();
+    Ok((run.status_success && !value.is_empty()).then(|| value.to_string()))
+}
+
+#[derive(Debug)]
+struct PushPlan {
+    args: Vec<String>,
+    upstream: Option<(String, String)>,
+}
+
+async fn push_plan(
     workspace: &FsPath,
     remote: Option<&str>,
     set_upstream: bool,
-) -> Result<Vec<String>, ApiError> {
-    let remote = remote.map(str::trim).filter(|remote| !remote.is_empty());
-    let remote = match (remote, set_upstream) {
-        (Some(remote), _) => Some(remote),
-        (None, true) => Some("origin"),
-        (None, false) => None,
-    };
-    let mut args = vec!["push".to_string()];
-    let Some(remote) = remote else {
-        return Ok(args);
-    };
-    validate_push_remote(remote, &git_read_ok(workspace, &["remote"]).await?)?;
-    if set_upstream {
-        let branch = git_read_ok(workspace, &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
-        let branch = branch.trim();
-        if branch.is_empty() || branch == "HEAD" {
-            return Err(ApiError::bad_request(
-                "cannot set upstream from a detached HEAD",
-            ));
+    named: Option<NamedPush>,
+) -> Result<Result<PushPlan, GitWriteError>, ApiError> {
+    let symbolic = git_read(workspace, &["symbolic-ref", "-q", "HEAD"]).await?;
+    let checked_out = symbolic
+        .status_success
+        .then(|| symbolic.stdout.trim().strip_prefix("refs/heads/"))
+        .flatten()
+        .map(str::to_string);
+    let tip = |branch: &str| {
+        let reference = format!("refs/heads/{branch}^{{commit}}");
+        async move {
+            let run = git_read(workspace, &["rev-parse", "--verify", "-q", &reference]).await?;
+            let oid = run.stdout.trim().to_ascii_lowercase();
+            Ok::<_, ApiError>((run.status_success && !oid.is_empty()).then_some(oid))
         }
-        args.push("--set-upstream".to_string());
-        args.extend(["--".to_string(), remote.to_string(), branch.to_string()]);
-    } else {
-        args.extend(["--".to_string(), remote.to_string()]);
+    };
+    let (branch, head) = match named {
+        Some(NamedPush { branch, head }) => {
+            let mut stale = Vec::new();
+            let mut parts = Vec::new();
+            if checked_out.as_deref() != Some(branch.as_str()) {
+                stale.push("branch");
+                parts.push(match &checked_out {
+                    Some(current) => format!("{current} is checked out, not {branch}"),
+                    None => "HEAD is detached".to_string(),
+                });
+            }
+            if tip(&branch).await?.as_deref() != Some(head.as_str()) {
+                stale.push("head");
+                parts.push(format!("{branch} moved"));
+            }
+            if !stale.is_empty() {
+                let root = workspace.to_path_buf();
+                let current = tokio::task::spawn_blocking(move || collect_git_status_detail(&root))
+                    .await
+                    .map_err(|_| ApiError::internal("git status failed"))??;
+                let mut extra = serde_json::Map::new();
+                extra.insert("stale".to_string(), json!(stale));
+                extra.insert("stale_paths".to_string(), json!([]));
+                extra.insert(
+                    "current".to_string(),
+                    serde_json::to_value(current)
+                        .map_err(|_| ApiError::internal("git status serialization failed"))?,
+                );
+                return Ok(Err(GitWriteError::Coded {
+                    status: StatusCode::CONFLICT,
+                    code: "git_state_changed",
+                    message: format!(
+                        "The repository changed since it was read ({}). Nothing was pushed; refresh and review again.",
+                        parts.join("; ")
+                    ),
+                    extra,
+                }));
+            }
+            (branch, head)
+        }
+        None => {
+            let Some(branch) = checked_out else {
+                return Err(ApiError::bad_request(
+                    "cannot push from a detached HEAD; check out a branch",
+                ));
+            };
+            let Some(head) = tip(&branch).await? else {
+                return Err(ApiError::bad_request(format!(
+                    "{branch} has no commits to push"
+                )));
+            };
+            (branch, head)
+        }
+    };
+    let tracking = git_config_value(workspace, &format!("branch.{branch}.remote")).await?;
+    let remote = match remote.map(str::trim).filter(|remote| !remote.is_empty()) {
+        Some(remote) => remote.to_string(),
+        None => {
+            let mut chosen =
+                git_config_value(workspace, &format!("branch.{branch}.pushRemote")).await?;
+            if chosen.is_none() {
+                chosen = git_config_value(workspace, "remote.pushDefault").await?;
+            }
+            chosen
+                .or_else(|| tracking.clone())
+                .unwrap_or_else(|| "origin".to_string())
+        }
+    };
+    validate_push_remote(&remote, &git_read_ok(workspace, &["remote"]).await?)?;
+    let destination = format!("refs/heads/{branch}");
+    if tracking.as_deref() == Some(remote.as_str())
+        && let Some(merge) = git_config_value(workspace, &format!("branch.{branch}.merge")).await?
+        && merge != destination
+    {
+        return Err(ApiError::bad_request(format!(
+            "{branch} tracks {merge} on {remote}; only a push to the same-named branch is supported"
+        )));
     }
-    Ok(args)
+    let args = vec![
+        "push".to_string(),
+        "--no-follow-tags".to_string(),
+        "--no-recurse-submodules".to_string(),
+        "--".to_string(),
+        remote.clone(),
+        format!("{head}:{destination}"),
+    ];
+    Ok(Ok(PushPlan {
+        args,
+        upstream: set_upstream.then_some((branch, remote)),
+    }))
+}
+
+async fn push(workspace: &FsPath, request: GitPushRequest) -> Result<Json<Value>, GitWriteError> {
+    let named = named_push(request.branch.as_deref(), request.expect)?;
+    let plan = push_plan(
+        workspace,
+        request.remote.as_deref(),
+        request.set_upstream,
+        named,
+    )
+    .await??;
+    let run = git_write(workspace, plan.args).await?;
+    if run.status_success
+        && let Some((branch, remote)) = plan.upstream
+    {
+        for (key, value) in [
+            (format!("branch.{branch}.remote"), remote),
+            (
+                format!("branch.{branch}.merge"),
+                format!("refs/heads/{branch}"),
+            ),
+        ] {
+            let config = git_write(workspace, vec!["config".to_string(), key, value]).await?;
+            if !config.status_success {
+                return Err(ApiError::bad_request(format!(
+                    "The push succeeded but its upstream was not recorded: {}",
+                    output_tail(&config)
+                ))
+                .into());
+            }
+        }
+    }
+    Ok(mutation_response(workspace, run).await?)
 }
 
 pub(super) async fn git_push(
     State(state): State<RuntimeApiState>,
     Query(scope): Query<ThreadScopeQuery>,
     Json(request): Json<GitPushRequest>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<Value>, GitWriteError> {
     let root = scoped_workspace(&state, scope.thread_id.as_deref()).await?;
     let workspace = resolve_workspace(&root, true).await?;
-    let args = push_args(&workspace, request.remote.as_deref(), request.set_upstream).await?;
     // Push stays outside the write lock: it crosses the network under a
     // 120 s bound and only moves a remote ref, never the index or worktree.
-    mutation_response(&workspace, git_write(&workspace, args).await?).await
+    push(&workspace, request).await
 }
 
 pub(super) async fn git_branch(
@@ -2488,6 +2697,7 @@ pub(super) async fn worktree_create(
             std::fs::write(&exclude, format!("{current}{separator}{line}\n"))
                 .map_err(|error| ApiError::internal(format!("update info/exclude: {error}")))?;
         }
+        codewhale_lane::set_git_command(Git::workspace_command);
         codewhale_lane::provision_worktree(&spec)
             .map_err(|error| ApiError::bad_request(format!("{error:#}")))?;
         Ok(())
@@ -2584,11 +2794,8 @@ pub(super) async fn worktree_remove(
         ));
     }
     if !row.prunable {
-        let status = git_read_ok(
-            &path,
-            &["status", "--porcelain", "--untracked-files=normal"],
-        )
-        .await?;
+        let status =
+            git_status_read_ok(&path, &["--porcelain", "--untracked-files=normal"]).await?;
         if !status.trim().is_empty() {
             let mut extra = serde_json::Map::new();
             extra.insert(
@@ -2702,6 +2909,10 @@ pub(super) async fn worktree_remove(
 }
 
 #[cfg(test)]
+#[path = "tests/git_push.rs"]
+mod git_push_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[cfg(unix)]
@@ -2712,7 +2923,7 @@ mod tests {
         pub(super) static GIT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
-    fn git(dir: &FsPath, args: &[&str]) {
+    pub(super) fn git(dir: &FsPath, args: &[&str]) {
         let output = Git::output(args, dir).expect("spawn git");
         assert!(
             output.status.success(),
@@ -2721,7 +2932,23 @@ mod tests {
         );
     }
 
-    fn repo() -> tempfile::TempDir {
+    #[test]
+    fn worktree_rename_consumes_its_original_path_record() {
+        let rows = parse_porcelain(" R new.md\0ab说明.md\0 M a.txt\0");
+        let rows: Vec<_> = rows
+            .iter()
+            .map(|row| (row.path.as_str(), row.status, row.old_path.as_deref()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("new.md", "renamed", Some("ab说明.md")),
+                ("a.txt", "modified", None),
+            ]
+        );
+    }
+
+    pub(super) fn repo() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path();
         git(dir, &["init", "-q", "-b", "main"]);
@@ -3027,6 +3254,50 @@ mod tests {
     }
 
     #[test]
+    fn review_outgoing_worktree_rename_exposes_source_deletion() {
+        let tmp = repo();
+        let root = tmp.path();
+        fs::create_dir(root.join("sub")).unwrap();
+        git(root, &["mv", "a.txt", "sub/a.txt"]);
+        git(root, &["commit", "-q", "-m", "inside"]);
+        git(root, &["mv", "sub/a.txt", "outside.txt"]);
+        git(root, &["reset"]);
+        git(root, &["add", "-N", "outside.txt"]);
+        let ws = root.join("sub");
+        let detail = collect_git_status_detail(&ws).unwrap();
+        assert_eq!(detail.files.len(), 1);
+        let row = &detail.files[0];
+        assert_eq!(row.path, "a.txt");
+        assert_eq!(row.index, " ");
+        assert_eq!(row.worktree, "D");
+        assert_eq!(row.status, "deleted");
+        assert!(!row.staged);
+        assert!(row.old_path.is_none());
+        let expect = expect_file("a.txt", row.rev.clone().unwrap());
+        assert!(check_preconditions(&ws, &expect).unwrap().is_ok());
+    }
+
+    #[test]
+    fn outgoing_copy_keeps_its_source_inside_the_workspace() {
+        let row = GitFileEntry {
+            path: "outside.txt".to_string(),
+            index: "C".to_string(),
+            worktree: " ".to_string(),
+            staged: true,
+            status: "copied",
+            old_path: Some("sub/a.txt".to_string()),
+            rev: None,
+        };
+        let (inside, outside) = split_by_workspace(vec![row], "sub/");
+        assert!(
+            inside.is_empty(),
+            "a copy leaves its source in place, so it must not read as a deletion: {:?}",
+            inside.iter().map(|row| &row.path).collect::<Vec<_>>()
+        );
+        assert_eq!(outside.len(), 1);
+    }
+
+    #[test]
     fn review_untracked_inventory_has_constant_git_reads() {
         let tmp = repo();
         let ws = tmp.path();
@@ -3259,6 +3530,47 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_submodule_is_reported() {
+        for breakage in ["nohead", "garbage", "badgitdir"] {
+            let tmp = repo();
+            let ws = tmp.path();
+            let nested = ws.join("vendor");
+            fs::create_dir(&nested).unwrap();
+            git(&nested, &["init", "-q", "-b", "main"]);
+            git(&nested, &["config", "user.email", "git-rev@example.test"]);
+            git(&nested, &["config", "user.name", "Git Rev Test"]);
+            fs::write(nested.join("lib.txt"), "library\n").unwrap();
+            git(&nested, &["add", "lib.txt"]);
+            git(&nested, &["commit", "-q", "-m", "nested"]);
+            git(ws, &["add", "vendor"]);
+            git(ws, &["commit", "-q", "-m", "gitlink"]);
+            if breakage == "nohead" {
+                fs::remove_file(nested.join(".git/HEAD")).unwrap();
+            } else {
+                fs::remove_dir_all(nested.join(".git")).unwrap();
+                let content = if breakage == "badgitdir" {
+                    "gitdir: /nonexistent\n"
+                } else {
+                    "garbage\n"
+                };
+                fs::write(nested.join(".git"), content).unwrap();
+            }
+            let detail = collect_git_status_detail(ws).unwrap();
+            assert!(
+                detail.revision.is_none(),
+                "{breakage}: whole-tree revision offered with an unreadable submodule"
+            );
+            assert!(
+                detail
+                    .files
+                    .iter()
+                    .any(|row| normalized_row_path(&row.path) == "vendor"),
+                "{breakage}: unreadable submodule has no row"
+            );
+        }
+    }
+
+    #[test]
     fn broken_nested_repo_only_withholds_affected_row() {
         for tracked in [false, true] {
             let tmp = repo();
@@ -3331,6 +3643,64 @@ mod tests {
         git(ws, &["add", "a.txt"]);
         assert_eq!(run_git_sync(ws, &["show", ":a.txt"]).unwrap(), "TWO\n");
         assert_conflict(ws, &expect);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_runs_no_nested_repository_filter() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = repo();
+        let ws = tmp.path();
+        let outside = tempfile::tempdir().unwrap();
+        let marker = outside.path().join("marker");
+        let clean = outside.path().join("clean.sh");
+        fs::write(
+            &clean,
+            format!("#!/bin/sh\necho ran >> '{}'\ncat\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&clean, fs::Permissions::from_mode(0o755)).unwrap();
+        let sub = ws.join("vendor");
+        fs::create_dir(&sub).unwrap();
+        git(&sub, &["init", "-q", "-b", "main"]);
+        git(&sub, &["config", "user.email", "git-rev@example.test"]);
+        git(&sub, &["config", "user.name", "Git Rev Test"]);
+        fs::write(sub.join(".gitattributes"), "* filter=evil\n").unwrap();
+        fs::write(sub.join("lib.txt"), "library\n").unwrap();
+        git(&sub, &["add", "."]);
+        git(&sub, &["commit", "-q", "-m", "nested"]);
+        git(ws, &["add", "vendor"]);
+        git(ws, &["commit", "-q", "-m", "gitlink"]);
+        git(
+            &sub,
+            &["config", "filter.evil.clean", clean.to_str().unwrap()],
+        );
+        git(ws, &["config", "submodule.vendor.ignore", "none"]);
+        fs::File::options()
+            .write(true)
+            .open(sub.join("lib.txt"))
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH)
+            .unwrap();
+
+        let control = Git::output(&["status", "--porcelain"], ws).unwrap();
+        assert!(control.status.success());
+        assert!(marker.exists(), "positive control: nested filter");
+        fs::remove_file(&marker).unwrap();
+
+        let detail = collect_git_status_detail(ws).unwrap();
+        assert!(detail.files.is_empty(), "{:?}", detail.files);
+        assert!(
+            !marker.exists(),
+            "status ran a nested repository filter: {}",
+            fs::read_to_string(&marker).unwrap_or_default()
+        );
+        let counts = collect_workspace_status(ws);
+        assert!(!counts.status_unavailable);
+        assert!(
+            !marker.exists(),
+            "workspace status ran a nested repository filter"
+        );
     }
 
     #[test]
@@ -3504,54 +3874,6 @@ mod tests {
             let body = diff(path);
             assert!(!body.contains("secret"), "{path} escaped: {body}");
         }
-    }
-
-    #[tokio::test]
-    async fn push_args_validate_the_effective_remote_and_end_options() {
-        let tmp = repo();
-        let root = tmp.path();
-        let status = |error: ApiError| error.status;
-
-        // No remote configured: plain `push` stays git's call, but an
-        // upstream push defaults to `origin`, which must exist too.
-        assert_eq!(push_args(root, None, false).await.unwrap(), ["push"]);
-        assert_eq!(push_args(root, Some("  "), false).await.unwrap(), ["push"]);
-        assert_eq!(
-            push_args(root, None, true)
-                .await
-                .map_err(status)
-                .unwrap_err(),
-            StatusCode::BAD_REQUEST
-        );
-
-        let bare = tempfile::tempdir().unwrap();
-        git(bare.path(), &["init", "-q", "--bare"]);
-        git(
-            root,
-            &["remote", "add", "origin", &bare.path().to_string_lossy()],
-        );
-        assert_eq!(
-            push_args(root, Some(" origin "), false).await.unwrap(),
-            ["push", "--", "origin"]
-        );
-        for remote in ["--mirror", "fork", "../other"] {
-            assert_eq!(
-                push_args(root, Some(remote), true)
-                    .await
-                    .map_err(status)
-                    .unwrap_err(),
-                StatusCode::BAD_REQUEST,
-                "{remote}"
-            );
-        }
-        let args = push_args(root, None, true).await.unwrap();
-        assert_eq!(args, ["push", "--set-upstream", "--", "origin", "main"]);
-
-        // The built arguments are ones git accepts: the push lands in the
-        // bare remote and records the upstream.
-        git(root, &args.iter().map(String::as_str).collect::<Vec<_>>());
-        let upstream = run_git_sync(root, &["rev-parse", "--abbrev-ref", "@{upstream}"]).unwrap();
-        assert_eq!(upstream.trim(), "origin/main");
     }
 
     #[test]

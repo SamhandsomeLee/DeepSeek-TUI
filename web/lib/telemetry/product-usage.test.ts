@@ -1,8 +1,10 @@
 import { existsSync, readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { handleProductTelemetry, ingestUrl, CANONICAL_INGEST_URL } from "../../app/api/product-telemetry/route";
 import {
   COUNTERS_STORAGE_KEY,
+  FUNNEL_STORAGE_KEY,
+  emptyFunnelCounters,
   INSTALL_ID_ROTATION_MS,
   INSTALL_STORAGE_KEY,
   NOTICE_VERSION,
@@ -11,6 +13,8 @@ import {
   buildEnvelope,
   createUsageRecorder,
   emptyCounters,
+  privacySignalActive,
+  privacySignalHeader,
   readUsagePreference,
   resolveInstallId,
   usageCountingEnabled,
@@ -35,7 +39,7 @@ function memoryStorage(seed: Record<string, string> = {}): StorageLike & { data:
   };
 }
 
-function recorderWith(storage: StorageLike, sent: string[] = [], now = () => NOW) {
+function recorderWith(storage: StorageLike, sent: string[] = [], now = () => NOW, blocked?: () => boolean) {
   const timers: (() => void)[] = [];
   const recorder = createUsageRecorder({
     surface: "website",
@@ -43,6 +47,7 @@ function recorderWith(storage: StorageLike, sent: string[] = [], now = () => NOW
     endpoint: "/api/product-telemetry",
     storage,
     now,
+    blocked,
     randomUuid: () => UUID,
     send: async (_endpoint, body) => {
       sent.push(body);
@@ -65,14 +70,15 @@ describe("product usage envelope", () => {
     counters.page_view = 1;
     const envelope = buildEnvelope({ counters, installId: UUID, appVersion: "0.9.12", surface: "website", now: NOW });
     expect(validateEnvelope(envelope)).toEqual({ ok: true, envelope });
-    expect(SCHEMA_VERSION).toBe(3);
-    expect(NOTICE_VERSION).toBe(5);
-    expect(envelope.notice_version).toBe(5);
+    expect(SCHEMA_VERSION).toBe(5);
+    expect(NOTICE_VERSION).toBe(7);
+    expect(envelope.notice_version).toBe(7);
     expect(envelope).not.toHaveProperty("consent_version");
     expect(envelope.sent_at).toBe("2026-09-04T20:00:00Z");
     if (existsSync(GOLDEN_PATH)) {
       const golden = JSON.parse(readFileSync(GOLDEN_PATH, "utf8"));
-      expect(envelope).toEqual(golden);
+      expect(golden.schema_version).toBe(3);
+      expect(golden.notice_version).toBe(5);
       expect(validateEnvelope(golden).ok).toBe(true);
     }
   });
@@ -103,7 +109,7 @@ describe("usage preference", () => {
   it("is on by default, keeps every recorded opt-out, and fails closed on unreadable state", () => {
     expect(readUsagePreference(null)).toBe("default");
     expect(readUsagePreference(undefined)).toBe("default");
-    expect(readUsagePreference("")).toBe("default");
+    expect(readUsagePreference("")).toBe("off");
     expect(usageCountingEnabled("default")).toBe(true);
     // Unreadable stored state is never replaced with the default.
     expect(readUsagePreference("{not json")).toBe("off");
@@ -343,5 +349,202 @@ describe("same-origin forwarder", () => {
     });
     expect(await response.json()).toEqual({ accepted: false, reason: "unavailable" });
     expect(attempts).toBe(1);
+  });
+});
+
+
+describe("website funnel contract and delivery", () => {
+  it("matches the ingest golden and rejects legacy or malformed funnel payloads", async () => {
+    const { validateBatch } = await import("../../../telemetry-ingest/src/schema");
+    const counters = emptyCounters(); counters.page_view = 1;
+    const funnel = emptyFunnelCounters();
+    funnel.home_view = 1; funnel.install_intent = 1; funnel.docs_search = 1; funnel.docs_search_result = 1;
+    const envelope = buildEnvelope({ counters, funnel, installId: UUID, appVersion: "0.9.12", surface: "website", now: NOW });
+    const golden = JSON.parse(readFileSync(new URL("../../../telemetry-ingest/test/golden/browser-v5.json", import.meta.url), "utf8"));
+    expect(envelope).toEqual(golden);
+    expect(validateBatch(envelope).ok).toBe(true);
+    expect(validateEnvelope(envelope).ok).toBe(true);
+    expect(validateEnvelope({ ...envelope, schema_version: 3, notice_version: 5 }).ok).toBe(false);
+    expect(validateEnvelope({ ...envelope, surface: "desktop" }).ok).toBe(false);
+    for (const bad of [-1, 1.5, 4294967296, "1"]) {
+      const invalid = structuredClone(golden); invalid.events[1].counters.docs_search = bad;
+      expect(validateEnvelope(invalid).ok).toBe(false); expect(validateBatch(invalid).ok).toBe(false);
+    }
+    const unexpected = structuredClone(golden); unexpected.events[1].counters.query = "private words";
+    expect(validateEnvelope(unexpected).ok).toBe(false); expect(validateBatch(unexpected).ok).toBe(false);
+  });
+
+  it.each([
+    [200, { accepted: true }, "accepted"],
+    [200, { accepted: false, reason: "disabled" }, "rejected"],
+    [200, { accepted: false, reason: "unavailable" }, "rejected"],
+    [200, { accepted: true, padding: "x".repeat(513) }, "rejected"],
+    [500, { accepted: true }, "rejected"],
+    [200, { other: true }, "rejected"],
+  ] as const)("requires an explicit bounded acceptance receipt (%s)", async (status, payload, expected) => {
+    const fetchMock = vi.fn(async (endpoint: string, init: RequestInit) => { expect(endpoint).toBe("/api/product-telemetry"); expect(init.method).toBe("POST"); return Response.json(payload, { status }); }); vi.stubGlobal("fetch", fetchMock);
+    try {
+      const recorder = createUsageRecorder({ surface: "website", appVersion: "0.10.3", endpoint: "/api/product-telemetry", storage: memoryStorage(), now: () => NOW, randomUuid: () => UUID, setTimer: () => 0, clearTimer: () => {} });
+      recorder.recordFunnel("quickstart_confirmed"); await recorder.flush();
+      expect(recorder.delivery()).toBe(expected); expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock.mock.calls[0][1]).toMatchObject({ credentials: "omit", referrerPolicy: "no-referrer" });
+      expect(recorder.pendingFunnel()).toEqual(emptyFunnelCounters());
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it("fails closed on unreadable storage and a failed opt-out write", async () => {
+    const unreadable = memoryStorage(); unreadable.getItem = () => { throw new Error("blocked"); };
+    const sent: string[] = []; const first = recorderWith(unreadable, sent).recorder;
+    expect(first.preference()).toBe("off"); first.recordFunnel("install_confirmed"); await first.flush(); expect(sent).toEqual([]);
+    const storage = memoryStorage(); const write = storage.setItem;
+    storage.setItem = (key, value) => { if (key === PREFERENCE_STORAGE_KEY) throw new Error("quota"); write(key, value); };
+    const second = recorderWith(storage, sent).recorder;
+    expect(second.disable()).toBe(false); expect(second.preference()).toBe("off");
+    second.record("page_view"); second.recordFunnel("install_confirmed"); await second.flush();
+    expect(sent).toEqual([]); expect(storage.data.has(INSTALL_STORAGE_KEY)).toBe(false);
+  });
+
+  it("aborts delivery and erases both queues when counting is turned off", async () => {
+    const storage = memoryStorage(); let signal: AbortSignal | undefined;
+    const recorder = createUsageRecorder({ surface: "website", appVersion: "0.10.3", endpoint: "/api/product-telemetry", storage, now: () => NOW, randomUuid: () => UUID, setTimer: () => 0, clearTimer: () => {}, send: async (_url, _body, abort) => {
+      signal = abort; return new Promise<boolean>((resolve) => abort!.addEventListener("abort", () => resolve(false), { once: true }));
+    } });
+    recorder.record("install_copy"); recorder.recordFunnel("install_intent"); const delivery = recorder.flush();
+    expect(signal?.aborted).toBe(false); expect(recorder.disable()).toBe(true); await delivery; expect(signal?.aborted).toBe(true);
+    for (const key of [COUNTERS_STORAGE_KEY, FUNNEL_STORAGE_KEY, INSTALL_STORAGE_KEY]) expect(storage.data.has(key)).toBe(false);
+    recorder.recordFunnel("quickstart_confirmed"); await recorder.flush(); expect(recorder.pendingFunnel()).toEqual(emptyFunnelCounters());
+  });
+
+  it("reschedules new interactions during delivery without retrying the previous batch", async () => {
+    const timers: (() => void)[] = []; const sent: { events: { event: string; counters: Record<string, number> }[] }[] = [];
+    let finish: ((accepted: boolean) => void) | undefined;
+    const recorder = createUsageRecorder({ surface: "website", appVersion: "0.10.3", endpoint: "/api/product-telemetry", storage: memoryStorage(), now: () => NOW, randomUuid: () => UUID, setTimer: (callback) => { timers.push(callback); return timers.length; }, clearTimer: () => {}, send: async (_url, body) => {
+      sent.push(JSON.parse(body)); return sent.length === 1 ? new Promise<boolean>((resolve) => { finish = resolve; }) : true;
+    } });
+    recorder.recordFunnel("install_intent"); const first = recorder.flush(); recorder.recordFunnel("docs_search"); timers.at(-1)!();
+    finish!(false); await first; expect(timers).toHaveLength(3); timers.at(-1)!(); await Promise.resolve(); await Promise.resolve(); expect(sent).toHaveLength(2);
+    expect(sent[0].events.find((event) => event.event === "funnel_usage")!.counters.install_intent).toBe(1);
+    const second = sent[1].events.find((event) => event.event === "funnel_usage")!.counters;
+    expect(second.install_intent).toBe(0); expect(second.docs_search).toBe(1);
+  });
+});
+
+describe("browser privacy signals", () => {
+  it("reads Global Privacy Control and Do Not Track, including the legacy properties", () => {
+    expect(privacySignalActive({}, {})).toBe(false);
+    expect(privacySignalActive({ globalPrivacyControl: false, doNotTrack: "0" }, { doNotTrack: "unspecified" })).toBe(false);
+    expect(privacySignalActive({ globalPrivacyControl: true }, {})).toBe(true);
+    expect(privacySignalActive({ doNotTrack: "1" }, {})).toBe(true);
+    expect(privacySignalActive({}, { doNotTrack: "1" })).toBe(true);
+    expect(privacySignalActive({}, { doNotTrack: "yes" })).toBe(true);
+    expect(privacySignalActive({ msDoNotTrack: "1" }, {})).toBe(true);
+    expect(privacySignalActive(null, null)).toBe(false);
+  });
+
+  it("reads the same two signals from request headers", () => {
+    expect(privacySignalHeader(new Headers())).toBe(false);
+    expect(privacySignalHeader(new Headers({ "sec-gpc": "0", dnt: "0" }))).toBe(false);
+    expect(privacySignalHeader(new Headers({ "Sec-GPC": "1" }))).toBe(true);
+    expect(privacySignalHeader(new Headers({ DNT: "1" }))).toBe(true);
+  });
+
+  it("counts nothing, reads and writes no install id, and sends nothing while a signal is present", async () => {
+    const storage = memoryStorage();
+    const reads: string[] = [];
+    const watched: StorageLike = {
+      getItem: (key) => (reads.push(key), storage.getItem(key)),
+      setItem: storage.setItem,
+      removeItem: storage.removeItem,
+    };
+    const { recorder, timers, sent } = recorderWith(watched, [], () => NOW, () => true);
+    recorder.record("page_view");
+    recorder.record("install_copy");
+    recorder.recordFunnel("star_exit");
+    await recorder.flush();
+    expect(reads).toEqual([]);
+    expect(storage.data.size).toBe(0);
+    expect(sent).toEqual([]);
+    expect(timers).toEqual([]);
+    expect(recorder.pending()).toEqual(emptyCounters());
+    expect(recorder.pendingFunnel()).toEqual(emptyFunnelCounters());
+  });
+
+  it("clears counts and the install id from an earlier visit but keeps the person's own choice", () => {
+    const choice = usagePreferenceRecord(true, NOW);
+    const storage = memoryStorage({
+      [COUNTERS_STORAGE_KEY]: JSON.stringify({ ...emptyCounters(), page_view: 3 }),
+      [FUNNEL_STORAGE_KEY]: JSON.stringify({ ...emptyFunnelCounters(), home_view: 1 }),
+      [INSTALL_STORAGE_KEY]: JSON.stringify({ id: UUID, createdAt: NOW }),
+      [PREFERENCE_STORAGE_KEY]: choice,
+    });
+    recorderWith(storage, [], () => NOW, () => true);
+    expect([...storage.data.keys()]).toEqual([PREFERENCE_STORAGE_KEY]);
+    expect(storage.data.get(PREFERENCE_STORAGE_KEY)).toBe(choice);
+  });
+
+  it("drops what was queued when a signal appears mid-session, and counts as before without one", async () => {
+    let signal = false;
+    const storage = memoryStorage();
+    const { recorder, sent } = recorderWith(storage, [], () => NOW, () => signal);
+    recorder.record("page_view");
+    expect(recorder.pending().page_view).toBe(1);
+    signal = true;
+    await recorder.flush();
+    expect(sent).toEqual([]);
+    expect(storage.data.size).toBe(0);
+    signal = false;
+    recorder.record("page_view");
+    await recorder.flush();
+    expect(sent).toHaveLength(1);
+    expect(storage.data.has(INSTALL_STORAGE_KEY)).toBe(true);
+  });
+});
+
+describe("forwarder and browser privacy signals", () => {
+  const envelope = buildEnvelope({ counters: { ...emptyCounters(), page_view: 1 }, installId: UUID, appVersion: "0.9.12", surface: "website", now: NOW });
+
+  it.each([["Sec-GPC"], ["DNT"]])("answers %s: 1 as disabled before reading the body and forwards nothing", async (header) => {
+    let bodyRead = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        bodyRead = true;
+        controller.enqueue(new TextEncoder().encode(JSON.stringify(envelope)));
+        controller.close();
+      },
+    }, { highWaterMark: 0 });
+    const request = new Request("http://localhost/api/product-telemetry", {
+      method: "POST",
+      headers: { "content-type": "application/json", [header]: "1" },
+      body,
+      duplex: "half",
+    } as RequestInit);
+    let forwarded = 0;
+    const response = await handleProductTelemetry(request, {
+      ingestUrl: CANONICAL_INGEST_URL,
+      forward: async () => {
+        forwarded += 1;
+        return { ok: true };
+      },
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ accepted: false, reason: "disabled" });
+    expect(bodyRead).toBe(false);
+    expect(forwarded).toBe(0);
+  });
+
+  it("still forwards a valid batch when the signals are absent or zero", async () => {
+    for (const headers of [{} as Record<string, string>, { "sec-gpc": "0", dnt: "0" }]) {
+      let forwarded = 0;
+      const response = await handleProductTelemetry(
+        new Request("http://localhost/api/product-telemetry", {
+          method: "POST",
+          headers: { "content-type": "application/json", ...headers },
+          body: JSON.stringify(envelope),
+        }),
+        { ingestUrl: CANONICAL_INGEST_URL, forward: async () => ((forwarded += 1), { ok: true }) },
+      );
+      expect(await response.json()).toEqual({ accepted: true });
+      expect(forwarded).toBe(1);
+    }
   });
 });

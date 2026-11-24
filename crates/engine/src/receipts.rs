@@ -45,6 +45,7 @@ use crate::runtime_threads::{
     RuntimeEventRecord, RuntimeTurnStatus, ThreadRecord, TurnItemKind, TurnItemLifecycleStatus,
     TurnItemRecord, TurnRecord,
 };
+use crate::tools::diff_format::make_unified_diff;
 
 const MAX_COMMAND_CHARS: usize = 200;
 const MAX_ERROR_CHARS: usize = 160;
@@ -69,6 +70,12 @@ const CLAIM_CEILING: [&str; 3] = [
 // ---------------------------------------------------------------------------
 
 pub use codewhale_command_contract::facets::debug_receipts::*;
+
+mod usage;
+pub use usage::{
+    cost_projection_from_snapshot, receipt_cost, saved_session_usage, session_usage,
+    tokens_from_sources, with_usage,
+};
 
 // ---------------------------------------------------------------------------
 // Normalized input
@@ -185,6 +192,7 @@ pub fn session_receipt(
     notes.insert(
         "Timestamps: a terminal session saves calls in order, not when each one ran.".to_string(),
     );
+    notes.insert("Plugin changes are not itemized for a terminal session yet".to_string());
     let log_since = DateTime::parse_from_rfc3339(APPROVAL_LOG_SINCE)
         .map(|at| at.with_timezone(&Utc))
         .ok();
@@ -325,7 +333,15 @@ pub fn thread_receipt(
     let notes = BTreeSet::from([
         "Shell file changes: a Runtime thread's workspace snapshots are not tagged with the thread, so files a command changed are not itemized; only file tools are.".to_string(),
     ]);
-    Ok(assemble(
+    let covered: Vec<&TurnRecord> = ordered
+        .iter()
+        .copied()
+        .filter(|record| turn.is_none_or(|turn| record.id == turn))
+        .collect();
+    let tokens = usage::thread_tokens(&covered);
+    let mut notes = notes;
+    notes.insert(usage::thread_cost_note().to_string());
+    let mut receipt = assemble(
         source,
         steps,
         approvals,
@@ -338,7 +354,12 @@ pub fn thread_receipt(
             approvals_recorded: true,
         },
         notes,
-    ))
+    );
+    receipt.usage = tokens.map(|tokens| ReceiptUsage {
+        tokens: Some(tokens),
+        cost: None,
+    });
+    Ok(receipt)
 }
 
 // ---------------------------------------------------------------------------
@@ -414,13 +435,16 @@ pub fn run_receipts_command(
         Some(prefix) => {
             let id = sessions.resolve_session_id_prefix(prefix)?;
             let session = sessions.load_session_snapshot(&id)?;
-            session_receipt(
-                session_source(&session.metadata),
-                &session.messages,
-                &session.approval_receipts,
-                &session.turn_outcomes,
-                turn,
-            )?
+            with_usage(
+                session_receipt(
+                    session_source(&session.metadata),
+                    &session.messages,
+                    &session.approval_receipts,
+                    &session.turn_outcomes,
+                    turn,
+                )?,
+                saved_session_usage(&session.metadata),
+            )
         }
         None => {
             let latest_session = sessions.list_sessions()?.into_iter().next();
@@ -440,13 +464,16 @@ pub fn run_receipts_command(
                 }
                 (Some(metadata), _, _) => {
                     let session = sessions.load_session_snapshot(&metadata.id)?;
-                    session_receipt(
-                        session_source(&session.metadata),
-                        &session.messages,
-                        &session.approval_receipts,
-                        &session.turn_outcomes,
-                        turn,
-                    )?
+                    with_usage(
+                        session_receipt(
+                            session_source(&session.metadata),
+                            &session.messages,
+                            &session.approval_receipts,
+                            &session.turn_outcomes,
+                            turn,
+                        )?,
+                        saved_session_usage(&session.metadata),
+                    )
                 }
                 _ => anyhow::bail!("no saved session or Runtime thread to read"),
             }
@@ -510,7 +537,9 @@ fn steps_from_messages(messages: &[Message]) -> (Vec<ToolStep>, Vec<TurnPosture>
                 ContentBlock::ToolUse {
                     id, name, input, ..
                 }
-                | ContentBlock::ServerToolUse { id, name, input } => {
+                | ContentBlock::ServerToolUse {
+                    id, name, input, ..
+                } => {
                     let key = block.tool_call_key().expect("tool use key");
                     let unambiguous = !key.as_str().trim().is_empty()
                         && call_counts.get(&key) == Some(&1)
@@ -1323,8 +1352,6 @@ fn files_from_input(semantic: &str, input: &Value, outcome: StepOutcome) -> Vec<
     }
 }
 
-/// `(+, -)` from an edit call's replacement pairs: the lines of every
-/// replacement text against the lines of every searched text.
 fn edit_line_counts(input: &Value) -> (Option<u64>, Option<u64>) {
     const SEARCH: &[&str] = &["search", "old_string", "old_str", "oldText", "old_text"];
     const REPLACE: &[&str] = &[
@@ -1349,8 +1376,10 @@ fn edit_line_counts(input: &Value) -> (Option<u64>, Option<u64>) {
             continue;
         }
         any = true;
-        removed += line_count(old.as_deref().unwrap_or(""));
-        added += line_count(new.as_deref().unwrap_or(""));
+        let (pair_added, pair_removed) =
+            pair_line_counts(old.as_deref().unwrap_or(""), new.as_deref().unwrap_or(""));
+        added += pair_added;
+        removed += pair_removed;
     }
     if any {
         (Some(added), Some(removed))
@@ -1359,12 +1388,19 @@ fn edit_line_counts(input: &Value) -> (Option<u64>, Option<u64>) {
     }
 }
 
-fn line_count(text: &str) -> u64 {
-    if text.is_empty() {
-        0
-    } else {
-        text.lines().count() as u64
-    }
+fn pair_line_counts(old: &str, new: &str) -> (u64, u64) {
+    let whole_lines = |text: &str| {
+        if text.is_empty() || text.ends_with('\n') {
+            text.to_string()
+        } else {
+            format!("{text}\n")
+        }
+    };
+    let diff = make_unified_diff("edit", &whole_lines(old), &whole_lines(new));
+    diff_counts_by_path(&diff)
+        .get("edit")
+        .copied()
+        .unwrap_or_default()
 }
 
 /// Files and counts from a patch the call supplied: `*** Add/Update/Delete
@@ -1690,7 +1726,7 @@ fn number(value: Option<&Value>, keys: &[&str]) -> Option<i64> {
 }
 
 fn redact(text: &str) -> String {
-    codewhale_secrets::redact::redact_secrets(text)
+    codewhale_sanitize::redact::redact_secrets(text)
 }
 
 use codewhale_commands::diagnostics_reports::receipts::{bounded, plural};
@@ -1702,6 +1738,114 @@ fn first_error_line(output: Option<&str>) -> Option<String> {
         .find(|line| !line.is_empty() && !line.starts_with("[approval]"))?;
     let line = line.strip_prefix("Error: ").unwrap_or(line);
     Some(bounded(&redact(line), MAX_ERROR_CHARS))
+}
+
+fn step_duration_ms(step: &ToolStep) -> Option<u64> {
+    number(step.metadata.as_ref(), &["duration_ms"])
+        .and_then(|ms| u64::try_from(ms).ok())
+        .or_else(|| match (step.started_at, step.ended_at) {
+            (Some(start), Some(end)) if end >= start => {
+                u64::try_from((end - start).num_milliseconds()).ok()
+            }
+            _ => None,
+        })
+}
+
+fn non_empty_act_str<'a>(act: &'a Value, key: &str) -> Option<&'a str> {
+    act.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn plugin_changes_from_step(
+    step: &ToolStep,
+    workspace: Option<&str>,
+    notes: &mut BTreeSet<String>,
+) -> Vec<ActionKind> {
+    let semantic =
+        codewhale_execpolicy::canonical_action::canonical_action_alias(&step.name, &step.input);
+    if step.name != "plugin_manager" && semantic != "plugin_manager" {
+        return Vec::new();
+    }
+    let Some(broker_acts) = step
+        .metadata
+        .as_ref()
+        .and_then(|meta| meta.pointer("/core_calls/broker_acts"))
+    else {
+        return Vec::new();
+    };
+    let total = broker_acts
+        .get("total")
+        .and_then(Value::as_u64)
+        .and_then(|count| usize::try_from(count).ok());
+    let acts = broker_acts.get("acts").and_then(Value::as_array);
+    if let Some(total) = total
+        && total > acts.map_or(0, Vec::len)
+    {
+        notes.insert("Plugin changes: more plugin acts than this receipt lists.".to_string());
+    }
+    let mut changes = Vec::new();
+    for act in acts.into_iter().flatten() {
+        if non_empty_act_str(act, "service") != Some("plugins") {
+            continue;
+        }
+        let is_cut = act.get("cut").and_then(Value::as_bool) == Some(true);
+        let application = non_empty_act_str(act, "application");
+        let outcome = non_empty_act_str(act, "outcome");
+        let applied = application == Some("applied")
+            || (is_cut && matches!(outcome, Some("applied" | "completed" | "ok")));
+        if !applied {
+            if is_cut && application.is_none() && outcome.is_none() {
+                notes.insert(
+                    "Plugin changes: a plugin act was cut before details were recorded (not recorded)."
+                        .to_string(),
+                );
+            }
+            continue;
+        }
+        let method = non_empty_act_str(act, "method")
+            .map(|value| bounded(&redact(value), MAX_QUERY_CHARS))
+            .unwrap_or_else(|| "not recorded".to_string());
+        let plugin = non_empty_act_str(act, "plugin")
+            .map(|value| {
+                bounded(
+                    &workspace_relative(&redact(value), workspace),
+                    MAX_COMMAND_CHARS,
+                )
+            })
+            .unwrap_or_else(|| "not recorded".to_string());
+        let hash = non_empty_act_str(act, "hash")
+            .or_else(|| non_empty_act_str(act, "content_hash"))
+            .map(|value| bounded(&redact(value), MAX_QUERY_CHARS));
+        let approver = codewhale_plugins::host_services::recorded_approver_label(
+            non_empty_act_str(act, "approver"),
+            non_empty_act_str(act, "posture"),
+        )
+        .map(str::to_string)
+        .unwrap_or_else(|| "not recorded".to_string());
+        let services = act
+            .get("services")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| bounded(&redact(value), MAX_QUERY_CHARS))
+                    .collect()
+            })
+            .unwrap_or_default();
+        changes.push(ActionKind::PluginChange {
+            method,
+            plugin,
+            hash,
+            approver,
+            services,
+        });
+    }
+    changes
 }
 
 // ---------------------------------------------------------------------------
@@ -1776,6 +1920,28 @@ fn assemble(
         if !in_scope(step.turn.as_deref()) {
             continue;
         }
+        let plugin_changes =
+            plugin_changes_from_step(step, source.workspace.as_deref(), &mut notes);
+        if !plugin_changes.is_empty() {
+            let duration_ms = step_duration_ms(step);
+            for what in plugin_changes {
+                actions.push(ReceiptAction {
+                    seq: 0,
+                    turn: step.turn.clone(),
+                    at: step.started_at,
+                    call_id: step.call_id.clone(),
+                    tool: step.name.clone(),
+                    what,
+                    status: ActionStatus::Ok,
+                    duration_ms,
+                    approval,
+                    error: None,
+                });
+            }
+            if step.outcome == StepOutcome::Ok {
+                continue;
+            }
+        }
         let classified = classify(step, &mut notes);
         let is_command = matches!(classified, Classified::Listed(ActionKind::Command { .. }));
         let held_at_approval = approval.is_some_and(|fact| {
@@ -1826,14 +1992,7 @@ fn assemble(
         {
             agents.insert(agent_id.clone(), actions.len());
         }
-        let duration_ms = number(step.metadata.as_ref(), &["duration_ms"])
-            .and_then(|ms| u64::try_from(ms).ok())
-            .or_else(|| match (step.started_at, step.ended_at) {
-                (Some(start), Some(end)) if end >= start => {
-                    u64::try_from((end - start).num_milliseconds()).ok()
-                }
-                _ => None,
-            });
+        let duration_ms = step_duration_ms(step);
         actions.push(ReceiptAction {
             seq: 0,
             turn: step.turn.clone(),
@@ -2009,6 +2168,7 @@ fn assemble(
         turn: turn.map(str::to_string),
         postures,
         totals,
+        usage: None,
         actions,
         omitted_actions,
         not_recorded: notes.into_iter().collect(),
@@ -2021,6 +2181,7 @@ fn tally(actions: &[ReceiptAction], totals: &mut ReceiptTotals) {
     let mut created: BTreeSet<&str> = BTreeSet::new();
     let mut deleted: BTreeSet<&str> = BTreeSet::new();
     let mut outside: BTreeSet<&str> = BTreeSet::new();
+    let mut seen_approval_calls: BTreeSet<&str> = BTreeSet::new();
     for action in actions {
         let ran = !matches!(
             action.status,
@@ -2072,10 +2233,17 @@ fn tally(actions: &[ReceiptAction], totals: &mut ReceiptTotals) {
                     totals.plugin_calls += 1;
                 }
             }
+            ActionKind::PluginChange { .. } if ran => totals.plugin_changes += 1,
             ActionKind::Subagent { .. } if ran => totals.subagents += 1,
             _ => {}
         }
-        if let Some(fact) = action.approval {
+        if let Some(fact) = action.approval.filter(|_| {
+            action
+                .call_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .is_none_or(|id| seen_approval_calls.insert(id))
+        }) {
             let approvals = &mut totals.approvals;
             approvals.total += 1;
             match fact.decision {

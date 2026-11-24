@@ -28,6 +28,7 @@ const tuiLocaleDir = path.join(repoRoot, "crates", "tui", "locales");
 const promptPath = path.join(repoRoot, "crates", "tui", "src", "prompts", "text.rs");
 
 const STEMS = {
+  project: { exportName: "project", typeName: "ProjectDict" },
   features: { exportName: "features", typeName: "FeaturesDict" },
   "docs-skills": { exportName: "docsSkills", typeName: "DocsPageDict" },
   "docs-claude-code": { exportName: "docsClaudeCode", typeName: "DocsPageDict" },
@@ -48,6 +49,7 @@ const STEMS = {
   "docs-web": { exportName: "docsWeb", typeName: "DocsWebDict" },
   "docs-auth": { exportName: "docsAuth", typeName: "DocsAuthDict" },
   "docs-trust": { exportName: "docsTrust", typeName: "DocsTrustDict" },
+  "docs-first-time": { exportName: "docsFirstTime", typeName: "DocsFirstTimeDict" },
   states: { exportName: "states", typeName: "StatesDict" },
   changelog: { exportName: "changelog", typeName: "ChangelogDict" },
   "computer-use": { exportName: "computerUse", typeName: "ComputerUseDict" },

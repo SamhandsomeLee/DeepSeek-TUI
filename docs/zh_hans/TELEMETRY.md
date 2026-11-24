@@ -45,14 +45,16 @@ codewhale --telemetry false              # 同样的终止开关，仅对单条�
 
 | 文件 | 作用 |
 |---|---|
-| `buffer.jsonl` | 待处理事件，每行一个 JSON 对象 |
+| `spool/<nonce>.jsonl` | 单个进程的待发送事件。首行记录模式版本、告知版本、应用版本、发布提交、使用界面和终端状态，其余各行各存一个事件。 |
+| `spool/<nonce>.lock` | 进程运行时持有该锁。锁已释放表示进程已结束。 |
+| `buffer.jsonl` | 旧版本遗留的缓冲文件。客户端只清空它，不再写入或发送其中的内容。 |
 | `buffer.jsonl.lock` | 兄弟排序锁，写入、投递、启动和擦除共享 |
 | `dryrun.jsonl` | 端点配置为空时批次的去向 |
 | `state.json` | 上次看到的应用版本和上次的 flush 尝试 |
 | `install_id.json` | 随机安装 id 及其生成时间 |
 | `disabled` | tombstone；存在即表示不会追加或发送任何内容 |
 
-`buffer.jsonl` 和 `dryrun.jsonl` 都是环形缓冲，上限为 512 条记录或 256 KiB，先到先截，最旧的被丢弃。因此整个目录有记录的占用上限为 **512 KiB 加几百字节元数据**。
+文件名中的随机数仅用于本机，不会发送。每个进程的暂存文件和 `dryrun.jsonl` 各自最多保存 512 条记录（含首行）或 256 KiB，达到任一上限就丢弃最旧的事件。因此磁盘占用上限是每个运行中的进程 256 KiB，另加 `dryrun.jsonl` 的 256 KiB。每次启动 TUI、`exec` 或 `serve` 后，最多保留四个已结束进程的暂存文件，此外还有几百字节的元数据。
 
 安装 id 是一个随机的 v4 UUID。它绝不从你的主机名、MAC 地址、`machine-id`、主目录、用户名或可执行文件路径派生——派生的 id 就是设备指纹，重装后依然存在，并在你自己选择退出之后重新识别你。每当 `$CODEWHALE_HOME/telemetry/` 被清空时它都会重新生成（选择退出会自动清空），并且在任何情况下每 90 天轮换一次。
 
@@ -275,7 +277,7 @@ Codewhale 没有恢复出厂设置命令，因此本文档也不会声称有。
 
 本节曾是配置任何非回环端点的门槛。端点现在默认已配置，因此这是对已存在服务的描述，而不是对可能存在的服务的承诺。
 
-**它是什么。** `https://telemetry.codewhale.net/v1/telemetry` ——一个名为 `codewhale-telemetry-ingest` 的 Cloudflare Worker，其完整源码就在本仓库的 [`telemetry-ingest/`](../../telemetry-ingest/) 中。它是唯一的 schema 与存储权威；浏览器应用可使用只转发主体的同源代理。没有遥测队列或第二套运行时采集器。它只写：Worker 中没有任何东西能回读已存储的内容，查询通过 Cloudflare 的 SQL API、以所有者的令牌带外进行。主机名刻意自描述，因此任何检查自己网络流量的人光看名字就能知道它是什么。
+**它是什么。** `https://telemetry.codewhale.net/v1/telemetry` ——一个名为 `codewhale-telemetry-ingest` 的 Cloudflare Worker，其完整源码就在本仓库的 [`telemetry-ingest/`](../../telemetry-ingest/) 中。它是唯一的 schema 与存储权威；浏览器应用可使用只转发主体的同源代理。没有遥测队列或第二套运行时采集器。它只写：Worker 中没有任何东西能回读已存储的内容，查询带外进行：所有者用令牌访问 Cloudflare 的 SQL API，或通过独立的私有 [`telemetry-stats/`](../../telemetry-stats/) Worker，它经账户绑定就地读取数据集，不使用令牌。主机名刻意自描述，因此任何检查自己网络流量的人光看名字就能知道它是什么。
 
 **它存储什么。** 本文档中的一切，仅此而已，存放在 Workers Analytics Engine——每个事件一行。`telemetry-ingest/src/schema.ts` 中的校验器是一个**封闭**字段集：批次任意位置的未知键都会以 `400` 拒绝整个批次。未来某个客户端 bug 开始附带路径、提示词或提供商表名时，会被服务器拒绝，而不是被悄悄存储。`telemetry-ingest/test/schema-doc.test.ts` 会从*本文件*中解析出字段名和枚举拼写，并断言与校验器的集合相等；`telemetry-ingest/test/ingest.test.ts` 会发布 Rust 客户端自己钉住的 golden 批次，并断言它被逐字节接受——因此本文档、客户端和端点不会在没有红色测试的情况下彼此漂移。
 
@@ -288,7 +290,7 @@ Codewhale 没有恢复出厂设置命令，因此本文档也不会声称有。
 - 限流以校验过主体中的 `install_id` 为键，绝不基于网络地址。按 IP 键控的限流器意味着这个 Worker 要处理 IP。它是更弱的限流器，也是正确的取舍。
 - `telemetry-ingest/test/no-ip.test.ts` 将已发布的源码作为文本读取，如果出现任何地址或地理名称、读取的头集合增长到两个以上、新增 `console.*` 调用，或构造带主体的 `Response`，构建就会失败。
 
-**保留期：三个月。** 这是 Analytics Engine 的固定窗口，不可配置，因此它是上限而非策略——没有任何设置能让它更长。
+**保留期：三个月。** 这是 Analytics Engine 的固定窗口，不可配置，因此它是上限而非策略——没有任何设置能让它更长。与只写的采集 Worker 分开，所有者运行一个受 Cloudflare Access 保护的私有统计页面，直接从 Analytics Engine 读取并只展示聚合图表（绝不显示安装 id），另有每日汇总任务把不含安装 id 的每日总数保存在我们自己的 Cloudflare 存储中、超过三个月，而原始行仍在三个月后过期。
 
 **可选 PostHog 数据处理方。** 第一方存储完成后，明确配置的采集服务可把已验证的 schema-v3 / notice-v5 批次及保留原有含义的 schema-v2 / consent-v4 批次发往 [PostHog 批量采集 API](https://posthog.com/docs/api/capture)。只允许 `https://us.i.posthog.com` 和 `https://eu.i.posthog.com`；v1 批次永不进入此路径。PostHog 接收相同的有限字段，以批次时间作为事件时间，以 `codewhale:<install_id>` 作为匿名 `distinct_id`；事件名分别为 `codewhale_install_or_upgrade`、`codewhale_session_start`、`codewhale_session_end`、`codewhale_panic`、`codewhale_product_usage` 或 `codewhale_operations_summary`。固定设置 `$process_person_profile = false`、`$geoip_disable = true`、`$ip = null`。不转发请求元数据、身份识别、自动采集、会话回放、广告或工作内容，不添加 SDK。全新的服务端请求不携带用户 cookie 或身份验证头，不跟随重定向，限时 1.5 秒，不重试、不记录日志；处理方失败不改变已成功的第一方响应。
 
@@ -304,7 +306,7 @@ PostHog 项目的保留期限和隐私设置是单独的部署配置，启用前
 
 ### 所有者回读的内容——观察到的活跃安装数
 
-从这些数据推导出的唯一产品指标是**观察到的活跃安装数（observed active installs）**：在一个 UTC 日内产生 `session_start` 事件的不同轮换匿名安装 id 的数量。这就是全部定义。它不是人数、不是账户数、也不是安装总数——id 按安装存在，每 90 天轮换，选择退出时被删除，因此任何由它推导出的数字都不可能是这些。
+从这些数据推导出的首要产品指标是**观察到的活跃安装数（observed active installs）**：在一个 UTC 日内产生 `session_start` 事件的不同轮换匿名安装 id 的数量。这就是该指标的全部定义。它不是人数、不是账户数、也不是安装总数——id 按安装存在，每 90 天轮换，选择退出时被删除，因此任何由它推导出的数字都不可能是这些。私有统计页还会绘制按版本、界面（surface）和操作系统（OS）划分的活跃安装数和会话数，聚合的回合数与工具调用数，按工具统计的工具调用数与错误数，按提供商和目录模型统计的模型回合与令牌，以及原生与网站漏斗；见 [`telemetry-stats/README.md`](../../telemetry-stats/README.md)。
 
 所有者的确切命令已签入仓库，因此例行查询是可审阅的代码，而不是从聊天里粘贴的 SQL：
 
@@ -322,3 +324,118 @@ CF_ACCOUNT_ID=... CF_API_TOKEN=... npm run report:active-installs
 给实现者的两个具名陷阱。`crates/state/src/lib.rs` 在线程表上持久化 `git_sha`、`git_branch`、`git_origin_url`、`cwd` 和 `path`（`:93, :399, :653`）：一个接受 `Thread` 或 `ThreadMeta` 并 `derive(Serialize)` 的 payload 构建器一行就违反契约。**绝不在现有状态类型上派生 `Serialize`**——从零开始、用显式字段构建每个遥测结构体。而 `crates/core/src/lib.rs:1389-1398` 是整棵树中 `telemetry` 一词与 `prompt`、`base_url`、`has_api_key` 同处一个 JSON 对象的唯一位置。它是某人会复制的那一个对象。不要复制。
 
 ---
+
+## 源码候选版本的网站漏斗聚合统计
+
+网站扩展使用 `FUNNEL_SCHEMA_VERSION = 5` 和告知版本 `7`。Rust 运行时仍使用
+`SCHEMA_VERSION = 4`、告知版本 `6`；现有浏览器 schema `3`、告知版本 `5`，以及
+旧 schema `1` 和 `2` 均保留原有约定。显示新版告知不会覆盖退出选择，也不代表
+用户接受。Schema 5 仅进入第一方采集，不会启用 PostHog。
+
+Schema 5 的批次保持原有十二个字段。`surface` 必须是 `website`，`git_sha` 为 null，
+`os` 和 `arch` 为 `other`，`libc` 为 `none`，`tty` 为 false。一个批次包含一至
+200 个聚合事件，每个事件只能是保留原有十三个计数器的 `product_usage`，或新增
+的 `funnel_usage`。下面十四个计数器全部必填，且只能是无符号 32 位整数。
+未知字段或越界值会使整个批次被拒绝。此 JSON 仅属于网站扩展，并非新增的
+Rust 运行时事件。
+
+```json
+{
+  "event": "funnel_usage",
+  "counters": {
+    "home_view": 0,
+    "install_view": 0,
+    "quickstart_view": 0,
+    "contribute_view": 0,
+    "install_intent": 0,
+    "install_confirmed": 0,
+    "star_exit": 0,
+    "issue_exit": 0,
+    "help_wanted_exit": 0,
+    "guide_exit": 0,
+    "docs_search": 0,
+    "docs_search_empty": 0,
+    "docs_search_result": 0,
+    "quickstart_confirmed": 0
+  }
+}
+```
+
+前四个计数器统计固定页面类别。`install_intent` 统计成功复制安装命令的操作。
+`install_confirmed` 统计读者运行版本检查后明确确认的操作；`quickstart_confirmed`
+统计读者对照引用文件行检查回答后明确确认的操作。这些都是用户自报的交互，
+不证明实际安装、模型执行或结果有用。四个出口计数器统计前往 GitHub Star、
+issue、help wanted 工作和贡献指南的链接操作。三个搜索计数器统计搜索、无结果
+和选中结果的操作，不发送搜索文本或结果网址。
+
+不新增页面网址、查询、语言标识、来源、账号、工作内容、凭据或网站与 CLI
+关联标识。网站和运行时的轮换 ID 保持独立，报告不会将两者关联。现有退出机制、
+有上限的本地存储、不重试投递和网站隐私控制仍然适用。计数并非独立访客数：
+重复操作可能重复计数，丢弃的投递可能丢失数据，采集服务也不保证恰好一次或
+重放去重。
+
+`telemetry-ingest/schema/website-funnel-v5.schema.json` 从现有校验器生成。
+Analytics Engine 使用原有聚合 JSON 列保存这些计数，二十个位置列保持不变。
+旧 schema 3/4 的产品计数保留为独立历史序列，不能悄悄改成新漏斗指标。
+
+### 安装和任务指标能够证明什么
+
+安装程序只在本地写入带校验和的 `.codewhale-install.sha256` 回执，不发送安装
+完成事件。运行时的 `install_or_upgrade`、`kind=install` 记录启用遥测状态的首次
+初始化；旧安装在重新开启统计或丢失本地状态后也可能出现此记录。因此它只是
+观察到的启动代理指标，不代表全部安装或人数。
+
+运行时 `model_usage` 的 `turns_ok > 0` 表明观察到模型回合技术性完成，不证明
+用户首次主任务完成或结果有用。提供商未上报用量的回复可能被省略，同进程子任务
+可能计入，当前实现的计数后也可能发生晚到的取消。批次时间是投递时间而非任务
+准确发生时间。报告说明这些局限，并将浏览器中的自报确认单列。
+
+维护者报告使用现有第一方 Analytics Engine 行或明确标注的离线回执。运行时群组
+仅使用运行时 ID 和足够的后续观察历史；历史不完整时显示不可用，而不是零。
+GitHub 首个公开 issue 和首个已合并 PR 群组使用另外的完整公开历史导出，只输出
+聚合结果。不作访客归因，也不向遥测发送 GitHub 身份。
+
+### 部署仍是独立操作
+
+这些约定和本地测试只是源码候选版本证据，不证明采集器已配置、已部署、已接收
+生产流量或转化有所改善。获得明确部署授权后，先部署向后兼容的采集服务，再让
+网站发送 schema 5。旧采集服务会拒绝 schema 5；即使网站转发路由返回 HTTP 200，
+客户端也必须将 `{ accepted: false }` 视为未接收。本文档和本地测试通过均不授权部署。
+
+### 使用维护者报告，不改变采集行为
+
+以下命令在 `telemetry-ingest/` 中运行。离线夹具明确标记为合成数据，只验证报告
+计算，不代表真实流量：
+
+```sh
+npm run report:funnel -- --input test/golden/funnel-report-synthetic.json
+npm run report:contributions -- --input test/golden/contributions-synthetic.json
+npm run report:funnel -- --sql --from 2026-10-01T00:00:00Z --to 2026-11-01T00:00:00Z
+```
+
+不传 `--input` 或 `--sql` 时，漏斗报告通过现有的 `CF_ACCOUNT_ID` 和
+`CF_API_TOKEN` 查询现有 Analytics Engine SQL API，不写入凭据，也不部署。
+日期使用 UTC，`--from` 包含起点，`--to` 不包含终点，默认覆盖此前 30 个完整
+UTC 日。查询达到行数上限时会失败，不会把截断结果当作完整数据。`--sql` 只输出
+查询计划，不读取凭据或访问网络。本地测试不证明查询已经通过托管 SQL 服务验证。
+
+离线格式为 `codewhale-funnel-receipt-v1`，包含明确的 `source`、带 `from`、
+`to`、`complete` 和 `accepted_only` 的 `coverage`，以及 `website_rows` 和
+`native_rows`。合成夹具展示规范化格式，本地原始缓冲不能当作已接收流量。
+报告输出来源、范围、新鲜度、计数和局限，不输出内部使用的运行时轮换 ID。
+
+网站输出只有固定交互计数，不会将全站安装命令复制数除以安装页浏览数，也不作
+因果推断。运行时的七日后续观察独立计算：分母为出现
+`install_or_upgrade(kind=install)` 且报告截止前已有完整七日观察期的不同运行时
+ID；分子为其中在该观察期内出现 `model_usage(turns_ok > 0)` 的 ID。
+运行时数据有抽样、覆盖不完整或没有合格群组时，比例显示为不可用，而不是零。
+任何观察到 CI 启动的 ID 都会整体排除，因为聚合模型行不能分配给具体会话。
+此比例既不是人的留存率，也不是网站转化率。
+
+不传 `--input` 时，贡献报告通过维护者现有登录状态的 `gh` CLI 读取标准公开
+仓库。它先确认仓库公开，再在每个端点最多 100 页的范围内读取全部 issue 和 PR；
+若分页未结束，就拒绝生成群组报告。报告按公开作者分别计算最早 issue 创建和
+最早 PR 合并，排除机器人和已删除作者，只输出每日聚合计数。它不会将 GitHub
+可变的首次贡献徽章当作历史证据。`--from` 和 `--to` 过滤的是计算后的群组，而非
+确立首次记录所需的历史。不输出公开作者账号或 API 响应内容，也不向遥测发送。
+完整的可访问导出仍无法恢复已删除的历史，也不是原子快照。

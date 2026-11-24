@@ -159,6 +159,30 @@ Next: [INSTALL.md](INSTALL.md) covers platform-specific install paths,
 
 ## 3. Your First Task
 
+For a bounded first task, open an existing project folder and launch Codewhale:
+
+```bash
+cd /path/to/your/project
+codewhale
+```
+
+Replace `/path/to/your/project` with your folder. Choose Plan, then paste this
+into the message box:
+
+```text
+Read one source file in this project and explain what it does. Cite its file
+path and the lines that support your explanation. Do not edit files or run
+commands.
+```
+
+The model receives the file content it needs to answer. Open the cited file
+yourself and compare the cited lines with the explanation. This task is
+complete when you can confirm what the file does and the cited evidence
+supports the answer. Ask about any mismatch. If setup fails or no reply
+arrives, follow [the troubleshooting steps](INSTALL.md#13-troubleshooting).
+You can configure a Fleet after this; it is not required for your first task.
+
+
 Start with a read-only task in a real workspace:
 
 ```text
@@ -370,9 +394,9 @@ For trusted workspaces where you intentionally want actions to proceed without
 approval prompts, select the Full Access permission posture with `Shift+Tab`.
 Do not use Full Access in a repository you do not trust.
 
-Modes are separate from model routing. `Tab` cycles visible modes when the
-composer is idle, while `/model auto` controls model and thinking selection for
-turns.
+Modes are separate from model routing. The `Shift+Tab` permission dial steps
+Ask → Accept Edits → Plan → Auto-Review → Full Access, while `/model auto`
+controls model and thinking selection for turns.
 
 You can also change approval behavior from `/config` by editing the approval
 mode. Use this only when you understand how it changes tool execution.
@@ -399,7 +423,11 @@ Common commands for first-time users:
 | `/workflow` | Orchestrate the current work as a Workflow; `status`, `cancel`, `settings` answer without a model turn |
 | `/workflows` | Open the live Workflow run dashboard: every run this workspace's journal keeps, with phases, children, progress, and host-side cancel |
 | `/config` | Edit runtime and provider settings |
+| `/settings` | Open the typed settings editor; `/settings text` prints the resolved values |
 | `/statusline` | Choose which footer status chips are visible |
+| `/anchor` | Pin a fact that stays when Codewhale makes room; `/anchor list` and `/anchor remove <n>` manage pins |
+| `/structcopy` | Copy one session object (`turn <n>`, `tool <call-id>`, `plan`, `workflow <run-id>`) as redacted JSON |
+| `/remote-env` | Show hosted Work options; `/remote-env open` opens new hosted Work from a GitHub or CNB branch tip |
 | `/color` | Give this chat's composer box its own color: bare `/color` cycles red, orange, amber, green, cyan, blue, purple and pink, `/color blue` picks one, `/color off` returns to the theme |
 | `/receipts` | List what this session did: files changed, commands run, web and MCP calls, agents, approvals and who gave them, failures |
 | `/compact` | Summarize long context to recover token budget |
@@ -657,7 +685,7 @@ Use skills when a task has a repeatable process:
 - Using a project-specific memory or wiki workflow.
 
 Inside the TUI, `/skill <name>` activates a skill when one is available, and
-bare `/skills` opens Extensions → Skills (owned-only inventory, no network).
+bare `/skills` opens Plugins → Skills (owned-only inventory, no network).
 Use `/skills manage` for the manager and
 `/skills <prefix>`, `/skills inspect`, `/skills --remote`, `/skills suggest <task>`,
 or `/skills sync` for the text/registry paths. Suggestions rank the remote
@@ -790,6 +818,16 @@ attached to the project you opened. Press `a` in the picker to show sessions
 from every workspace, or run `codewhale sessions` to list all saved sessions
 with last-updated timestamps before resuming a specific id.
 
+If you move or rename a project folder, update saved sessions, recovery
+checkpoints, and Runtime thread bindings together before resuming:
+
+```sh
+codewhale sessions migrate --old-path /path/to/old-project --new-path /path/to/new-project
+```
+
+Pass `--dry-run` to preview affected records, or `--session <id>` to migrate
+one session.
+
 To archive the durable record and its artifacts, run:
 
 ```sh
@@ -817,8 +855,8 @@ To continue the exact running session from the web app, type `/rc` or launch
 with `codewhale rc`. Approve the one-time code in the system browser. While the
 lease is active, the browser owns new prompts and approvals and the terminal is
 a readable safety surface. Once connected, the banner and a transcript note
-show the live session link (`https://app.codewhale.net/session?run=…`);
-`/rc open` opens it in your browser and `/rc link` prints it. `/rc status`
+show the live session link; `/rc open` opens it in your browser and `/rc link`
+prints it. The hosted browser app at app.codewhale.net is not open yet. `/rc status`
 shows ownership, `/rc stop` returns it to the terminal, and interrupt remains
 available. A dropped connection keeps local input locked until the last web
 lease expires so two controllers never race. Every folder you enroll from one
@@ -829,11 +867,10 @@ If remote control fails, the reason remains in the current terminal transcript
 and TUI log after the error toast expires. The footer then shows `/rc status`;
 run it to inspect the failure and whether retrying must wait for a prior lease.
 
-> Note (2026-09-14): the hosted web app at app.codewhale.net sunsets in phases
-> under the 2026-09-14 product-client decision; the native GPUI desktop app
-> (private `codehwhale-gpui` repo, phase map in `docs/TRANSITION.md`) is the
-> successor surface. `/rc` keeps working against the web app while it remains
-> live.
+> Note: the hosted browser app at app.codewhale.net is not open yet. The
+> desktop app (Electron and React, a development build) is the client being
+> built. The local browser client, `codewhale web`, is released and needs no
+> account.
 
 ### What should I do when the model gets confused?
 

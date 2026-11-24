@@ -8,14 +8,11 @@ import type { ChromeDict } from "../types";
  */
 export const chrome: ChromeDict = {
   navDocs: "Documentação",
-  navStart: "Começar",
-  navInstall: "Instalar",
-  navFaq: "Dúvidas",
-  navCommunity: "Comunidade",
   navContribute: "Contribuir",
+  navSignIn: "Entrar",
+  navDesktop: "Desktop",
 
   navFeatures: "Capacidades",
-  navProduct: "Produto",
   navModels: "Modelos",
   navPlugins: "Plugins",
 
@@ -30,6 +27,7 @@ export const chrome: ChromeDict = {
 
   menuOpen: "Abrir menu",
   menuClose: "Fechar menu",
+  translationMachineDraft: "Esta tradução é um rascunho automático que ainda não foi revisado por um falante nativo.",
 
   themeAuto: "auto",
   themeLight: "claro",
@@ -37,19 +35,17 @@ export const chrome: ChromeDict = {
   themeAria: "Tema: {mode} (clique para alternar)",
   themeTitle: "Tema · auto / claro / escuro",
 
-  footerTagline:
-    "O agente de programação de código aberto para seu terminal e os modelos que você escolher.",
   footerProduct: "Produto",
   footerProject: "Projeto",
   footerDocs: "Documentação",
   footerGuide: "Primeiros passos",
   footerInstall: "Instalação",
   footerModels: "Modelos",
-  footerRuntime: "Runtime",
   footerFaq: "Perguntas frequentes",
-  footerIssues: "Issues",
   footerContribute: "Contribuir",
+  footerRoadmap: "Roadmap",
   footerLicense: "Licença MIT",
+  footerMerch: "Produtos",
   footerTerms: "Termos de serviço",
   footerPrivacy: "Privacidade",
   footerChangelog: "Registro de alterações",
@@ -57,8 +53,25 @@ export const chrome: ChromeDict = {
   footerReleases: " · Lançamentos: ",
   footerReleasesLink: "Lançamentos no GitHub",
   footerSecurity: "Segurança",
+  footerLegal: "Legal",
 
   switcherLabel: "Idioma",
   switcherSwitchTo: "Mudar para {label}",
   partialBadge: "(parcial)",
+
+  stateReleased: "Lançado",
+  stateAvailable: "Disponível",
+  stateBeta: "Beta",
+  stateDev: "Versão de desenvolvimento",
+  stateOpen: "Aberto",
+  stateInviteOnly: "Somente por convite",
+  stateNotOpen: "Ainda não aberto",
+  stateNotPublic: "Não público",
+  stateInSource: "No código-fonte, ainda não lançado",
+  numbersAsOf: "Em {date}",
+  downloadMacos: "Baixar para macOS",
+  downloadVersion: "Versão {version}",
+  downloadSize: "Tamanho {size}",
+  downloadChecksum: "Soma de verificação SHA-256",
+  downloadSigned: "Assinado e notarizado",
 };

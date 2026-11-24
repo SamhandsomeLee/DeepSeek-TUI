@@ -1,207 +1,34 @@
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::Duration;
 
 use axum::Json;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::task::JoinSet;
 
-const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
-const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_CONCURRENT_PROBES: usize = 4;
+static PROBES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_PROBES);
 const MAX_PROBE_LINE_BYTES: usize = 256 * 1024;
 const MAX_TEXT_CHARS: usize = 80;
 const MAX_AUTH_METHODS: usize = 8;
+const PROBE_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+const SILENT_HANDSHAKE: &str = "It did not answer the Agent Client Protocol handshake.";
 
-struct Agent {
-    id: &'static str,
-    name: &'static str,
-    binary: &'static str,
-    acp_args: Option<&'static [&'static str]>,
-    website: &'static str,
-    min_version: Option<&'static str>,
-    upgrade: Option<&'static str>,
-    login: Option<&'static str>,
-    adapter: Option<&'static str>,
-}
+use codewhale_engine::fleet::agents::{
+    AGENTS, AgentQuota, CustomExternalAgent, ExecutorUnavailable, ExternalAgent, QuotaGate,
+    QuotaSource, QuotaUnknown, below_minimum, cli_version_with_env, custom_agents, foreign_command,
+    local_signin_quota, not_installed, resolve, resolve_custom_binary,
+};
+use codewhale_runtime::process_tree::ProcessTree;
+use codewhale_runtime::settings::{AgentSettings, Settings};
 
-const AGENTS: &[Agent] = &[
-    Agent {
-        id: "claude",
-        name: "Claude Agent",
-        binary: "claude",
-        acp_args: None,
-        website: "https://github.com/agentclientprotocol/claude-agent-acp",
-        min_version: Some("2.1.226"),
-        upgrade: Some("npm i -g @anthropic-ai/claude-code@latest"),
-        login: Some("claude auth login"),
-        adapter: Some("@agentclientprotocol/claude-agent-acp"),
-    },
-    Agent {
-        id: "codex",
-        name: "Codex",
-        binary: "codex",
-        acp_args: None,
-        website: "https://github.com/agentclientprotocol/codex-acp",
-        min_version: Some("0.160.0"),
-        upgrade: Some("npm i -g @openai/codex@latest"),
-        login: Some("codex login"),
-        adapter: Some("@agentclientprotocol/codex-acp"),
-    },
-    Agent {
-        id: "dsh",
-        name: "DeepSeek Harness",
-        binary: "dsh",
-        acp_args: Some(&["acp"]),
-        website: "https://github.com/deepseek-ai/deepseek-harness",
-        min_version: None,
-        upgrade: Some("npm i -g @deepseek-ai/dsh@latest"),
-        login: None,
-        adapter: None,
-    },
-    Agent {
-        id: "gemini",
-        name: "Gemini CLI",
-        binary: "gemini",
-        acp_args: Some(&["--acp"]),
-        website: "https://geminicli.com",
-        min_version: Some("0.62.0"),
-        upgrade: Some("npm i -g @google/gemini-cli@latest"),
-        login: None,
-        adapter: None,
-    },
-    Agent {
-        id: "opencode",
-        name: "OpenCode",
-        binary: "opencode",
-        acp_args: Some(&["acp"]),
-        website: "https://opencode.ai",
-        min_version: Some("1.15.5"),
-        upgrade: Some("npm i -g opencode-ai@latest"),
-        login: Some("opencode auth login"),
-        adapter: None,
-    },
-    Agent {
-        id: "kimi",
-        name: "Kimi Code",
-        binary: "kimi",
-        acp_args: Some(&["acp"]),
-        website: "https://moonshotai.github.io/kimi-code/",
-        min_version: None,
-        upgrade: None,
-        login: Some("kimi login"),
-        adapter: None,
-    },
-    Agent {
-        id: "mistral-vibe",
-        name: "Mistral Vibe",
-        binary: "vibe-acp",
-        acp_args: Some(&[]),
-        website: "https://mistral.ai/products/vibe",
-        min_version: None,
-        upgrade: None,
-        login: None,
-        adapter: None,
-    },
-    Agent {
-        id: "qoder",
-        name: "Qoder",
-        binary: "qodercli",
-        acp_args: Some(&["--acp"]),
-        website: "https://qoder.com",
-        min_version: None,
-        upgrade: None,
-        login: None,
-        adapter: None,
-    },
-    Agent {
-        id: "codebuddy",
-        name: "CodeBuddy",
-        binary: "codebuddy",
-        acp_args: Some(&["--acp"]),
-        website: "https://www.codebuddy.cn/cli/",
-        min_version: None,
-        upgrade: None,
-        login: None,
-        adapter: None,
-    },
-    Agent {
-        id: "grok",
-        name: "Grok",
-        binary: "grok",
-        acp_args: Some(&["agent", "stdio"]),
-        website: "https://x.ai/cli",
-        min_version: None,
-        upgrade: None,
-        login: None,
-        adapter: None,
-    },
-];
-
-const USER_BIN_DIRS: &[&str] = &[
-    ".local/bin",
-    ".npm-global/bin",
-    ".opencode/bin",
-    ".kimi-code/bin",
-    ".bun/bin",
-    ".cargo/bin",
-];
-const SYSTEM_BIN_DIRS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin"];
-
-async fn resolve(binary: &str) -> Option<PathBuf> {
-    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).collect())
-        .unwrap_or_default();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        dirs.extend(USER_BIN_DIRS.iter().map(|dir| home.join(dir)));
-    }
-    dirs.extend(SYSTEM_BIN_DIRS.iter().map(PathBuf::from));
-    for dir in dirs {
-        let candidate = dir.join(binary);
-        if is_executable(&candidate).await {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-#[cfg(unix)]
-async fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    tokio::fs::metadata(path)
-        .await
-        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(not(unix))]
-async fn is_executable(path: &Path) -> bool {
-    tokio::fs::metadata(path)
-        .await
-        .is_ok_and(|meta| meta.is_file())
-}
-
-fn foreign_command(path: &Path, args: &[&str]) -> Command {
-    let mut command = Command::new(path);
-    command
-        .args(args)
-        .current_dir(std::env::temp_dir())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    for (name, _) in std::env::vars_os() {
-        let Some(name) = name.to_str() else { continue };
-        if name.starts_with("CODEWHALE_")
-            || name.ends_with("_API_KEY")
-            || name.ends_with("_AUTH_TOKEN")
-            || name.ends_with("_ACCESS_KEY")
-            || name.ends_with("_SECRET_KEY")
-        {
-            command.env_remove(name);
-        }
-    }
-    command
+#[derive(Debug)]
+enum Handshake {
+    Answered(Value),
+    Refused(String),
+    Silent,
 }
 
 fn clean(text: &str) -> String {
@@ -213,30 +40,20 @@ fn clean(text: &str) -> String {
         .to_string()
 }
 
-fn version_token(text: &str) -> Option<String> {
-    text.split(|ch: char| ch.is_whitespace() || ch == '(' || ch == ')' || ch == ',')
-        .map(|token| token.trim_start_matches('v'))
-        .find(|token| {
-            token.chars().next().is_some_and(|ch| ch.is_ascii_digit()) && token.contains('.')
-        })
-        .map(clean)
-}
-
-async fn cli_version(path: &Path) -> Option<String> {
-    let mut command = foreign_command(path, &["--version"]);
-    command.stdin(Stdio::null());
-    let output = tokio::time::timeout(VERSION_TIMEOUT, command.output())
-        .await
-        .ok()?
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    version_token(text.lines().next().unwrap_or_default())
-}
-
-async fn acp_initialize(path: &Path, args: &[&str]) -> Option<Value> {
-    let mut child = foreign_command(path, args).spawn().ok()?;
-    let mut stdin = child.stdin.take()?;
-    let stdout = child.stdout.take()?;
+async fn acp_initialize(path: &Path, args: &[&str], env: &BTreeMap<String, String>) -> Handshake {
+    let mut command = foreign_command(path, args);
+    command.envs(env);
+    #[cfg(unix)]
+    command.process_group(0);
+    let Ok(mut child) = command.spawn() else {
+        return Handshake::Silent;
+    };
+    let Ok(tree) = ProcessTree::attach_tokio(&child) else {
+        return Handshake::Silent;
+    };
+    let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        return Handshake::Silent;
+    };
     let request = json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -256,30 +73,55 @@ async fn acp_initialize(path: &Path, args: &[&str]) -> Option<Value> {
     });
     let mut line = request.to_string();
     line.push('\n');
-    stdin.write_all(line.as_bytes()).await.ok()?;
-    stdin.flush().await.ok()?;
-    let mut lines = BufReader::new(stdout).lines();
-    let reply = tokio::time::timeout(PROBE_TIMEOUT, async {
+    let mut lines = crate::stdio::BoundedLines::new(BufReader::new(stdout));
+    let handshake = tokio::time::timeout(PROBE_TIMEOUT, async {
+        if stdin.write_all(line.as_bytes()).await.is_err() || stdin.flush().await.is_err() {
+            return Handshake::Silent;
+        }
         while let Ok(Some(line)) = lines.next_line().await {
             if line.len() > MAX_PROBE_LINE_BYTES {
-                return None;
+                return Handshake::Refused(
+                    "It answered the Agent Client Protocol handshake with a line larger than Codewhale reads."
+                        .to_string(),
+                );
             }
             let Ok(message) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
-            if message.get("id") == Some(&json!(1)) {
-                return message.get("result").cloned();
+            if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+                return Handshake::Refused(
+                    "It answered without JSON-RPC 2.0, which the Agent Client Protocol requires."
+                        .to_string(),
+                );
             }
+            if message.get("id") != Some(&json!(1)) {
+                continue;
+            }
+            let Some(result) = message.get("result") else {
+                return Handshake::Refused(
+                    "It refused the Agent Client Protocol handshake.".to_string(),
+                );
+            };
+            return match result.get("protocolVersion").and_then(Value::as_u64) {
+                Some(1) => Handshake::Answered(result.clone()),
+                Some(version) => Handshake::Refused(format!(
+                    "It speaks Agent Client Protocol version {version}; Codewhale drives version 1."
+                )),
+                None => Handshake::Refused(
+                    "It answered the Agent Client Protocol handshake without a protocol version."
+                        .to_string(),
+                ),
+            };
         }
-        None
+        Handshake::Silent
     })
     .await
-    .ok()
-    .flatten();
+    .unwrap_or(Handshake::Silent);
     drop(stdin);
+    drop(tree);
     let _ = child.start_kill();
-    let _ = child.wait().await;
-    reply
+    let _ = tokio::time::timeout(PROBE_REAP_TIMEOUT, child.wait()).await;
+    handshake
 }
 
 fn auth_methods(result: &Value) -> Vec<Value> {
@@ -307,25 +149,6 @@ fn auth_methods(result: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-fn parsed_version(text: &str) -> Option<semver::Version> {
-    let core: String = text
-        .trim_start_matches('v')
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit() || *ch == '.')
-        .collect();
-    semver::Version::parse(core.trim_end_matches('.')).ok()
-}
-
-fn needs_update(version: Option<&str>, minimum: Option<&str>) -> bool {
-    match (
-        version.and_then(parsed_version),
-        minimum.and_then(parsed_version),
-    ) {
-        (Some(found), Some(floor)) => found < floor,
-        _ => false,
-    }
-}
-
 fn clean_kind(kind: &str) -> &'static str {
     if kind == "terminal" {
         "terminal"
@@ -334,7 +157,85 @@ fn clean_kind(kind: &str) -> &'static str {
     }
 }
 
-async fn describe(agent: &'static Agent) -> Value {
+async fn describe_custom(agent: CustomExternalAgent) -> Value {
+    let Some(path) = resolve_custom_binary(&agent.binary).await else {
+        return json!({
+            "id": agent.id,
+            "name": agent.name,
+            "state": "not_installed",
+            "version": null,
+            "acp": null,
+            "auth_methods": [],
+            "website": agent.website,
+            "min_version": null,
+            "upgrade": null,
+            "login": null,
+            "adapter": null,
+            "adapter_installed": false,
+            "needs_update": false,
+            "runnable": false,
+            "depth": null,
+            "auth_status": "unknown",
+            "custom": true,
+            "reason_code": ExecutorUnavailable::NOT_INSTALLED,
+            "reason": format!("{} (`{}`) is not installed.", agent.name, agent.binary),
+        });
+    };
+    let arg_refs: Vec<&str> = agent.args.iter().map(String::as_str).collect();
+    let _permit = PROBES.acquire().await;
+    let (version, handshake) = tokio::join!(
+        cli_version_with_env(&path, &agent.env),
+        acp_initialize(&path, &arg_refs, &agent.env),
+    );
+    let (initialized, refusal) = match handshake {
+        Handshake::Answered(result) => (Some(result), None),
+        Handshake::Refused(reason) => (None, Some(reason)),
+        Handshake::Silent => (None, None),
+    };
+    let acp = if initialized.is_some() {
+        "native"
+    } else {
+        "unreachable"
+    };
+    let reported = initialized
+        .as_ref()
+        .and_then(|result| result.pointer("/agentInfo/version"))
+        .and_then(Value::as_str)
+        .map(clean);
+    let version = version.or(reported);
+    let runnable = acp == "native";
+    let (reason_code, reason) = if runnable {
+        (None, None)
+    } else {
+        (
+            Some(ExecutorUnavailable::NO_ACP),
+            Some(refusal.unwrap_or_else(|| SILENT_HANDSHAKE.to_string())),
+        )
+    };
+    json!({
+        "id": agent.id,
+        "name": agent.name,
+        "state": "installed",
+        "needs_update": false,
+        "min_version": null,
+        "upgrade": null,
+        "login": null,
+        "adapter": null,
+        "version": version,
+        "acp": acp,
+        "auth_methods": initialized.as_ref().map(auth_methods).unwrap_or_default(),
+        "website": agent.website,
+        "adapter_installed": false,
+        "runnable": runnable,
+        "depth": if runnable { "driven" } else { "observed" },
+        "auth_status": "unknown",
+        "custom": true,
+        "reason_code": reason_code,
+        "reason": reason,
+    })
+}
+
+async fn describe(agent: &'static ExternalAgent) -> Value {
     let Some(path) = resolve(agent.binary).await else {
         return json!({
             "id": agent.id,
@@ -348,16 +249,37 @@ async fn describe(agent: &'static Agent) -> Value {
             "upgrade": agent.upgrade,
             "login": agent.login,
             "adapter": agent.adapter,
+            "adapter_installed": false,
             "needs_update": false,
             "runnable": false,
+            "depth": null,
+            "auth_status": "unknown",
+            "reason_code": ExecutorUnavailable::NOT_INSTALLED,
+            "reason": not_installed(agent).message,
         });
     };
-    let (version, initialized) = tokio::join!(cli_version(&path), async {
-        match agent.acp_args {
-            Some(args) => acp_initialize(&path, args).await,
-            None => None,
+    let env = agent.process_env();
+    let _permit = PROBES.acquire().await;
+    let (version, handshake, adapter_installed) = tokio::join!(
+        cli_version_with_env(&path, &env),
+        async {
+            match agent.acp_args {
+                Some(args) => acp_initialize(&path, args, &env).await,
+                None => Handshake::Silent,
+            }
+        },
+        async {
+            match agent.adapter_binary {
+                Some(binary) => resolve(binary).await.is_some(),
+                None => false,
+            }
         }
-    });
+    );
+    let (initialized, refusal) = match handshake {
+        Handshake::Answered(result) => (Some(result), None),
+        Handshake::Refused(reason) => (None, Some(reason)),
+        Handshake::Silent => (None, None),
+    };
     let acp = match (&initialized, agent.acp_args) {
         (Some(_), _) => "native",
         (None, Some(_)) => "unreachable",
@@ -368,12 +290,48 @@ async fn describe(agent: &'static Agent) -> Value {
         .and_then(|result| result.pointer("/agentInfo/version"))
         .and_then(Value::as_str)
         .map(clean);
-    let version = reported.or(version);
+    let version = version.or(reported);
+    let needs_update = below_minimum(version.as_deref(), agent.min_version);
+    let runnable = !needs_update && (acp == "native" || (acp == "adapter" && adapter_installed));
+    let (reason_code, reason) = if needs_update {
+        (
+            Some(ExecutorUnavailable::BELOW_MIN_VERSION),
+            Some(format!(
+                "Version {} is installed; Codewhale needs {} or newer to drive it.",
+                version.as_deref().unwrap_or("unknown"),
+                agent.min_version.unwrap_or("a newer one")
+            )),
+        )
+    } else if version.is_none() && agent.min_version.is_some() && acp == "unreachable" {
+        (
+            Some(ExecutorUnavailable::VERSION_UNKNOWN),
+            Some(format!(
+                "Codewhale could not read its version, so it cannot check the {} minimum. {}",
+                agent.min_version.unwrap_or_default(),
+                refusal.unwrap_or_else(|| SILENT_HANDSHAKE.to_string())
+            )),
+        )
+    } else if acp == "unreachable" {
+        (
+            Some(ExecutorUnavailable::NO_ACP),
+            Some(refusal.unwrap_or_else(|| SILENT_HANDSHAKE.to_string())),
+        )
+    } else if acp == "adapter" && !adapter_installed {
+        let adapter = agent.adapter.unwrap_or("its ACP adapter");
+        (
+            Some(ExecutorUnavailable::ADAPTER_MISSING),
+            Some(format!(
+                "It runs through the ACP adapter {adapter}, which is not installed. Install it with `npm i -g {adapter}`."
+            )),
+        )
+    } else {
+        (None, None)
+    };
     json!({
         "id": agent.id,
         "name": agent.name,
         "state": "installed",
-        "needs_update": needs_update(version.as_deref(), agent.min_version),
+        "needs_update": needs_update,
         "min_version": agent.min_version,
         "upgrade": agent.upgrade,
         "login": agent.login,
@@ -382,26 +340,227 @@ async fn describe(agent: &'static Agent) -> Value {
         "acp": acp,
         "auth_methods": initialized.as_ref().map(auth_methods).unwrap_or_default(),
         "website": agent.website,
-        "runnable": false,
+        "adapter_installed": adapter_installed,
+        "runnable": runnable,
+        "depth": if runnable { "driven" } else { "observed" },
+        "auth_status": "unknown",
+        "reason_code": reason_code,
+        "reason": reason,
     })
 }
 
 pub(super) async fn list_external_agents() -> Json<Value> {
+    let customs = custom_agents();
+    let custom_ids: Vec<String> = customs.iter().map(|c| c.id.clone()).collect();
     let mut tasks = JoinSet::new();
     for agent in AGENTS {
         tasks.spawn(describe(agent));
     }
-    let mut found = Vec::with_capacity(AGENTS.len());
+    for custom in customs {
+        tasks.spawn(describe_custom(custom));
+    }
+    let mut found = Vec::with_capacity(AGENTS.len() + custom_ids.len());
     while let Some(result) = tasks.join_next().await {
         if let Ok(entry) = result {
             found.push(entry);
         }
     }
     found.sort_by_key(|entry| {
+        let id = entry.get("id").and_then(Value::as_str).unwrap_or_default();
         AGENTS
             .iter()
-            .position(|agent| entry.get("id").and_then(Value::as_str) == Some(agent.id))
+            .position(|agent| agent.id == id)
+            .or_else(|| {
+                custom_ids
+                    .iter()
+                    .position(|cid| cid == id)
+                    .map(|idx| AGENTS.len() + idx)
+            })
             .unwrap_or(usize::MAX)
     });
     Json(json!({ "agents": found }))
+}
+
+fn quota_json(quota: &AgentQuota) -> Value {
+    match quota {
+        AgentQuota::Known { source, windows } => json!({
+            "status": "known",
+            "source": source.as_str(),
+            "windows": windows
+                .iter()
+                .map(|window| json!({
+                    "name": window.name,
+                    "used_percent": window.used_percent,
+                    "resets_at": window.resets_at,
+                }))
+                .collect::<Vec<_>>(),
+        }),
+        AgentQuota::Unknown(reason) => json!({
+            "status": "unknown",
+            "reason": reason.as_str(),
+        }),
+    }
+}
+
+async fn agent_quota_report(agents: &AgentSettings) -> Value {
+    let mut entries = Vec::with_capacity(AGENTS.len());
+    for agent in AGENTS {
+        let choice = agents.quota(agent.id);
+        let gate = QuotaGate {
+            enabled: choice.enabled,
+            consented: choice.consented_at.is_some(),
+        };
+        let quota = local_signin_quota(agent, gate).await;
+        entries.push(json!({
+            "id": agent.id,
+            "name": agent.name,
+            "quota": quota_json(&quota),
+        }));
+    }
+    for id in agents
+        .quota
+        .keys()
+        .filter(|id| !AGENTS.iter().any(|agent| agent.id == id.as_str()))
+    {
+        entries.push(json!({
+            "id": id,
+            "name": null,
+            "quota": quota_json(&AgentQuota::Unknown(QuotaUnknown::UnknownAgent)),
+        }));
+    }
+    json!({
+        "default_source": QuotaSource::AgentReported.as_str(),
+        "agents": entries,
+    })
+}
+
+pub(super) async fn get_external_agent_quota() -> Json<Value> {
+    #[cfg(any(test, feature = "test-support"))]
+    let env_ticket = codewhale_engine::test_support::env_scope_ticket();
+    let agents = tokio::task::spawn_blocking(move || {
+        #[cfg(any(test, feature = "test-support"))]
+        let _membership = codewhale_engine::test_support::join_env_scope(env_ticket);
+        Settings::load_read_only()
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .map(|settings| settings.agents)
+    .unwrap_or_default();
+    Json(agent_quota_report(&agents).await)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn script(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\nread request\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn discovery_passes_registered_env_to_version_and_initialize() {
+        let root = tempfile::tempdir().unwrap();
+        let path = script(
+            root.path(),
+            "agent",
+            r#"
+            test "$AUGMENT_DISABLE_AUTO_UPDATE" = 1 || exit 3
+            test "$DROID_DISABLE_AUTO_UPDATE" = true || exit 4
+            test "$FACTORY_DROID_AUTO_UPDATE_ENABLED" = false || exit 5
+            if [ "$1" = --version ]; then echo "agent 1.2.3"; exit; fi
+            test "$1" = acp || exit 6
+            echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
+        "#,
+        );
+        let mut env = codewhale_engine::fleet::agents::find("auggie")
+            .unwrap()
+            .process_env();
+        env.extend(
+            codewhale_engine::fleet::agents::find("factory-droid")
+                .unwrap()
+                .process_env(),
+        );
+        let row = describe_custom(CustomExternalAgent {
+            id: "local".into(),
+            name: "Local".into(),
+            binary: path.display().to_string(),
+            args: vec!["acp".into()],
+            website: String::new(),
+            env,
+        })
+        .await;
+        assert_eq!(row["version"], "1.2.3");
+        assert_eq!(row["runnable"], true);
+    }
+
+    #[tokio::test]
+    async fn handshake_keeps_answered_unsupported_and_silent_agents_distinct() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("agent dir ünï");
+        std::fs::create_dir_all(&dir).unwrap();
+        let answer = |reply: &str| format!("echo 'log line'; echo '{reply}'; sleep 30");
+        let native = script(
+            &dir,
+            "native",
+            &answer(
+                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentInfo":{"version":"2.0.0"},"authMethods":[{"id":"login","name":"Log in","type":"terminal"}]}}"#,
+            ),
+        );
+        let Handshake::Answered(result) = acp_initialize(&native, &["acp"], &BTreeMap::new()).await
+        else {
+            panic!("a v1 answer must count as native ACP");
+        };
+        assert_eq!(auth_methods(&result)[0]["type"], "terminal");
+
+        let cases = [
+            (
+                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":2}}"#,
+                "It speaks Agent Client Protocol version 2; Codewhale drives version 1.",
+            ),
+            (
+                r#"{"id":1,"result":{"protocolVersion":1}}"#,
+                "It answered without JSON-RPC 2.0, which the Agent Client Protocol requires.",
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"no"}}"#,
+                "It refused the Agent Client Protocol handshake.",
+            ),
+        ];
+        for (index, (reply, expected)) in cases.into_iter().enumerate() {
+            let agent = script(&dir, &format!("refusing {index}"), &answer(reply));
+            match acp_initialize(&agent, &[], &BTreeMap::new()).await {
+                Handshake::Refused(reason) => assert_eq!(reason, expected),
+                other => panic!("{reply}: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn silent_handshake_is_bounded_and_kills_the_agent_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let pid_file = root.path().join("grandchild.pid");
+        let silent = script(
+            root.path(),
+            "silent",
+            &format!("sleep 300 & echo $! > '{}'; sleep 300", pid_file.display()),
+        );
+        let started = Instant::now();
+        assert!(matches!(
+            acp_initialize(&silent, &[], &BTreeMap::new()).await,
+            Handshake::Silent
+        ));
+        assert!(started.elapsed() < PROBE_TIMEOUT + PROBE_REAP_TIMEOUT + Duration::from_secs(2));
+        let grandchild =
+            codewhale_runtime::process_tree::read_pid_file(&pid_file, Duration::from_secs(5));
+        assert!(codewhale_runtime::process_tree::wait_for_pid_exit(
+            grandchild,
+            Duration::from_secs(5)
+        ));
+    }
 }

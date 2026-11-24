@@ -14,23 +14,19 @@ import {
   EN_DOCS_PET,
   EN_DOCS_AUTH,
   EN_DOCS_TRUST,
+  EN_DOCS_FIRST_TIME,
   EN_DOCS_REVIEW,
   EN_DOCS_VOCABULARY,
   EN_COMPUTER_USE,
   EN_CHANGELOG,
   EN_DOCS_SHELL,
   EN_DOCS_TROUBLESHOOTING,
-  EN_DIGEST,
-  EN_FEED,
-  EN_COMMUNITY,
   EN_FAQ,
   EN_HOME,
   EN_LEGAL_PRIVACY,
   EN_LEGAL_TERMS,
-  EN_ROADMAP,
   EN_CONTRIBUTE,
   EN_CONSTITUTION,
-  EN_RUNTIME,
   fill,
   getChrome,
   getDocsGuide,
@@ -44,6 +40,7 @@ import {
   getDocsPet,
   getDocsAuth,
   getDocsTrust,
+  getDocsFirstTime,
   getComputerUse,
   getChangelog,
   getDocsShell,
@@ -53,17 +50,12 @@ import {
   getDocsModes,
   getDocsReview,
   getDocsVocabulary,
-  getDigest,
-  getFeed,
-  getCommunity,
   getFaq,
   getHome,
   getLegalPrivacy,
   getLegalTerms,
-  getRoadmap,
   getContribute,
   getConstitution,
-  getRuntime,
   pickText,
   pickTextLocale,
   splitToken,
@@ -84,15 +76,14 @@ const NON_PROSE_KEYS = new Set([
 const CHROME_PROSE_KEYS = [
   "skipToContent",
   "navDocs",
-  "navProduct",
-  "navCommunity",
+  "navSignIn",
+  "translationMachineDraft",
   "navPrimaryAria",
   "navHomeAria",
   "menuOpen",
   "menuClose",
   "themeAria",
   "themeTitle",
-  "footerTagline",
   "footerProduct",
   "footerProject",
   "footerGuide",
@@ -109,40 +100,67 @@ const CHROME_PROSE_KEYS = [
  * is deliberate and visible. German "Community" matches the TUI pack
  * (crates/tui/locales/de.json: "Community & Mitwirken").
  */
-const CHROME_LOANWORDS: Record<string, readonly string[]> = {
-  de: ["navCommunity"],
-};
+const CHROME_LOANWORDS: Record<string, readonly string[]> = {};
 
 /** Home keys that are real sentences and must be translated. */
 const HOME_PROSE_KEYS = [
   "metaTitle",
   "metaDescription",
   "heroTitle",
+  "heroTitleLead",
   "heroIntro",
+  "readTheCode",
+  "installNote",
+  "captionReleased",
+  "captureFrameNoPosture",
+  "sectionModelHeading",
+  "sectionModelBody",
+  "sectionControlHeading",
+  "sectionControlBody",
+  "sectionAgentsHeading",
+  "sectionAgentsBody",
+  "agentsRolesLabel",
+  "agentRoleExplore",
+  "agentRoleImplement",
+  "agentRoleReviewer",
+  "agentsLink",
+  "directionShotAlt",
+  "directionShotCaption",
+  "directionShotLink",
+  "factRust",
+  "factLicense",
+  "sectionDirectionHeading",
+  "sectionDirectionBody",
+  "sectionOpenHeading",
+  "sectionOpenBody",
+  "sectionStartHeading",
+  "sectionStartBody",
+  "mapHeading",
+  "mapStateReleased",
+  "mapStateDeveloping",
+  "mapStateInviteOnly",
+  "mapStateBeingBuilt",
+  "mapTerminal",
+  "mapTerminalSentence",
+  "mapLocalBrowser",
+  "mapLocalBrowserSentence",
+  "mapManyAgents",
+  "mapManyAgentsSentence",
+  "mapDesktop",
+  "mapDesktopSentence",
+  "mapCloud",
+  "mapCloudSentence",
+  "mapOneSession",
+  "mapOneSessionSentence",
   "getCodewhale",
   "heroInstallAria",
-  "exploreProduct",
   "shotPreview",
-  "screenshotAlt",
-  "gainHeading",
-  "gainLede",
-  "modelsHeading",
-  "modelsBody",
-  "modelsLink",
-  "startHeading",
-  "startLede",
-  "startGuideLink",
-  "startVocabularyLink",
-  "availabilityHeading",
-  "availabilityLede",
-  "availabilityNote",
-  "surfacesHeading",
-  "runtimeLink",
-  "installBandHeading",
-  "installGuideLink",
-  "communityHeading",
-  "communityBody",
-  "communityLinksAria",
+  "frameSummaryPrompt",
+  "frameSummaryEdit",
+  "frameSummaryApproval",
+  "frameSummaryResult",
+  "frameSummaryProvider",
+  "frameSummaryReceipt",
 ] as const satisfies readonly (keyof HomeDict)[];
 
 function templateTokens(value: string): string[] {
@@ -277,19 +295,15 @@ describe("website dictionaries", () => {
       ["docs-pet", getDocsPet, EN_DOCS_PET],
       ["docs-auth", getDocsAuth, EN_DOCS_AUTH],
       ["docs-trust", getDocsTrust, EN_DOCS_TRUST],
+      ["docs-first-time", getDocsFirstTime, EN_DOCS_FIRST_TIME],
       ["docs-review", getDocsReview, EN_DOCS_REVIEW],
       ["docs-vocabulary", getDocsVocabulary, EN_DOCS_VOCABULARY],
       ["changelog", getChangelog, EN_CHANGELOG],
       ["legal-terms", getLegalTerms, EN_LEGAL_TERMS],
       ["legal-privacy", getLegalPrivacy, EN_LEGAL_PRIVACY],
-      ["digest", getDigest, EN_DIGEST],
-      ["feed", getFeed, EN_FEED],
-      ["community", getCommunity, EN_COMMUNITY],
       ["faq", getFaq, EN_FAQ],
-      ["roadmap", getRoadmap, EN_ROADMAP],
       ["contribute", getContribute, EN_CONTRIBUTE],
       ["constitution", getConstitution, EN_CONSTITUTION],
-      ["runtime", getRuntime, EN_RUNTIME],
     ] as const) {
       const enKeys = Object.keys(reference).sort();
       for (const locale of [...DICTIONARY_LOCALES, "fr", "und"]) {
@@ -299,11 +313,14 @@ describe("website dictionaries", () => {
       // `metaTitle` rather than `overviewTitle` because docs/mcp's heading is
       // the code-owned literal `MCP` and stays in the page.
       expect(get("zh").metaTitle, `zh ${label}`).not.toBe(reference.metaTitle);
-      // Every other locale renders English today, exactly as the `isZh`
-      // ternaries in the page did before the move.
-      for (const locale of ["ja", "fr", "ar", "und"]) {
-        expect(get(locale), `${locale} ${label}`).toBe(reference);
+      // Contribute ships in every routed locale; the other page
+      // dictionaries still render English outside en and zh.
+      const translated = label === "contribute";
+      for (const locale of ["ja", "fr", "ar"]) {
+        if (translated) expect(get(locale).metaTitle, `${locale} ${label}`).not.toBe(reference.metaTitle);
+        else expect(get(locale), `${locale} ${label}`).toBe(reference);
       }
+      expect(get("und"), `und ${label}`).toBe(reference);
     }
   });
 
@@ -341,6 +358,7 @@ describe("website dictionaries", () => {
       ["docs-subagents", getDocsSubagents],
       ["docs-troubleshooting", getDocsTroubleshooting],
       ["docs-trust", getDocsTrust],
+      ["docs-first-time", getDocsFirstTime],
       ["docs-web", getDocsWeb],
       ["docs-work", getDocsWork],
       ["docs-pet", getDocsPet],
@@ -393,30 +411,6 @@ describe("website dictionaries", () => {
     expect(pickText(pair, "ja"), "non-zh locales read the English side").toBe("English");
     expect(pickTextLocale("zh")).toBe("zh");
     for (const locale of ["en", "ja", "ar"]) expect(pickTextLocale(locale)).toBe("en");
-  });
-
-  it("keeps the gain, models, availability, and surface lists structurally aligned", () => {
-    for (const locale of DICTIONARY_LOCALES) {
-      const home = getHome(locale);
-      expect(home.gain, `${locale} gain`).toHaveLength(3);
-      expect(home.modelsFacts, `${locale} modelsFacts`).toHaveLength(4);
-      expect(home.availability, `${locale} availability`).toHaveLength(4);
-      expect(home.surfaces, `${locale} surfaces`).toHaveLength(5);
-      for (const row of [...home.gain, ...home.modelsFacts, ...home.availability, ...home.surfaces]) {
-        for (const cell of row) {
-          if (cell === undefined) continue;
-          expect(cell.length, `${locale} empty cell`).toBeGreaterThan(0);
-        }
-      }
-    }
-  });
-
-  it("links the community VS Code GUI to its Marketplace listing in every locale", () => {
-    const marketplace = "https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode";
-    for (const locale of ["en", ...DICTIONARY_LOCALES]) {
-      const row = getHome(locale).availability.find(([surface]) => surface.startsWith("CodeWhale GUI"));
-      expect(row?.[3], `${locale} GUI Marketplace link`).toBe(marketplace);
-    }
   });
 
   it("falls back to the English dictionary for unrouted locales — no missing markers", () => {
@@ -520,6 +514,15 @@ describe("website dictionaries", () => {
       const parts = splitToken(lede, "brand");
       expect(parts.length, `${locale} heroIntro brand split`).toBe(2);
       expect(parts.join("").includes("{brand}")).toBe(false);
+    }
+  });
+
+  it("starts every headline with its lead sentence so a page can set the two sentences apart", () => {
+    for (const locale of ["en", ...DICTIONARY_LOCALES]) {
+      const home = getHome(locale);
+      expect(home.heroTitle.startsWith(home.heroTitleLead), `${locale} heroTitle`).toBe(true);
+      expect(home.heroTitle.length, `${locale} heroTitle has a second sentence`).toBeGreaterThan(home.heroTitleLead.length);
+      expect(home.metaTitle, `${locale} metaTitle`).toBe(`Codewhale · ${home.heroTitle}`);
     }
   });
 

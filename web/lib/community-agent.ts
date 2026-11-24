@@ -12,14 +12,11 @@
 
 import type { DraftClaimLockNamespace, DraftClaimLockStub, DraftLockAction } from "./draft-claim-lock";
 
+import { maintainerTokenUsable } from "./maintainer-token";
 import { requestChat, type ChatMessage, type DeepSeekEnv } from "./deepseek";
 export type { DeepSeekEnv } from "./deepseek";
 
 export const AGENT_DRAFT_TYPES = [
-  "triage",
-  "pr-review",
-  "stale",
-  "dupes",
   "digest",
   "linkcheck",
   "semantic-drift",
@@ -110,67 +107,6 @@ export const VOICE_CONSTRAINTS = `Voice constraints (apply to ALL output):
 - For English drafts, end with: "— drafted by community assistant, pending maintainer review"
 - For Chinese drafts, end with: "— 由社区助理草拟，待维护者审阅"
 - Chinese output should sound like it was written by a Chinese-fluent maintainer, not machine-translated. Rewrite in zh-CN, do not translate.`;
-
-export const TRIAGE_PROMPT = `You are a community triage assistant for the Codewhale open source project (codewhale-hq/CodeWhale).
-
-Given a newly opened issue, produce a JSON object:
-{
-  "bodyEn": "English draft comment — suggested labels, clarifying questions, links to related issues/docs",
-  "bodyZh": "Chinese (zh-CN) draft comment — same content, rewritten natively"
-}
-
-Rules:
-- Suggest labels by name (e.g. "bug", "enhancement", "good first issue", "question").
-- If the issue is a duplicate, link the likely original.
-- If docs already cover the topic, link them.
-- Keep the draft under 300 words.
-${VOICE_CONSTRAINTS}`;
-
-export const PR_REVIEW_PROMPT = `You are a community PR review assistant for the Codewhale open source project (codewhale-hq/CodeWhale).
-
-Given a newly opened pull request, produce a JSON object:
-{
-  "bodyEn": "English draft review — high-level diff summary, did-they-update-tests check, suggested reviewers",
-  "bodyZh": "Chinese (zh-CN) draft review — same content, rewritten natively"
-}
-
-Rules:
-- Summarise what the PR changes at a high level.
-- Note whether tests were updated.
-- If the PR touches CI, release scripts, or config, flag it.
-- Do not approve or request changes — that's the maintainer's call.
-- Keep the draft under 300 words.
-${VOICE_CONSTRAINTS}`;
-
-export const STALE_PROMPT = `You are a community maintenance assistant for the Codewhale open source project (codewhale-hq/CodeWhale).
-
-Given an issue with no activity in 30+ days, produce a JSON object:
-{
-  "bodyEn": "English draft nudge — polite 'still relevant?' check-in",
-  "bodyZh": "Chinese (zh-CN) draft nudge — same, rewritten natively"
-}
-
-Rules:
-- Be polite and brief (under 100 words).
-- Ask if the issue is still relevant.
-- If there's a workaround or the issue may have been fixed, mention it.
-- Don't close the issue — just nudge.
-${VOICE_CONSTRAINTS}`;
-
-export const DUPES_PROMPT = `You are a community deduplication assistant for the Codewhale open source project (codewhale-hq/CodeWhale).
-
-Given a list of open issues with titles and bodies, identify likely duplicates and produce a JSON object:
-{
-  "suggestions": [
-    { "targetNumber": 123, "duplicateNumber": 456, "reason": "brief explanation", "bodyEn": "English draft close-with-link comment", "bodyZh": "Chinese (zh-CN) draft" }
-  ]
-}
-
-Rules:
-- Only flag high-confidence duplicates (similar title, similar symptoms).
-- If no duplicates found, return empty suggestions array.
-- Keep each draft under 150 words.
-${VOICE_CONSTRAINTS}`;
 
 export const DIGEST_PROMPT = `You are the editor of a weekly digest for the Codewhale open source project (codewhale-hq/CodeWhale).
 
@@ -315,7 +251,7 @@ const RESOLUTION_REOPEN_GRACE_MS = 10 * 60 * 1000;
  * True while a maintainer decision still applies to the item as it is now.
  * A decision covers everything up to shortly after it was made; an item
  * updated later (new commits, a reply) can be drafted again. An in-flight
- * post, or an item without an update time (digests, dupes, content-watch
+ * post, or an item without an update time (digests, content-watch
  * findings, whose identity already encodes their content), stays covered
  * for the marker's lifetime.
  */
@@ -787,6 +723,7 @@ export async function deleteDraft(kv: KVNamespace | undefined, key: string): Pro
 
 const SESSION_PREFIX = "session:admin:";
 const SESSION_TTL_SEC = 60 * 60 * 24; // 24h
+const SESSION_TOKEN_DOMAIN = "codewhale-web:admin-session:v1:";
 
 function toBase64Url(bytes: Uint8Array): string {
   let s = "";
@@ -803,21 +740,39 @@ export async function safeEqual(a: string, b: string): Promise<boolean> {
   return diff === 0;
 }
 
-export async function createSession(kv: KVNamespace | undefined): Promise<string | null> {
-  if (!kv) return null;
+async function tokenFingerprint(token: string): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(SESSION_TOKEN_DOMAIN + token)));
+  let hex = "";
+  for (const byte of digest) hex += byte.toString(16).padStart(2, "0");
+  return hex;
+}
+
+export async function createSession(kv: KVNamespace | undefined, token: string | undefined): Promise<string | null> {
+  if (!kv || !maintainerTokenUsable(token)) return null;
   const bytes = new Uint8Array(32);
   crypto.getRandomValues(bytes);
   const sid = toBase64Url(bytes);
-  const value = JSON.stringify({ createdAt: Date.now() });
+  const value = JSON.stringify({ createdAt: Date.now(), tokenFingerprint: await tokenFingerprint(token) });
   await kv.put(SESSION_PREFIX + sid, value, { expirationTtl: SESSION_TTL_SEC });
   return sid;
 }
 
-export async function validateSession(kv: KVNamespace | undefined, sid: string | undefined | null): Promise<boolean> {
-  if (!kv || !sid) return false;
+export async function validateSession(
+  kv: KVNamespace | undefined,
+  sid: string | undefined | null,
+  token: string | undefined,
+): Promise<boolean> {
+  if (!kv || !sid || !maintainerTokenUsable(token)) return false;
   if (!/^[A-Za-z0-9_-]{40,64}$/.test(sid)) return false;
   const raw = await kv.get(SESSION_PREFIX + sid);
-  return raw !== null;
+  if (raw === null) return false;
+  let stored: unknown;
+  try {
+    stored = (JSON.parse(raw) as { tokenFingerprint?: unknown }).tokenFingerprint;
+  } catch {
+    return false;
+  }
+  return typeof stored === "string" && (await safeEqual(stored, await tokenFingerprint(token)));
 }
 
 export async function deleteSession(kv: KVNamespace | undefined, sid: string | undefined | null): Promise<void> {

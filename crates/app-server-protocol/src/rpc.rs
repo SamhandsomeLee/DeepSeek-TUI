@@ -1,6 +1,8 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
+pub use crate::v2::{ThreadExecutor, ThreadPlacement as ThreadEnvironment};
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RequestId {
@@ -143,6 +145,10 @@ pub struct ThreadListItem {
     pub turns: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<ThreadExecutor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<ThreadEnvironment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

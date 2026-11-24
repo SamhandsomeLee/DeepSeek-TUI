@@ -11,7 +11,6 @@ export const docsShell: DocsShellDict = {
   metaTitle: "Docs · Codewhale",
   metaDescription:
     "Install Codewhale, connect a provider, and get work done: modes and approvals, reviewing changes, workflows, sub-agents, MCP tools, hooks, the Runtime API, and troubleshooting.",
-  portalMark: "Codewhale documentation",
   heroTitle: "Install and use Codewhale",
   heroLead:
     "Find installation steps, model setup, tool configuration and troubleshooting. The guides include commands and examples you can run.",
@@ -19,13 +18,16 @@ export const docsShell: DocsShellDict = {
 
   releaseLabel: "Release",
   releasePublished: "Latest release {tag} · {date}",
-  releaseCandidate:
-    "These pages describe the {version} source candidate, which is not published yet.",
-  releaseMatches: "These pages describe {tag}, the published release.",
+  releaseDescribes: "These pages describe {tag}, the published release.",
+  sourceLead:
+    "This section describes behavior that exists in the project's source and is not in the published release. Check which version you have with `codewhale --version`.",
   releaseChangelog: "Changelog →",
 
   searchLabel: "Search the documentation",
-  searchPlaceholder: "Search by task or topic… (press / to focus)",
+  searchPlaceholder: "Search guides and reference",
+  searchLoading: "Loading the documentation index. Your search stays in this browser.",
+  searchUnavailable: "The full index could not load. Try again to search article text and reference commands.",
+  searchRetry: "Load the index again",
   searchClear: "Clear",
   searchMatches: "{matched} of {total} entries match “{query}”",
   searchNoMatches: "Nothing matches “{query}”",

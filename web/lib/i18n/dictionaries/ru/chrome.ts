@@ -13,14 +13,11 @@ import type { ChromeDict } from "../types";
  */
 export const chrome: ChromeDict = {
   navDocs: "Документация",
-  navStart: "Начало",
-  navInstall: "Установка",
-  navFaq: "Вопросы",
-  navCommunity: "Сообщество",
   navContribute: "Участие",
+  navSignIn: "Войти",
+  navDesktop: "Десктоп",
 
   navFeatures: "Возможности",
-  navProduct: "Продукт",
   navModels: "Модели",
   navPlugins: "Плагины",
 
@@ -35,6 +32,7 @@ export const chrome: ChromeDict = {
 
   menuOpen: "Открыть меню",
   menuClose: "Закрыть меню",
+  translationMachineDraft: "Этот перевод — машинный черновик, ещё не проверенный носителями языка.",
 
   themeAuto: "авто",
   themeLight: "светлая",
@@ -42,19 +40,17 @@ export const chrome: ChromeDict = {
   themeAria: "Тема: {mode} (нажмите, чтобы переключить)",
   themeTitle: "Тема · авто / светлая / тёмная",
 
-  footerTagline:
-    "Агент для программирования с открытым кодом для вашего терминала и выбранных вами моделей.",
   footerProduct: "Продукт",
   footerProject: "Проект",
   footerDocs: "Документация",
   footerGuide: "С чего начать",
   footerInstall: "Установка",
   footerModels: "Модели",
-  footerRuntime: "Рантайм",
   footerFaq: "Вопросы и ответы",
-  footerIssues: "Задачи",
   footerContribute: "Участие",
+  footerRoadmap: "Дорожная карта",
   footerLicense: "Лицензия MIT",
+  footerMerch: "Мерч",
   footerTerms: "Условия использования",
   footerPrivacy: "Конфиденциальность",
   footerChangelog: "Журнал изменений",
@@ -62,8 +58,25 @@ export const chrome: ChromeDict = {
   footerReleases: " · Релизы: ",
   footerReleasesLink: "Релизы на GitHub",
   footerSecurity: "Безопасность",
+  footerLegal: "Правовая информация",
 
   switcherLabel: "Язык",
   switcherSwitchTo: "Переключиться на {label}",
   partialBadge: "(частично)",
+
+  stateReleased: "Выпущено",
+  stateAvailable: "Доступно",
+  stateBeta: "Бета",
+  stateDev: "Сборка для разработки",
+  stateOpen: "Открыто",
+  stateInviteOnly: "Только по приглашениям",
+  stateNotOpen: "Пока не открыто",
+  stateNotPublic: "Не опубликовано",
+  stateInSource: "Есть в исходном коде, ещё не выпущено",
+  numbersAsOf: "По состоянию на {date}",
+  downloadMacos: "Скачать для macOS",
+  downloadVersion: "Версия {version}",
+  downloadSize: "Размер {size}",
+  downloadChecksum: "Контрольная сумма SHA-256",
+  downloadSigned: "Подписано и нотаризовано",
 };

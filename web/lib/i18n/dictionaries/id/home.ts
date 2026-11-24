@@ -3,129 +3,80 @@ import type { HomeDict } from "../types";
 /** Indonesian home copy: useful work with chosen models and connected tools. */
 
 export const home: HomeDict = {
-  metaTitle: "Codewhale · Agen sumber terbuka untuk komputermu",
-  metaDescription: "Codewhale adalah agen pemrograman sumber terbuka untuk terminal. Baca, edit dan uji proyek dengan model jarak jauh atau lokal pilihan Anda.",
-  heroTitle: "Agen sumber terbuka untuk komputermu",
-  heroIntro: "Bangun perangkat lunak dan jalankan alur kerja yang dapat diulang dengan {brand} di terminalmu. Tambahkan Computer Use untuk bekerja di aplikasi Mac.",
+  metaTitle: "Codewhale · Model boleh milik siapa saja. Agen seharusnya milik Anda.",
+  metaDescription: "Codewhale adalah agen pemrograman bersumber terbuka untuk terminal Anda, ditulis dalam Rust. Ia bekerja dengan model apa pun, dapat membagi satu tugas ke beberapa agen, dan setiap barisnya bisa Anda baca.",
+  heroTitle: "Model boleh milik siapa saja. Agen seharusnya milik Anda.",
+  heroTitleLead: "Model boleh milik siapa saja.",
+  heroIntro: "{brand} adalah agen pemrograman bersumber terbuka untuk terminal Anda, ditulis dalam Rust. Ia bekerja dengan model apa pun, dapat membagi satu tugas ke beberapa agen, dan setiap barisnya bisa Anda baca.",
+  readTheCode: "Baca kodenya",
+  installNote: "Versi {version} sudah dirilis dan tidak memerlukan akun.",
+  captionReleased: "Sesi nyata dengan model langsung, deepseek-flash melalui API DeepSeek: model yang menulis perubahan, dan perubahan serta uji coba terjadi seperti yang terlihat. Direkam dengan build pengembangan 0.10.3.",
+  captureFrameNoPosture: "Bingkai Permintaan dan Hasil menampilkan nama model dan mode persetujuan.",
+  frameLabelPrompt: "Perintah",
+  frameLabelEdit: "Edit",
+  frameLabelApproval: "Persetujuan",
+  frameLabelResult: "Hasil",
+  frameSummaryPrompt: "Codewhale di terminal. Permintaan “Add a --json flag to ls.py so the tests pass, then run the tests.” telah dikirim, dan baris status menampilkan Accept edits serta model deepseek-flash.",
+  frameSummaryEdit: "Codewhale di terminal, digulir ke atas saat sebuah perintah menunggu. Ia membaca ls.py dan test_ls.py, lalu memperbarui ls.py: diff menambahkan opsi --json ke skrip.",
+  frameSummaryApproval: "Codewhale di sebuah terminal. Perubahan pada ls.py ditampilkan, dan perintah python3 -m unittest -v test_ls.py menunggu persetujuan. Kartu menyatakan sedang menunggu persetujuan dan menawarkan Allow dan Deny.",
+  frameSummaryResult: "Codewhale di terminal. Setelah disetujui, perintah menjalankan 2 tes dan mencetak OK. Model deepseek-flash menyatakan telah menambahkan --json ke ls.py dan kedua tes lulus.",
+  frameSummaryProvider: "Codewhale di terminal. Pemilih model, dengan pencarian “deepseek-flash”, menampilkan deepseek-flash dari DeepSeek, Fireworks AI, dan OpenRouter, dengan DeepSeek terpilih.",
+  frameSummaryReceipt: "Codewhale di terminal. Tanda terima sesi: file yang diubah dan perintah yang dijalankannya, disetujui oleh Anda; total token dan perkiraan biaya sesi; lalu perubahan dan perintah yang disetujui.",
   getCodewhale: "Instal Codewhale",
   heroInstallAria: "Perintah instalasi",
-  exploreProduct: "Jelajahi Codewhale",
-  shotPreview: "Pratinjau terminal",
-  screenshotAlt:
-    "Codewhale v{version}: tangkapan terminal berisi percakapan, kolom pesan, dan kontrol sesi.",
-  latestRelease: "Rilis terbaru {tag}",
-  releaseUnavailable: "Status rilis tidak tersedia",
-  proofContributors: "{count} kontributor",
-  currentSource: "Sumber",
-  sourceCandidate: "Belum dirilis",
-  publishedRelease: "dirilis",
-  gainHeading: "Bangun dan otomatisasikan dari terminalmu",
-  gainLede:
-    "Jelaskan apa yang ingin kamu buat atau otomatisasikan. Codewhale dapat mengedit berkas, menjalankan perintah, dan memeriksa hasilnya, dengan akses yang kamu kendalikan.",
-  gain: [
-    [
-      "Buat aplikasi dan alat",
-      "Buat aplikasi, tambahkan fitur, atau tulis skrip. Codewhale dapat mengerjakan berkas proyek, menjalankan kode, dan menguji hasil yang dibuatnya."
-    ],
-    [
-      "Otomatiskan pekerjaan berulang",
-      "Jalankan alur kerja dari terminal, skrip, atau CI. Untuk tugas yang lebih besar, delegasikan sebagian pekerjaan ke Fleet agen dengan model yang berbeda."
-    ],
-    [
-      "Hubungkan alat yang kamu pakai",
-      "Tambahkan alat melalui plugin dan server MCP, atau gunakan API dari skripmu sendiri. Setiap layanan memerlukan penyiapan dan autentikasi tersendiri."
-    ]
-  ],
-  chapterModels: "Model Anda",
-  modelsHeading: "Gunakan model pilihanmu",
-  modelsBody:
-    "Hubungkan akun penyedia, endpoint yang kompatibel dengan OpenAI, atau model lokal dan yang kamu host sendiri. Pilih model untuk sesi dan untuk setiap agen dalam Fleet.",
-  modelsFacts: [
-    [
-      "Akun API milikmu",
-      "Hubungkan penyedia seperti DeepSeek, OpenAI, Anthropic, atau Google dengan kuncimu sendiri. Model bawaan, deepseek-flash, kini menjalankan DeepSeek-V4.1-Flash."
-    ],
-    [
-      "Gateway milikmu",
-      "Gunakan endpoint yang kompatibel dengan OpenAI dan pilih model yang disediakannya."
-    ],
-    [
-      "Inferensi milikmu",
-      "Jalankan model lokal atau yang dihosting sendiri dengan Ollama, vLLM, atau SGLang."
-    ],
-    [
-      "Paket ChatGPT milikmu",
-      "Masuk dengan codewhale auth chatgpt untuk memakai paket ChatGPT sebagai pengganti kunci API. Eksperimental."
-    ]
-  ],
-  modelsLink: "Lihat model dan penyedia",
-  startHeading: "Mulai menggunakan",
-  startLede:
-    "Instal Codewhale, hubungkan model, dan buka folder proyek. Kamu bisa menambahkan plugin dan agen lain saat membutuhkannya.",
-  startGuideLink: "Ikuti panduan memulai",
-  startVocabularyLink: "Lihat kosakata produk",
-  chapterAvailability: "Tempat menjalankan",
-  availabilityHeading: "Tersedia sekarang dan sedang dikembangkan",
-  availabilityLede:
-    "Terminal dan klien peramban lokal sudah tersedia. Aplikasi desktop native dan aplikasi web yang dihosting sedang dikembangkan ulang.",
-  availability: [
-    [
-      "Terminal dan peramban lokal",
-      "Dirilis",
-      "Instal di Linux, macOS, atau Windows, lalu jalankan codewhale, atau codewhale web untuk klien peramban lokal. npm dan Cargo juga dapat digunakan; Android di Termux masih berupa pratinjau."
-    ],
-    [
-      "CodeWhale GUI (VS Code)",
-      "Tersedia",
-      "Proyek terpisah yang dipelihara oleh komunitas: obrolan, utas, dan perubahan berkas di sidebar VS Code di atas Codewhale Runtime yang sama. Pasang dari VS Code Marketplace.",
-      "https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode"
-    ],
-    [
-      "Aplikasi web hosted",
-      "Dalam pengembangan",
-      "Sedang dibangun ulang agar sesuai dengan aplikasi desktop dan belum dibuka. Untuk menggunakannya di peramban sekarang, jalankan codewhale web di komputermu."
-    ],
-    [
-      "Desktop",
-      "Build pengembangan",
-      "Aplikasi native dengan mesin yang sama. Tinjau dan commit perubahan, ikuti pekerjaan lintas proyek, dan edit pesan untuk mengirimkannya kembali sebagai cabang baru. Belum ada unduhan publik."
-    ]
-  ],
-  availabilityNote:
-    "Terminal, peramban lokal, dan GUI tidak memerlukan akun Codewhale. Jika Anda memakai kunci penyedia milik Anda sendiri, penyedia tersebut menagih penggunaan itu.",
-  surfacesHeading: "Bekerja dengan berkas dan alat",
-  surfaces: [
-    [
-      "Berkas dan terminal",
-      "Buat berkas, jalankan perintah, periksa data, dan uji hasilmu. Kamu menentukan folder kerja dan izin."
-    ],
-    [
-      "Plugin dan aplikasi terhubung",
-      "Tambahkan keterampilan dan alat melalui plugin dan MCP. Tinjau dan aktifkan koneksi yang boleh digunakan agen."
-    ],
-    [
-      "Peramban dan komputer · pratinjau",
-      "Gunakan alat peramban dan plugin Computer Use untuk bekerja di aplikasi dan situs dengan akses yang kamu berikan."
-    ],
-    [
-      "Sesi yang bisa dilanjutkan",
-      "Simpan percakapan, hasil alat, dan riwayat kerja bersama. Lanjutkan tugas di terminal atau klien peramban lokal."
-    ],
-    [
-      "Tim agen",
-      "Gunakan Fleet untuk membagi pekerjaan besar ke agen dengan peran dan model berbeda, lalu ikuti kemajuannya di satu tempat."
-    ]
-  ],
-  runtimeLink: "Jelajahi alat dan integrasi",
-  installBandHeading: "Instal di macOS atau Linux",
+  shotPreview: "Rekaman sesi terminal",
   copy: "Salin",
   copied: "Tersalin ✓",
-  binaries: "Biner",
-  chinaMirrors: "Mirror Tiongkok",
-  installGuideLink: "Baca panduan instalasi",
-  communityHeading: "Berkontribusi pada Codewhale",
-  communityBody:
-    "{count} orang telah ikut membangun Codewhale. Laporkan bug, perbaiki dokumentasi, atau sumbangkan kode di GitHub.",
-  communityLinksAria: "Tautan komunitas",
-  contribute: "Berkontribusi di GitHub",
+
+  sectionModelHeading: "Model apa pun bisa bekerja lewat agen Anda.",
+  sectionModelBody: "Gunakan penyedia bawaan, endpoint apa pun yang kompatibel dengan OpenAI, atau model di mesin Anda sendiri, dan ganti model di antara giliran. Codewhale berjalan di repositori Anda tanpa akun, dan `codewhale web` memungkinkan Anda memakainya di browser di mesin Anda sendiri.",
+  sectionControlHeading: "Agen Anda bertanggung jawab kepada Anda.",
+  sectionControlBody: "Anda yang menentukan apa yang boleh dilakukan Codewhale tanpa bertanya, dan perintahnya dapat berjalan di sandbox pada macOS dan Linux. Setiap sesi meninggalkan tanda terima berisi berkas yang diubah, perintah yang dijalankan, dan siapa yang menyetujui setiap langkah.",
+  sectionAgentsHeading: "Beberapa agen dapat berbagi satu tugas bersama Anda.",
+  sectionAgentsBody: "Codewhale membagi pekerjaan ke beberapa agen dengan peran seperti penjelajah, pelaksana, dan peninjau, dan Anda dapat memantau, memeriksa, dan menghentikan masing-masing. Sebuah Fleet menyimpan buku catatan, sehingga proses dapat dilanjutkan setelah restart.",
+  agentsRolesLabel: "Tiga dari peran yang bisa diambil sub-agen",
+  agentRoleExplore: "Membaca kode dan memetakan bagian yang penting, tanpa mengubah file.",
+  agentRoleImplement: "Membuat satu perubahan spesifik dengan suntingan terkecil.",
+  agentRoleReviewer: "Membaca perubahan dan menilai temuannya menurut tingkat keparahan, tanpa mengubah file.",
+  agentsLink: "Baca cara kerja sub-agen",
+  directionShotAlt: "Aplikasi desktop Codewhale. Di kiri ada daftar sesi; di tengah, tugas untuk memperbaiki tes yang gagal menunggu izin menjalankan python3 -m pytest, dengan Allow dan Deny.",
+  directionShotCaption: "Aplikasi desktop yang sedang dikembangkan berjalan di mesin yang sama. Di sini, dengan DeepSeek V4.1 Flash dalam mode Accept Edits, aplikasi bertanya sebelum menjalankan perintah pengujian.",
+  directionShotLink: "Lihat aplikasi desktop",
+  sectionDirectionHeading: "Ke sinilah agen Anda menuju.",
+  sectionDirectionBody: "Codewhale sedang menjadi satu lingkungan yang mencakup terminal Anda, aplikasi desktop, browser, dan komputer cloud, semuanya dijalankan oleh satu mesin, sehingga pekerjaan Anda dapat berpindah di antaranya dan tetap milik Anda. Setiap bagian di bawah menyebutkan posisinya hari ini.",
+  sectionOpenHeading: "Codewhale dibangun secara terbuka oleh orang-orang yang memakainya.",
+  sectionOpenBody: "Ia bermula sebagai alat terminal sumber terbuka untuk satu model dan menjadi proyek yang dibangun bersama oleh ratusan orang dalam banyak bahasa. Anda dapat membaca kodenya, mengubahnya, atau memintanya menjelaskan dirinya sendiri.",
+  sectionStartHeading: "Jadikan agen Anda milik Anda hari ini.",
+  sectionStartBody: "Instal Codewhale dan jalankan di repositori dengan kunci model yang sudah Anda miliki atau model di komputer Anda sendiri. Anda tidak memerlukan akun, dan `codewhale update` menjaganya tetap mutakhir.",
+
+  contributorsCount: {
+    other: "{n} kontributor",
+  },
+  factsLabel: "Sekilas tentang Codewhale",
+  factRust: "Ditulis dalam Rust",
+  factLicense: "Sumber terbuka, lisensi {license}",
+  factProviders: {
+    other: "{n} rute penyedia",
+  },
+  factModels: {
+    other: "{n} model",
+  },
+
+  mapHeading: "Satu mesin",
+  mapStateReleased: "Dirilis",
+  mapStateDeveloping: "Dalam pengembangan, belum ada unduhan",
+  mapStateInviteOnly: "Hanya undangan",
+  mapStateBeingBuilt: "Sedang dibangun",
+  mapTerminal: "Aplikasi terminal",
+  mapTerminalSentence: "Instal di macOS, Linux, atau Windows dan jalankan `codewhale` di repositori mana pun.",
+  mapLocalBrowser: "Klien browser lokal",
+  mapLocalBrowserSentence: "Jalankan `codewhale web` untuk membaca percakapan, mengirim tugas, dan menjawab persetujuan di browser Anda; klien ini menyertai terminal dan tidak memerlukan akun.",
+  mapManyAgents: "Banyak agen pada satu tugas",
+  mapManyAgentsSentence: "Sub-agen, Fleet, dan alur kerja memungkinkan beberapa agen berbagi satu tugas, masing-masing dengan perannya sendiri.",
+  mapDesktop: "Aplikasi desktop",
+  mapDesktopSentence: "Kami sedang membangun aplikasi desktop di atas mesin yang sama, dan belum ada unduhan publik.",
+  mapCloud: "Komputer cloud",
+  mapCloudSentence: "Komputer cloud hanya untuk undangan, dan kami sedang membangunnya agar sebuah sesi dapat terus bekerja di mesin di cloud.",
+  mapOneSession: "Satu sesi di semuanya",
+  mapOneSessionSentence: "Kami sedang membangun satu sesi yang ikut bersama Anda dari terminal ke desktop, browser, dan cloud, dan tetap milik Anda sepanjang jalan.",
 };

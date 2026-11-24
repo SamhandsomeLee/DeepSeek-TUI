@@ -111,6 +111,31 @@ pub(crate) fn workflow_dirs(workspace: Option<&Path>) -> Vec<PathBuf> {
     dirs
 }
 
+const MAX_COMMAND_FILE_BYTES: u64 = 1024 * 1024;
+
+fn read_command_file(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let read = std::fs::File::open(path).and_then(|file| {
+        let mut text = String::new();
+        file.take(MAX_COMMAND_FILE_BYTES + 1)
+            .read_to_string(&mut text)?;
+        if text.len() as u64 > MAX_COMMAND_FILE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("larger than {MAX_COMMAND_FILE_BYTES} bytes"),
+            ));
+        }
+        Ok(text)
+    });
+    match read {
+        Ok(text) => Some(text),
+        Err(error) => {
+            tracing::warn!(target: "commands", path = %path.display(), %error, "skipping unreadable command file");
+            None
+        }
+    }
+}
+
 /// Canonical saved-workflow source suffix.
 pub(crate) const WORKFLOW_SOURCE_SUFFIX: &str = ".workflow.js";
 
@@ -137,8 +162,7 @@ pub(crate) fn load_workflow_commands_from_dir(dir: &Path) -> Vec<(String, String
         if name.is_empty() {
             continue;
         }
-        let description = std::fs::read_to_string(&path)
-            .ok()
+        let description = read_command_file(&path)
             .and_then(|source| workflow_headline(&source))
             .unwrap_or_else(|| format!("Run the saved workflow {name}"));
         let content = synthesize_workflow_command(&name, &description, &path);
@@ -189,8 +213,7 @@ pub(crate) fn load_command_entries_from_component(
         let Some(stem) = component.file_stem().and_then(|value| value.to_str()) else {
             return Vec::new();
         };
-        return std::fs::read_to_string(component)
-            .ok()
+        return read_command_file(component)
             .map(|content| vec![(stem.to_lowercase(), content, component.to_path_buf())])
             .unwrap_or_default();
     }
@@ -215,9 +238,8 @@ pub(crate) fn load_command_entries_from_component(
             Some(stem) => stem.to_lowercase(),
             None => continue,
         };
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => continue,
+        let Some(content) = read_command_file(&path) else {
+            continue;
         };
         commands.push((stem, content, path));
     }
@@ -324,10 +346,34 @@ pub(crate) fn parse_allowed_tools(value: &str) -> Vec<String> {
 /// Substitute $1, $2, $ARGUMENTS placeholders in a command template.
 pub(crate) fn apply_template(template: &str, args: &str) -> String {
     let positional: Vec<&str> = args.split_whitespace().collect();
-    let mut result = template.replace("$ARGUMENTS", args);
-    for (i, arg) in positional.iter().enumerate() {
-        result = result.replace(&format!("${}", i + 1), arg);
+    let mut result = String::with_capacity(template.len() + args.len());
+    let mut rest = template;
+    while let Some(pos) = rest.find('$') {
+        result.push_str(&rest[..pos]);
+        let after = &rest[pos + 1..];
+        if let Some(tail) = after.strip_prefix("ARGUMENTS") {
+            result.push_str(args);
+            rest = tail;
+            continue;
+        }
+        let digits = if after.starts_with('0') {
+            0
+        } else {
+            after.bytes().take_while(u8::is_ascii_digit).count()
+        };
+        let arg = after[..digits]
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| positional.get(n - 1));
+        if let Some(arg) = arg {
+            result.push_str(arg);
+            rest = &after[digits..];
+        } else {
+            result.push('$');
+            rest = after;
+        }
     }
+    result.push_str(rest);
     result
 }
 
@@ -401,6 +447,22 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         codewhale_runtime::config::save_workspace_trust(tmp.path()).expect("trust test workspace");
         tmp
+    }
+
+    #[test]
+    fn oversized_command_file_is_skipped_not_loaded() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("small.md"), "small").unwrap();
+        std::fs::write(
+            tmp.path().join("huge.md"),
+            vec![b'x'; MAX_COMMAND_FILE_BYTES as usize + 1],
+        )
+        .unwrap();
+        let names: Vec<String> = load_command_entries_from_component(tmp.path())
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect();
+        assert_eq!(names, vec!["small".to_string()]);
     }
 
     #[test]
@@ -902,5 +964,21 @@ mod tests {
             "Read_File, Grep_Files".to_string()
         )));
         assert_eq!(body, "inspect $ARGUMENTS");
+    }
+
+    #[test]
+    fn apply_template_substitutes_in_one_pass() {
+        assert_eq!(
+            apply_template("explain $ARGUMENTS", "why does awk '{print $1}' fail"),
+            "explain why does awk '{print $1}' fail"
+        );
+        assert_eq!(
+            apply_template("ship $1 with $ARGUMENTS", "$2 off"),
+            "ship $2 with $2 off"
+        );
+        assert_eq!(apply_template("$10|$1", "a b c d e f g h i j"), "j|a");
+        assert_eq!(apply_template("$1 $3 $0 $ x", "a b"), "a $3 $0 $ x");
+        assert_eq!(apply_template("$12", "a"), "$12");
+        assert_eq!(apply_template("$01", "a"), "$01");
     }
 }

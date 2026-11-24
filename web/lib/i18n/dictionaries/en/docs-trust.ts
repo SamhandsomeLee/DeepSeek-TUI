@@ -42,7 +42,7 @@ export const docsTrust: DocsTrustDict = {
           rows: [
             ["Stays on your machine", "The runtime, your workspace, session history, snapshots, and the audit log."],
             ["Goes to your provider", "The context each turn needs — your messages, the files and tool results Codewhale reads for that turn — goes directly to the provider you selected. There is no Codewhale relay in between."],
-            ["Stays local entirely", "With a local model (Ollama, vLLM, SGLang), inference never leaves your machine."],
+            ["Stays local entirely", "With a model you run yourself, inference never leaves your machine."],
             ["Needs no account", "Installing and running Codewhale locally needs no Codewhale account."],
             ["Plan mode", "Cannot edit files or run shell commands. Research it is allowed to do may still contact outside services."],
           ],
@@ -61,9 +61,9 @@ export const docsTrust: DocsTrustDict = {
         },
         {
           rows: [
-            ["Never sent", "Prompts, responses, code, diffs, file contents, file or repository or branch names, paths, model ids, MCP server names, API keys or tokens, error message text, keystrokes, or any per-turn or per-tool timeline."],
+            ["Never sent", "Prompts, responses, code, diffs, file contents, file or repository or branch names, paths, model ids outside the bundled public catalog, MCP server names, API keys or tokens, error message text, keystrokes, or any per-turn or per-tool timeline."],
             ["Sent while on", "Version and platform classes, session length and outcome, feature and error counts as fixed categories, and a random install id that changes every 90 days."],
-            ["Where it goes", "`https://telemetry.codewhale.net/v1/telemetry`, a first-party service whose source is in the repository. It stores no IP address, country, or location, keeps no request logs, and holds data for three months."],
+            ["Where it goes", "`https://telemetry.codewhale.net/v1/telemetry`, a first-party service whose source is in the repository. It stores no IP address, country, or location, keeps no request logs, and holds raw data for three months; only aggregate daily totals with no install id are kept longer."],
             ["PostHog", "Forwarding to PostHog happens only if the service operator configures it separately; it carries the same fields and nothing more."],
           ],
         },

@@ -32,6 +32,7 @@ use codewhale_core::{
     ContextReference, ContextReferenceKind, ContextReferenceSource, MediaAttachmentReference,
     media_attachment_references,
 };
+use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_runtime::working_set::Workspace;
 
 /// Maximum number of `@`-mentions whose contents are inlined into one user
@@ -42,6 +43,8 @@ pub const MAX_FILE_MENTIONS_PER_MESSAGE: usize = 8;
 pub const MAX_MENTION_FILE_BYTES: u64 = 128 * 1024;
 /// Per-directory entry ceiling when inlining a directory listing.
 pub const MAX_DIRECTORY_MENTION_ENTRIES: usize = 80;
+const MAX_DIRECTORY_MENTION_SCAN: usize = 10_000;
+const MAX_MENTION_RANGE_SCAN_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Maximum file-mention completion candidates to consider per keypress. Caps
 /// the cost of walking large workspaces; subsequent keystrokes narrow further.
@@ -332,7 +335,8 @@ pub fn apply_mention_menu_selection(app: &mut App, entries: &[String]) -> bool {
     super::file_frecency::record_mention(&app.workspace, replacement);
     replace_file_mention(app, byte_start, &partial, &file_mention_body(replacement));
     app.mention_menu_hidden = false;
-    app.status_message = Some(format!("Attached @{replacement}"));
+    app.status_message =
+        Some(tr(app.ui_locale, MessageId::MentionAttached).replace("{path}", replacement));
     true
 }
 
@@ -353,6 +357,7 @@ pub fn try_autocomplete_file_mention(app: &mut App) -> bool {
     }
     if candidates.is_empty() {
         app.status_message = Some(no_file_mention_matches_status(
+            app.ui_locale,
             &partial,
             app.mention_walk_depth,
         ));
@@ -367,7 +372,8 @@ pub fn try_autocomplete_file_mention(app: &mut App) -> bool {
             &partial,
             &file_mention_body(&candidates[0]),
         );
-        app.status_message = Some(format!("Attached @{}", candidates[0]));
+        app.status_message =
+            Some(tr(app.ui_locale, MessageId::MentionAttached).replace("{path}", &candidates[0]));
         return true;
     }
     let candidate_refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
@@ -390,18 +396,20 @@ pub fn try_autocomplete_file_mention(app: &mut App) -> bool {
         .map(|c| format!("@{c}"))
         .collect::<Vec<_>>()
         .join(", ");
-    app.status_message = Some(format!("Matches: {preview}"));
+    app.status_message =
+        Some(tr(app.ui_locale, MessageId::MentionMatches).replace("{preview}", &preview));
     true
 }
 
-fn no_file_mention_matches_status(partial: &str, walk_depth: usize) -> String {
-    if path_partial_reaches_walk_depth(partial, walk_depth) {
-        format!(
-            "No files match @{partial} (mention_walk_depth={walk_depth}; use /config set mention_walk_depth 0 to search deeper)"
-        )
+fn no_file_mention_matches_status(locale: Locale, partial: &str, walk_depth: usize) -> String {
+    let id = if path_partial_reaches_walk_depth(partial, walk_depth) {
+        MessageId::MentionNoMatchesDepth
     } else {
-        format!("No files match @{partial}")
-    }
+        MessageId::MentionNoMatches
+    };
+    tr(locale, id)
+        .replace("{partial}", partial)
+        .replace("{walk_depth}", &walk_depth.to_string())
 }
 
 fn path_partial_reaches_walk_depth(partial: &str, walk_depth: usize) -> bool {
@@ -512,9 +520,10 @@ pub fn user_request_with_file_mentions_cached(
 }
 
 #[must_use]
-pub fn pending_context_previews(input: &str) -> Vec<FileMentionPreview> {
+pub fn pending_context_previews(input: &str, locale: Locale) -> Vec<FileMentionPreview> {
     let mut previews = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    let resolved_on_send = tr(locale, MessageId::ComposerContextResolvedOnSend);
     for mention in extract_file_mentions(input)
         .into_iter()
         .take(MAX_FILE_MENTIONS_PER_MESSAGE)
@@ -529,7 +538,7 @@ pub fn pending_context_previews(input: &str) -> Vec<FileMentionPreview> {
             previews.push(FileMentionPreview {
                 kind: "git".to_string(),
                 label: kind.label().to_string(),
-                detail: Some("resolved on send".to_string()),
+                detail: Some(resolved_on_send.to_string()),
                 included: false,
                 removable: false,
             });
@@ -542,7 +551,7 @@ pub fn pending_context_previews(input: &str) -> Vec<FileMentionPreview> {
             detail: Some(if media {
                 "use /attach for media bytes".to_string()
             } else {
-                "resolved on send".to_string()
+                resolved_on_send.to_string()
             }),
             // Lexical preview deliberately does not stat the path while the
             // user types. Exact inclusion/missing metadata is resolved once,
@@ -828,15 +837,34 @@ fn stabilize_screencapture_file(path: &Path, artifact_dir: &Path) -> Option<Path
     } else {
         codewhale_util::files::WorkspaceFile::open
     };
-    let target = open(root, &relative, true).ok()?;
+    let target = match open(root, &relative, true) {
+        Ok(target) => target,
+        Err(error) => {
+            tracing::warn!(%error, "screenshot stabilization target unavailable");
+            return None;
+        }
+    };
     // An existing regular destination is reused; a link there fails to open.
     if target.open_file().is_ok() {
         return Some(dest);
     }
-    if std::fs::metadata(path).ok()?.len() > MAX_STABLE_ATTACHMENT_BYTES {
-        return None;
-    }
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = match std::fs::metadata(path) {
+        Ok(metadata) if metadata.len() > MAX_STABLE_ATTACHMENT_BYTES => {
+            tracing::warn!(path = %path.display(), "screenshot too large to stabilize");
+            return None;
+        }
+        Ok(_) => match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "screenshot read failed");
+                return None;
+            }
+        },
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "screenshot metadata failed");
+            return None;
+        }
+    };
     match target.publish(&bytes) {
         Ok(()) => Some(dest),
         // Lost a race to another writer of the same name: reuse only if what
@@ -846,7 +874,10 @@ fn stabilize_screencapture_file(path: &Path, artifact_dir: &Path) -> Option<Path
         {
             Some(dest)
         }
-        Err(_) => None,
+        Err(error) => {
+            tracing::warn!(%error, "screenshot stabilization publish failed");
+            None
+        }
     }
 }
 
@@ -1119,7 +1150,10 @@ fn local_context_from_file_mentions(
         // Missing mentions dedup on the typed token: there is no resolved
         // path to key on, and the workspace-root guess must not become one.
         let dedup_key = if exists {
-            display_path.clone()
+            match range {
+                Some(FileRange { start, end }) => format!("{display_path}\0{start}-{end}"),
+                None => display_path.clone(),
+            }
         } else {
             format!("missing:{mention}")
         };
@@ -1346,9 +1380,11 @@ fn is_file_mention_start(chars: &[char], idx: usize) -> bool {
     if idx == 0 {
         return true;
     }
-    chars
-        .get(idx.saturating_sub(1))
-        .is_some_and(|ch| ch.is_whitespace() || matches!(ch, '(' | '[' | '{' | '<' | '"' | '\''))
+    chars.get(idx.saturating_sub(1)).is_some_and(|ch| {
+        ch.is_whitespace()
+            || matches!(ch, '(' | '[' | '{' | '<' | '"' | '\'')
+            || codewhale_tui_kit::translation::is_cjk(*ch)
+    })
 }
 
 fn trim_unquoted_mention(raw: &str) -> &str {
@@ -1357,7 +1393,7 @@ fn trim_unquoted_mention(raw: &str) -> &str {
         && trimmed
             .chars()
             .last()
-            .is_some_and(|ch| matches!(ch, ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}'))
+            .is_some_and(|ch| ",;:!?)]}，。、；：！？）］｝」』】》〉".contains(ch))
     {
         trimmed = &trimmed[..trimmed.len() - trimmed.chars().last().unwrap().len_utf8()];
     }
@@ -1410,46 +1446,78 @@ fn render_file_mention_context(
 }
 
 fn render_directory_mention_context(raw: &str, path: &Path, display_path: &str) -> String {
-    let entries = match std::fs::read_dir(path) {
-        Ok(entries) => entries,
-        Err(err) => {
-            return format!(
-                "<unreadable-directory mention=\"@{raw}\" path=\"{display_path}\">\n{err}\n</unreadable-directory>"
-            );
+    match directory_listing(
+        path,
+        MAX_DIRECTORY_MENTION_ENTRIES,
+        MAX_DIRECTORY_MENTION_SCAN,
+    ) {
+        Ok((body, false)) => {
+            format!("<directory mention=\"@{raw}\" path=\"{display_path}\">\n{body}\n</directory>")
         }
-    };
+        Ok((body, true)) => format!(
+            "<directory mention=\"@{raw}\" path=\"{display_path}\" truncated=\"true\">\n{body}\n</directory>"
+        ),
+        Err(err) => format!(
+            "<unreadable-directory mention=\"@{raw}\" path=\"{display_path}\">\n{err}\n</unreadable-directory>"
+        ),
+    }
+}
 
-    // Keep only the first MAX entries in sort order while counting the rest:
-    // a max-heap of that size bounds memory to the output instead of
-    // materializing and sorting the whole directory (U07-03).
-    let mut total = 0usize;
-    let mut kept = std::collections::BinaryHeap::with_capacity(MAX_DIRECTORY_MENTION_ENTRIES + 1);
-    for entry in entries.filter_map(|entry| entry.ok()) {
-        total += 1;
+/// The first `keep` entry names of `path` in sort order (directories marked
+/// `/`) and whether enumeration stopped at `scan_limit` with entries left.
+/// A max-heap of `keep` names bounds memory (U07-03); the scan limit bounds
+/// work, so a partial listing's names are the first among those examined.
+fn directory_listing(
+    path: &Path,
+    keep: usize,
+    scan_limit: usize,
+) -> std::io::Result<(String, bool)> {
+    let mut entries = std::fs::read_dir(path)?;
+    let mut scanned = 0usize;
+    let mut kept = std::collections::BinaryHeap::with_capacity(keep.saturating_add(1));
+    let mut partial = false;
+    loop {
+        if scanned == scan_limit {
+            partial = entries.next().is_some();
+            break;
+        }
+        let Some(entry) = entries.next() else {
+            break;
+        };
+        scanned += 1;
+        let Ok(entry) = entry else {
+            continue;
+        };
         let marker = entry
             .file_type()
             .ok()
             .filter(|ty| ty.is_dir())
             .map_or("", |_| "/");
         kept.push(format!("{}{}", entry.file_name().to_string_lossy(), marker));
-        if kept.len() > MAX_DIRECTORY_MENTION_ENTRIES {
+        if kept.len() > keep {
             kept.pop();
         }
     }
     let names = kept.into_sorted_vec();
     let mut body = names.join("\n");
-    if total > MAX_DIRECTORY_MENTION_ENTRIES {
-        let omitted = total - MAX_DIRECTORY_MENTION_ENTRIES;
+    let omitted = scanned.saturating_sub(names.len());
+    if partial {
+        let _ = write!(
+            body,
+            "\n... listing stopped after {scanned} entries; more exist"
+        );
+    } else if omitted > 0 {
         let _ = write!(body, "\n... {omitted} more entries");
     }
-    format!("<directory mention=\"@{raw}\" path=\"{display_path}\">\n{body}\n</directory>")
+    Ok((body, partial))
 }
 
 /// Bounded read of a mention's file content, optionally sliced to a line
 /// range. Returns `(text, truncated, beyond_eof)`: `truncated` mirrors the
 /// full-file byte bound, except for a range that starts past that bound,
 /// where it says whether the streamed range itself was cut; `beyond_eof` is
-/// set only when the requested range starts past the end of the file.
+/// set only when the requested range starts past the end of the file. A range
+/// whose scan budget runs out first is `truncated` with no `beyond_eof`.
 fn read_file_content(
     path: &Path,
     range: Option<FileRange>,
@@ -1469,7 +1537,12 @@ fn read_file_content(
             // The prefix ended, not the file: read the range from the file
             // itself instead of calling it past EOF (U07-04).
             std::io::Seek::rewind(&mut file)?;
-            return read_line_range_past_prefix(file, u64::from(start), u64::from(end));
+            return read_line_range_past_prefix(
+                file,
+                u64::from(start),
+                u64::from(end),
+                MAX_MENTION_RANGE_SCAN_BYTES,
+            );
         }
         return Ok((String::new(), truncated, true));
     }
@@ -1479,19 +1552,26 @@ fn read_file_content(
 
 /// Stream a 1-based inclusive line range that starts beyond the bounded
 /// prefix. Skipped lines are scanned, never stored; the range text itself is
-/// held to the same byte budget as a whole-file mention.
+/// held to the same byte budget as a whole-file mention. At most `scan_limit`
+/// bytes are consumed; running out before the first line yields no text and
+/// `truncated`, and only a real end of file reads as beyond EOF.
 fn read_line_range_past_prefix(
     file: impl Read,
     start: u64,
     end: u64,
+    scan_limit: u64,
 ) -> std::io::Result<(String, bool, bool)> {
     use std::io::BufRead;
     let mut reader = std::io::BufReader::new(file);
     let mut line = 1u64;
+    let mut scanned = 0u64;
     while line < start {
         let buf = reader.fill_buf()?;
         if buf.is_empty() {
             return Ok((String::new(), false, true));
+        }
+        if scanned >= scan_limit {
+            return Ok((String::new(), true, false));
         }
         let consumed = match buf.iter().position(|byte| *byte == b'\n') {
             Some(newline) => {
@@ -1500,6 +1580,7 @@ fn read_line_range_past_prefix(
             }
             None => buf.len(),
         };
+        scanned += consumed as u64;
         reader.consume(consumed);
     }
     if reader.fill_buf()?.is_empty() {
@@ -1517,6 +1598,10 @@ fn read_line_range_past_prefix(
             Some(newline) => (newline + 1, true),
             None => (buf.len(), false),
         };
+        if scanned >= scan_limit {
+            truncated = true;
+            break;
+        }
         let room = budget - buffer.len();
         if take > room {
             buffer.extend_from_slice(&buf[..room]);
@@ -1524,6 +1609,7 @@ fn read_line_range_past_prefix(
             break;
         }
         buffer.extend_from_slice(&buf[..take]);
+        scanned += take as u64;
         reader.consume(take);
         if newline {
             line += 1;
@@ -1631,6 +1717,23 @@ mod tests {
         assert_eq!(file_mention_body("src/main.rs"), "src/main.rs");
     }
 
+    #[test]
+    fn mention_directly_after_cjk_text_is_recognized() {
+        assert_eq!(
+            extract_file_mentions("请看@src/main.rs 讲了什么"),
+            vec!["src/main.rs".to_string()]
+        );
+        assert_eq!(
+            partial_file_mention_at_cursor("请看@src/ma", 9),
+            Some(("请看".len(), "src/ma".to_string()))
+        );
+        assert!(extract_file_mentions("mail me at a@b.com").is_empty());
+        assert_eq!(
+            extract_file_mentions("（@a.rs） 「@b.rs」 看@c.rs。"),
+            vec!["a.rs".to_string(), "b.rs".to_string(), "c.rs".to_string()]
+        );
+    }
+
     /// #101 regression — workspace-vs-cwd divergence: `@bar.txt` typed from
     /// the cwd `<root>/sub` MUST resolve to `<root>/sub/bar.txt`, never to
     /// `<root>/bar.txt` (which doesn't exist).
@@ -1718,6 +1821,32 @@ mod tests {
         assert!(!content.contains("<missing-file"), "got: {content}");
     }
 
+    #[test]
+    fn two_ranges_of_one_file_are_both_attached() {
+        let tmp = TempDir::new().expect("tempdir");
+        std::fs::write(tmp.path().join("notes.txt"), "one\ntwo\nthree\nfour\n").expect("write");
+
+        let content = user_request_with_file_mentions(
+            "compare @notes.txt:1-1 with @notes.txt:4-4",
+            tmp.path(),
+            None,
+        );
+
+        assert!(content.contains("lines=\"1-1\">\none\n"), "got: {content}");
+        assert!(content.contains("lines=\"4-4\">\nfour\n"), "got: {content}");
+
+        if cfg!(unix) {
+            std::fs::write(tmp.path().join("notes.txt:1-1"), "literal\n").expect("write");
+            let content = user_request_with_file_mentions(
+                "@notes.txt:01-01 @notes.txt:1-1",
+                tmp.path(),
+                None,
+            );
+            assert!(content.contains("lines=\"1-1\">\none\n"), "got: {content}");
+            assert!(content.contains("literal\n"), "got: {content}");
+        }
+    }
+
     /// Negative test: a truly missing path still produces `<missing-file>`
     /// so the user gets an explicit signal instead of silent failure.
     #[test]
@@ -1738,7 +1867,7 @@ mod tests {
 
     #[test]
     fn pending_context_preview_is_lexical_and_does_not_probe_paths() {
-        let previews = pending_context_previews("read @guide.md and @missing.md");
+        let previews = pending_context_previews("read @guide.md and @missing.md", Locale::En);
 
         assert_eq!(previews.len(), 2);
         assert_eq!(previews[0].kind, "mention");
@@ -1758,7 +1887,7 @@ mod tests {
         let attached = tmp.path().join("photo.png").display().to_string();
         let input = format!("inspect @photo.png\n[Attached image: {attached}]");
 
-        let previews = pending_context_previews(&input);
+        let previews = pending_context_previews(&input, Locale::En);
 
         assert!(
             previews
@@ -2120,6 +2249,49 @@ mod tests {
     }
 
     #[test]
+    fn mention_scan_bounds_report_partial_not_eof() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("lines.txt");
+        std::fs::write(&path, "aaaa\nbbbb\ncccc\ndddd\n").expect("write");
+        let open = || std::fs::File::open(&path).expect("open");
+
+        let (text, truncated, beyond_eof) =
+            read_line_range_past_prefix(open(), 4, 4, 7).expect("bounded read");
+        assert!(truncated && !beyond_eof && text.is_empty());
+        let (text, truncated, beyond_eof) =
+            read_line_range_past_prefix(open(), 4, 4, 1 << 20).expect("unbounded read");
+        assert!(!truncated && !beyond_eof);
+        assert_eq!(text, "dddd");
+        let (_, truncated, beyond_eof) =
+            read_line_range_past_prefix(open(), 9, 9, 1 << 20).expect("past the end");
+        assert!(!truncated && beyond_eof);
+        let (text, truncated, beyond_eof) =
+            read_line_range_past_prefix(open(), 1, 4, 12).expect("cut short");
+        assert!(truncated && !beyond_eof, "{text:?}");
+        assert!(text.starts_with("aaaa\nbbbb"), "{text:?}");
+
+        let dir = tmp.path().join("many");
+        std::fs::create_dir(&dir).expect("mkdir");
+        for n in 0..30 {
+            std::fs::write(dir.join(format!("f{n:02}")), "x").expect("write");
+        }
+        let (body, partial) = directory_listing(&dir, 5, 100).expect("listing");
+        assert!(!partial);
+        assert!(body.ends_with("... 25 more entries"), "{body}");
+        let (body, partial) = directory_listing(&dir, 5, 12).expect("listing");
+        assert!(partial);
+        assert!(
+            body.ends_with("listing stopped after 12 entries; more exist"),
+            "{body}"
+        );
+        let (_, partial) = directory_listing(&dir, 5, 30).expect("listing");
+        assert!(
+            !partial,
+            "exactly the scan limit with nothing left is complete"
+        );
+    }
+
+    #[test]
     fn ranged_file_mention_slices_lines_and_reports_beyond_eof() {
         let tmp = TempDir::new().expect("tempdir");
         let path = tmp.path().join("lines.rs");
@@ -2316,10 +2488,17 @@ mod tests {
 
     #[test]
     fn composer_preview_lists_git_mentions_without_running_git() {
-        let previews = pending_context_previews("@git @diff");
+        let previews = pending_context_previews("@git @diff", Locale::En);
         let kinds: Vec<&str> = previews.iter().map(|p| p.kind.as_str()).collect();
         assert_eq!(kinds, vec!["git", "git"]);
         assert!(previews.iter().all(|p| !p.included));
+        let localized = pending_context_previews("@git @notes.md", Locale::ZhHans);
+        assert!(
+            localized
+                .iter()
+                .all(|p| p.detail.as_deref() == Some("发送时解析")),
+            "{localized:?}"
+        );
     }
 
     /// #4067 review follow-up: `mention_menu_limit = 0` is a documented way to

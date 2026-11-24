@@ -14,7 +14,7 @@ import { describe, expect, it } from "vitest";
 import { FACTS } from "./facts.generated";
 import { SNIPPETS, VERIFY } from "./install-binary-snippets";
 import { INSTALL_GUIDE } from "./install-guide.generated";
-import { getChrome, getHome } from "./i18n/dictionaries";
+import { getChrome } from "./i18n/dictionaries";
 import { footerProjectLinks } from "./i18n/links";
 import { TERMINAL_SCREENSHOT } from "./media-manifest";
 import { PRODUCT_COPY } from "./content/product";
@@ -53,11 +53,15 @@ type PublicSurfaceMatrix = {
     };
   };
   control: {
+    scope: string;
     modes: string[];
     permissionPostures: string[];
+    permissionDial: string[];
+    defaultPermissionPosture: string;
+    retiredModeAliases: Record<string, string>;
     shortcuts: {
-      mode: { chord: string; when: string };
-      permissionPosture: { chord: string; when: string };
+      completion: { chord: string; when: string };
+      permissionDial: { chord: string; when: string };
     };
   };
   toolSurface: {
@@ -93,6 +97,7 @@ type PublicSurfaceMatrix = {
     website: string;
     sourceVersion: string | null;
     sourceCommit: string | null;
+    model: string;
     terminal: string;
     capture: string;
     sources: string[];
@@ -148,7 +153,12 @@ describe("public surface contracts", () => {
       version: matrix.latestPublishedRelease.version,
       publishedAt: matrix.latestPublishedRelease.publishedAt,
       url: matrix.latestPublishedRelease.url,
-    }).toEqual(FACTS.latestPublishedRelease);
+    }).toEqual({
+      tag: FACTS.latestPublishedRelease?.tag,
+      version: FACTS.latestPublishedRelease?.version,
+      publishedAt: FACTS.latestPublishedRelease?.publishedAt,
+      url: FACTS.latestPublishedRelease?.url,
+    });
     // The published release may equal the source candidate: that is the normal
     // state in the window between shipping vX.Y.Z and opening the next lane.
     // What must never happen is the site advertising a version that is not
@@ -265,7 +275,6 @@ describe("public surface contracts", () => {
     expect(installDoc).toContain("One Cargo package is required");
     expect(installDoc).toContain("`codewhale-cli` installs the `codewhale` command");
     expect(installDoc).toContain("Cargo does\nnot create that alias");
-    expect(installPage).toContain('from "@/lib/install-guide.generated"');
     expect(INSTALL_GUIDE.chunks.some((chunk) => chunk.kind === "code" && chunk.text.includes("cargo install --path crates/cli --locked"))).toBe(true);
     expect(installPage).not.toContain("codewhale-tui");
     expect(npmReadme).toContain("installs `codewhale` plus the `codew` convenience name");
@@ -375,29 +384,34 @@ done
 
     expect(matrix.trust.audit).toContain("best-effort");
     expect(matrix.trust.audit).toContain("$CODEWHALE_HOME");
-    // Install links to configuration instead of duplicating its storage map.
-    expect(installPage).toContain("/docs/configuration");
     expect(installPage).not.toContain(
       "audit.log        credential / approval / elevation audit trail",
     );
   });
 
-  it("keeps modes, permission postures, and idle shortcuts exact", () => {
+  it("keeps source-candidate modes and permission controls aligned with runtime authority", () => {
     const modes = text("docs/MODES.md");
     const keys = text("docs/KEYBINDINGS.md");
-    const homepage = text("web/app/[locale]/page.tsx");
-    const docsMap = text("web/lib/docs-map.ts");
-    const matrixText = text("docs/public-surface-facts.json");
+    const appModes = text("crates/config/src/app_mode.rs");
+    const approvals = text("crates/execpolicy/src/approval_mode.rs");
+    const app = text("crates/tui/src/tui/app.rs");
+    const init = text("crates/tui/src/tui/app/init.rs");
 
-    expect(matrix.control.modes).toEqual(["Plan", "Work", "Operate"]);
-    expect(matrix.control.permissionPostures).toEqual(["Ask", "Auto-Review", "Full Access"]);
-    // Tab is gated on the composer being EMPTY, not idle
-    // (crates/tui/src/tui/ui.rs:6978 `if !app.input.is_empty() { continue; }`
-    // immediately before `app.cycle_mode()`); Shift+Tab has no composer
-    // precondition at all (ui.rs:6363-6367 gates only on the modal stack).
+    expect(matrix.control.scope).toContain(`${FACTS.version} source candidate`);
+    expect(matrix.control.modes).toEqual(["Plan", "Work"]);
+    expect(appModes).toMatch(/pub enum AppMode\s*\{\s*Agent,\s*Plan,\s*\}/);
+    expect(matrix.control.permissionPostures).toEqual(["Ask", "Accept Edits", "Auto-Review", "Full Access"]);
+    expect(approvals).toMatch(/PERMISSION_CYCLE:[\s\S]*?Self::Suggest, Self::AcceptEdits, Self::Auto, Self::Bypass/);
+    expect(matrix.control.permissionDial).toEqual(["Ask", "Accept Edits", "Plan", "Auto-Review", "Full Access"]);
+    expect(app).toContain("ApprovalMode::AcceptEdits => (AppMode::Plan, ApprovalMode::AcceptEdits)");
+    expect(matrix.control.defaultPermissionPosture).toBe("Accept Edits");
+    expect(init).toMatch(/explicit_approval_mode\s*\.or\(saved_permission_posture\)/);
+    expect(init).toMatch(/unwrap_or\(if approval_policy_locked \{\s*ApprovalMode::Suggest\s*\} else \{\s*ApprovalMode::AcceptEdits/);
+    expect(matrix.control.retiredModeAliases).toEqual({ Operate: "Work" });
+    expect(appModes).toContain("Self::is_retired_operate_alias(other) => Some(Self::Agent)");
     expect(matrix.control.shortcuts).toEqual({
-      mode: { chord: "Tab", when: "composer empty" },
-      permissionPosture: {
+      completion: { chord: "Tab", when: "composer completion only" },
+      permissionDial: {
         chord: "Shift+Tab",
         when: "always (suppressed only under a non-Config modal)",
       },
@@ -407,14 +421,10 @@ done
     }
     expect(PRODUCT_COPY.modes.map(({ title }) => title.en)).toEqual(matrix.control.modes);
     expect(PRODUCT_COPY.permissions.map(({ title }) => title.en)).toEqual(matrix.control.permissionPostures);
-    expect(modes).toContain("when the composer is empty");
-    expect(keys).toContain("When the composer is empty, cycle TUI mode");
-    expect(keys).toContain("`Shift+Tab`");
-    // Detailed key semantics belong to the canonical keybinding/mode docs, not
-    // the concise README or every translation.
-    expect(keys).not.toContain("When the composer is idle");
-    expect(`${modes}\n${homepage}\n${docsMap}`).not.toContain("approval posture");
-    expect(matrixText).not.toContain('"approvalPostures"');
+    expect(modes).toContain("it never changes the mode");
+    expect(modes).toContain("Operate is retired");
+    expect(keys).toContain("Tab never changes the mode");
+    expect(keys).toContain("Ask → Accept Edits → Plan → Auto-Review → Full Access → Ask");
   });
 
   it("keeps public tool facts aligned with the native core and discovery boundaries", () => {
@@ -422,8 +432,6 @@ done
     const toolsPage = text("web/app/[locale]/docs/tools/page.tsx") + text("web/lib/content/tools.ts");
     const registry = text("crates/engine/src/tools/registry.rs");
     const limits = text("crates/runtime/src/config/subagent_limits.rs");
-    const roadmap = text("web/app/[locale]/roadmap/page.tsx");
-
     const catalog = text("crates/engine/src/core/engine/tool_catalog.rs");
     const nativeCore = catalog.match(/const DEFAULT_ACTIVE_NATIVE_TOOLS: &[\s\S]*?= &\[([\s\S]*?)\];/);
     expect(nativeCore, "native core declaration must be found").not.toBeNull();
@@ -455,11 +463,11 @@ done
     expect(limits).toContain("DEFAULT_MAX_SUBAGENTS: usize = 64");
     expect(limits).toContain("MAX_SUBAGENTS: usize = 128");
     expect(limits).toContain("MAX_SUBAGENT_ADMISSION: usize = 1024");
-    expect(roadmap).toContain("64 concurrent sessions by default, configurable to 128");
-    expect(roadmap.indexOf('{ title: "Local web client"')).toBeLessThan(
-      roadmap.indexOf('title: "Underway"'),
-    );
-    expect(roadmap).toContain("In published releases: `codewhale web`");
+    for (const deferred of ["workflow", "context_archive_get", "context_archive_search"]) {
+      expect(nativeNames).not.toContain(deferred);
+      expect(catalog).toContain(deferred);
+      expect(toolDoc).toContain(deferred);
+    }
     for (const name of matrix.toolSurface.defaultActive) {
       expect(toolDoc, name).toContain(`\`${name}\``);
       expect(toolsPage, name).toContain(name);
@@ -480,7 +488,6 @@ done
 
   it("states the hosted-provider privacy boundary without a false local-only promise", () => {
     const faq = text("web/lib/content/faq.tsx");
-    const roadmap = text("web/app/[locale]/roadmap/page.tsx");
     const providers = text("docs/PROVIDERS.md");
     const runtime = text("docs/RUNTIME_API.md");
 
@@ -516,8 +523,6 @@ done
     expect(faq).toContain("你选择的托管 provider 会收到");
     expect(faq).not.toContain("No telemetry, no cloud processing of your code");
     expect(faq).not.toContain("不会将你的代码上传到云端处理");
-    expect(roadmap).not.toContain("what happens there stays there");
-    expect(roadmap).not.toContain("你的数据不会离开");
     expect(providers).toMatch(/Hosted\s+routes/);
     expect(runtime).toContain("No hosted relay");
   });
@@ -563,47 +568,34 @@ done
     expect(text("web/lib/i18n/links.ts")).toContain(
       'export const REPO_URL = "https://github.com/codewhale-hq/CodeWhale"',
     );
-    expect(footer).toContain("GITEE_ENABLED &&");
+    // Mirrors are listed on /install#mirrors, not in the footer.
+    expect(footer).not.toMatch(/gitee|cnb\.cool|npmmirror/i);
   });
 
   it("keeps supplied terminal screenshots and website dimensions truthful", () => {
-    // The site and README use the same measured native capture. Demo route
-    // and development-source provenance remain explicit in capture metadata.
+    // The README image is a frame of the real released-capture set; its build
+    // and model are recorded in the fact matrix and the capture provenance.
     const readmeImage = bytes(matrix.screenshot.readme);
     const websiteImage = bytes(matrix.screenshot.website);
 
     expect(imageDimensions(websiteImage)).toEqual([TERMINAL_SCREENSHOT.width, TERMINAL_SCREENSHOT.height]);
     expect(readmeImage).toEqual(websiteImage);
     expect(statSync(new URL(matrix.screenshot.readme, root)).size).toBeLessThan(500_000);
-    expect(statSync(new URL(matrix.screenshot.website, root)).size).toBeLessThan(500_000);
-    expect(matrix.screenshot.terminal).toContain("real PTY cell capture");
-    // A development-build capture, never a release claim.
+    expect(matrix.screenshot.terminal).toContain("real PTY capture");
     expect(matrix.screenshot.capture).toContain("development build");
-    const capture = JSON.parse(text("web/lib/terminal-captures/manifest.json"));
-    expect(capture.baseCommit).toBe(matrix.screenshot.sourceCommit);
-    expect(capture.binarySha256).toMatch(/^[0-9a-f]{64}$/);
-    expect(capture.sourceDiffSha256).toMatch(/^[0-9a-f]{64}$/);
-    expect(capture.sourceDirty).toBe(true);
-    expect(capture.conditions.provider).toContain("loopback");
-    expect(capture.conditions.model).toBe("website-demo");
-    expect(capture.conditions.submittedPrompts).toBeGreaterThan(0);
-    expect(capture.conditions.fixtureHistory).toBe(false);
+    expect(matrix.screenshot.model).toBe(TERMINAL_SCREENSHOT.model);
+    expect(matrix.screenshot.sourceCommit).toBe(TERMINAL_SCREENSHOT.sourceCommit);
+    const provenance = JSON.parse(text("web/lib/terminal-captures/released/provenance.json"));
+    expect(provenance.model.scripted).toBe(false);
+    expect(provenance.model.model).toBe(TERMINAL_SCREENSHOT.model);
 
     const readme = text("README.md");
-    const productPage = text("web/app/[locale]/product/page.tsx");
+    const homePage = text("web/app/[locale]/page.tsx");
+    const guidePage = text("web/app/[locale]/docs/guide/page.tsx");
     expect(readme).toContain(matrix.screenshot.readme);
     expect(`web/public${TERMINAL_SCREENSHOT.src}`).toBe(matrix.screenshot.website);
-    expect(imageDimensions(websiteImage)).toEqual([TERMINAL_SCREENSHOT.width, TERMINAL_SCREENSHOT.height]);
-    expect(productPage).toContain("<NativeTerminalGallery");
-    expect(TERMINAL_SCREENSHOT.capture).toBe("web/lib/terminal-captures/website-home-100x24.json");
-    expect(matrix.screenshot.sources).toContain(TERMINAL_SCREENSHOT.capture);
-    // Every locale describes the actual capture; build identity comes from
-    // the media manifest instead of a stale version embedded in translations.
-    expect(productPage).toContain("label={fill(home.screenshotAlt, { version: TERMINAL_SCREENSHOT.version })}");
-    for (const locale of ["en", "zh", "ja", "vi", "ko", "ru", "uk", "es", "pt-BR", "id", "fr", "de", "ca", "hi", "tr", "it", "pl", "ar"]) {
-      const home = getHome(locale);
-      expect(home.screenshotAlt, `${locale} alt`).toContain("{version}");
-    }
+    expect(homePage).toContain("RELEASED_CAPTURE_FRAMES");
+    expect(guidePage).toContain("RELEASED_CAPTURE_FRAMES");
   });
 
   it("keeps the homepage free of fabricated demo panels", () => {

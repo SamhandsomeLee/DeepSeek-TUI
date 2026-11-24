@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{expand_path, normalize_model_name};
+use crate::config::expand_path;
 use codewhale_config::resolve::Layer;
 use codewhale_localization::normalize_configured_locale;
 use codewhale_palette::{normalize_hex_rgb_color, normalize_theme_setting};
@@ -492,6 +492,8 @@ pub struct Settings {
     /// One-time Operate-retirement toast has been shown. Same suppression
     /// contract as `yolo_deprecation_shown`.
     pub operate_deprecation_shown: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_preferences_notice_shown: Option<String>,
     /// Round 3 (2026-09-01) moved the work bar under the composer. Every
     /// settings.toml saved before that carries `work_surface_placement =
     /// "top"` — the old default, persisted verbatim by ordinary saves, not a
@@ -514,6 +516,8 @@ pub struct Settings {
     /// Omitted entirely before the first recorded use.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub footer_hint_uses: std::collections::BTreeMap<String, u8>,
+    #[serde(default, skip_serializing_if = "AgentSettings::is_empty")]
+    pub agents: AgentSettings,
     /// True only for the current load when `default_mode = "yolo"` was read
     /// from an older settings file. App startup uses this provenance to migrate
     /// the old bundled Full Access choice without weakening project or managed
@@ -535,6 +539,81 @@ pub struct Settings {
     /// policy / project producers mark their own layers when they land.
     #[serde(skip)]
     pub provenance: std::collections::BTreeMap<String, Layer>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentSettings {
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub quota: std::collections::BTreeMap<String, AgentQuotaSetting>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentQuotaSetting {
+    #[serde(skip_serializing_if = "is_false")]
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consented_at: Option<String>,
+}
+
+pub const AGENT_QUOTA_KEY_PREFIX: &str = "agents.quota.";
+const MAX_AGENT_ID_CHARS: usize = 64;
+const MAX_AGENT_QUOTA_ENTRIES: usize = 32;
+
+impl AgentSettings {
+    pub fn is_empty(&self) -> bool {
+        self.quota.is_empty()
+    }
+
+    pub fn quota(&self, agent_id: &str) -> AgentQuotaSetting {
+        self.quota.get(agent_id).cloned().unwrap_or_default()
+    }
+
+    fn set_quota_key(&mut self, key: &str, value: &str) -> Result<()> {
+        let rest = &key[AGENT_QUOTA_KEY_PREFIX.len()..];
+        let (agent_id, consent) = match rest.strip_suffix(".consent") {
+            Some(agent_id) => (agent_id, true),
+            None => (rest, false),
+        };
+        let valid_id = !agent_id.is_empty()
+            && agent_id.len() <= MAX_AGENT_ID_CHARS
+            && agent_id
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-');
+        if !valid_id {
+            anyhow::bail!(
+                "Failed to update setting: `{key}` does not name an agent. Expected agents.quota.<agent> or agents.quota.<agent>.consent with a lowercase agent id."
+            );
+        }
+        if !self.quota.contains_key(agent_id) && self.quota.len() >= MAX_AGENT_QUOTA_ENTRIES {
+            anyhow::bail!(
+                "Failed to update setting: `{key}` would exceed {MAX_AGENT_QUOTA_ENTRIES} agent quota entries. Turn one off first."
+            );
+        }
+        let mut entry = self.quota(agent_id);
+        if consent {
+            entry.consented_at = match value.trim().to_ascii_lowercase().as_str() {
+                "granted" => Some(chrono::Utc::now().to_rfc3339()),
+                "revoked" => None,
+                _ => anyhow::bail!(
+                    "Failed to update setting: invalid consent for {key}. Expected: granted or revoked."
+                ),
+            };
+        } else {
+            entry.enabled = parse_bool(value).map_err(|_| {
+                anyhow::anyhow!(
+                    "Failed to update setting: invalid value for {key}. Expected: on or off."
+                )
+            })?;
+        }
+        if entry == AgentQuotaSetting::default() {
+            self.quota.remove(agent_id);
+        } else {
+            self.quota.insert(agent_id.to_string(), entry);
+        }
+        Ok(())
+    }
 }
 
 impl Default for Settings {
@@ -573,9 +652,7 @@ impl Default for Settings {
             mention_menu_limit: 128,
             mention_walk_depth: 10,
             mention_menu_behavior: "fuzzy".to_string(),
-            // Reasoning is useful when explicitly requested, but it should
-            // never displace the actual conversation in the default TUI.
-            show_thinking: false,
+            show_thinking: true,
             thinking_default_expanded: false,
             thinking_preview_lines: default_thinking_preview_lines(),
             thinking_highlight: true,
@@ -617,11 +694,13 @@ impl Default for Settings {
             feature_intro_shown: false,
             yolo_deprecation_shown: false,
             operate_deprecation_shown: false,
+            account_preferences_notice_shown: None,
             legacy_operate_default: false,
             work_surface_bottom_migrated: false,
             behavioral_tip_impressions: std::collections::BTreeMap::new(),
             dismissed_plugin_suggestions: std::collections::BTreeSet::new(),
             footer_hint_uses: std::collections::BTreeMap::new(),
+            agents: AgentSettings::default(),
             legacy_yolo_default: false,
             tui_prefs_migration: None,
             provenance: std::collections::BTreeMap::new(),
@@ -1003,7 +1082,22 @@ impl Settings {
                 .to_string();
             s.background_color = normalize_optional_background_color(s.background_color.as_deref());
             s.theme = normalize_settings_theme(&s.theme);
-            s.default_model = s.default_model.as_deref().and_then(normalize_default_model);
+            s.default_model = s.default_model.as_deref().and_then(|value| {
+                let trimmed = value.trim();
+                codewhale_config::route::resolve_model(
+                    codewhale_config::ProviderKind::Deepseek,
+                    trimmed,
+                    None,
+                )
+                .ok()
+                .map(|_| {
+                    if trimmed.eq_ignore_ascii_case("auto") {
+                        "auto".to_string()
+                    } else {
+                        trimmed.to_string()
+                    }
+                })
+            });
             s.reasoning_effort = s
                 .reasoning_effort
                 .as_deref()
@@ -1790,6 +1884,9 @@ impl Settings {
                     );
                 }
             }
+            quota if quota.starts_with(AGENT_QUOTA_KEY_PREFIX) => {
+                self.agents.set_quota_key(quota, value)?;
+            }
             _ => {
                 anyhow::bail!("Failed to update setting: unknown setting '{key}'.");
             }
@@ -2471,7 +2568,12 @@ fn atomically_replace_settings_file(path: &Path, body: &[u8]) -> Result<()> {
     tmp.persist(path)
         .map_err(|error| error.error)
         .with_context(|| format!("Failed to write settings to {}", path.display()))?;
-    Ok(())
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    codewhale_config::persistence::sync_parent_dir(dir)
+        .with_context(|| format!("Failed to sync settings directory for {}", path.display()))
 }
 
 /// Last-resort delivery for `settings.toml`: rewrite it without a rename.
@@ -2829,15 +2931,6 @@ fn migrate_settings_file_to_primary_if_needed(primary: &Path, active_read_path: 
             active_read_path.display(),
             primary.display()
         );
-    }
-}
-
-fn normalize_default_model(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.eq_ignore_ascii_case("auto") {
-        Some("auto".to_string())
-    } else {
-        normalize_model_name(trimmed)
     }
 }
 
@@ -3474,6 +3567,45 @@ mod tests {
     }
 
     #[test]
+    fn agent_quota_keys_validate_cap_and_never_echo_the_value() {
+        let mut settings = Settings::default();
+        settings.set("agents.quota.claude", "on").unwrap();
+        settings
+            .set("agents.quota.claude.consent", "granted")
+            .unwrap();
+        assert!(settings.agents.quota("claude").enabled);
+        assert!(settings.agents.quota("claude").consented_at.is_some());
+
+        let secret = "sk-do-not-echo";
+        for (key, value) in [
+            ("agents.quota.claude", secret),
+            ("agents.quota.claude.consent", secret),
+            ("agents.quota.Claude", "on"),
+            ("agents.quota.", "on"),
+        ] {
+            let err = settings.set(key, value).unwrap_err().to_string();
+            assert!(!err.contains(secret), "{err}");
+        }
+
+        settings.set("agents.quota.claude", "off").unwrap();
+        settings
+            .set("agents.quota.claude.consent", "revoked")
+            .unwrap();
+        assert!(settings.agents.is_empty(), "a default entry is removed");
+
+        for index in 0..MAX_AGENT_QUOTA_ENTRIES {
+            settings
+                .set(&format!("agents.quota.agent-{index}"), "on")
+                .unwrap();
+        }
+        let err = settings.set("agents.quota.one-more", "on").unwrap_err();
+        assert!(err.to_string().contains("would exceed"), "{err}");
+        settings.set("agents.quota.agent-0", "off").unwrap();
+        settings.set("agents.quota.one-more", "on").unwrap();
+        assert_eq!(settings.agents.quota.len(), MAX_AGENT_QUOTA_ENTRIES);
+    }
+
+    #[test]
     fn retired_ocean_treatment_folds_into_the_underwater_theme() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("settings.toml");
@@ -3596,6 +3728,65 @@ mod tests {
         assert!(settings.set("work_surface_top_height", "17").is_err());
         assert!(settings.set("work_surface_top_height", "4").is_err());
         assert!(settings.set("work_surface_side_width", "25").is_err());
+    }
+
+    #[test]
+    fn explicit_permission_postures_survive_reload_without_migration_markers() {
+        let _g = config_path_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let settings_path = tmp.path().join("settings.toml");
+        let _config_override =
+            EnvVarRestore::set("DEEPSEEK_CONFIG_PATH", tmp.path().join("config.toml"));
+
+        Settings::transact(|settings| settings.set("permission_posture", "ask"))
+            .expect("pick Ask on a new install");
+        let fresh = Settings::load().expect("reload new settings");
+        assert_eq!(fresh.permission_posture.as_deref(), Some("ask"));
+
+        for posture in ["ask", "accept-edits", "auto-review", "full-access"] {
+            std::fs::write(
+                &settings_path,
+                format!("permission_posture = \"{posture}\"\n"),
+            )
+            .expect("preexisting settings");
+            let loaded = Settings::load().expect("load preexisting settings");
+            assert_eq!(loaded.permission_posture.as_deref(), Some(posture));
+        }
+
+        Settings::transact(|settings| settings.set("permission_posture", "ask"))
+            .expect("pick Ask after another posture");
+        let reloaded = Settings::load().expect("reload settings");
+        assert_eq!(reloaded.permission_posture.as_deref(), Some("ask"));
+    }
+
+    #[test]
+    fn thinking_shows_by_default_and_a_saved_choice_survives_reload_and_other_saves() {
+        let _g = config_path_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let settings_path = tmp.path().join("settings.toml");
+        let _config_override =
+            EnvVarRestore::set("DEEPSEEK_CONFIG_PATH", tmp.path().join("config.toml"));
+
+        let absent = Settings::load().expect("load without a settings file");
+        assert!(absent.show_thinking);
+        assert!(!absent.thinking_default_expanded);
+        assert!(!absent.is_set("show_thinking"));
+
+        std::fs::write(&settings_path, "theme = \"light\"\n").expect("settings without the key");
+        let unnamed = Settings::load().expect("load settings without the key");
+        assert!(unnamed.show_thinking);
+        assert!(!unnamed.is_set("show_thinking"));
+
+        for saved in [false, true] {
+            std::fs::write(&settings_path, format!("show_thinking = {saved}\n"))
+                .expect("saved choice");
+            let loaded = Settings::load().expect("load the saved choice");
+            assert_eq!(loaded.show_thinking, saved);
+            assert!(loaded.is_set("show_thinking"));
+            Settings::transact(|settings| settings.set("locale", "en")).expect("another save");
+            let reloaded = Settings::load().expect("reload after another save");
+            assert_eq!(reloaded.show_thinking, saved);
+        }
     }
 
     #[test]
@@ -3737,7 +3928,7 @@ mod tests {
         let mut settings = Settings::default();
         // Density is calm by default; motion is an independent axis.
         assert!(settings.calm_mode);
-        assert!(!settings.show_thinking);
+        settings.show_thinking = false;
 
         let changed = settings.apply_preset("CALM").expect("calm preset applies");
         assert_eq!(
@@ -3767,8 +3958,8 @@ mod tests {
         assert!(settings.fancy_animations);
         assert_eq!(settings.transcript_spacing, "spacious");
         assert_eq!(settings.tool_collapse_mode, "compact");
-        // Thinking is opt-in so the transcript stays focused on the chat.
-        assert!(!settings.show_thinking);
+        assert!(settings.show_thinking);
+        assert!(!settings.thinking_default_expanded);
     }
 
     #[test]
@@ -4389,6 +4580,46 @@ mod tests {
                 "archived value shown as current: {display}"
             );
         }
+    }
+
+    #[test]
+    fn legacy_default_model_keeps_its_spelling_for_custom_deepseek_endpoints() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.toml");
+        for (value, expected) in [
+            ("deepseek-ai/DeepSeek-V4-Pro", "deepseek-ai/DeepSeek-V4-Pro"),
+            (" deepseek-reasoner ", "deepseek-reasoner"),
+            ("AUTO", "auto"),
+        ] {
+            std::fs::write(&path, format!("default_model = '{value}'\n")).unwrap();
+            let settings = Settings::load_persisted_from_candidates_with_migration(
+                Some(path.clone()),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+            assert_eq!(settings.default_model.as_deref(), Some(expected));
+        }
+
+        std::fs::write(&path, "default_model = 'deepseek-ai/DeepSeek-V4-Pro'\n").unwrap();
+        let settings =
+            Settings::load_persisted_from_candidates_with_migration(Some(path), None, None, false)
+                .unwrap();
+        let mut config: crate::config::Config = toml::from_str(
+            "provider = \"deepseek\"\n[providers.deepseek]\nbase_url = \"https://models.example/v1\"\n",
+        )
+        .unwrap();
+        config.apply_saved_selection(&settings);
+        let model = config.default_model();
+        let wire = codewhale_config::route::resolve_model(
+            codewhale_config::ProviderKind::Deepseek,
+            &model,
+            Some(&config.active_route_base_url()),
+        )
+        .expect("custom endpoint id resolves")
+        .wire_id;
+        assert_eq!(wire, "deepseek-ai/DeepSeek-V4-Pro");
     }
 
     #[test]

@@ -28,6 +28,9 @@ use codewhale_config::cloud_facts::{
 use codewhale_config::persistence::atomic_write;
 use serde::{Deserialize, Serialize};
 
+pub mod registry;
+pub use registry::RegistrySettings;
+
 /// `{channel}` is replaced with the channel slug.
 pub const DEFAULT_URL_TEMPLATE: &str = "https://codewhale.net/api/facts/v1/{channel}";
 /// Refresh interval for a verified payload (6 h).
@@ -206,11 +209,14 @@ fn source(settings: &Settings) -> Result<String, RefreshError> {
         }
         return Ok(value);
     }
-    let raw = settings.url();
+    checked_url(&settings.url())
+}
+
+fn checked_url(raw: &str) -> Result<String, RefreshError> {
     if raw.len() > MAX_SOURCE_BYTES {
         return Err(RefreshError::TooLarge(raw.len()));
     }
-    let url = reqwest::Url::parse(&raw)
+    let url = reqwest::Url::parse(raw)
         .map_err(|_| RefreshError::InvalidSettings("invalid URL".into()))?;
     if !matches!(url.scheme(), "http" | "https")
         || url.host_str().is_none()
@@ -363,6 +369,14 @@ fn read_bounded_regular(path: &Path, limit: usize) -> Result<Vec<u8>, RefreshErr
         return Err(RefreshError::TooLarge(bytes.len()));
     }
     Ok(bytes)
+}
+
+async fn off_runtime<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, RefreshError> + Send + 'static,
+) -> Result<T, RefreshError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| RefreshError::Io(e.to_string()))?
 }
 
 fn load_cache(path: &Path) -> Option<PersistedCache> {
@@ -567,6 +581,7 @@ pub fn maybe_load_persisted_cache(settings: &Settings) -> Option<u64> {
 }
 fn maybe_load_persisted_cache_with_keys(settings: &Settings, keys: &[TrustedKey]) -> Option<u64> {
     let ticket = ticket(settings, keys).ok()?;
+    registry::load_cached_registry(&RegistrySettings::from_facts(settings), &ticket, keys);
     let cache = cache_for(settings, keys).ok()?;
     if cache.envelope.is_empty() {
         return None;
@@ -629,6 +644,14 @@ enum Fetched {
 }
 
 async fn fetch(url: String, etag: Option<String>) -> Result<Fetched, RefreshError> {
+    fetch_limited(url, etag, MAX_BODY_BYTES).await
+}
+
+async fn fetch_limited(
+    url: String,
+    etag: Option<String>,
+    limit: usize,
+) -> Result<Fetched, RefreshError> {
     let client = codewhale_release::tls::reqwest_client_builder()
         .timeout(FETCH_TIMEOUT)
         .connect_timeout(CONNECT_TIMEOUT)
@@ -656,9 +679,9 @@ async fn fetch(url: String, etag: Option<String>) -> Result<Fetched, RefreshErro
     }
     if response
         .content_length()
-        .is_some_and(|len| len > MAX_BODY_BYTES as u64)
+        .is_some_and(|len| len > limit as u64)
     {
-        return Err(RefreshError::TooLarge(MAX_BODY_BYTES + 1));
+        return Err(RefreshError::TooLarge(limit + 1));
     }
     let etag = response
         .headers()
@@ -673,7 +696,7 @@ async fn fetch(url: String, etag: Option<String>) -> Result<Fetched, RefreshErro
         .map_err(|e| RefreshError::Network(e.to_string()))?
     {
         let size = bytes.len().saturating_add(chunk.len());
-        if size > MAX_BODY_BYTES {
+        if size > limit {
             return Err(RefreshError::TooLarge(size));
         }
         bytes.extend_from_slice(&chunk);
@@ -683,6 +706,9 @@ async fn fetch(url: String, etag: Option<String>) -> Result<Fetched, RefreshErro
 
 /// Uses only admitted settings; callers must configure synchronously first.
 pub async fn refresh(settings: &Settings, force: bool) -> Result<RefreshOutcome, RefreshError> {
+    if let Ok(admitted) = ticket(settings, codewhale_config::cloud_facts::TRUSTED_KEYS) {
+        registry::spawn_registry_refresh(RegistrySettings::from_facts(settings), admitted, None);
+    }
     refresh_with_keys(settings, force, codewhale_config::cloud_facts::TRUSTED_KEYS).await
 }
 async fn refresh_with_keys(
@@ -714,11 +740,16 @@ where
     if !overlay::is_current(&ticket) {
         return Err(RefreshError::Superseded);
     }
-    let mut cache = cache_for(settings, keys)?;
+    let mut cache = {
+        let (settings, keys) = (settings.clone(), keys.to_vec());
+        off_runtime(move || cache_for(&settings, &keys)).await?
+    };
     let path = settings.cache_file();
     let now = now_unix();
-    let fetched = if let Some(local) = &settings.local_path {
-        read_bounded_regular(local, MAX_BODY_BYTES).map(|bytes| Fetched::Body { bytes, etag: None })
+    let fetched = if let Some(local) = settings.local_path.clone() {
+        off_runtime(move || read_bounded_regular(&local, MAX_BODY_BYTES))
+            .await
+            .map(|bytes| Fetched::Body { bytes, etag: None })
     } else {
         if suppress_network {
             return Err(RefreshError::Suppressed);
@@ -921,6 +952,11 @@ pub fn spawn_background_refresh(
     let Ok(admitted) = ticket(&settings, codewhale_config::cloud_facts::TRUSTED_KEYS) else {
         return;
     };
+    registry::spawn_registry_refresh(
+        RegistrySettings::from_facts(&settings),
+        admitted.clone(),
+        on_update.clone(),
+    );
     if settings.local_path.is_none() && fetch_suppressed() {
         return;
     }

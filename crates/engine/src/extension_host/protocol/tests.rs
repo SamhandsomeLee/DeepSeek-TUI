@@ -56,6 +56,7 @@ fn params_schema(method: &str, generator: &mut SchemaGenerator) -> Schema {
         "user-questions/ask" => generator.subschema_for::<UserQuestionParams>(),
         "subagent/start" => generator.subschema_for::<SubagentStartParams>(),
         "subagent/result" | "subagent/dispose" => generator.subschema_for::<SubagentHandleParams>(),
+        "dsh/broker" => generator.subschema_for::<DshBrokerParams>(),
         "ext/faulted" => generator.subschema_for::<FaultedParams>(),
         "log" => generator.subschema_for::<LogParams>(),
         other => panic!("method `{other}` has no params type in the TypeScript generator"),
@@ -188,6 +189,38 @@ fn render() -> String {
     let _ = writeln!(out, "export const HEADER_LEN = {HEADER_LEN}");
     let _ = writeln!(out, "export const MAX_FRAME = {MAX_FRAME}");
     let _ = writeln!(out, "export const MAX_INFLIGHT = {MAX_INFLIGHT}");
+    let media_types: Vec<String> = crate::image_attach::ACCEPTED_IMAGE_MEDIA_TYPES
+        .iter()
+        .map(|kind| quote(kind))
+        .collect();
+    out.push_str("\nexport const IMAGE_LIMITS = {\n");
+    let _ = writeln!(
+        out,
+        "  maxImageBytes: {},",
+        crate::image_attach::MAX_IMAGE_BYTES
+    );
+    let _ = writeln!(
+        out,
+        "  maxImagesPerMessage: {},",
+        crate::image_attach::MAX_TOOL_RESULT_IMAGES
+    );
+    let _ = writeln!(
+        out,
+        "  maxMessageImageBytes: {},",
+        codewhale_app_server_protocol::runtime::MAX_RUNTIME_IMAGE_TOTAL_BYTES
+    );
+    let _ = writeln!(
+        out,
+        "  maxImagePixels: {},",
+        crate::image_attach::MAX_IMAGE_PIXELS
+    );
+    let _ = writeln!(
+        out,
+        "  maxImageDimension: {},",
+        crate::image_attach::MAX_IMAGE_DIMENSION
+    );
+    let _ = writeln!(out, "  mediaTypes: [{}] as const,", media_types.join(", "));
+    out.push_str("} as const\n");
     out.push_str(
         "\n/** JSON-RPC error codes used on this channel. */\nexport const ErrorCode = {\n",
     );
@@ -195,6 +228,15 @@ fn render() -> String {
         let _ = writeln!(out, "  {name}: {code},");
     }
     out.push_str("} as const\n\nexport type Direction = 'core_to_host' | 'host_to_core'\n");
+    let services: Vec<String> = DshService::EVERY
+        .iter()
+        .map(|service| quote(service.name()))
+        .collect();
+    let _ = writeln!(
+        out,
+        "\nexport const DSH_SERVICES = [{}] as const\nexport type DshService = typeof DSH_SERVICES[number]",
+        services.join(", ")
+    );
     out.push_str("\n/** Every method either side may send, and the trust tiers it is allowed on; nothing else is admitted. */\nexport const METHODS = [\n");
     for (spec, params) in &methods {
         let tiers: Vec<String> = spec.tiers.iter().map(|tier| quote(tier.name())).collect();
@@ -239,6 +281,32 @@ fn typescript_protocol_is_generated_from_the_rust_types() {
     }
 }
 
+#[test]
+fn the_generated_image_limits_match_the_engines_own_constants() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("extension-host")
+        .join("src")
+        .join("protocol.generated.ts");
+    let generated = std::fs::read_to_string(&path).expect("read protocol.generated.ts");
+    let media_types: Vec<String> = crate::image_attach::ACCEPTED_IMAGE_MEDIA_TYPES
+        .iter()
+        .map(|kind| quote(kind))
+        .collect();
+    let expected = format!(
+        "export const IMAGE_LIMITS = {{\n  maxImageBytes: {},\n  maxImagesPerMessage: {},\n  maxMessageImageBytes: {},\n  maxImagePixels: {},\n  maxImageDimension: {},\n  mediaTypes: [{}] as const,\n}} as const",
+        crate::image_attach::MAX_IMAGE_BYTES,
+        crate::image_attach::MAX_TOOL_RESULT_IMAGES,
+        codewhale_app_server_protocol::runtime::MAX_RUNTIME_IMAGE_TOTAL_BYTES,
+        crate::image_attach::MAX_IMAGE_PIXELS,
+        crate::image_attach::MAX_IMAGE_DIMENSION,
+        media_types.join(", ")
+    );
+    assert!(
+        generated.contains(&expected),
+        "protocol.generated.ts IMAGE_LIMITS drifted from image_attach/runtime constants:\n{expected}"
+    );
+}
+
 /// Authority only the core may hold (CURRENT_DECISIONS §26): the event
 /// authority, the store, approval, secrets and credentials, the turn loop,
 /// sessions and the prompt. Names remain refused except the exact reviewed
@@ -274,6 +342,11 @@ const REVIEWED: &[(&str, &str, &str)] = &[
         "host_to_core",
         "subagent/dispose",
         "opaque live ticket and a child id this invocation started; asks the manager to cancel and dispose its own child; no other child, session or turn",
+    ),
+    (
+        "host_to_core",
+        "dsh/broker",
+        "opaque live invocation ticket minted per plugin owner, DSH service and session; Rust redeems it under the same owner, tier, host-generation, lifetime and use checks as core/call, takes the session from the ticket and never from the host, and dispatches only to that service's typed Rust arm, which refuses an unknown method or an unimplemented service; no tool name, approval, credential or model route",
     ),
     (
         "host_to_core",
@@ -622,4 +695,72 @@ fn production_methods_follow_their_tier_rows_and_reserved_families_stay_builtin_
         "no/such-method",
         HostTier::Builtin
     ));
+}
+
+#[test]
+fn dsh_broker_is_one_strict_envelope_and_names_only_the_closed_service_list() {
+    let frame = json!({
+        "jsonrpc": "2.0", "id": 91, "method": "dsh/broker",
+        "params": {
+            "owner": {"plugin_id": "dsh-owner", "owner_token": "opaque", "generation": 1},
+            "ticket": "broker-ticket", "service": "workspace", "method": "read", "input": {"path": "a"},
+        },
+    });
+    for tier in HostTier::ALL {
+        let parsed = parse_host_message(frame.clone(), tier).unwrap();
+        assert_eq!(parsed.to_value(), frame);
+        let HostMessage::Request { request, .. } = parsed else {
+            panic!("dsh/broker is a request")
+        };
+        let HostRequest::DshBroker(params) = *request else {
+            panic!("wrong broker variant")
+        };
+        assert_eq!(params.service, "workspace");
+        assert!(parse_core_message(frame.clone(), tier).is_err());
+        for field in ["session_id", "call_id", "approval", "name"] {
+            let mut forged = frame.clone();
+            forged["params"][field] = json!("foreign-selector");
+            assert!(parse_host_message(forged, tier).is_err(), "{field}");
+        }
+        for field in ["owner", "ticket", "service", "method", "input"] {
+            let mut missing = frame.clone();
+            missing["params"].as_object_mut().unwrap().remove(field);
+            assert!(parse_host_message(missing, tier).is_err(), "{field}");
+        }
+        let mut notification = frame.clone();
+        notification.as_object_mut().unwrap().remove("id");
+        assert!(parse_host_message(notification, tier).is_err());
+        let mut unknown = frame.clone();
+        unknown["params"]["service"] = json!("vault");
+        assert!(parse_host_message(unknown, tier).is_ok());
+    }
+    let names: Vec<&str> = DshService::EVERY
+        .iter()
+        .map(|service| service.name())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "workspace",
+            "llm",
+            "network",
+            "settings",
+            "catalog",
+            "terminal",
+            "remote",
+            "attachments",
+            "plugins"
+        ]
+    );
+    assert_eq!(DshService::BUILTIN_ONLY, [DshService::Plugins]);
+    assert!(
+        DshService::ALL
+            .iter()
+            .all(|service| !service.builtin_only())
+    );
+    for service in DshService::EVERY {
+        assert_eq!(DshService::parse(service.name()), Some(service));
+    }
+    assert_eq!(DshService::parse("Workspace"), None);
+    assert_eq!(DshService::parse("vault"), None);
 }

@@ -3,7 +3,7 @@
 > 英文原文：[INSTALL.md](../INSTALL.md)。
 > 最后与英文同步日期（last synced with English revision）：2026-10-19。按当前英文源码复核；下文 v0.10.0 安装记录与附录的原始测试范围保留，不能当作 v0.10.1 发布安装回执。
 
-Codewhale 是一个在终端里运行的开源编码智能体（coding agent）。你交给它一个任务（"修复失败的测试"、"加一个 CLI 参数"），它会读取你的仓库、编辑文件并运行命令。在默认的 **Ask**（询问）权限级别下，它在每次文件编辑和每条 shell 命令之前都会询问；按一次 `Shift+Tab` 切到 **Accept Edits**（接受编辑）后，它会立即应用仓库内的文件编辑（并给你看 diff），所以请先提交或暂存你在意的改动。它支持多家模型提供商，默认是 **DeepSeek**。
+Codewhale 是一个在终端里运行的开源编码智能体（coding agent）。你交给它一个任务（"修复失败的测试"、"加一个 CLI 参数"），它会读取你的仓库、编辑文件并运行命令。在默认的 **Accept Edits**（接受编辑）权限级别下，它会立即应用仓库内的文件编辑（并给你看 diff），每条 shell 命令之前仍会询问，所以请先提交或暂存你在意的改动。**Ask**（询问；用 `Shift+Tab` 拨盘或 `/config` 选择）在每次编辑之前也会询问。它支持多家模型提供商，默认是 **DeepSeek**。
 
 命令是 `codewhale`。`codew` 是同一个程序的较短别名。
 
@@ -28,7 +28,7 @@ cargo build --release --locked -p codewhale-cli
 target/release/codewhale --version
 ```
 
-构建前置条件见下文 Cargo 章节；使用仓库选定的 stable Rust，最低声明版本
+构建前置条件见下文 Cargo 章节；使用仓库固定的 Rust 1.100.0，最低声明版本
 为 1.89。首次构建可能耗时较长。Windows 的可执行文件为
 `target/release/codewhale.exe`，并需要 MSVC 工具链。开发构建不等于已签名发布包。
 
@@ -45,9 +45,10 @@ target/release/codewhale --version
 # 1. Install. Downloads two checksum-verified binaries into ~/.local/bin (no sudo).
 curl -fsSL https://codewhale.net/install.sh | sh
 
-# 2. Make sure ~/.local/bin is on your PATH, now and in future terminals.
-printf '%s\n' '# >>> codewhale PATH >>>' 'export PATH="$HOME/.local/bin:$PATH"' '# <<< codewhale PATH <<<' >> ~/.bashrc    # zsh: use ~/.zshrc
-export PATH="$HOME/.local/bin:$PATH"
+# 2. The installer adds ~/.local/bin to your shell profile (it prints what it added and
+#    how to undo it; --no-modify-path skips that). Shells that are already open do not
+#    reread the profile, so use it in this one now, then check it.
+export PATH="$HOME/.local/bin:$PATH"; hash -r
 codewhale --version          # -> codewhale 0.10.0 (1be1a703b975)
 
 # 3. Give it a DeepSeek API key (from https://platform.deepseek.com/api_keys).
@@ -67,7 +68,7 @@ create a Python file primes.py that prints the first 10 primes, run it, and show
 
 Codewhale 会写出文件、给你看 diff，然后询问 **APPROVAL: bash python3 primes.py – Do you want to proceed?**。按 `y` 允许本次执行。它会运行该命令并报告输出。（输入框为空时）按 `Ctrl-D` 退出，它会打印出之后恢复该会话的命令。
 
-> **如果发送第一条消息后没有任何反应，** 说明你还没有配置密钥。v0.10.0 在这种情况下不会给出警告。按 **F3**。如果 DeepSeek 显示 `missing key`，按 Enter，粘贴密钥，然后选择模型并确认。
+> **如果发送第一条消息后没有任何反应，** 说明你还没有连接模型。v0.10.2 会在首屏显示 `no model connected · run /provider`，并把你的第一条消息放回输入框。输入 `/provider`，选择一个提供商或粘贴自定义端点（Custom endpoint），然后重新发送。如果连接之后消息提示已保存、稍后发送，按 Ctrl+D 退出，再重新运行 `codewhale`。
 
 ---
 
@@ -132,10 +133,10 @@ curl -fsSL https://codewhale.net/install.sh | sh
   时，两个命令名会复用同一次下载；摘要不同时才会单独下载并校验
   `codew-<platform>`。只要有一个摘要不匹配，就会在安装任何东西之前停止
   （`codewhale install: checksum mismatch for …`）。
-* 使用校验过的发布内容分别安装 `~/.local/bin/codewhale` 和
-  `~/.local/bin/codew`。当两个清单摘要相同时，下载暂存阶段尽量使用硬链接，
-  失败时使用临时副本。
-* **从不使用 sudo，也从不修改你的 shell 配置文件。** 它拒绝安装到系统或包管理器目录（`/usr/bin`、`~/.cargo/bin`、Homebrew 与 MacPorts 的 bin 目录、`node_modules`、`/nix/store` 等）、你的主目录或 `/`，以及其他用户或用户组可写的目录（你自己的目录可用 `chmod go-w <目录>` 修复）；也拒绝覆盖一个*不同的*已有 `codewhale`。
+* 先安装 `~/.local/bin/codewhale`，然后在两者字节一致且文件系统支持硬链接时，
+  将 `~/.local/bin/codew` 安装为指向 `~/.local/bin/codewhale` 的硬链接（不支
+  持或失败时退回单独副本），确保更新后两者不会停留在不同版本。
+* **从不使用 sudo。** 当安装目录不在 `PATH` 上时，它会向你的 shell 配置文件追加一个带标记的三行块（见[把它加入 PATH](#把它加入-path)），原样打印它加了什么，并可用 `--no-modify-path` 跳过。它拒绝安装到系统或包管理器目录（`/usr/bin`、`~/.cargo/bin`、Homebrew 与 MacPorts 的 bin 目录、`node_modules`、`/nix/store` 等）、你的主目录或 `/`，以及其他用户或用户组可写的目录（你自己的目录可用 `chmod go-w <目录>` 修复）；也拒绝覆盖一个*不同的*已有 `codewhale`。
 
 预期输出：
 
@@ -149,40 +150,66 @@ Installed checksummed release commands:
   /home/you/.local/bin/codew
 …
 PATH selects no codewhale command; this install is /home/you/.local/bin/codewhale
-…
-Put /home/you/.local/bin first on PATH in future shells (run once; this installer does not edit shell profiles):
-  printf '%s\n' '# >>> codewhale PATH >>>' 'export PATH="$HOME/.local/bin:$PATH"' '# <<< codewhale PATH <<<' >> ~/.bashrc
-The marker lines let codewhale uninstall remove exactly this block; a bare export line is yours and is never touched.
-Then run: . ~/.bashrc   (or open a new terminal)
-…
+
+codewhale is not on your PATH in this shell yet.
+Added to ~/.bashrc so new shells find codewhale (skip this with --no-modify-path):
+  # >>> codewhale PATH >>>
+  export PATH="$HOME/.local/bin:$PATH"
+  # <<< codewhale PATH <<<
+Only those three lines were added; nothing else in the file was changed. Shells that are already open do not reread the profile.
+To undo, run:
+  cw_tmp="$(mktemp)" && sed -e '/^# >>> codewhale PATH >>>$/{$!N;$!N;/\n# <<< codewhale PATH <<<$/d;}' ~/.bashrc > "$cw_tmp" && cat "$cw_tmp" > ~/.bashrc; rm -f "$cw_tmp"
+PATH help: https://github.com/codewhale-hq/CodeWhale/blob/main/docs/INSTALL.md#put-it-on-your-path
+
+Run this now, in this shell:
+  export PATH="$HOME/.local/bin:$PATH"; hash -r
+Then check it:
+  codewhale --version
 ```
+
+PATH 代码块始终是安装器打印的最后内容。如果你的 PATH 已经选中了这次安装，最后一行是 `Next: codewhale --version`。
 
 ### macOS 说明
 
 在 macOS 26.1、Apple silicon（`macos-arm64`）上，用全新的 `HOME` 重新检查过：
 
 * 安装器打印了 `Installing Codewhale for macos-arm64`，用系统自带工具校验了校验和，并在 4.3 秒内装好了 `codewhale` 和 `codew`（各 64 MiB，Mach-O arm64）。两者都报告 `codewhale 0.10.0 (1be1a703b975)`。运行时没有弹出 Gatekeeper 提示。
-* 当 `PATH` 上没有 Node 时，它还会打印 `Computer Use is included and needs Node.js 20 or newer on PATH.`。核心 TUI 没有 Node 也能用，但在 `PATH` 上有 Node 之前，Computer Use 和 JavaScript 执行工具（`js_execution`）不可用。
+* 核心 TUI 没有 Node 也能用；JavaScript 执行工具（`js_execution`）需要 `PATH` 上有 Node。
 * `codewhale doctor` 的行为与 Linux 相同（退出码 0；没有密钥时输出 `All checks complete!`；文件型密钥存储位于 `~/.codewhale/secrets/`），只是它会报告 `✓ sandbox available: macos-seatbelt`。
 
 ### 把它加入 PATH
 
-如果安装器提示 `PATH selects no codewhale command`，说明 `~/.local/bin` **在当前 shell 里**不在 PATH 上。此时 `codewhale.net/install.sh` 安装器会根据你的 `$SHELL`（zsh、bash、fish 或 POSIX `sh`），打印下面这个代码块里对应的那一行；对于其他 shell，或者目录名含有引号、`$`、反引号或反斜杠的情况，它会让你自己添加该目录。它自己从不修改 shell 配置文件。发布压缩包内的 `install.sh` 只会打印针对当前 shell 的 `export` 行。在 Ubuntu 和 Debian 上，`~/.profile` 会加入 `~/.local/bin`，但前提是该目录在你*登录*时已经存在。所以：
+如果安装器提示 `PATH selects no codewhale command`，说明 `~/.local/bin` **在当前 shell 里**不在 PATH 上。此时 `codewhale.net/install.sh` 以及 0.10.3 起发布压缩包内的 `install.sh` 默认会向你的 `$SHELL` 对应的配置文件追加一个带标记的三行块，打印文件名和这三行，并打印移除它们的命令：
 
-* 新开的 SSH 会话或登录 shell 会自动生效；
-* 桌面上新开的终端**窗口**（GNOME Terminal、Ghostty 等）通常不会，要等到你注销再登录。我刚装完就在 Ghostty 里遇到了 `bash: codewhale: command not found`。
+| `$SHELL` | 修改的文件 |
+| --- | --- |
+| zsh | `~/.zshrc`（设置了 `ZDOTDIR` 时为 `$ZDOTDIR/.zshrc`） |
+| Linux 上的 bash | `~/.bashrc` |
+| macOS 上的 bash | `~/.bash_profile`、`~/.bash_login`、`~/.profile` 中第一个存在的（都不存在则用 `~/.bash_profile`） |
+| sh、dash、ksh、ash | `~/.profile` |
 
-一次性修复：
+只会追加这三行（文件末尾没有换行时先补一个换行），不会改写或重排其他任何行。下列情况安装器不会修改任何文件：
+
+* 你传了 `--no-modify-path`（或设置 `CODEWHALE_NO_MODIFY_PATH=1`）；用网页安装器时写 `curl -fsSL https://codewhale.net/install.sh | sh -s -- --no-modify-path`。它会改为打印 `printf` 命令，由你自己运行；
+* 安装目录已经在 `PATH` 上；
+* 配置文件是符号链接、不是可写的普通文件，或其所在目录不存在，此时改为打印命令；
+* 你的 shell 是 fish 或其他它没有对应配置文件的 shell、`$SHELL` 为空，或目录名含有引号、`$`、反引号或反斜杠。安装器会告诉你该自己添加什么（fish 用 `fish_add_path ~/.local/bin`）。
+
+v0.10.2 发布压缩包（`releases/latest` 在 0.10.3 发布前提供的版本）不会这样做：其 `install.sh` 不接受任何选项、从不修改配置文件，只打印当前 shell 用的 `export` 行，其 `install.ps1` 则提示你自行添加目录。请自行把同样的三行（`# >>> codewhale PATH >>>`、`export PATH="$HOME/.local/bin:$PATH"`、`# <<< codewhale PATH <<<`）追加到配置文件末尾。
+
+重复运行安装器不会再加第二个块：它看到标记行就保持文件原样。配置文件的改动不会影响已经打开的 shell，所以安装器的最后几行会给出当前 shell 用的 `export` 命令和 `codewhale --version`。
+
+要手动撤销，请删除两个标记行之间（含标记行）的三行，或运行安装器打印的命令：
 
 ```bash
-printf '%s\n' '# >>> codewhale PATH >>>' 'export PATH="$HOME/.local/bin:$PATH"' '# <<< codewhale PATH <<<' >> ~/.bashrc   # bash (macOS login bash: ~/.bash_profile, or ~/.profile if only that exists)
-# printf '%s\n' '# >>> codewhale PATH >>>' 'export PATH="$HOME/.local/bin:$PATH"' '# <<< codewhale PATH <<<' >> ~/.zshrc  # zsh
-# fish_add_path ~/.local/bin                               # fish (untested on this VM)
-export PATH="$HOME/.local/bin:$PATH"; hash -r
+cw_tmp="$(mktemp)" && sed -e '/^# >>> codewhale PATH >>>$/{$!N;$!N;/\n# <<< codewhale PATH <<<$/d;}' ~/.bashrc > "$cw_tmp" && cat "$cw_tmp" > ~/.bashrc; rm -f "$cw_tmp"   # undo
+export PATH="$HOME/.local/bin:$PATH"; hash -r   # this shell only
 command -v codewhale codew
 ```
 
-这个三行块带有标记，`codewhale uninstall` 之后可以精确地移除它。你自己加的裸 `export PATH=…`
+在 Linux 桌面上，新开的终端**窗口**（GNOME Terminal、Ghostty 等）启动的是非登录 shell，读取 `~/.bashrc` 而不是 `~/.profile`，所以块写在 Linux 的 `~/.bashrc` 里。
+
+这个三行块带有标记，`codewhale uninstall`（0.10.3 及更高版本）之后可以精确地移除它；0.10.2 请用上面的命令或自行删除这三行。你自己加的裸 `export PATH=…`
 行归你自己管理：卸载从不改动它，因为 `~/.local/bin` 也被其他工具共用。
 
 ### 选项
@@ -216,8 +243,8 @@ codewhale doctor        # diagnostics; see the note in §8 about what it does NO
 ### 升级 / 卸载
 
 * 升级：此安装会自动更新（见 §7），也可以立即运行 `codewhale update`。
-* 卸载：`~/.local/bin/codewhale uninstall` 预览该安装收据所拥有的文件；加上
-  `--yes` 才会删除。数据的清理见 §12。
+* 卸载（0.10.3 及更高版本）：`~/.local/bin/codewhale uninstall` 预览该安装收据所拥有的文件；加上
+  `--yes` 才会删除。0.10.2 及更早版本没有这个命令（输入它会开启一次对话，并把这个词发给模型），请运行 `rm ~/.local/bin/codewhale ~/.local/bin/codew ~/.local/bin/.codewhale-install.sha256`。数据的清理见 §12。
 
 ---
 
@@ -268,7 +295,7 @@ cd codewhale-linux-x64 && ./install.sh               # -> ~/.local/bin; PREFIX=/
 
 （注意：校验清单是 *bundles*，不是 *artifacts*。）
 
-压缩包里的 `install.sh` 不用 sudo，不动内容不同的已有文件，从不修改 shell 配置文件，也不提问；它只打印针对当前 shell 的 `export` 行。
+压缩包里的 `install.sh` 不用 sudo，不动内容不同的已有文件，也不提问；0.10.3 起的压缩包与网页安装器一样，当目录不在 `PATH` 上时会向 shell 配置文件追加带标记的 PATH 块（`./install.sh --no-modify-path` 可跳过）。v0.10.2 压缩包不会：其 `install.sh` 不接受任何选项，只打印当前 shell 用的 `export` 行，请自行添加该块（见[把它加入 PATH](#把它加入-path)）。
 
 **升级：** `codewhale update` 对 3a 和 3b 都适用，因为它们都属于"直接二进制"安装。**卸载：** 删除那两个文件（见 §12）。
 
@@ -276,7 +303,7 @@ cd codewhale-linux-x64 && ./install.sh               # -> ~/.local/bin; PREFIX=/
 
 ## 4. npm
 
-**前置条件：** Node.js 18+ 和 npm，并且有一个**你能写入的全局 prefix**。npm 安装的是注册表上最新已发布的版本，绝不会是未发布的源码候选版。
+**前置条件：** Node.js 22+ 和 npm，并且有一个**你能写入的全局 prefix**。在 Node.js 18 或 20 上，安装会停止并提示你升级 Node.js。npm 安装的是注册表上最新已发布的版本，绝不会是未发布的源码候选版。
 
 ```bash
 npm install -g codewhale
@@ -377,15 +404,15 @@ cargo install --path crates/cli --locked      # installs ~/.cargo/bin/codewhale
 
 需要知道的事（实际观察到的）：
 
-* 仓库里有 `rust-toolchain.toml`（`channel = "stable"`）。在检出目录里运行的第一条 `cargo` 命令，无论你的默认工具链是什么，都会**悄悄下载最新的 stable 工具链**（约 250 MB）。
-* workspace 把所有编译器警告都当作错误。用 Rust 1.89 时，构建会在大约 11 分钟后**失败**，在 `codewhale-tui` 中出现 8 个 `error: this lint expectation is unfulfilled`。请使用仓库选定的 stable 工具链，不要传入更旧的 `+toolchain`。
+* 仓库里有 `rust-toolchain.toml`（`channel = "1.100.0"`）。使用 rustup 时，如果本机没有 Rust 1.100.0，在检出目录里运行的第一条 `cargo` 命令，无论你的默认工具链是什么，都会**悄悄下载 Rust 1.100.0**（约 250 MB）。
+* workspace 把所有编译器警告都当作错误。声明的最低版本是 Rust 1.89，CI 的 MSRV 任务会检查它；但发布二进制和仓库自身的检查使用 1.100.0。不使用 rustup 时，请使用 1.89 或更新的 rustc。
 * workspace 的 release profile 使用 thin LTO。在 4 vCPU / 15 GB 的虚拟机上，仅 `codewhale-tui` 这一个 crate 就编译了一个多小时，内存峰值 6–8 GB。请准备 16 GB 或更多内存，并预期这是迄今最慢的安装路径。`target/` 增长超过了 1.2 GB。
 
-测试结果：用仓库选定的 stable Rust（1.98.1）**可行**。
+测试结果：用 Rust 1.98.1（测量时仓库选定的版本）**可行**。
 * `Finished release profile … in 83m 12s`。其间大部分时间有一个 Nix 构建在争抢 CPU 和内存，所以请把它当作上限。
 * `target/` 最终达到 **3.1 GB**。之后用 `cargo clean` 删除。
 * 该二进制报告 `codewhale 0.10.0 (dev)`，`exec` 可用。
-* Cargo 会打印 `warning: default toolchain implicitly overridden with stable-x86_64-unknown-linux-gnu by rustup toolchain file`，这是无害的。
+* Cargo 会打印 `warning: default toolchain implicitly overridden with 1.100.0-x86_64-unknown-linux-gnu by rustup toolchain file`，这是无害的。
 * **Cargo 构建不提供 `codew`。**
 
 **升级：** 重新运行同样的 `cargo install … --force`（对 crates.io 可以加 `--version X.Y.Z`）。`codewhale update` 会拒绝处理 Cargo 安装。**卸载：** `cargo uninstall codewhale-cli`，然后见 §12。
@@ -413,7 +440,7 @@ Run `brew trust --formula hmbown/deepseek-tui/codewhale` or `brew trust hmbown/d
 
 先运行 `brew trust hmbown/deepseek-tui`，或者使用上面的完整名称。
 
-用 Homebrew 7.0.6 对照 v0.10.0 的 tap formula 测试过：安装用了 73 秒。tap formula 跟踪最新发布并下载官方发布二进制，所以不需要编译。它**同时**提供 `codewhale` 和 `codew`。`Hmbown/deepseek-tui` 这个 tap 的 formula 还依赖 `node`，在 Linux 上拉了 31 个 bottle（约 560 MB）。这个 `node` 依赖只属于该 tap formula。核心 TUI 没有 Node 也能运行；Computer Use 和 JS 执行工具在 PATH 上有 Node 时会使用它。
+用 Homebrew 7.0.6 对照 v0.10.0 的 tap formula 测试过：安装用了 73 秒。tap formula 跟踪最新发布并下载官方发布二进制，所以不需要编译。它**同时**提供 `codewhale` 和 `codew`。`Hmbown/deepseek-tui` 这个 tap 的 formula 还依赖 `node`，在 Linux 上拉了 31 个 bottle（约 560 MB）。这个 `node` 依赖只属于该 tap formula。核心 TUI 没有 Node 也能运行；JS 执行工具在 PATH 上有 Node 时会使用它。
 
 * **升级：** `brew upgrade codewhale`。（`codewhale update` 会拒绝，并建议迁移。）
 * **卸载：** `brew uninstall codewhale && brew untap Hmbown/deepseek-tui`。这也会自动移除该 tap 的 node 依赖以及它拉进来的其他东西。Homebrew 的下载缓存（`~/.cache/Homebrew`，约 330 MB）会保留，直到运行 `brew cleanup --prune=all`。
@@ -598,8 +625,8 @@ cd your-git-repo
 codewhale
 ```
 
-* 输入框（composer）在底部。页脚显示权限级别（`ask`）、模式（`work`）和模型（`DeepSeek · deepseek-flash`）。
-* **Shift+Tab** 循环切换权限级别：Ask → Accept Edits（接受编辑）→ Auto-Review（自动审核）→ Full Access（完全访问）。（输入框为空时）**Tab** 循环切换模式：Plan → Work → Operate。
+* 输入框（composer）在底部。页脚显示权限拨盘的当前档位（`accept edits`）和模型（`DeepSeek · deepseek-flash`）。
+* **Shift+Tab** 切换权限拨盘：Ask → Accept Edits（接受编辑）→ Plan → Auto-Review（自动审核）→ Full Access（完全访问）。Plan 是只读规划；其余每一档都是 Work。**Tab** 只补全命令和文件提及。
 * 在 **Ask** 下，文件编辑和 shell 命令都会停在 **APPROVAL** 提示：`y` 允许本次，`a` 在本次会话中允许，`n` 拒绝，`Esc` 中止当前回合。在 **Accept Edits** 下，仓库内的文件编辑会被直接应用并以 diff 显示，shell 命令仍会提示。
 * 常用按键：**F1** 帮助（或 `/help`），**Ctrl-K** 命令面板，**F3** 提供商/模型选择器，**Ctrl-R** 恢复过去的会话，**Ctrl-U** 清空输入（**Ctrl-Z** 可恢复），**Ctrl-C** 取消或退出，**Ctrl-D** 在输入为空时退出。完整列表见 [KEYBINDINGS.md](./KEYBINDINGS.md)。
 * 退出时它会打印 `To resume this session, run codewhale resume <id>`。
@@ -658,7 +685,7 @@ TUI 会话、恢复的 exec 会话，以及向模型提供工具的 exec 运行�
 | 窗口标题显示状态（`waiting on you…`、`✓ done`） | ✅ |
 | 退出后终端恢复正常（回到普通屏幕、光标正常、没有鼠标上报的乱码） | ✅ |
 
-Linux 上的 Ghostty 启动的是**非登录** shell，所以它读取 `~/.bashrc` 而不是 `~/.profile`。这就是为什么 PATH 那一行需要写进 `~/.bashrc`（§2）。
+Linux 上的 Ghostty 启动的是**非登录** shell，所以它读取 `~/.bashrc` 而不是 `~/.profile`。这就是为什么 安装器把 PATH 块写进 `~/.bashrc`（§2）。
 
 你可能会注意到，一个回合结束后，一些小圆点和淡淡的标签（例如 `other · drift`）在空白区域飘动。那是 Codewhale 装饰性的"环境生命（ambient life）"小鲸鱼，不是渲染故障。
 
@@ -680,7 +707,7 @@ codewhale auth clear --provider <id>
 
 ### 第 2 步：预览并删除所选安装
 
-先运行 `codewhale doctor --installs` 查看每个副本的路径、所有者和删除方式。
+先运行 `codewhale doctor --installs` 查看每个副本的路径、所有者和删除方式。`uninstall` 命令从 0.10.3 起提供；0.10.2 及更早版本请手动删除文件：`rm <目录>/codewhale <目录>/codew <目录>/.codewhale-install.sha256`。
 使用要移除的程序的完整路径运行 `uninstall` 查看计划，确认后再加 `--yes`。
 普通卸载保留会话、配置和文件快照。
 
@@ -832,7 +859,7 @@ cargo install codewhale-cli --locked   # installs `codewhale`
 ```bash
 mkdir -p "$HOME/.local"
 codewhale_install_dir="$(mktemp -d "$HOME/.local/codewhale-release.XXXXXX")"
-curl -fsSL https://codewhale.net/install.sh | CODEWHALE_INSTALL_DIR="$codewhale_install_dir" sh
+curl -fsSL https://codewhale.net/install.sh | CODEWHALE_INSTALL_DIR="$codewhale_install_dir" sh -s -- --no-modify-path
 "$codewhale_install_dir/codewhale" --version
 export PATH="$codewhale_install_dir:$PATH"
 hash -r
@@ -840,7 +867,7 @@ command -v codewhale codew
 "$codewhale_install_dir/codewhale" update --check
 ```
 
-确认版本和命令路径之后，把该目录放在 shell 配置里 PATH 的最前面。在 PowerShell 里，用 `Get-Command codewhale, codew -All` 检查解析结果；运行所选可执行文件时使用它的完整路径。一次成功的更新只会改动它自己所在的安装目录，所以 PATH 上更靠前的其他条目仍可能启动旧副本。
+`--no-modify-path` 让安装器不去改动你的配置文件。确认版本和命令路径之后，把该目录放在 shell 配置里 PATH 的最前面。在 PowerShell 里，用 `Get-Command codewhale, codew -All` 检查解析结果；运行所选可执行文件时使用它的完整路径。一次成功的更新只会改动它自己所在的安装目录，所以 PATH 上更靠前的其他条目仍可能启动旧副本。
 
 现代的、成对匹配的 `codewhale`、`codew` 以及兼容性副本，都从同一份已校验的字节更新。指向正在运行的二进制的符号链接会被保留。内容不同或不相关的同级文件会在错误里被点名并原样保留；不会仅仅为了猜测其归属而执行任何同级文件。对于带有独立 dispatcher/TUI 二进制的旧安装，请使用上面的新目录迁移方式。
 
@@ -1028,6 +1055,8 @@ NSIS 安装器目前包含 Windows x64 二进制。Windows ARM64 用户应通过
 
 卸载会移除二进制、`codewhale.bat`、开始菜单快捷方式和用户 `PATH` 条目。
 
+自 0.10.3 起，发布压缩包里的 `install.ps1` 默认把 `%USERPROFILE%\bin` 加入**用户** PATH（只写注册表值 `HKCU\Environment\Path`，不动系统 PATH），打印加了什么以及只移除该条目的 PowerShell 命令；目录已在 PATH 上时什么都不做；加 `-NoModifyPath`（或 `CODEWHALE_NO_MODIFY_PATH=1`）可跳过（`install.bat -NoModifyPath` 会把该参数传给它），此时改为打印命令；重复运行不会重复添加。已打开的窗口看不到这个改动，所以最后几行给出当前窗口用的命令和 `codewhale --version`。v0.10.2 的 `install.ps1` 不做这些，只提示你自行添加目录。该路径尚未在 Windows 主机上运行过。
+
 **静默安装**（供 IT 管理员、SCCM、Intune 使用）：
 
 ```powershell
@@ -1067,7 +1096,7 @@ codewhale --version
 codewhale doctor
 ```
 
-`rquickjs` 的 FreeBSD 绑定在构建时通过 `bindgen` 生成（见 `1582ba965`/`5eb0385e8`）。目前还没有单独的 `pkg install codewhale` 端口——原生端口作为 #1097 的后续工作，记录在 `packaging/freebsd/` 之下（欢迎贡献）。请在 release 分支上用 `cargo check --target x86_64-unknown-freebsd -p codewhale-cli --locked` 验证；7×1 发布矩阵（Linux musl x64/arm64、Android arm64、macOS x64/arm64、Windows x64/arm64）仍是 7 个目标——FreeBSD 是源码构建目标，不是预编译资源。
+`rquickjs` 的 FreeBSD 绑定在构建时通过 `bindgen` 生成（见 `1582ba965`/`5eb0385e8`）。目前还没有单独的 `pkg install codewhale` 端口——原生端口作为 #1097 的后续工作，记录在 `packaging/freebsd/` 之下（欢迎贡献）。请在 release 分支上用 `cargo check --target x86_64-unknown-freebsd -p codewhale-cli --locked` 验证；8×1 发布矩阵（Linux musl x64/arm64、Android arm64、macOS x64/arm64、Windows x64/arm64、OpenHarmony arm64）仍是 8 个目标——FreeBSD 是源码构建目标，不是预编译资源。
 
 #### 从 x64 交叉编译到 ARM64 Linux
 

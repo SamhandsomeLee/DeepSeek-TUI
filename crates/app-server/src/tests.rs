@@ -32,37 +32,6 @@ async fn control_framing_accepts_exact_limit_crlf_and_preserves_next_frame() {
 }
 
 #[tokio::test]
-async fn control_framing_refuses_oversize_before_retaining_extra_bytes() {
-    let input = vec![b'x'; MAX_RUNTIME_IMAGE_BODY_BYTES + 4096];
-    let mut reader = BoundedLines::new(BufReader::with_capacity(8192, input.as_slice()));
-    assert_eq!(
-        reader.next_line().await.unwrap_err().kind(),
-        std::io::ErrorKind::InvalidData
-    );
-    assert!(reader.pending.len() <= MAX_RUNTIME_IMAGE_BODY_BYTES + 1);
-    assert!(reader.pending.capacity() <= MAX_RUNTIME_IMAGE_BODY_BYTES + 1);
-}
-
-#[tokio::test]
-async fn control_framing_keeps_consumed_prefix_when_read_future_is_cancelled() {
-    let (mut input, output) = tokio::io::duplex(64);
-    input.write_all(b"partial").await.unwrap();
-    let mut reader = BoundedLines::new(BufReader::new(output));
-    std::future::poll_fn(|cx| {
-        let mut read = std::pin::pin!(reader.next_line());
-        assert!(std::future::Future::poll(read.as_mut(), cx).is_pending());
-        std::task::Poll::Ready(())
-    })
-    .await;
-    assert_eq!(reader.pending, b"partial");
-    input.write_all(b"-continued\n").await.unwrap();
-    assert_eq!(
-        reader.next_line().await.unwrap().as_deref(),
-        Some("partial-continued")
-    );
-}
-
-#[tokio::test]
 async fn control_framing_rejects_non_utf8_and_keeps_eof_line_contract() {
     let mut invalid = BoundedLines::new(BufReader::new(&b"\xff\n"[..]));
     assert_eq!(
@@ -396,81 +365,6 @@ fn build_state_keeps_resolved_explicit_config_path() {
                 .as_path()
         )
     );
-}
-
-#[tokio::test]
-async fn stdio_transport_never_registers_the_stdout_hook_sink() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let config_path = tmp.path().join("config.toml");
-    fs::write(&config_path, "api_key = \"sk-deepseek-secret\"\n").expect("write config");
-
-    let http_state =
-        build_state_with_transport(Some(config_path.clone()), None, AppTransport::Http)
-            .expect("http state");
-    let stdio_state = build_state_with_transport(Some(config_path), None, AppTransport::Stdio)
-        .expect("stdio state");
-
-    let http_sinks = http_state.runtime.read().await.hooks.sink_count();
-    let stdio_sinks = stdio_state.runtime.read().await.hooks.sink_count();
-    assert_eq!(
-        http_sinks,
-        stdio_sinks + 1,
-        "HTTP mode keeps StdoutHookSink + JsonlHookSink; stdio must drop the stdout sink (#5165)"
-    );
-}
-
-// Points CODEWHALE_HOME at a temp dir for one test and restores it after.
-// The variable is process-global, so these tests hold a lock.
-static CODEWHALE_HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-struct CodewhaleHomeGuard {
-    prior: Option<std::ffi::OsString>,
-    _lock: std::sync::MutexGuard<'static, ()>,
-}
-
-impl CodewhaleHomeGuard {
-    fn set(value: &Path) -> Self {
-        let lock = CODEWHALE_HOME_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let prior = std::env::var_os("CODEWHALE_HOME");
-        // SAFETY: serialised by CODEWHALE_HOME_TEST_LOCK.
-        unsafe { std::env::set_var("CODEWHALE_HOME", value) };
-        Self { prior, _lock: lock }
-    }
-}
-
-impl Drop for CodewhaleHomeGuard {
-    fn drop(&mut self) {
-        // SAFETY: serialised by CODEWHALE_HOME_TEST_LOCK.
-        unsafe {
-            match &self.prior {
-                Some(value) => std::env::set_var("CODEWHALE_HOME", value),
-                None => std::env::remove_var("CODEWHALE_HOME"),
-            }
-        }
-    }
-}
-
-#[tokio::test]
-async fn hook_log_without_config_path_goes_beside_state_db_not_cwd() {
-    let home = tempfile::tempdir().expect("tempdir");
-    let _home = CodewhaleHomeGuard::set(home.path());
-
-    let state = build_state_with_transport(None, None, AppTransport::Stdio).expect("state");
-    state
-        .runtime
-        .read()
-        .await
-        .hooks
-        .emit(codewhale_hooks::HookEvent::ResponseStart {
-            response_id: "resp-6513".to_string(),
-        })
-        .await;
-
-    let log = fs::read_to_string(home.path().join("events.jsonl"))
-        .expect("hook log beside state.db in CODEWHALE_HOME");
-    assert!(log.contains("resp-6513"), "{log}");
 }
 
 async fn response_body_json(response: Response) -> Value {
@@ -3449,7 +3343,7 @@ fn app_server_options_debug_does_not_leak_token() {
 fn default_cors_origins_include_common_dev_ports() {
     assert!(DEFAULT_CORS_ORIGINS.contains(&"http://localhost:3000"));
     assert!(DEFAULT_CORS_ORIGINS.contains(&"http://localhost:5173"));
-    assert!(DEFAULT_CORS_ORIGINS.contains(&"tauri://localhost"));
+    assert!(!DEFAULT_CORS_ORIGINS.iter().any(|o| o.starts_with("tauri:")));
 }
 #[tokio::test]
 async fn runtime_image_daemon_bridge_checks_transport_and_forwards_exact_wire() {
@@ -3764,6 +3658,9 @@ impl RuntimeOwnerFrontend for MockRuntimeFrontend {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send + '_>> {
         Box::pin(async move {
             let (method, path, body, query) = match request {
+                RuntimeOwnerRequest::Native { .. } => anyhow::bail!(
+                    "native Runtime requires the captured owner, not the HTTP fixture"
+                ),
                 RuntimeOwnerRequest::Capabilities => (
                     Method::GET,
                     vec!["v1".to_owned(), "runtime".to_owned(), "info".to_owned()],

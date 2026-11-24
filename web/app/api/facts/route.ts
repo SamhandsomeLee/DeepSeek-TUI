@@ -1,13 +1,16 @@
 import { NextResponse } from "next/server";
+import { releaseView } from "@/lib/capabilities";
 import { BUILD_FACTS, getFactsWithProvenance, type RepoFacts } from "@/lib/facts";
 import { cloudFactsSummary } from "@/lib/cloud-facts";
 import { getEnv } from "@/lib/kv";
+import { liveRecord } from "@/lib/repo-activity";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
 function summary(facts: RepoFacts) {
   return {
+    generatedAt: facts.generatedAt,
     sourceRevision: facts.sourceRevision,
     sourceCommittedAt: facts.sourceCommittedAt,
     version: facts.version,
@@ -35,7 +38,9 @@ export async function GET() {
         reason: resolution.reason,
       },
       latestPublishedRelease: resolution.facts.latestPublishedRelease,
+      releaseCounts: releaseView(resolution.facts).counts,
       cloudFacts,
+      liveRecord: liveRecord(),
     },
     {
       headers: {

@@ -423,10 +423,18 @@ fn workspace_prompt_omits_disabled_skills_without_configured_directory() {
         "User debug",
         "from compatible root",
     );
+    std::fs::create_dir_all(owned.join("feishu")).unwrap();
+    std::fs::write(owned.join("feishu/SKILL.md"), super::system::feishu_body()).unwrap();
     let baseline = super::discover_for_workspace(&workspace, None, &config, None);
     assert!(baseline.get("debug").unwrap().path.starts_with(&owned));
+    assert!(baseline.get("feishu").is_some());
     let mut filtered = config.clone();
-    filtered.bundled.disabled = Some(vec!["debug".into(), "docx".into()]);
+    filtered.bundled.disabled = Some(vec![
+        "debug".into(),
+        "docx".into(),
+        "feishu".into(),
+        "v4-best-practices".into(),
+    ]);
     filtered.bundled.explicit_only = Some(vec![
         "pdf".into(),
         "debug\n".into(),
@@ -458,7 +466,11 @@ fn workspace_prompt_omits_disabled_skills_without_configured_directory() {
             .lines()
             .any(|line| line == "- pdf" || line.starts_with("- pdf:"))
     );
+    assert!(registry.get("feishu").is_none());
     let status = super::bundled_skills_status(&filtered, &registry).unwrap();
+    assert_eq!(status.retired.len(), 2, "{:?}", status.retired);
+    assert!(status.retired[0].starts_with("disabled=feishu (installed copy"));
+    assert!(status.retired[1].starts_with("disabled=v4-best-practices (no copy installed"));
     assert!(status.disabled.contains(&"debug"));
     assert!(status.disabled.contains(&"documents"));
     assert!(status.explicit_only.contains(&"pdf"));
@@ -472,11 +484,59 @@ fn workspace_prompt_omits_disabled_skills_without_configured_directory() {
     assert_eq!(status.ignored, vec![r"debug\n"]);
     assert!(status.unknown.iter().all(|name| !name.contains('\n')));
     assert!(!status.inspection().join("\n").contains('\u{1b}'));
+
+    let mut selected_and_disabled = filtered.clone();
+    selected_and_disabled.bundled.selected = Some(vec!["feishu".into()]);
+    let selected_status = super::bundled_skills_status(&selected_and_disabled, &registry).unwrap();
+    assert!(
+        selected_status
+            .retired
+            .iter()
+            .any(|line| line == "selected=feishu (hidden by disabled)"),
+        "{:?}",
+        selected_status.retired
+    );
+
+    std::fs::write(owned.join("feishu/.installed-from"), "github:test/feishu\n").unwrap();
+    let installed_registry = super::discover_for_workspace(&workspace, None, &filtered, None);
+    assert!(installed_registry.get("feishu").is_some());
+    let installed_status = super::bundled_skills_status(&filtered, &installed_registry).unwrap();
+    assert!(
+        installed_status
+            .retired
+            .iter()
+            .any(|line| line.starts_with("disabled=feishu (installed copy")
+                && line.contains("has .installed-from and stays active")),
+        "{:?}",
+        installed_status.retired
+    );
+
+    write_skill(&owned, "feedback", "Custom feedback", "user edited body");
+    let mut custom_policy = config.clone();
+    custom_policy.bundled.disabled = Some(vec!["feedback".into()]);
+    let custom_registry = super::discover_for_workspace(&workspace, None, &custom_policy, None);
+    assert!(custom_registry.get("feedback").is_some());
+    let custom_status = super::bundled_skills_status(&custom_policy, &custom_registry).unwrap();
+    assert!(
+        custom_status
+            .retired
+            .iter()
+            .any(|line| line.starts_with("disabled=feedback (")
+                && line.contains("was customized or renamed and stays active")),
+        "{:?}",
+        custom_status.retired
+    );
     assert!(
         status
             .inspection()
             .iter()
             .any(|line| line.contains("disabled by config"))
+    );
+    assert!(
+        status
+            .inspection()
+            .iter()
+            .any(|line| line.contains("Creator mode only"))
     );
     assert!(
         super::discover_for_workspace(&workspace, None, &config, None)
@@ -2938,4 +2998,92 @@ fn workspace_skill_discovery_does_not_follow_links_out_of_the_workspace() {
         "{:?}",
         registry.warnings()
     );
+}
+
+#[test]
+fn creator_skills_are_hidden_by_default_and_found_when_the_input_is_set() {
+    let _env_lock = codewhale_runtime::test_support::lock_test_env();
+    let tmpdir = TempDir::new().unwrap();
+    let home = tmpdir.path().join("home");
+    let workspace = tmpdir.path().join("workspace");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+    let _home = codewhale_runtime::test_support::EnvVarGuard::set("HOME", &home);
+    let _userprofile = codewhale_runtime::test_support::EnvVarGuard::set("USERPROFILE", &home);
+    let _codewhale_home = codewhale_runtime::test_support::EnvVarGuard::set(
+        "CODEWHALE_HOME",
+        home.join("isolated-product-state"),
+    );
+    codewhale_runtime::test_support::trust_workspace(&workspace);
+    super::clear_skill_discovery_cache();
+
+    let owned = codewhale_runtime::config::owned_skills_dir().unwrap();
+    let config = codewhale_runtime::config::SkillsConfig::default();
+    super::install_system_skills(&owned, &config.bundled).unwrap();
+    for name in super::CREATOR_SKILL_NAMES {
+        assert!(
+            owned.join(name).join("LICENSE").is_file(),
+            "{name} files are installed"
+        );
+    }
+
+    let hidden = super::discover_for_workspace(&workspace, None, &config, None);
+    for name in super::CREATOR_SKILL_NAMES {
+        assert!(
+            hidden.get(name).is_none(),
+            "{name} must be hidden by default"
+        );
+    }
+    let hidden_status = super::bundled_skills_status(&config, &hidden).unwrap();
+    for name in super::CREATOR_SKILL_NAMES {
+        let row = hidden_status
+            .skills
+            .iter()
+            .find(|row| row.name == name)
+            .unwrap();
+        assert_eq!(row.reason, "Creator mode only", "{name}");
+    }
+    assert!(hidden.get("plugin-creator").is_some());
+    let catalogue = super::render_index(&workspace, None, &config, "en", None, None).unwrap();
+    for name in super::CREATOR_SKILL_NAMES {
+        assert!(
+            !catalogue.contains(name),
+            "{name} must not be in the catalogue"
+        );
+    }
+
+    let creator = codewhale_runtime::config::SkillsConfig {
+        creator_skills: true,
+        ..Default::default()
+    };
+    let shown = super::discover_for_workspace(&workspace, None, &creator, None);
+    for name in super::CREATOR_SKILL_NAMES {
+        assert!(
+            shown.get(name).is_some(),
+            "{name} must be found when enabled"
+        );
+    }
+    let catalogue = super::render_index(&workspace, None, &creator, "en", None, None).unwrap();
+    assert!(catalogue.contains("cordis-plugin-development"));
+
+    let development = shown.get("cordis-plugin-development").unwrap();
+    let context = super::bundled_skill_load_context(&development.name, &development.path).unwrap();
+    assert_eq!(
+        std::fs::canonicalize(&context.base_dir).unwrap(),
+        std::fs::canonicalize(owned.join("cordis-plugin-development")).unwrap()
+    );
+    assert!(context.base_dir.join("references/host-plugin.md").is_file());
+    assert!(
+        context
+            .base_dir
+            .join("templates/decoration/client.js")
+            .is_file()
+    );
+    assert!(context.host_notes.unwrap().contains("`load_skill`"));
+    let experience = shown.get("agent-experience").unwrap();
+    let context = super::bundled_skill_load_context(&experience.name, &experience.path).unwrap();
+    assert!(context.host_notes.is_none());
+
+    std::fs::write(development.path.clone(), "my own copy").unwrap();
+    assert!(super::bundled_skill_load_context(&development.name, &development.path).is_none());
 }

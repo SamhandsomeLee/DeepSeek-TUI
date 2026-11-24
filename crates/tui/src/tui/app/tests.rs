@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_support::{EnvVarGuard, lock_test_env};
-use crate::tui::clipboard::{ClipboardHandler, PastedImage};
+use crate::tui::clipboard::{ClipboardContent, ClipboardHandler, PastedImage};
 use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell, ToolStatus};
 use crate::tui::motion::MotionMode;
 use codewhale_config::ProviderKind;
@@ -182,6 +182,46 @@ fn feature_intro_shows_once_persists_then_is_idempotent() {
     );
 
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn account_preferences_notice_shows_once_per_sign_in_and_can_be_dismissed() {
+    let _env_lock = lock_test_env();
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.toml");
+    let _env = EnvVarGuard::set(
+        "DEEPSEEK_CONFIG_PATH",
+        config_path.to_string_lossy().as_ref(),
+    );
+    let shown = |app: &App| {
+        let notice = app
+            .tr(MessageId::AccountPreferencesNotLoaded)
+            .replace("{command}", "codewhale login");
+        app.status_toasts
+            .iter()
+            .filter(|toast| toast.text == notice && toast.kind == StatusToastKind::Standing)
+            .count()
+    };
+
+    let mut app = App::new(test_options(false), &Config::default());
+    app.notify_account_preferences_not_loaded_for("first-sign-in");
+    app.notify_account_preferences_not_loaded_for("first-sign-in");
+    assert_eq!(shown(&app), 1);
+    assert_eq!(
+        Settings::load()
+            .expect("settings should load")
+            .account_preferences_notice_shown
+            .as_deref(),
+        Some("first-sign-in")
+    );
+    assert!(app.dismiss_account_preferences_notice());
+    assert_eq!(shown(&app), 0);
+
+    let mut later_session = App::new(test_options(false), &Config::default());
+    later_session.notify_account_preferences_not_loaded_for("first-sign-in");
+    assert_eq!(shown(&later_session), 0, "the same sign-in is told once");
+    later_session.notify_account_preferences_not_loaded_for("second-sign-in");
+    assert_eq!(shown(&later_session), 1, "a later sign-in is told again");
 }
 
 #[test]
@@ -668,7 +708,7 @@ fn thinking_is_locked_but_mode_moves_while_a_turn_is_running() {
         app.status_message
     );
 
-    app.cycle_mode();
+    app.select_mode(AppMode::Plan);
     assert_ne!(app.mode, AppMode::Agent, "mode changes mid-turn");
 }
 
@@ -2196,7 +2236,7 @@ fn explicit_launch_provider_overrides_saved_startup_provider() {
     let app = App::new(options, &config);
 
     assert_eq!(app.api_provider, ProviderKind::XiaomiMimo);
-    assert_eq!(app.model, "mimo-v2.5-pro");
+    assert_eq!(app.model, "mimo-v2.6-pro");
 }
 
 #[test]
@@ -2360,6 +2400,96 @@ fn subscription_route_hides_stale_session_dollars_in_footer() {
     .unwrap_or_default();
     assert!(!rendered.contains('$'), "{rendered}");
     assert!(rendered.contains("Codex OAuth quota"), "{rendered}");
+}
+
+#[test]
+fn session_cost_label_renders_money_or_unknown_without_plan_names_or_local() {
+    let unknown = codewhale_localization::tr(
+        codewhale_localization::Locale::En,
+        codewhale_localization::MessageId::CmdCostUnknownValue,
+    )
+    .into_owned();
+
+    let mut sub = App::new(test_options(false), &Config::default());
+    sub.billing_presentation =
+        codewhale_engine::route_billing::BillingPresentation::Subscription("Codex OAuth quota");
+    assert_eq!(sub.session_cost_label(), unknown);
+    assert_eq!(sub.status_cost_label().as_deref(), Some(unknown.as_str()));
+
+    let mut local = App::new(test_options(false), &Config::default());
+    local.billing_presentation = codewhale_engine::route_billing::BillingPresentation::Local;
+    assert_eq!(local.session_cost_label(), unknown);
+    assert_eq!(local.status_cost_label().as_deref(), Some(unknown.as_str()));
+
+    let mut metered = App::new(test_options(false), &Config::default());
+    metered.api_provider = ProviderKind::Deepseek;
+    metered.model = "deepseek-v4-flash".to_string();
+    metered.billing_presentation = codewhale_engine::route_billing::BillingPresentation::Metered;
+    assert_eq!(metered.session_cost_label(), "$0.00");
+    assert_eq!(metered.status_cost_label(), None);
+
+    metered.session.cost_priced_turns = 1;
+    metered.accrue_session_cost_estimate(CostEstimate::usd_only(0.42));
+    assert_eq!(metered.session_cost_label(), "$0.42");
+    assert_eq!(metered.status_cost_label(), None);
+
+    metered.session.cost_unpriced_turns = 1;
+    assert_eq!(metered.session_cost_label(), "$0.42");
+    assert_eq!(metered.status_cost_label().as_deref(), Some("$0.42"));
+}
+
+#[test]
+fn late_reported_usage_prunes_stale_request_outcome_unknown_reason() {
+    let mut app = App::new(test_options(false), &Config::default());
+    let route = codewhale_engine::cost_status::EffectiveRouteEnvelope::capture(
+        None,
+        ProviderKind::Deepseek,
+        "deepseek",
+        "deepseek-v4-flash",
+        Some(ProviderKind::Deepseek.provider().default_base_url()),
+        chrono::Utc::now(),
+    );
+    let drop_pool = codewhale_engine::cost_status::background_cost_for_runtime_drop(
+        &codewhale_engine::cost_status::RuntimeUsageDropRecord {
+            reason: codewhale_engine::cost_status::RuntimeUsageMissingReason::RequestOutcomeUnknown,
+            source_id: "cw-7882-late-source".to_string(),
+            route: route.clone(),
+        },
+    );
+    app.absorb_pending_background_cost(&drop_pool);
+    assert_eq!(app.session.cost_unpriced_turns, 1);
+    assert!(
+        app.session
+            .cost_unpriced_reasons
+            .contains("request_outcome_unknown")
+    );
+
+    let settled = codewhale_engine::cost_status::NativeUsageSource::capture(
+        "cw-7882-late-source",
+        codewhale_engine::cost_status::UsageSpendOwner::Auxiliary,
+    )
+    .reported(
+        &route,
+        &codewhale_models::Usage {
+            input_tokens: 1_000,
+            output_tokens: 200,
+            ..Default::default()
+        },
+    );
+    let settled_pool = codewhale_engine::cost_status::background_cost_for_runtime_usage(&settled);
+    app.absorb_pending_background_cost(&settled_pool);
+    assert_eq!(app.session.cost_priced_turns, 1);
+    assert_eq!(app.session.cost_unpriced_turns, 0);
+    assert!(
+        !app.session
+            .cost_unpriced_reasons
+            .contains("request_outcome_unknown")
+    );
+    assert!(
+        !app.session
+            .cost_cny_unpriced_reasons
+            .contains("request_outcome_unknown")
+    );
 }
 
 #[test]
@@ -3783,35 +3913,6 @@ fn entering_operate_preserves_user_rail_panel() {
 }
 
 #[test]
-fn test_cycle_scenario() {
-    // Scenario consolidation of: test_cycle_mode_transitions, test_cycle_mode_reverse_transitions
-    // from test_cycle_mode_transitions
-    {
-        let mut app = App::new(test_options(false), &Config::default());
-        let initial_mode = app.mode;
-        app.cycle_mode();
-        // Mode should have changed
-        assert_ne!(app.mode, initial_mode);
-    }
-    // from test_cycle_mode_reverse_transitions
-    {
-        let mut app = App::new(test_options(false), &Config::default());
-
-        app.mode = AppMode::Plan;
-        app.cycle_mode_reverse();
-        assert_eq!(app.mode, AppMode::Agent);
-
-        app.mode = AppMode::Agent;
-        app.cycle_mode_reverse();
-        assert_eq!(app.mode, AppMode::Plan);
-
-        app.mode = AppMode::Agent;
-        app.cycle_mode_reverse();
-        assert_eq!(app.mode, AppMode::Plan);
-    }
-}
-
-#[test]
 fn effective_route_display_tracks_inflight_and_last_auto_provider() {
     let mut app = App::new(test_options(false), &Config::default());
     app.auto_model = true;
@@ -3836,8 +3937,8 @@ fn test_mode_scenario() {
     // from test_mode_switch_does_not_emit_redundant_toast
     {
         let mut app = App::new(test_options(false), &Config::default());
-        let first_mode = app.mode.next();
-        let second_mode = first_mode.next();
+        let first_mode = AppMode::Plan;
+        let second_mode = AppMode::Agent;
 
         app.set_mode(first_mode);
         app.sync_status_message_to_toasts();
@@ -3884,6 +3985,17 @@ fn test_queue_message() {
     app.queue_message(QueuedMessage::new("test message".to_string(), None));
     assert_eq!(app.queued_message_count(), 1);
     assert!(app.queued_messages.front().is_some());
+}
+
+#[test]
+fn queue_message_at_cap_returns_message_to_composer() {
+    let mut app = App::new(test_options(false), &Config::default());
+    for index in 0..MAX_QUEUED_MESSAGES {
+        app.queue_message(QueuedMessage::new(format!("m{index}"), None));
+    }
+    app.queue_message(QueuedMessage::new("overflow".to_string(), None));
+    assert_eq!(app.queued_message_count(), MAX_QUEUED_MESSAGES);
+    assert_eq!(app.input, "overflow");
 }
 
 #[test]
@@ -4050,9 +4162,51 @@ fn base_policy_for_mode_projects_the_mode_permission_table() {
 }
 
 #[test]
+fn every_dial_step_writes_one_permissions_receipt() {
+    let _env_lock = lock_test_env();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+    let _config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
+    let mut options = test_options(false);
+    options.start_in_agent_mode = true;
+    options.config_path = Some(config_path);
+    let mut app = App::new(options, &Config::default());
+    app.set_agent_approval_posture(ApprovalMode::AcceptEdits);
+    app.history.clear();
+    app.yolo_compat_notified = true;
+
+    let mut receipts = Vec::new();
+    for _ in 0..5 {
+        let before = app.history.len();
+        assert!(app.step_permission_dial(false).changed());
+        let added: Vec<String> = app.history[before..]
+            .iter()
+            .filter_map(|cell| match cell {
+                HistoryCell::System { content } if content.starts_with("Permissions changed") => {
+                    Some(content.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(added.len(), 1, "one receipt per press: {added:?}");
+        receipts.extend(added);
+    }
+    assert_eq!(
+        receipts,
+        [
+            "Permissions changed to plan",
+            "Permissions changed to auto",
+            "Permissions changed to Full Access",
+            "Permissions changed to ask",
+            "Permissions changed to accept edits",
+        ]
+    );
+}
+
+#[test]
 fn cycle_approval_scenario() {
-    // Scenario consolidation of: cycle_approval_posture_cycles_suggest_auto_bypass, cycle_approval_posture_emits_rebinding_notice_once
-    // from cycle_approval_posture_cycles_suggest_auto_bypass
+    // Scenario consolidation of: the permission dial walk, cycle_approval_posture_emits_rebinding_notice_once
+    // from the permission dial walk
     {
         let _env_lock = lock_test_env();
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -4062,22 +4216,55 @@ fn cycle_approval_scenario() {
         options.start_in_agent_mode = true;
         options.config_path = Some(config_path);
         let mut app = App::new(options, &Config::default());
-        app.approval_mode = ApprovalMode::Suggest;
+        app.set_agent_approval_posture(ApprovalMode::Suggest);
 
-        assert!(app.cycle_approval_posture());
-        assert_eq!(app.approval_mode, ApprovalMode::AcceptEdits);
-
-        assert!(app.cycle_approval_posture());
-        assert_eq!(app.approval_mode, ApprovalMode::Auto);
-
-        assert!(app.cycle_approval_posture());
-        assert_eq!(app.approval_mode, ApprovalMode::Bypass);
-
-        assert!(app.cycle_approval_posture());
-        assert_eq!(app.approval_mode, ApprovalMode::Suggest);
+        for (mode, posture) in [
+            (AppMode::Agent, ApprovalMode::AcceptEdits),
+            (AppMode::Plan, ApprovalMode::AcceptEdits),
+            (AppMode::Agent, ApprovalMode::Auto),
+            (AppMode::Agent, ApprovalMode::Bypass),
+            (AppMode::Agent, ApprovalMode::Suggest),
+        ] {
+            assert!(app.step_permission_dial(false).changed());
+            assert_eq!(app.mode, mode);
+            assert_eq!(app.mode_prefs.agent_approval_mode, posture);
+            if mode == AppMode::Agent {
+                assert_eq!(app.approval_mode, posture);
+            }
+        }
         let persisted =
             std::fs::read_to_string(tmp.path().join("settings.toml")).expect("settings");
         assert!(persisted.contains("permission_posture = \"ask\""));
+    }
+    {
+        let _env_lock = lock_test_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        let _config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
+        let mut options = test_options(false);
+        options.start_in_agent_mode = true;
+        options.config_path = Some(config_path);
+        let mut config = Config::default();
+        config.auto_review = Some(codewhale_runtime::config::AutoReviewConfig {
+            disabled: true,
+            ..Default::default()
+        });
+        let mut app = App::new(options, &config);
+        app.set_agent_approval_posture(ApprovalMode::Suggest);
+
+        for (mode, posture) in [
+            (AppMode::Agent, ApprovalMode::AcceptEdits),
+            (AppMode::Plan, ApprovalMode::AcceptEdits),
+            (AppMode::Agent, ApprovalMode::Bypass),
+            (AppMode::Agent, ApprovalMode::Suggest),
+        ] {
+            assert!(app.step_permission_dial(false).changed());
+            assert_eq!(app.mode, mode);
+            assert_eq!(app.mode_prefs.agent_approval_mode, posture);
+            if mode == AppMode::Agent {
+                assert_eq!(app.approval_mode, posture);
+            }
+        }
     }
     // from cycle_approval_posture_emits_rebinding_notice_once
     {
@@ -4090,7 +4277,7 @@ fn cycle_approval_scenario() {
         options.config_path = Some(config_path);
         let mut app = App::new(options, &Config::default());
 
-        assert!(app.cycle_approval_posture());
+        assert!(app.select_approval_posture(ApprovalMode::Auto));
         let notices = app
             .status_toasts
             .iter()
@@ -4098,7 +4285,7 @@ fn cycle_approval_scenario() {
             .count();
         assert_eq!(notices, 1, "first cycle posts the rebinding notice");
 
-        assert!(app.cycle_approval_posture());
+        assert!(app.select_approval_posture(ApprovalMode::Bypass));
         let notices = app
             .status_toasts
             .iter()
@@ -4108,15 +4295,132 @@ fn cycle_approval_scenario() {
     }
 }
 
-/// Tab cycles the mode, Shift+Tab cycles the permission posture. They are two
-/// independent axes, and Plan used to veto the second key — which welded them
-/// together on the keyboard: Shift+Tab silently did nothing in Plan.
-///
-/// Allowing it weakens nothing. Plan's read-only guarantee is mode-derived:
-/// `authority` maps `(Plan, _, Bypass)` to `SandboxPolicy::ReadOnly` and
-/// `tool_catalog` gates every write tool on `mode != AppMode::Plan`. So the
-/// cycle moves the durable Act/Operate baseline while the *live* Plan policy
-/// stays `Suggest`, and the new posture lands when the mode leaves Plan.
+#[test]
+fn auto_review_posture_transition_emits_broad_allow_pause_note_when_suspended() {
+    let _env_lock = lock_test_env();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+    let _config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
+    let mut options = test_options(false);
+    options.start_in_agent_mode = true;
+    options.config_path = Some(config_path);
+
+    let mut broad_shell_allow = codewhale_runtime::config::AutoReviewRuleConfig::default();
+    broad_shell_allow.id = Some("broad-shell".to_string());
+    broad_shell_allow.action_kind = Some("shell".to_string());
+    broad_shell_allow.reason = Some("allow shell".to_string());
+
+    let mut cfg = Config::default();
+    cfg.auto_review = Some(codewhale_runtime::config::AutoReviewConfig {
+        allow: vec![broad_shell_allow],
+        ..Default::default()
+    });
+    let mut app = App::new(options.clone(), &cfg);
+    app.ui_locale = codewhale_localization::Locale::En;
+    app.set_agent_approval_posture(ApprovalMode::Suggest);
+
+    let before = app.history.len();
+    assert!(app.select_approval_posture(ApprovalMode::Auto));
+    let notes: Vec<_> = app.history[before..]
+        .iter()
+        .filter_map(|cell| match cell {
+            HistoryCell::System { content }
+                if content.contains("Broad allow rules are paused while Auto-Review is on") =>
+            {
+                Some(content.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+
+    assert!(app.select_approval_posture(ApprovalMode::Suggest));
+    let step_before = app.history.len();
+    assert!(app.select_approval_posture(ApprovalMode::Auto));
+    let notes_second: Vec<_> = app.history[step_before..]
+        .iter()
+        .filter_map(|cell| match cell {
+            HistoryCell::System { content }
+                if content.contains("Broad allow rules are paused while Auto-Review is on") =>
+            {
+                Some(content.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notes_second.len(), 1, "{notes_second:?}");
+
+    let mut clean_app = App::new(options, &Config::default());
+    clean_app.ui_locale = codewhale_localization::Locale::En;
+    clean_app.set_agent_approval_posture(ApprovalMode::Suggest);
+    let clean_before = clean_app.history.len();
+    assert!(clean_app.select_approval_posture(ApprovalMode::Auto));
+    let clean_notes: Vec<_> = clean_app.history[clean_before..]
+        .iter()
+        .filter_map(|cell| match cell {
+            HistoryCell::System { content } if content.contains("Broad allow rules are paused") => {
+                Some(content.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(clean_notes.is_empty(), "{clean_notes:?}");
+}
+
+#[test]
+fn startup_in_auto_review_emits_broad_allow_pause_note_once() {
+    let _env_lock = lock_test_env();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+    let _config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
+    let mut options = test_options(false);
+    options.start_in_agent_mode = true;
+    options.config_path = Some(config_path);
+
+    let mut broad_shell_allow = codewhale_runtime::config::AutoReviewRuleConfig::default();
+    broad_shell_allow.id = Some("broad-shell".to_string());
+    broad_shell_allow.action_kind = Some("shell".to_string());
+    broad_shell_allow.reason = Some("allow shell".to_string());
+
+    let mut cfg = Config::default();
+    cfg.approval_policy = Some("auto-review".to_string());
+    cfg.auto_review = Some(codewhale_runtime::config::AutoReviewConfig {
+        allow: vec![broad_shell_allow],
+        ..Default::default()
+    });
+    let mut app = App::new(options.clone(), &cfg);
+    app.ui_locale = codewhale_localization::Locale::En;
+    let count_notes = |a: &App| {
+        let expected = a.tr(MessageId::AutoReceiptBroadAllowsPaused);
+        a.history
+            .iter()
+            .filter(|cell| matches!(cell, HistoryCell::System { content } if content == expected.as_ref()))
+            .count()
+    };
+    assert_eq!(count_notes(&app), 1);
+
+    app.apply_cli_permission_mode(Some(
+        codewhale_engine::runtime_options::PermissionMode::AutoReview,
+    ));
+    assert_eq!(count_notes(&app), 1);
+
+    let mut clean_cfg = Config::default();
+    clean_cfg.approval_policy = Some("auto-review".to_string());
+    let clean_app = App::new(options.clone(), &clean_cfg);
+    assert_eq!(count_notes(&clean_app), 0);
+
+    let mut cli_cfg = cfg;
+    cli_cfg.approval_policy = None;
+    let mut cli_app = App::new(options, &cli_cfg);
+    cli_app.ui_locale = codewhale_localization::Locale::En;
+    assert_eq!(count_notes(&cli_app), 0);
+    cli_app.apply_cli_permission_mode(Some(
+        codewhale_engine::runtime_options::PermissionMode::AutoReview,
+    ));
+    assert_eq!(cli_app.approval_mode, ApprovalMode::Auto);
+    assert_eq!(count_notes(&cli_app), 1);
+}
+
 #[test]
 fn plan_permission_cycle_moves_the_baseline_and_leaves_plan_read_only() {
     let _env_lock = lock_test_env();
@@ -4130,8 +4434,8 @@ fn plan_permission_cycle_moves_the_baseline_and_leaves_plan_read_only() {
     app.set_mode(AppMode::Plan);
 
     assert!(
-        app.cycle_approval_posture(),
-        "Shift+Tab must still change permissions while in Plan"
+        app.select_approval_posture(ApprovalMode::Bypass),
+        "permissions must still change while in Plan"
     );
     assert_eq!(
         app.mode_prefs.agent_approval_mode,
@@ -4178,11 +4482,11 @@ fn busy_permission_cycle_moves_the_live_posture() {
     let mut options = test_options(false);
     options.config_path = Some(config_path);
     let mut app = App::new(options, &Config::default());
-    let before = app.approval_mode;
+    let before = (app.mode, app.mode_prefs.agent_approval_mode);
     app.is_loading = true;
 
-    assert!(app.cycle_approval_posture());
-    assert_ne!(app.mode_prefs.agent_approval_mode, before);
+    assert!(app.step_permission_dial(false).changed());
+    assert_ne!((app.mode, app.mode_prefs.agent_approval_mode), before);
     assert!(
         !app.status_message
             .as_deref()
@@ -4193,11 +4497,11 @@ fn busy_permission_cycle_moves_the_live_posture() {
 #[test]
 fn permission_postures_persist_across_restart() {
     let _env_lock = lock_test_env();
-    for (cycles, expected) in [
-        (1, ApprovalMode::AcceptEdits),
-        (2, ApprovalMode::Auto),
-        (3, ApprovalMode::Bypass),
-        (4, ApprovalMode::Suggest),
+    for expected in [
+        ApprovalMode::AcceptEdits,
+        ApprovalMode::Auto,
+        ApprovalMode::Bypass,
+        ApprovalMode::Suggest,
     ] {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("config.toml");
@@ -4206,9 +4510,10 @@ fn permission_postures_persist_across_restart() {
         options.start_in_agent_mode = true;
         options.config_path = Some(path.clone());
         let mut app = App::new(options.clone(), &Config::default());
-        for _ in 0..cycles {
-            assert!(app.cycle_approval_posture());
+        if app.approval_mode == expected {
+            assert!(app.select_approval_posture(ApprovalMode::Auto));
         }
+        assert!(app.select_approval_posture(expected));
         assert_eq!(app.approval_mode, expected);
         assert_eq!(app.trust_mode, expected == ApprovalMode::Bypass);
 
@@ -4241,7 +4546,7 @@ fn shift_tab_migrates_user_root_policy_to_durable_tui_posture() {
     assert_eq!(app.approval_mode, ApprovalMode::Suggest);
     assert!(app.approval_policy_locked());
 
-    assert!(app.cycle_root_approval_posture());
+    assert!(app.step_permission_dial(true).posture_changed);
     assert_eq!(app.approval_mode, ApprovalMode::AcceptEdits);
     assert!(!app.approval_policy_locked());
     let saved_config = std::fs::read_to_string(&config_path).expect("saved config");
@@ -4380,12 +4685,19 @@ fn managed_requirements_ignore_saved_full_access_and_lock_changes() {
     assert!(app.approval_policy_locked());
     assert!(app.approval_policy_requirements_managed());
     assert_eq!(app.approval_mode, ApprovalMode::Suggest);
-    assert!(!app.cycle_approval_posture());
+    assert!(!app.select_approval_posture(ApprovalMode::AcceptEdits));
     assert_eq!(app.approval_mode, ApprovalMode::Suggest);
     assert!(
         app.status_toasts
             .iter()
             .any(|toast| toast.text.contains("controlled"))
+    );
+    let step = app.step_permission_dial(false);
+    assert!(!step.posture_changed);
+    assert_eq!(
+        app.mode,
+        AppMode::Plan,
+        "a locked posture still reaches Plan"
     );
 }
 
@@ -4423,7 +4735,7 @@ fn sandbox_requirements_prevent_full_access_overrides() {
         assert!(!app.trust_mode);
         assert!(!app.yolo);
         assert!(app.approval_policy_requirements_managed());
-        assert!(!app.cycle_approval_posture());
+        assert!(!app.select_approval_posture(ApprovalMode::AcceptEdits));
         assert_eq!(app.select_yolo_compat(), SettingSelection::Refused);
         assert!(matches!(
             codewhale_engine::core::authority::sandbox_policy_for_turn(
@@ -4604,7 +4916,7 @@ fn yolo_start_with_default_config_restores_interactive_agent_shell_baseline() {
         "default interactive Agent baseline should expose approval-gated shell after YOLO downshift"
     );
     assert!(!app.trust_mode);
-    assert_eq!(app.approval_mode, ApprovalMode::Suggest);
+    assert_eq!(app.approval_mode, ApprovalMode::AcceptEdits);
 }
 
 #[test]
@@ -4636,7 +4948,7 @@ fn leaving_yolo_after_startup_restores_baseline_policies() {
     app.set_mode(AppMode::Agent);
     assert!(!app.allow_shell);
     assert!(!app.trust_mode);
-    assert_eq!(app.approval_mode, ApprovalMode::Suggest);
+    assert_eq!(app.approval_mode, ApprovalMode::AcceptEdits);
 }
 
 #[test]
@@ -5265,7 +5577,7 @@ fn enter_during_active_paste_burst_appends_newline_to_buffer_not_submit() {
     assert!(app.paste_burst.is_active());
     assert!(app.input.is_empty());
 
-    let result = app.handle_composer_enter(true);
+    let result = app.handle_composer_enter(true, Instant::now());
 
     assert!(
         result.is_none(),
@@ -5297,7 +5609,7 @@ fn enter_inside_paste_burst_window_after_flush_inserts_newline_not_submit() {
         "suppression window should be open"
     );
 
-    let result = app.handle_composer_enter(true);
+    let result = app.handle_composer_enter(true, Instant::now());
 
     assert!(
         result.is_none(),
@@ -5307,9 +5619,12 @@ fn enter_inside_paste_burst_window_after_flush_inserts_newline_not_submit() {
         app.input, "hello\n",
         "newline must be inserted into the composer instead of firing a submit"
     );
-    assert!(!app.composer_enter_would_submit(true));
-    assert!(app.composer_enter_would_submit(false));
-    assert_eq!(app.handle_composer_enter(false).as_deref(), Some("hello\n"));
+    assert!(!app.composer_enter_would_submit(true, Instant::now()));
+    assert!(app.composer_enter_would_submit(false, Instant::now()));
+    assert_eq!(
+        app.handle_composer_enter(false, Instant::now()).as_deref(),
+        Some("hello\n")
+    );
 }
 
 /// The absorbed Enter above must not buy the window more time. Re-arming on
@@ -5326,7 +5641,7 @@ fn enter_absorbed_after_flush_does_not_re_arm_the_suppression_window() {
     app.paste_burst.extend_window(now);
 
     assert!(
-        app.handle_composer_enter(true).is_none(),
+        app.handle_composer_enter(true, Instant::now()).is_none(),
         "first Enter is absorbed as the paste's possible trailing newline"
     );
     assert_eq!(app.input, "hello\n");
@@ -5349,7 +5664,7 @@ fn enter_outside_any_paste_burst_window_submits_normally() {
     app.input = "hello world".to_string();
     app.cursor_position = "hello world".chars().count();
 
-    let result = app.handle_composer_enter(true);
+    let result = app.handle_composer_enter(true, Instant::now());
 
     assert_eq!(
         result.as_deref(),
@@ -5376,9 +5691,14 @@ fn enter_with_paste_burst_detection_disabled_submits_normally() {
     let now = Instant::now();
     app.paste_burst.extend_window(now);
 
-    let result = app.handle_composer_enter(true);
+    let result = app.handle_composer_enter(true, Instant::now());
 
     assert_eq!(result.as_deref(), Some("ship it"));
+}
+
+fn clipboard_paste(app: &mut App, content: ClipboardContent) -> bool {
+    app.clipboard = ClipboardHandler::with_content_for_test(content);
+    crate::tui::paste::handle_paste(app, crate::tui::paste::PasteSource::Shortcut)
 }
 
 #[test]
@@ -5387,13 +5707,48 @@ fn clipboard_text_paste_matches_bracketed_paste_state() {
     let mut bracketed = App::new(test_options(false), &Config::default());
     let mut clipboard = App::new(test_options(false), &Config::default());
 
-    bracketed.insert_paste_text(text);
-    clipboard.apply_clipboard_content(ClipboardContent::Text(text.to_string()));
+    crate::tui::paste::handle_paste(
+        &mut bracketed,
+        crate::tui::paste::PasteSource::Terminal(text),
+    );
+    assert!(clipboard_paste(
+        &mut clipboard,
+        ClipboardContent::Text(text.to_string())
+    ));
 
     assert_eq!(clipboard.input, bracketed.input);
     assert_eq!(clipboard.cursor_position, bracketed.cursor_position);
     assert_eq!(clipboard.slash_menu_hidden, bracketed.slash_menu_hidden);
     assert_eq!(clipboard.mention_menu_hidden, bracketed.mention_menu_hidden);
+}
+
+#[test]
+fn release_only_paste_edge_leaves_text_to_the_terminal_and_still_attaches_an_image() {
+    use crate::tui::paste::{PasteSource, handle_paste};
+
+    let mut app = App::new(test_options(false), &Config::default());
+    app.clipboard = ClipboardHandler::with_content_for_test(ClipboardContent::Text(
+        "already pasted".to_string(),
+    ));
+    handle_paste(&mut app, PasteSource::Terminal("already pasted"));
+    handle_paste(&mut app, PasteSource::ReleaseOnly);
+    assert_eq!(app.input, "already pasted");
+
+    let mut app = App::new(test_options(false), &Config::default());
+    app.clipboard = ClipboardHandler::with_content_for_test(ClipboardContent::Image(
+        crate::tui::clipboard::PastedImage {
+            path: std::path::PathBuf::from("/tmp/pasted.png"),
+            width: 8,
+            height: 4,
+            byte_len: 2048,
+        },
+    ));
+
+    handle_paste(&mut app, PasteSource::ReleaseOnly);
+    assert!(app.input.contains("pasted.png"), "{}", app.input);
+    // The other edge of the same chord does not attach it twice.
+    handle_paste(&mut app, PasteSource::Shortcut);
+    assert_eq!(app.input.matches("pasted.png").count(), 1, "{}", app.input);
 }
 
 #[test]
@@ -5403,7 +5758,7 @@ fn ssh_direct_clipboard_paste_points_to_terminal_owned_bracketed_paste() {
     app.cursor_position = app.input.chars().count();
     app.clipboard = ClipboardHandler::for_test(true, true);
 
-    assert!(!app.paste_from_clipboard());
+    crate::tui::paste::handle_paste(&mut app, crate::tui::paste::PasteSource::Shortcut);
     assert_eq!(app.input, "keep this draft");
     let hint = app
         .status_message
@@ -5421,12 +5776,15 @@ fn clipboard_image_paste_keeps_adjacent_text_and_concise_status() {
     app.input = "before after".to_string();
     app.cursor_position = "before".chars().count();
 
-    app.apply_clipboard_content(ClipboardContent::Image(PastedImage {
-        path: PathBuf::from("/tmp/pasted.png"),
-        width: 8,
-        height: 4,
-        byte_len: 2048,
-    }));
+    assert!(clipboard_paste(
+        &mut app,
+        ClipboardContent::Image(PastedImage {
+            path: PathBuf::from("/tmp/pasted.png"),
+            width: 8,
+            height: 4,
+            byte_len: 2048,
+        })
+    ));
 
     assert!(
         app.input
@@ -6865,9 +7223,14 @@ fn interactive_mode_cycle_persists_the_startup_default() {
 
     let mut app = App::new(test_options(false), &Config::default());
     app.mode = AppMode::Agent;
-    app.cycle_mode();
+    app.approval_mode = ApprovalMode::AcceptEdits;
+    assert!(app.step_permission_dial(false).mode_changed);
 
-    assert_eq!(app.mode, AppMode::Plan, "Work -> Plan is the Tab cycle");
+    assert_eq!(
+        app.mode,
+        AppMode::Plan,
+        "Accept Edits -> Plan is the dial's next stop"
+    );
     let reloaded = Settings::load().expect("reload settings");
     assert_eq!(
         reloaded.default_mode, "plan",
@@ -6962,10 +7325,11 @@ fn mode_change_while_a_turn_runs_is_live_and_persisted() {
     let mut app = App::new(test_options(false), &Config::default());
     app.select_mode(AppMode::Plan);
     app.is_loading = true;
-    app.cycle_mode();
+    assert!(app.step_permission_dial(false).mode_changed);
     app.startup_defaults.flush();
 
-    assert_eq!(app.mode, AppMode::Plan.next());
+    assert_eq!(app.mode, AppMode::Agent);
+    assert_eq!(app.approval_mode, ApprovalMode::Auto);
     assert_eq!(
         Settings::load().expect("reload").default_mode,
         app.mode.as_setting(),
@@ -7254,7 +7618,7 @@ async fn mode_and_permission_posture_writes_do_not_clobber_each_other() {
             "mode selection must change mode"
         );
         assert!(
-            app.cycle_approval_posture(),
+            app.select_approval_posture(app.mode_prefs.agent_approval_mode.cycle_permission_next()),
             "the posture write must succeed, or the assertion below is vacuous"
         );
     }
@@ -7358,7 +7722,9 @@ async fn rapid_mixed_writes_settle_on_the_last_value_for_every_field() {
         );
         app.apply_reasoning_effort_cycle();
         // Synchronous direct writers.
-        assert!(app.cycle_approval_posture());
+        assert!(
+            app.select_approval_posture(app.mode_prefs.agent_approval_mode.cycle_permission_next())
+        );
         Settings::transact(|settings| settings.set("max_history", &(200 + index).to_string()))
             .expect("the direct write must land");
     }
@@ -8371,4 +8737,216 @@ async fn pet_view_save_failure_keeps_the_live_view_and_reports_without_overwriti
         app.pet_watch.enabled,
         "a failed save does not undo the live view"
     );
+}
+
+#[test]
+fn a_session_start_notice_names_active_agent_approved_plugins() {
+    use codewhale_plugins::host_services::{
+        AgentApproval, AgentPosture, PersonVia, PluginApprover, ReviewApproval,
+    };
+
+    let _lock = lock_test_env();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    let workspace = tmp.path().join("project");
+    let other_project = tmp.path().join("otherproject");
+    for dir in [&home, &workspace, &other_project] {
+        std::fs::create_dir_all(dir).expect("dir");
+    }
+    let _env = sealed_settings_home(&home);
+
+    let ctx = codewhale_plugins::PluginDiscoveryContext::capture_pre_dotenv();
+    for (dir_root, name) in [
+        (workspace.join(".codewhale/plugins"), "agent-one"),
+        (workspace.join(".codewhale/plugins"), "agent-two"),
+        (workspace.join(".codewhale/plugins"), "agent-off"),
+        (workspace.join(".codewhale/plugins"), "person-ok"),
+        (ctx.user_plugins_dir().to_path_buf(), "agent-other"),
+    ] {
+        let skill = dir_root.join(name).join("skills/hello");
+        std::fs::create_dir_all(&skill).expect("skill dir");
+        std::fs::write(
+            dir_root.join(name).join("plugin.toml"),
+            format!(
+                "schema_version = 1\n[plugin]\nname = {name:?}\nversion = \"1.0.0\"\n[skills]\npath = \"skills\"\n"
+            ),
+        )
+        .expect("manifest");
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: hello\ndescription: hi\n---\nbody\n",
+        )
+        .expect("skill");
+    }
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        ctx.user_plugins_dir(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .expect("private user plugin dir");
+
+    {
+        let mut other_registry = ctx.registry_for_workspace(&other_project);
+        let other_ws_str = other_registry.workspace().to_string_lossy().into_owned();
+        let agent_elsewhere = PluginApprover::Agent(AgentApproval {
+            posture: AgentPosture::AutoReview,
+            workspace: other_ws_str,
+            thread_id: Some("th-other-1".to_string()),
+            turn_id: Some("turn-other-1".to_string()),
+            tool_call_id: Some("call-other-1".to_string()),
+        });
+        let other_hs = other_registry
+            .host_service_review_for("agent-other", &agent_elsewhere)
+            .map(|review| review.token);
+        std::sync::Arc::make_mut(&mut other_registry)
+            .trust_and_enable_by(
+                "agent-other",
+                ReviewApproval {
+                    approved_by: agent_elsewhere.clone(),
+                    host_services: other_hs,
+                },
+                agent_elsewhere,
+            )
+            .expect("agent-other");
+    }
+
+    let mut clean_registry = ctx.registry_for_workspace(&workspace);
+    let ws_str = clean_registry.workspace().to_string_lossy().into_owned();
+    assert!(!clean_registry.get("agent-other").unwrap().active());
+    assert!(clean_registry.get("agent-other").unwrap().outside_reach);
+    {
+        let agent_off = PluginApprover::Agent(AgentApproval {
+            posture: AgentPosture::FullAccess,
+            workspace: ws_str.clone(),
+            thread_id: Some("th-off-1".to_string()),
+            turn_id: Some("turn-off-1".to_string()),
+            tool_call_id: Some("call-off-1".to_string()),
+        });
+        let off_hs = clean_registry
+            .host_service_review_for("agent-off", &agent_off)
+            .map(|review| review.token);
+        let reg = std::sync::Arc::make_mut(&mut clean_registry);
+        let person = PluginApprover::person(PersonVia::Terminal);
+        reg.trust_and_enable_by(
+            "person-ok",
+            ReviewApproval {
+                approved_by: person.clone(),
+                host_services: None,
+            },
+            person,
+        )
+        .expect("person-ok");
+        reg.trust_reviewed(
+            "agent-off",
+            ReviewApproval {
+                approved_by: agent_off,
+                host_services: off_hs,
+            },
+        )
+        .expect("agent-off");
+    }
+
+    let clean_app = App::new_with_plugin_registry(
+        crate::tui::test_support::test_tui_options(&workspace),
+        &Config::default(),
+        clean_registry.clone(),
+    );
+    assert!(clean_app.launch.visible);
+    assert!(clean_app.history.is_empty());
+    assert!(
+        !clean_app.status_toasts.iter().any(|toast| toast
+            .text
+            .contains("Agent-approved plugins active in this project")),
+        "{:?}",
+        clean_app.status_toasts
+    );
+
+    let mut registry = clean_registry;
+    {
+        let agent_full = PluginApprover::Agent(AgentApproval {
+            posture: AgentPosture::FullAccess,
+            workspace: ws_str.clone(),
+            thread_id: Some("th-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            tool_call_id: Some("call-1".to_string()),
+        });
+        let full_hs = registry
+            .host_service_review_for("agent-one", &agent_full)
+            .map(|review| review.token);
+        let agent_auto = PluginApprover::Agent(AgentApproval {
+            posture: AgentPosture::AutoReview,
+            workspace: ws_str,
+            thread_id: Some("th-2".to_string()),
+            turn_id: Some("turn-2".to_string()),
+            tool_call_id: Some("call-2".to_string()),
+        });
+        let auto_hs = registry
+            .host_service_review_for("agent-two", &agent_auto)
+            .map(|review| review.token);
+        let reg = std::sync::Arc::make_mut(&mut registry);
+        reg.trust_and_enable_by(
+            "agent-one",
+            ReviewApproval {
+                approved_by: agent_full.clone(),
+                host_services: full_hs,
+            },
+            agent_full,
+        )
+        .expect("agent-one");
+        reg.trust_and_enable_by(
+            "agent-two",
+            ReviewApproval {
+                approved_by: agent_auto.clone(),
+                host_services: auto_hs,
+            },
+            agent_auto,
+        )
+        .expect("agent-two");
+    }
+
+    let mut app = App::new_with_plugin_registry(
+        crate::tui::test_support::test_tui_options(&workspace),
+        &Config::default(),
+        registry,
+    );
+    assert!(app.launch.visible);
+    assert!(app.history.is_empty());
+    fn notices(app: &App) -> Vec<&StatusToast> {
+        app.status_toasts
+            .iter()
+            .filter(|toast| {
+                toast
+                    .text
+                    .contains("Agent-approved plugins active in this project")
+            })
+            .collect()
+    }
+    let initial = notices(&app);
+    assert_eq!(initial.len(), 1, "{initial:?}");
+    let text = initial[0].text.clone();
+    assert_eq!(initial[0].level, StatusToastLevel::Warning);
+    assert!(initial[0].ttl_ms.is_none());
+    assert!(text.contains("agent-one"), "{text}");
+    assert!(text.contains("agent-two"), "{text}");
+    assert!(!text.contains("agent-off"), "{text}");
+    assert!(!text.contains("agent-other"), "{text}");
+    assert!(!text.contains("person-ok"), "{text}");
+
+    app.refresh_agent_approved_plugins_notice();
+    assert_eq!(notices(&app).len(), 1);
+
+    std::sync::Arc::make_mut(&mut app.plugin_registry)
+        .trust("agent-one")
+        .expect("person trust agent-one");
+    app.refresh_agent_approved_plugins_notice();
+    let after_one = notices(&app);
+    assert_eq!(after_one.len(), 1);
+    assert!(!after_one[0].text.contains("agent-one"), "{after_one:?}");
+    assert!(after_one[0].text.contains("agent-two"), "{after_one:?}");
+
+    std::sync::Arc::make_mut(&mut app.plugin_registry)
+        .trust("agent-two")
+        .expect("person trust agent-two");
+    app.refresh_agent_approved_plugins_notice();
+    assert!(notices(&app).is_empty(), "{:?}", notices(&app));
 }

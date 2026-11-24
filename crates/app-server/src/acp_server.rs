@@ -1,7 +1,17 @@
 //! ACP stdio projection of the existing Runtime/Engine owner.
 //! History, provider requests, tools, approval and cancellation are Core facts.
-//! This module keeps only connection configuration, canonical bindings and
-//! JSON-RPC correlation. Secure cross-process attachment is not yet qualified.
+//! This module keeps only connection configuration and canonical bindings; the
+//! official ACP SDK owns framing, request ids and correlation. Secure
+//! cross-process attachment is not yet qualified.
+//!
+//! Known limits: a slow editor no longer slows a turn, because updates queue
+//! (SDK queue, then 256 frames of up to 8 MiB each) and memory is bounded only
+//! by what one turn emits; `$/cancel_request` for a running `session/prompt` is
+//! not honored (only `session/cancel` is). Requested file arguments carry no
+//! verified full preimage, so live approvals and replay omit structured diffs.
+use agent_client_protocol::Error as SdkError;
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::v1::schema as acp;
 use anyhow::{Result, anyhow};
 use codewhale_config::AppMode;
 use codewhale_config::ProviderKind;
@@ -13,19 +23,19 @@ use codewhale_engine::runtime_threads::{
 };
 use codewhale_execpolicy::ApprovalMode;
 use codewhale_runtime::config::Config;
+use codewhale_runtime::features::Feature;
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufRead, AsyncWrite};
 #[cfg(test)]
 use tokio::io::{AsyncWriteExt, BufReader};
+mod connection;
 mod runtime;
-const ACP_PROTOCOL_VERSION: u64 = 1;
+use connection::serve_connection;
 const MAX_ACP_SESSIONS: usize = 64;
 const TOOL_CALL_CONTENT_PREVIEW_CHARS: usize = 4_000;
-static NEXT_ACP_PERMISSION_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 pub async fn run_acp_server(
     config: Config,
@@ -54,7 +64,7 @@ pub async fn run_acp_server(
     .await
 }
 
-pub(crate) struct CapturedAcpFrontend {
+pub struct CapturedAcpFrontend {
     config: Config,
     model: String,
     cwd: PathBuf,
@@ -63,7 +73,7 @@ pub(crate) struct CapturedAcpFrontend {
     config_path: Option<PathBuf>,
     config_profile: Option<String>,
 }
-pub(crate) fn capture_frontend(
+pub fn capture_frontend(
     config: Config,
     model: String,
     cwd: PathBuf,
@@ -84,13 +94,13 @@ pub(crate) fn capture_frontend(
     }))
 }
 impl CapturedAcpFrontend {
-    pub(crate) fn serve<'a>(
+    pub fn serve<'a>(
         &'a self,
         input: Box<dyn AsyncBufRead + Send + Unpin>,
-        mut output: Box<dyn AsyncWrite + Send + Unpin + 'a>,
+        output: Box<dyn AsyncWrite + Send + Unpin + 'a>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
-            let mut server = AcpServer::new(
+            let server = AcpServer::new(
                 self.config.clone(),
                 self.model.clone(),
                 self.cwd.clone(),
@@ -99,8 +109,7 @@ impl CapturedAcpFrontend {
                 self.config_path.clone(),
                 self.config_profile.clone(),
             );
-            let mut input = crate::stdio::BoundedLines::new(input);
-            server.serve(&mut input, &mut output).await
+            serve_connection(server, input, output).await.map(drop)
         })
     }
 }
@@ -162,7 +171,7 @@ impl crate::RuntimeOwnerFrontend for CapturedAcpFrontend {
 }
 
 struct AcpServer {
-    config: Config,
+    config: Arc<Config>,
     model: String,
     default_cwd: PathBuf,
     runtime: Arc<RuntimeThreadManager>,
@@ -172,30 +181,569 @@ struct AcpServer {
     sessions: HashMap<String, AcpSession>,
     insertion_order: VecDeque<String>,
     client_supports_terminal: bool,
-    response_id_policy: JsonRpcResponseIdPolicy,
 }
 /// A transport binding, never another conversation or executable registry.
 struct AcpSession {
     thread_id: String,
-    cursor: u64,
 }
 struct PendingToolCall {
     execution_id: String,
     name: String,
     input: Value,
 }
-enum AcpDispatch {
-    Response(Value),
-    Shutdown,
-}
 #[derive(Debug)]
 struct AcpError {
     code: i32,
     message: String,
 }
+enum Outgoing {
+    Update(acp::SessionNotification),
+    Permission {
+        key: String,
+        request: acp::RequestPermissionRequest,
+    },
+}
+enum Inbound {
+    Cancel { session: String },
+    Permission { key: String, allow: bool },
+    Eof,
+}
+type Emit<'a> = &'a mut (dyn FnMut(Outgoing) -> Result<()> + Send);
+struct SessionViewContext {
+    config: Arc<Config>,
+    runtime: Arc<RuntimeThreadManager>,
+    thread_id: String,
+}
+
+struct NewSessionContext {
+    config: Arc<Config>,
+    model: String,
+    default_cwd: PathBuf,
+    runtime: Arc<RuntimeThreadManager>,
+    sessions_dir: PathBuf,
+    config_path: Option<PathBuf>,
+    config_profile: Option<String>,
+    shell_allowed: bool,
+}
+
+struct LoadSessionContext {
+    config: Arc<Config>,
+    runtime: Arc<RuntimeThreadManager>,
+    sessions_dir: PathBuf,
+    config_path: Option<PathBuf>,
+    config_profile: Option<String>,
+    shell_allowed: bool,
+}
+
+struct SetSessionConfigContext {
+    view: SessionViewContext,
+    config_path: Option<PathBuf>,
+    config_profile: Option<String>,
+    shell_allowed: bool,
+}
+
+async fn spawn_blocking_io<T, F>(f: F) -> std::result::Result<T, tokio::task::JoinError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    #[cfg(any(test, feature = "test-support"))]
+    let env_ticket = codewhale_engine::test_support::env_scope_ticket();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(any(test, feature = "test-support"))]
+        let _membership = codewhale_engine::test_support::join_env_scope(env_ticket);
+        f()
+    })
+    .await
+}
+
+async fn create_new_session(
+    ctx: NewSessionContext,
+    params: Value,
+) -> std::result::Result<(String, String), AcpError> {
+    validate_mcp_servers(&params)?;
+    let cwd = absolute_cwd(&params, "session/new")?.unwrap_or(ctx.default_cwd);
+    let identity = ctx
+        .config
+        .active_provider_identity()
+        .map_err(|error| AcpError::internal(error.to_string()))?;
+    let thread = Box::pin(
+        ctx.runtime.create_thread_with_shell_policy(
+            CreateThreadRequest {
+                model: Some(ctx.model),
+                model_provider: Some(identity.persisted_kind().to_string()),
+                model_provider_id: identity.persisted_id().map(str::to_string),
+                workspace: Some(cwd),
+                mode: Some(
+                    if acp_mode(&ctx.config) == AppMode::Plan {
+                        "plan"
+                    } else {
+                        "agent"
+                    }
+                    .to_string(),
+                ),
+                permission_posture: Some(acp_permission_value(&ctx.config).to_string()),
+                allow_shell: Some(ctx.shell_allowed),
+                ..Default::default()
+            },
+            ctx.config_path.as_deref(),
+            ctx.config_profile.as_deref(),
+        ),
+    )
+    .await
+    .map_err(|error| AcpError::internal(error.to_string()))?;
+    let id = uuid::Uuid::new_v4().to_string();
+    Box::pin(crate::runtime_api::sessions::initialize_empty_session(
+        &ctx.runtime,
+        &ctx.sessions_dir,
+        &thread.id,
+        &id,
+    ))
+    .await
+    .map_err(|error| AcpError::internal(error.message))?;
+    Ok((id, thread.id))
+}
+
+async fn list_sessions_from_dir(
+    sessions_dir: PathBuf,
+    params: Value,
+) -> std::result::Result<Value, AcpError> {
+    let cwd = match params.get("cwd") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(path)) if std::path::Path::new(path).is_absolute() => {
+            Some(PathBuf::from(path))
+        }
+        Some(_) => {
+            return Err(AcpError::invalid_params(
+                "session/list cwd must be an absolute path",
+            ));
+        }
+    };
+    let sessions = spawn_blocking_io(move || {
+        codewhale_engine::session_manager::SessionManager::new(sessions_dir)
+            .ok()
+            .map(|manager| manager.list_sessions_lenient())
+            .unwrap_or_default()
+    })
+    .await
+    .map_err(|error| AcpError::internal(format!("list sessions task failed: {error}")))?;
+    let sessions: Vec<acp::SessionInfo> = sessions
+        .into_iter()
+        .filter(|meta| {
+            cwd.as_ref().is_none_or(|cwd| {
+                codewhale_engine::session_manager::paths_equivalent(&meta.workspace, cwd)
+            })
+        })
+        .map(|meta| {
+            acp::SessionInfo::new(
+                meta.id,
+                PathBuf::from(meta.workspace.to_string_lossy().into_owned()),
+            )
+            .title(meta.title)
+            .updated_at(meta.updated_at.to_rfc3339())
+            .meta(codewhale_meta(json!({
+                "createdAt": meta.created_at.to_rfc3339(),
+                "messageCount": meta.message_count,
+            })))
+        })
+        .collect();
+    to_wire(&acp::ListSessionsResponse::new(sessions))
+}
+
+async fn resolve_saved_session_id(
+    sessions_dir: PathBuf,
+    requested: String,
+) -> std::result::Result<String, AcpError> {
+    spawn_blocking_io(move || {
+        let store = codewhale_engine::session_manager::SessionManager::new(sessions_dir)
+            .map_err(|error| AcpError::internal(error.to_string()))?;
+        store
+            .resume_session_by_prefix(&requested)
+            .map(|resumed| resumed.session.metadata.id)
+            .map_err(|error| {
+                AcpError::invalid_params(format!("could not load session {requested}: {error}"))
+            })
+    })
+    .await
+    .map_err(|error| AcpError::internal(format!("load session task failed: {error}")))?
+}
+
+async fn resume_and_configure_loaded_session(
+    ctx: &LoadSessionContext,
+    id: &str,
+) -> std::result::Result<String, AcpError> {
+    let (_, axum::Json(resumed)) =
+        Box::pin(crate::runtime_api::sessions::resume_session_in_runtime(
+            &ctx.runtime,
+            &ctx.sessions_dir,
+            id,
+            crate::runtime_api::sessions::ResumeSessionRequest {
+                model: None,
+                mode: (acp_mode(&ctx.config) == AppMode::Plan).then(|| "plan".to_string()),
+            },
+            (ctx.config_path.as_deref(), ctx.config_profile.as_deref()),
+            Some(ctx.shell_allowed),
+        ))
+        .await
+        .map_err(|error| AcpError::internal(error.message))?;
+    // A saved posture cannot widen the server, and connection terminal
+    // negotiation only narrows the canonical thread's shell ceiling.
+    Box::pin(ctx.runtime.update_thread_with_shell_policy(
+        &resumed.thread_id,
+        UpdateThreadRequest {
+            permission_posture: Some(acp_permission_value(&ctx.config).to_string()),
+            allow_shell: Some(ctx.shell_allowed),
+            ..Default::default()
+        },
+        ctx.config_path.as_deref(),
+        ctx.config_profile.as_deref(),
+    ))
+    .await
+    .map_err(|error| AcpError::internal(error.to_string()))?;
+    Ok(resumed.thread_id)
+}
+
+async fn history_updates_for(
+    sessions_dir: PathBuf,
+    config: Arc<Config>,
+    session_id: String,
+) -> Result<Vec<acp::SessionUpdate>> {
+    use codewhale_models::ContentBlock;
+    let saved = spawn_blocking_io(move || {
+        codewhale_engine::session_manager::SessionManager::new(sessions_dir)?
+            .load_session(&session_id)
+    })
+    .await
+    .map_err(|error| anyhow!("load session history task failed: {error}"))??;
+    let secrets = Box::pin(
+        codewhale_engine::runtime_threads::manager::receipt_secret_values((*config).clone()),
+    )
+    .await?;
+    let mut calls = HashMap::new();
+    let mut updates = Vec::new();
+    for message in &saved.messages {
+        let chunk: Option<fn(acp::ContentChunk) -> acp::SessionUpdate> = match message.role.as_str()
+        {
+            "user" => Some(acp::SessionUpdate::UserMessageChunk),
+            "assistant" => Some(acp::SessionUpdate::AgentMessageChunk),
+            _ => None,
+        };
+        if let Some(chunk) = chunk
+            && !codewhale_engine::runtime_handoff::is_internal_runtime_handoff(message)
+            && codewhale_models::turn_classify::restored_subagent_checkpoint_display(message)
+                .is_none()
+        {
+            let mut chunks = Vec::<String>::new();
+            let mut coalesce = false;
+            for (index, block) in message.content.iter().enumerate() {
+                match block {
+                    ContentBlock::Text { text, .. } => {
+                        if codewhale_engine::runtime_handoff::is_turn_metadata_block(
+                            message, index, text,
+                        ) {
+                            continue;
+                        }
+                        if text.starts_with("[tool_history_repair]")
+                            || (message.role == "assistant"
+                                && codewhale_engine::runtime_handoff::archived_context_parts(text)
+                                    .is_some())
+                        {
+                            coalesce = false;
+                            continue;
+                        }
+                        if coalesce {
+                            if let Some(chunk) = chunks.last_mut() {
+                                if !chunk.is_empty() {
+                                    chunk.push('\n');
+                                }
+                                chunk.push_str(text);
+                            }
+                        } else {
+                            chunks.push(text.clone());
+                        }
+                        coalesce = true;
+                    }
+                    ContentBlock::Thinking { thinking, .. }
+                        if thinking != "(reasoning omitted)" =>
+                    {
+                        coalesce = false;
+                    }
+                    ContentBlock::ToolUse { name, .. } if name == "update_plan" => {
+                        coalesce = false;
+                    }
+                    _ => {}
+                }
+            }
+            updates.extend(
+                chunks
+                    .into_iter()
+                    .map(|text| chunk(acp::ContentChunk::new(acp::ContentBlock::from(text)))),
+            );
+        }
+        for block in &message.content {
+            let Some(key) = block.tool_call_key().map(|key| key.as_str().to_string()) else {
+                continue;
+            };
+            match block {
+                ContentBlock::ToolUse { name, input, .. } => {
+                    let call = PendingToolCall {
+                        execution_id: key.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                    };
+                    updates.push(acp::SessionUpdate::ToolCall(tool_call_start(
+                        &call,
+                        &saved.metadata.workspace,
+                        None,
+                    )));
+                    calls.insert(key, call);
+                }
+                ContentBlock::ToolResult {
+                    content, is_error, ..
+                } => {
+                    if let Some(call) = calls.remove(&key) {
+                        let status = if is_error.unwrap_or(false) {
+                            acp::ToolCallStatus::Failed
+                        } else {
+                            acp::ToolCallStatus::Completed
+                        };
+                        let detail =
+                            codewhale_engine::runtime_threads::manager::tool_receipt_detail(
+                                &call.name, content, &secrets,
+                            );
+                        updates.push(acp::SessionUpdate::ToolCallUpdate(tool_call_update(
+                            &call,
+                            &saved.metadata.workspace,
+                            status,
+                            Some(&detail),
+                            &[],
+                            None,
+                        )));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(updates)
+}
+
+async fn current_acp_locale() -> codewhale_localization::Locale {
+    let settings =
+        spawn_blocking_io(|| codewhale_runtime::settings::Settings::load().unwrap_or_default())
+            .await
+            .unwrap_or_default();
+    codewhale_localization::resolve_locale(&settings.locale)
+}
+
+async fn session_view_from(
+    ctx: &SessionViewContext,
+    session_id: &str,
+    locale: codewhale_localization::Locale,
+) -> std::result::Result<acp::NewSessionResponse, AcpError> {
+    use codewhale_localization::{MessageId, tr};
+    let thread = ctx
+        .runtime
+        .get_thread(&ctx.thread_id)
+        .await
+        .map_err(|error| AcpError::internal(error.to_string()))?;
+    let identity = ctx
+        .config
+        .resolve_persisted_provider_identity(
+            thread.model_provider.as_deref(),
+            thread.model_provider_id.as_deref(),
+        )
+        .map_err(AcpError::invalid_params)?;
+    let mut models = codewhale_engine::provider_lake::models_for_provider(&ctx.config, &identity);
+    if !models.contains(&thread.model) {
+        models.push(thread.model.clone());
+    }
+    let mut modes = vec![
+        acp::SessionMode::new("plan", tr(locale, MessageId::AppModePlan).to_string())
+            .description(tr(locale, MessageId::AppModePlanHint).to_string()),
+    ];
+    // #6310: the permission posture is server-owned (a client can never
+    // relax it), but it must be discoverable. Work under Full Access must
+    // not claim that edits ask for approval, and the posture is surfaced
+    // below as a read-only select that names how Full Access is enabled.
+    let posture = acp_approval_mode(&ctx.config);
+    let agent_hint = if posture == ApprovalMode::Bypass {
+        tr(locale, MessageId::HomeYoloModeTip)
+    } else {
+        tr(locale, MessageId::AppModeAgentHint)
+    };
+    if acp_mode(&ctx.config) != AppMode::Plan {
+        modes.insert(
+            0,
+            acp::SessionMode::new("agent", tr(locale, MessageId::AppModeAgent).to_string())
+                .description(agent_hint.to_string()),
+        );
+    }
+    let current_mode = if thread.mode == "plan" {
+        "plan"
+    } else {
+        "agent"
+    };
+    let (posture_value, posture_name, posture_description) = match posture {
+        ApprovalMode::Bypass => (
+            "full-access",
+            MessageId::ConfigChoiceFullAccess,
+            MessageId::PermissionsPostureBypass,
+        ),
+        ApprovalMode::Auto => (
+            "auto-review",
+            MessageId::ConfigChoiceAutoReview,
+            MessageId::PermissionsPostureAuto,
+        ),
+        ApprovalMode::Never => (
+            "never",
+            MessageId::ConfigChoiceNever,
+            MessageId::PermissionsPostureNever,
+        ),
+        ApprovalMode::Suggest | ApprovalMode::AcceptEdits => (
+            "ask",
+            MessageId::ConfigChoiceAsk,
+            MessageId::PermissionsPostureAsk,
+        ),
+    };
+    let mode_choices: Vec<acp::SessionConfigSelectOption> = modes
+        .iter()
+        .map(|mode| {
+            acp::SessionConfigSelectOption::new(mode.id.0.clone(), mode.name.clone())
+                .description(mode.description.clone())
+        })
+        .collect();
+    let model_choices: Vec<acp::SessionConfigSelectOption> = models
+        .iter()
+        .map(|model| acp::SessionConfigSelectOption::new(model.clone(), model.clone()))
+        .collect();
+    let options = vec![
+        acp::SessionConfigOption::select(
+            "mode",
+            tr(locale, MessageId::SettingSubjectMode).to_string(),
+            current_mode,
+            mode_choices,
+        )
+        .category(acp::SessionConfigOptionCategory::Mode),
+        acp::SessionConfigOption::select(
+            "model",
+            tr(locale, MessageId::SettingSubjectModel).to_string(),
+            thread.model.clone(),
+            model_choices,
+        )
+        .category(acp::SessionConfigOptionCategory::Model),
+        // Exactly one option: the posture the server was started
+        // with. Offering a looser value here would let a client relax
+        // the operator's floor.
+        acp::SessionConfigOption::select(
+            "permission",
+            tr(locale, MessageId::SettingSubjectPermissions).to_string(),
+            posture_value,
+            vec![
+                acp::SessionConfigSelectOption::new(
+                    posture_value,
+                    tr(locale, posture_name).to_string(),
+                )
+                .description(tr(locale, posture_description).to_string()),
+            ],
+        )
+        .category(acp::SessionConfigOptionCategory::Other(
+            "_permission".to_string(),
+        ))
+        .meta(codewhale_meta(json!({
+            "readOnly": true,
+            "fullAccess": posture == ApprovalMode::Bypass,
+            "enableFullAccess": tr(locale, MessageId::AcpFullAccessHint).to_string(),
+        }))),
+    ];
+    Ok(acp::NewSessionResponse::new(session_id.to_string())
+        .modes(acp::SessionModeState::new(current_mode, modes))
+        .config_options(options))
+}
+
+fn parse_set_session_config_params(
+    params: &Value,
+) -> std::result::Result<(String, String, String), AcpError> {
+    let session_id = params
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AcpError::invalid_params("sessionId is required"))?;
+    let config_id = params
+        .get("configId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AcpError::invalid_params("configId is required"))?;
+    let value = params
+        .get("value")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AcpError::invalid_params("value must be an offered string option"))?;
+    Ok((
+        session_id.to_string(),
+        config_id.to_string(),
+        value.to_string(),
+    ))
+}
+
+async fn set_session_config_with(
+    ctx: SetSessionConfigContext,
+    session_id: &str,
+    config_id: &str,
+    value: &str,
+) -> std::result::Result<Value, AcpError> {
+    let locale = current_acp_locale().await;
+    let options = Box::pin(session_view_from(&ctx.view, session_id, locale))
+        .await?
+        .config_options
+        .unwrap_or_default();
+    let offered = options.iter().any(|option| {
+        &*option.id.0 == config_id
+            && match &option.kind {
+                acp::SessionConfigKind::Select(select) => match &select.options {
+                    acp::SessionConfigSelectOptions::Ungrouped(choices) => {
+                        choices.iter().any(|choice| &*choice.value.0 == value)
+                    }
+                    _ => false,
+                },
+                _ => false,
+            }
+    });
+    if !offered {
+        return Err(AcpError::invalid_params(
+            "unknown configuration option or value",
+        ));
+    }
+    let request = match config_id {
+        "model" => UpdateThreadRequest {
+            model: Some(value.to_string()),
+            ..Default::default()
+        },
+        "mode" => UpdateThreadRequest {
+            mode: Some(value.to_string()),
+            allow_shell: Some(value != "plan" && ctx.shell_allowed),
+            ..Default::default()
+        },
+        "permission" => {
+            return to_wire(&acp::SetSessionConfigOptionResponse::new(options));
+        }
+        _ => unreachable!("validated offered option"),
+    };
+    Box::pin(ctx.view.runtime.update_thread_with_shell_policy(
+        &ctx.view.thread_id,
+        request,
+        ctx.config_path.as_deref(),
+        ctx.config_profile.as_deref(),
+    ))
+    .await
+    .map_err(|error| AcpError::internal(error.to_string()))?;
+    let options = Box::pin(session_view_from(&ctx.view, session_id, locale))
+        .await?
+        .config_options
+        .unwrap_or_default();
+    to_wire(&acp::SetSessionConfigOptionResponse::new(options))
+}
+
 impl AcpServer {
     fn new(
-        config: Config,
+        config: impl Into<Arc<Config>>,
         model: String,
         default_cwd: PathBuf,
         runtime: Arc<RuntimeThreadManager>,
@@ -204,7 +752,7 @@ impl AcpServer {
         config_profile: Option<String>,
     ) -> Self {
         Self {
-            config,
+            config: config.into(),
             model,
             default_cwd,
             runtime,
@@ -214,124 +762,71 @@ impl AcpServer {
             sessions: HashMap::new(),
             insertion_order: VecDeque::new(),
             client_supports_terminal: false,
-            response_id_policy: JsonRpcResponseIdPolicy::Preserve,
         }
     }
-    async fn serve<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
-        &mut self,
-        reader: &mut crate::stdio::BoundedLines<R>,
-        writer: &mut W,
-    ) -> Result<()> {
-        loop {
-            let line = match reader.next_line().await {
-                Ok(Some(line)) => line,
-                Ok(None) => break,
-                Err(error) if crate::stdio::is_frame_refusal(&error) => {
-                    write_jsonrpc_error(writer, None, -32700, error.to_string()).await?;
-                    continue;
-                }
-                Err(error) => return Err(error.into()),
-            };
-            if line.trim().is_empty() {
-                continue;
-            }
-            let message: Value = match serde_json::from_str(&line) {
-                Ok(value) => value,
-                Err(error) => {
-                    write_jsonrpc_error(writer, None, -32700, format!("invalid json: {error}"))
-                        .await?;
-                    continue;
-                }
-            };
-            if crate::is_control_input_closed(&message) {
-                break;
-            }
-            let response_id = message
-                .get("id")
-                .cloned()
-                .map(|id| self.response_id_policy.response_id(id));
-            if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-                write_jsonrpc_error(writer, response_id, -32600, "jsonrpc version must be 2.0")
-                    .await?;
-                continue;
-            }
-            let Some(method) = message.get("method").and_then(Value::as_str) else {
-                if is_jsonrpc_response(&message) {
-                    continue;
-                }
-                write_jsonrpc_error(writer, response_id, -32600, "missing method").await?;
-                continue;
-            };
-            let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
-            if method == "session/prompt" {
-                if let Err(error) = self.validate_prompt(&params) {
-                    write_jsonrpc_error(writer, response_id, error.code, error.message).await?;
-                    continue;
-                }
-                let result = self.drive_prompt(params, reader, writer).await;
-                match result {
-                    Ok(reason) => {
-                        if let Some(id) = response_id {
-                            write_jsonrpc_result(writer, id, json!({"stopReason":reason})).await?;
-                        }
-                    }
-                    Err(error) => {
-                        if crate::stdio::is_control_write_failure(&error) {
-                            return Err(error);
-                        }
-                        write_jsonrpc_error(
-                            writer,
-                            response_id,
-                            -32603,
-                            codewhale_engine::client::redact_model_bound_text(
-                                &error.to_string(),
-                                &[],
-                            ),
-                        )
-                        .await?
-                    }
-                }
-                continue;
-            }
-            match self.handle_request(method, params).await {
-                Ok(AcpDispatch::Response(result)) => {
-                    let replayed = match result.get("sessionId").and_then(Value::as_str) {
-                        Some(session) if method == "session/load" => {
-                            self.replay_history(writer, session).await
-                        }
-                        _ => Ok(()),
-                    };
-                    match (replayed, response_id) {
-                        (Ok(()), Some(id)) => write_jsonrpc_result(writer, id, result).await?,
-                        (Ok(()), None) => {}
-                        (Err(error), id) => {
-                            if crate::stdio::is_control_write_failure(&error) {
-                                return Err(error);
-                            }
-                            write_jsonrpc_error(writer, id, -32603, error.to_string()).await?
-                        }
-                    }
-                }
-                Ok(AcpDispatch::Shutdown) => {
-                    if let Some(id) = response_id {
-                        write_jsonrpc_result(writer, id, json!(null)).await?;
-                    }
-                    break;
-                }
-                Err(error) => {
-                    write_jsonrpc_error(writer, response_id, error.code, error.message).await?
-                }
-            }
+    fn prompt_run(&self) -> runtime::PromptRun {
+        runtime::PromptRun {
+            runtime: Arc::clone(&self.runtime),
+            sessions_dir: self.sessions_dir.clone(),
         }
-        Ok(())
     }
-    // `session/prompt` is handled in the main loop (it needs to run concurrently
-    // with the reader for cancellation); every other method is request/response.
-    async fn handle_request(
+
+    fn session_view_context(
+        &self,
+        session_id: &str,
+    ) -> std::result::Result<SessionViewContext, AcpError> {
+        let binding = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| AcpError::invalid_params("unknown sessionId"))?;
+        Ok(SessionViewContext {
+            config: Arc::clone(&self.config),
+            runtime: Arc::clone(&self.runtime),
+            thread_id: binding.thread_id.clone(),
+        })
+    }
+
+    fn new_session_context(&self) -> NewSessionContext {
+        NewSessionContext {
+            config: Arc::clone(&self.config),
+            model: self.model.clone(),
+            default_cwd: self.default_cwd.clone(),
+            runtime: Arc::clone(&self.runtime),
+            sessions_dir: self.sessions_dir.clone(),
+            config_path: self.config_path.clone(),
+            config_profile: self.config_profile.clone(),
+            shell_allowed: self.shell_allowed(),
+        }
+    }
+
+    fn load_session_context(&self) -> LoadSessionContext {
+        LoadSessionContext {
+            config: Arc::clone(&self.config),
+            runtime: Arc::clone(&self.runtime),
+            sessions_dir: self.sessions_dir.clone(),
+            config_path: self.config_path.clone(),
+            config_profile: self.config_profile.clone(),
+            shell_allowed: self.shell_allowed(),
+        }
+    }
+
+    fn set_session_config_context(
+        &self,
+        session_id: &str,
+    ) -> std::result::Result<SetSessionConfigContext, AcpError> {
+        Ok(SetSessionConfigContext {
+            view: self.session_view_context(session_id)?,
+            config_path: self.config_path.clone(),
+            config_profile: self.config_profile.clone(),
+            shell_allowed: self.shell_allowed(),
+        })
+    }
+
+    fn handle_sync_request(
         &mut self,
         method: &str,
         params: Value,
-    ) -> std::result::Result<AcpDispatch, AcpError> {
+    ) -> std::result::Result<Value, SdkError> {
         match method {
             "initialize" => {
                 if let Some(terminal) = params
@@ -340,40 +835,164 @@ impl AcpServer {
                 {
                     self.client_supports_terminal = terminal;
                 }
-                self.response_id_policy = JsonRpcResponseIdPolicy::from_initialize_params(&params);
-                Ok(AcpDispatch::Response(initialize_result(
-                    params.get("protocolVersion").and_then(Value::as_u64),
-                    &self.config,
-                )))
+                let terminal_auth = params
+                    .pointer("/clientCapabilities/auth/terminal")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                Ok(to_wire(&initialize_result(&self.config, terminal_auth))?)
             }
-            "session/new" => Ok(AcpDispatch::Response(self.new_session(params).await?)),
-            "session/list" => Ok(AcpDispatch::Response(self.list_sessions(params)?)),
-            "session/load" => Ok(AcpDispatch::Response(self.load_session(params).await?)),
-            "session/listProviders" => Ok(AcpDispatch::Response(self.list_providers())),
-            "session/currentModel" => Ok(AcpDispatch::Response(self.current_model())),
-            "session/selectModel" => Ok(AcpDispatch::Response(self.select_model(params)?)),
-            "session/set_config_option" => Ok(AcpDispatch::Response(
-                self.set_session_config(params).await?,
-            )),
+            "session/listProviders" => Ok(self.list_providers()),
+            "session/currentModel" => Ok(self.current_model()),
+            "session/selectModel" => Ok(self.select_model(params)?),
+            _ => Err(SdkError::method_not_found().data(Value::String(method.to_string()))),
+        }
+    }
+
+    async fn handle_request_shared(
+        server: &tokio::sync::Mutex<Self>,
+        method: &str,
+        params: Value,
+    ) -> std::result::Result<Value, SdkError> {
+        match method {
+            "initialize"
+            | "session/listProviders"
+            | "session/currentModel"
+            | "session/selectModel" => server.lock().await.handle_sync_request(method, params),
+            "session/list" => {
+                let sessions_dir = server.lock().await.sessions_dir.clone();
+                Ok(Box::pin(list_sessions_from_dir(sessions_dir, params)).await?)
+            }
+            "session/new" => {
+                let ctx = server.lock().await.new_session_context();
+                let (id, thread_id) = Box::pin(create_new_session(ctx, params)).await?;
+                let view_ctx = {
+                    let mut guard = server.lock().await;
+                    guard.remember(id.clone(), thread_id);
+                    guard.session_view_context(&id)?
+                };
+                let locale = current_acp_locale().await;
+                Ok(to_wire(
+                    &Box::pin(session_view_from(&view_ctx, &id, locale)).await?,
+                )?)
+            }
+            "session/load" => Ok(Box::pin(Self::load_session_shared(server, params)).await?),
+            "session/set_config_option" => {
+                let (session_id, config_id, value) = parse_set_session_config_params(&params)?;
+                let ctx = server
+                    .lock()
+                    .await
+                    .set_session_config_context(&session_id)?;
+                Ok(Box::pin(set_session_config_with(
+                    ctx,
+                    &session_id,
+                    &config_id,
+                    &value,
+                ))
+                .await?)
+            }
             "session/set_mode" | "session/set_model" => {
                 let (config_id, field) = if method == "session/set_mode" {
                     ("mode", "modeId")
                 } else {
                     ("model", "modelId")
                 };
-                self.set_session_config(json!({
+                let normalized = json!({
                     "sessionId": params.get("sessionId"),
                     "configId": config_id,
                     "value": params.get(field),
-                }))
+                });
+                let (session_id, config_id, value) = parse_set_session_config_params(&normalized)?;
+                let ctx = server
+                    .lock()
+                    .await
+                    .set_session_config_context(&session_id)?;
+                Box::pin(set_session_config_with(
+                    ctx,
+                    &session_id,
+                    &config_id,
+                    &value,
+                ))
                 .await?;
-                Ok(AcpDispatch::Response(json!({})))
+                Ok(to_wire(&acp::SetSessionModeResponse::new())?)
             }
-            // A cancel that arrives with no prompt in flight is an idempotent
-            // no-op (the in-flight case is handled by the prompt driver).
-            "session/cancel" => Ok(AcpDispatch::Response(json!(null))),
-            "shutdown" => Ok(AcpDispatch::Shutdown),
-            _ => Err(AcpError::method_not_found(method)),
+            _ => Err(SdkError::method_not_found().data(Value::String(method.to_string()))),
+        }
+    }
+
+    async fn load_session_shared(
+        server: &tokio::sync::Mutex<Self>,
+        params: Value,
+    ) -> std::result::Result<Value, AcpError> {
+        validate_mcp_servers(&params)?;
+        absolute_cwd(&params, "session/load")?;
+        let requested = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AcpError::invalid_params("session/load requires sessionId"))?
+            .to_string();
+        let initial = {
+            let guard = server.lock().await;
+            match guard.session_view_context(&requested) {
+                Ok(view_ctx) => Ok(view_ctx),
+                Err(_) => Err(guard.load_session_context()),
+            }
+        };
+        let ctx = match initial {
+            Ok(view_ctx) => {
+                let locale = current_acp_locale().await;
+                return to_wire(&Box::pin(session_view_from(&view_ctx, &requested, locale)).await?);
+            }
+            Err(ctx) => ctx,
+        };
+        let id = resolve_saved_session_id(ctx.sessions_dir.clone(), requested).await?;
+        let existing = {
+            let guard = server.lock().await;
+            guard.session_view_context(&id).ok()
+        };
+        if let Some(view_ctx) = existing {
+            let locale = current_acp_locale().await;
+            return to_wire(&Box::pin(session_view_from(&view_ctx, &id, locale)).await?);
+        }
+        let thread_id = Box::pin(resume_and_configure_loaded_session(&ctx, &id)).await?;
+        let view_ctx = {
+            let mut guard = server.lock().await;
+            guard.remember(id.clone(), thread_id);
+            guard.session_view_context(&id)?
+        };
+        let locale = current_acp_locale().await;
+        to_wire(&Box::pin(session_view_from(&view_ctx, &id, locale)).await?)
+    }
+
+    #[cfg(test)]
+    async fn handle_request(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> std::result::Result<Value, SdkError> {
+        match method {
+            "initialize"
+            | "session/listProviders"
+            | "session/currentModel"
+            | "session/selectModel" => self.handle_sync_request(method, params),
+            "session/new" => Ok(Box::pin(self.new_session(params)).await?),
+            "session/list" => Ok(Box::pin(self.list_sessions(params)).await?),
+            "session/load" => Ok(Box::pin(self.load_session(params)).await?),
+            "session/set_config_option" => Ok(Box::pin(self.set_session_config(params)).await?),
+            "session/set_mode" | "session/set_model" => {
+                let (config_id, field) = if method == "session/set_mode" {
+                    ("mode", "modeId")
+                } else {
+                    ("model", "modelId")
+                };
+                Box::pin(self.set_session_config(json!({
+                    "sessionId": params.get("sessionId"),
+                    "configId": config_id,
+                    "value": params.get(field),
+                })))
+                .await?;
+                Ok(to_wire(&acp::SetSessionModeResponse::new())?)
+            }
+            _ => Err(SdkError::method_not_found().data(Value::String(method.to_string()))),
         }
     }
 
@@ -385,6 +1004,11 @@ impl AcpServer {
         if !self.sessions.contains_key(id) {
             return Err(AcpError::invalid_params("unknown sessionId"));
         }
+        if let Some(kind) = unsupported_prompt_block(params.get("prompt")) {
+            return Err(AcpError::invalid_params(format!(
+                "unsupported prompt content block `{kind}`: this agent accepts text, resource and resource_link blocks only"
+            )));
+        }
         let prompt = extract_prompt_text(params.get("prompt"))
             .filter(|text| !text.trim().is_empty())
             .ok_or_else(|| AcpError::invalid_params("prompt must include text content"))?;
@@ -393,7 +1017,7 @@ impl AcpServer {
     fn shell_allowed(&self) -> bool {
         self.client_supports_terminal && self.config.allow_shell()
     }
-    fn remember(&mut self, id: String, thread_id: String, cursor: u64) {
+    fn remember(&mut self, id: String, thread_id: String) {
         if self.sessions.contains_key(&id) {
             return;
         }
@@ -403,60 +1027,12 @@ impl AcpServer {
             self.sessions.remove(&old);
         }
         self.insertion_order.push_back(id.clone());
-        self.sessions.insert(id, AcpSession { thread_id, cursor });
+        self.sessions.insert(id, AcpSession { thread_id });
     }
+    #[cfg(test)]
     async fn new_session(&mut self, params: Value) -> std::result::Result<Value, AcpError> {
-        validate_mcp_servers(&params)?;
-        let cwd = params
-            .get("cwd")
-            .and_then(Value::as_str)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| self.default_cwd.clone());
-        let identity = self
-            .config
-            .active_provider_identity()
-            .map_err(|error| AcpError::internal(error.to_string()))?;
-        let thread = self
-            .runtime
-            .create_thread_with_shell_policy(
-                CreateThreadRequest {
-                    model: Some(self.model.clone()),
-                    model_provider: Some(identity.persisted_kind().to_string()),
-                    model_provider_id: identity.persisted_id().map(str::to_string),
-                    workspace: Some(cwd),
-                    mode: Some(
-                        if acp_mode(&self.config) == AppMode::Plan {
-                            "plan"
-                        } else {
-                            "agent"
-                        }
-                        .to_string(),
-                    ),
-                    permission_posture: Some(self.permission_value().to_string()),
-                    allow_shell: Some(self.shell_allowed()),
-                    ..Default::default()
-                },
-                self.config_path.as_deref(),
-                self.config_profile.as_deref(),
-            )
-            .await
-            .map_err(|error| AcpError::internal(error.to_string()))?;
-        let id = uuid::Uuid::new_v4().to_string();
-        crate::runtime_api::sessions::initialize_empty_session(
-            &self.runtime,
-            &self.sessions_dir,
-            &thread.id,
-            &id,
-        )
-        .await
-        .map_err(|error| AcpError::internal(error.message))?;
-        let cursor = self
-            .runtime
-            .get_thread_detail(&thread.id)
-            .await
-            .map_err(|error| AcpError::internal(error.to_string()))?
-            .latest_seq;
-        self.remember(id.clone(), thread.id, cursor);
+        let (id, thread_id) = create_new_session(self.new_session_context(), params).await?;
+        self.remember(id.clone(), thread_id);
         self.session_configuration(&id).await
     }
     /// Durable Codewhale sessions an ACP client can resume (#5864).
@@ -466,379 +1042,64 @@ impl AcpServer {
     /// that cannot be read is an empty list, not a failed request: enumeration
     /// is discovery, and a client asking what exists should not be broken by a
     /// missing sessions directory.
-    fn list_sessions(&self, params: Value) -> std::result::Result<Value, AcpError> {
-        let cwd = match params.get("cwd") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(path)) if std::path::Path::new(path).is_absolute() => {
-                Some(PathBuf::from(path))
-            }
-            Some(_) => {
-                return Err(AcpError::invalid_params(
-                    "session/list cwd must be an absolute path",
-                ));
-            }
-        };
-        let sessions =
-            codewhale_engine::session_manager::SessionManager::new(self.sessions_dir.clone())
-                .ok()
-                .map(|manager| manager.list_sessions_lenient())
-                .unwrap_or_default();
-        let sessions: Vec<Value> = sessions
-            .into_iter()
-            .filter(|meta| {
-                cwd.as_ref().is_none_or(|cwd| {
-                    codewhale_engine::session_manager::paths_equivalent(&meta.workspace, cwd)
-                })
-            })
-            .map(|meta| {
-                json!({
-                    "sessionId": meta.id,
-                    "title": meta.title,
-                    "cwd": meta.workspace.to_string_lossy(),
-                    "createdAt": meta.created_at.to_rfc3339(),
-                    "updatedAt": meta.updated_at.to_rfc3339(),
-                    "messageCount": meta.message_count,
-                })
-            })
-            .collect();
-        Ok(json!({ "sessions": sessions }))
+    #[cfg(test)]
+    async fn list_sessions(&self, params: Value) -> std::result::Result<Value, AcpError> {
+        list_sessions_from_dir(self.sessions_dir.clone(), params).await
     }
 
+    #[cfg(test)]
     async fn load_session(&mut self, params: Value) -> std::result::Result<Value, AcpError> {
         validate_mcp_servers(&params)?;
+        absolute_cwd(&params, "session/load")?;
         let requested = params
             .get("sessionId")
             .and_then(Value::as_str)
-            .ok_or_else(|| AcpError::invalid_params("session/load requires sessionId"))?;
-        if self.sessions.contains_key(requested) {
-            return self.session_configuration(requested).await;
+            .ok_or_else(|| AcpError::invalid_params("session/load requires sessionId"))?
+            .to_string();
+        if self.sessions.contains_key(&requested) {
+            return self.session_configuration(&requested).await;
         }
-        let store =
-            codewhale_engine::session_manager::SessionManager::new(self.sessions_dir.clone())
-                .map_err(|error| AcpError::internal(error.to_string()))?;
-        let saved = store
-            .resume_session_by_prefix(requested)
-            .map_err(|error| {
-                AcpError::invalid_params(format!("could not load session {requested}: {error}"))
-            })?
-            .session;
-        let id = saved.metadata.id;
+        let id = resolve_saved_session_id(self.sessions_dir.clone(), requested).await?;
         if self.sessions.contains_key(&id) {
             return self.session_configuration(&id).await;
         }
-        let (_, axum::Json(resumed)) = crate::runtime_api::sessions::resume_session_in_runtime(
-            &self.runtime,
-            &self.sessions_dir,
-            &id,
-            crate::runtime_api::sessions::ResumeSessionRequest {
-                model: None,
-                mode: (acp_mode(&self.config) == AppMode::Plan).then(|| "plan".to_string()),
-            },
-            (self.config_path.as_deref(), self.config_profile.as_deref()),
-            Some(self.shell_allowed()),
-        )
-        .await
-        .map_err(|error| AcpError::internal(error.message))?;
-        // A saved posture cannot widen the server, and connection terminal
-        // negotiation only narrows the canonical thread's shell ceiling.
-        self.runtime
-            .update_thread_with_shell_policy(
-                &resumed.thread_id,
-                UpdateThreadRequest {
-                    permission_posture: Some(self.permission_value().to_string()),
-                    allow_shell: Some(self.shell_allowed()),
-                    ..Default::default()
-                },
-                self.config_path.as_deref(),
-                self.config_profile.as_deref(),
-            )
-            .await
-            .map_err(|error| AcpError::internal(error.to_string()))?;
-        let cursor = self
-            .runtime
-            .get_thread_detail(&resumed.thread_id)
-            .await
-            .map_err(|error| AcpError::internal(error.to_string()))?
-            .latest_seq;
-        self.remember(id.clone(), resumed.thread_id, cursor);
+        let ctx = self.load_session_context();
+        let thread_id = Box::pin(resume_and_configure_loaded_session(&ctx, &id)).await?;
+        self.remember(id.clone(), thread_id);
         self.session_configuration(&id).await
     }
-    async fn replay_history<W: AsyncWrite + Unpin>(
-        &self,
-        writer: &mut W,
-        session_id: &str,
-    ) -> Result<()> {
-        use codewhale_models::ContentBlock;
-        let saved =
-            codewhale_engine::session_manager::SessionManager::new(self.sessions_dir.clone())?
-                .load_session(session_id)?;
-        let secrets =
-            codewhale_engine::runtime_threads::manager::receipt_secret_values(self.config.clone())
-                .await?;
-        let mut calls = HashMap::new();
-        for message in &saved.messages {
-            let kind = match message.role.as_str() {
-                "user" => Some("user_message_chunk"),
-                "assistant" => Some("agent_message_chunk"),
-                _ => None,
-            };
-            if let Some(kind) = kind
-                && !codewhale_engine::runtime_handoff::is_internal_runtime_handoff(message)
-                && codewhale_models::turn_classify::restored_subagent_checkpoint_display(message)
-                    .is_none()
-            {
-                let mut chunks = Vec::<String>::new();
-                let mut coalesce = false;
-                for (index, block) in message.content.iter().enumerate() {
-                    match block {
-                        ContentBlock::Text { text, .. } => {
-                            if codewhale_engine::runtime_handoff::is_turn_metadata_block(
-                                message, index, text,
-                            ) {
-                                continue;
-                            }
-                            if text.starts_with("[tool_history_repair]")
-                                || (message.role == "assistant"
-                                    && codewhale_engine::runtime_handoff::archived_context_parts(
-                                        text,
-                                    )
-                                    .is_some())
-                            {
-                                coalesce = false;
-                                continue;
-                            }
-                            if coalesce {
-                                if let Some(chunk) = chunks.last_mut() {
-                                    if !chunk.is_empty() {
-                                        chunk.push('\n');
-                                    }
-                                    chunk.push_str(text);
-                                }
-                            } else {
-                                chunks.push(text.clone());
-                            }
-                            coalesce = true;
-                        }
-                        ContentBlock::Thinking { thinking, .. }
-                            if thinking != "(reasoning omitted)" =>
-                        {
-                            coalesce = false;
-                        }
-                        ContentBlock::ToolUse { name, .. } if name == "update_plan" => {
-                            coalesce = false;
-                        }
-                        _ => {}
-                    }
-                }
-                for text in chunks {
-                    write_json_line(
-                        writer,
-                        json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session_id,"update":{"sessionUpdate":kind,"content":{"type":"text","text":text}}}}),
-                    )
-                    .await?;
-                }
-            }
-            for block in &message.content {
-                let Some(key) = block.tool_call_key().map(|key| key.as_str().to_string()) else {
-                    continue;
-                };
-                match block {
-                    ContentBlock::ToolUse { name, input, .. } => {
-                        let call = PendingToolCall {
-                            execution_id: key.clone(),
-                            name: name.clone(),
-                            input: input.clone(),
-                        };
-                        write_tool_call_start(writer, session_id, &call).await?;
-                        calls.insert(key, call);
-                    }
-                    ContentBlock::ToolResult {
-                        content, is_error, ..
-                    } => {
-                        if let Some(call) = calls.remove(&key) {
-                            let status = if is_error.unwrap_or(false) {
-                                "failed"
-                            } else {
-                                "completed"
-                            };
-                            let detail =
-                                codewhale_engine::runtime_threads::manager::tool_receipt_detail(
-                                    &call.name, content, &secrets,
-                                );
-                            write_tool_call_update(
-                                writer,
-                                session_id,
-                                &call,
-                                status,
-                                Some(&detail),
-                            )
-                            .await?;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        Ok(())
+    #[cfg(test)]
+    async fn history_updates(&self, session_id: &str) -> Result<Vec<acp::SessionUpdate>> {
+        history_updates_for(
+            self.sessions_dir.clone(),
+            Arc::clone(&self.config),
+            session_id.to_string(),
+        )
+        .await
     }
-    fn permission_value(&self) -> &'static str {
-        acp_permission_value(&self.config)
-    }
+    #[cfg(test)]
     async fn session_configuration(
         &self,
         session_id: &str,
     ) -> std::result::Result<Value, AcpError> {
-        use codewhale_localization::{MessageId, resolve_locale, tr};
-        let settings = codewhale_runtime::settings::Settings::load().unwrap_or_default();
-        let locale = resolve_locale(&settings.locale);
-        let binding = self
-            .sessions
-            .get(session_id)
-            .ok_or_else(|| AcpError::invalid_params("unknown sessionId"))?;
-        let thread = self
-            .runtime
-            .get_thread(&binding.thread_id)
-            .await
-            .map_err(|error| AcpError::internal(error.to_string()))?;
-        let identity = self
-            .config
-            .resolve_persisted_provider_identity(
-                thread.model_provider.as_deref(),
-                thread.model_provider_id.as_deref(),
-            )
-            .map_err(AcpError::invalid_params)?;
-        let mut models =
-            codewhale_engine::provider_lake::models_for_provider(&self.config, &identity);
-        if !models.contains(&thread.model) {
-            models.push(thread.model.clone());
-        }
-        let mut modes = vec![
-            json!({"id": "plan", "name": tr(locale, MessageId::AppModePlan), "description": tr(locale, MessageId::AppModePlanHint)}),
-        ];
-        // #6310: the permission posture is server-owned (a client can never
-        // relax it), but it must be discoverable. Work under Full Access must
-        // not claim that edits ask for approval, and the posture is surfaced
-        // below as a read-only select that names how Full Access is enabled.
-        let posture = acp_approval_mode(&self.config);
-        let agent_hint = if posture == ApprovalMode::Bypass {
-            tr(locale, MessageId::HomeYoloModeTip)
-        } else {
-            tr(locale, MessageId::AppModeAgentHint)
-        };
-        if acp_mode(&self.config) != AppMode::Plan {
-            modes.insert(0, json!({"id": "agent", "name": tr(locale, MessageId::AppModeAgent), "description": agent_hint}));
-        }
-        let current_mode = if thread.mode == "plan" {
-            "plan"
-        } else {
-            "agent"
-        };
-        let (posture_value, posture_name, posture_description) = match posture {
-            ApprovalMode::Bypass => (
-                "full-access",
-                MessageId::ConfigChoiceFullAccess,
-                MessageId::PermissionsPostureBypass,
-            ),
-            ApprovalMode::Auto => (
-                "auto-review",
-                MessageId::ConfigChoiceAutoReview,
-                MessageId::PermissionsPostureAuto,
-            ),
-            ApprovalMode::Never => (
-                "never",
-                MessageId::ConfigChoiceNever,
-                MessageId::PermissionsPostureNever,
-            ),
-            ApprovalMode::Suggest | ApprovalMode::AcceptEdits => (
-                "ask",
-                MessageId::ConfigChoiceAsk,
-                MessageId::PermissionsPostureAsk,
-            ),
-        };
-        Ok(json!({
-            "sessionId": session_id,
-            "modes": {"currentModeId": current_mode, "availableModes": modes},
-            "models": {
-                "currentModelId": thread.model,
-                "availableModels": models.iter().map(|model| json!({"modelId": model, "name": model})).collect::<Vec<_>>()
-            },
-            "configOptions": [
-                {"id": "mode", "name": tr(locale, MessageId::SettingSubjectMode), "category": "mode", "type": "select", "currentValue": current_mode,
-                 "options": modes.iter().map(|mode| json!({"value": mode["id"], "name": mode["name"], "description": mode["description"]})).collect::<Vec<_>>()},
-                {"id": "model", "name": tr(locale, MessageId::SettingSubjectModel), "category": "model", "type": "select", "currentValue": thread.model,
-                 "options": models.iter().map(|model| json!({"value": model, "name": model})).collect::<Vec<_>>()},
-                // Exactly one option: the posture the server was started
-                // with. Offering a looser value here would let a client relax
-                // the operator's floor.
-                {"id": "permission", "name": tr(locale, MessageId::SettingSubjectPermissions), "category": "_permission", "type": "select", "currentValue": posture_value,
-                 "options": [{"value": posture_value, "name": tr(locale, posture_name), "description": tr(locale, posture_description)}],
-                 "_meta": {"codewhale": {
-                     "readOnly": true,
-                     "fullAccess": posture == ApprovalMode::Bypass,
-                     "enableFullAccess": ACP_FULL_ACCESS_HINT,
-                 }}}
-            ]
-        }))
+        let locale = current_acp_locale().await;
+        to_wire(&self.session_view_for_locale(session_id, locale).await?)
+    }
+    #[cfg(test)]
+    async fn session_view_for_locale(
+        &self,
+        session_id: &str,
+        locale: codewhale_localization::Locale,
+    ) -> std::result::Result<acp::NewSessionResponse, AcpError> {
+        let ctx = self.session_view_context(session_id)?;
+        session_view_from(&ctx, session_id, locale).await
     }
 
+    #[cfg(test)]
     async fn set_session_config(&mut self, params: Value) -> std::result::Result<Value, AcpError> {
-        let session_id = params
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AcpError::invalid_params("sessionId is required"))?;
-        let config_id = params
-            .get("configId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AcpError::invalid_params("configId is required"))?;
-        let value = params
-            .get("value")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AcpError::invalid_params("value must be an offered string option"))?;
-        if !self.sessions.contains_key(session_id) {
-            return Err(AcpError::invalid_params("unknown sessionId"));
-        }
-        let state = self.session_configuration(session_id).await?;
-        let offered = state["configOptions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|option| {
-                option["id"] == config_id
-                    && option["options"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|choice| choice["value"] == value)
-            });
-        if !offered {
-            return Err(AcpError::invalid_params(
-                "unknown configuration option or value",
-            ));
-        }
-        let binding = &self.sessions[session_id];
-        let request = match config_id {
-            "model" => UpdateThreadRequest {
-                model: Some(value.to_string()),
-                ..Default::default()
-            },
-            "mode" => UpdateThreadRequest {
-                mode: Some(value.to_string()),
-                allow_shell: Some(value != "plan" && self.shell_allowed()),
-                ..Default::default()
-            },
-            "permission" => return Ok(json!({"configOptions": state["configOptions"]})),
-            _ => unreachable!("validated offered option"),
-        };
-        self.runtime
-            .update_thread_with_shell_policy(
-                &binding.thread_id,
-                request,
-                self.config_path.as_deref(),
-                self.config_profile.as_deref(),
-            )
-            .await
-            .map_err(|error| AcpError::internal(error.to_string()))?;
-        Ok(json!({"configOptions": self.session_configuration(session_id).await?["configOptions"]}))
+        let (session_id, config_id, value) = parse_set_session_config_params(&params)?;
+        let ctx = self.set_session_config_context(&session_id)?;
+        set_session_config_with(ctx, &session_id, &config_id, &value).await
     }
 
     fn list_providers(&self) -> Value {
@@ -880,7 +1141,7 @@ impl AcpServer {
                 .config
                 .resolve_provider_selection_identity(provider_name)
                 .map_err(AcpError::invalid_params)?;
-            self.config
+            Arc::make_mut(&mut self.config)
                 .scope_to_provider_identity(&identity)
                 .map_err(AcpError::invalid_params)?;
         }
@@ -889,7 +1150,6 @@ impl AcpServer {
         Ok(self.current_model())
     }
 }
-const ACP_FULL_ACCESS_HINT: &str = "Start the server with `codewhale serve --acp --full-access` (alias `--yolo`), or set `yolo = true` in config.toml. Full Access also turns off Codewhale's own sandbox unless sandbox_mode tightens it; Plan stays read-only.";
 
 fn acp_permission_value(config: &Config) -> &'static str {
     match acp_approval_mode(config) {
@@ -965,17 +1225,19 @@ fn ensure_acp_approval_posture(config: &Config) -> Result<()> {
 /// `File` is a single canonical tool covering read/list/search/write/edit/
 /// patch (#4625), so its kind depends on the `action` argument rather than
 /// the tool name alone.
-fn tool_call_kind(call: &PendingToolCall) -> &'static str {
+fn tool_call_kind(call: &PendingToolCall) -> acp::ToolKind {
     match call.name.as_str() {
         "File" => match call.input.get("action").and_then(Value::as_str) {
-            Some("write" | "edit" | "patch") => "edit",
-            _ => "read",
+            Some("write" | "edit" | "patch") => acp::ToolKind::Edit,
+            _ => acp::ToolKind::Read,
         },
-        "apply_patch" => "edit",
-        "Git" => "read",
-        "bash" | "Bash" | "terminal/run" | "terminal/send" | "terminal/wait"
-        | "terminal/cancel" | "terminal/reset" => "execute",
-        _ => "other",
+        "apply_patch" | "write" | "edit" | "write_file" | "edit_file" => acp::ToolKind::Edit,
+        "read" | "read_file" => acp::ToolKind::Read,
+        "Git" => acp::ToolKind::Read,
+        "bash" | "Bash" | "terminal_run" | "terminal_send" | "terminal_wait"
+        | "terminal_cancel" | "terminal_reset" | "terminal/run" | "terminal/send"
+        | "terminal/wait" | "terminal/cancel" | "terminal/reset" => acp::ToolKind::Execute,
+        _ => acp::ToolKind::Other,
     }
 }
 
@@ -990,9 +1252,15 @@ fn tool_call_title(call: &PendingToolCall) -> String {
         .or_else(|| call.input.get("pattern"))
         .or_else(|| call.input.get("task_id"))
         .and_then(Value::as_str);
+    let action = if call.name == "File" {
+        call.input.get("action").and_then(Value::as_str)
+    } else {
+        None
+    };
+    let name = action.map_or_else(|| call.name.clone(), |action| format!("File {action}"));
     match detail {
-        Some(detail) => format!("{}: {}", call.name, detail),
-        None => call.name.clone(),
+        Some(detail) => format!("{name}: {detail}"),
+        None => name,
     }
 }
 
@@ -1007,86 +1275,118 @@ fn truncate_for_acp(content: &str) -> String {
     format!("{truncated}\n… [truncated for display; the full result was sent to the model]")
 }
 
-async fn write_tool_call_start<W>(
-    writer: &mut W,
-    session_id: &str,
-    call: &PendingToolCall,
-) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    let notification = json!({
-        "jsonrpc": "2.0",
-        "method": "session/update",
-        "params": {
-            "sessionId": session_id,
-            "update": {
-                "sessionUpdate": "tool_call",
-                "toolCallId": call.execution_id,
-                "title": tool_call_title(call),
-                "kind": tool_call_kind(call),
-                "status": "pending",
-                "rawInput": call.input,
-            }
-        }
-    });
-    write_json_line(writer, notification).await
+fn tool_call_location(call: &PendingToolCall, workspace: &Path) -> Option<PathBuf> {
+    matches!(
+        tool_call_kind(call),
+        acp::ToolKind::Read | acp::ToolKind::Edit
+    )
+    .then(|| {
+        ["path", "file_path", "filePath"]
+            .iter()
+            .find_map(|key| call.input.get(*key).and_then(Value::as_str))
+    })
+    .flatten()
+    .filter(|path| !path.is_empty())
+    .and_then(|path| {
+        let resolved = codewhale_engine::tools::spec::resolve_home_path(path)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| workspace.join(path));
+        let normalized = codewhale_engine::tools::spec::normalize_path(&resolved);
+        normalized.to_str().map(PathBuf::from)
+    })
 }
 
-async fn write_tool_call_update<W>(
-    writer: &mut W,
-    session_id: &str,
-    call: &PendingToolCall,
-    status: &str,
-    content: Option<&str>,
-) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    write_tool_call_update_with_blocks(writer, session_id, call, status, content, &[]).await
+fn tool_call_requested_diffs(_call: &PendingToolCall, _workspace: &Path) -> Vec<acp::Diff> {
+    Vec::new()
 }
 
-async fn write_tool_call_update_with_blocks<W>(
-    writer: &mut W,
-    session_id: &str,
+fn external_locations(value: &Value) -> Option<Vec<acp::ToolCallLocation>> {
+    value.as_array().map(|entries| {
+        entries
+            .iter()
+            .filter_map(|entry| {
+                let path = entry.get("path").and_then(Value::as_str)?;
+                let mut location = acp::ToolCallLocation::new(PathBuf::from(path));
+                if let Some(line) = entry.get("line").and_then(Value::as_u64) {
+                    location = location.line(line as u32);
+                }
+                Some(location)
+            })
+            .collect()
+    })
+}
+
+fn tool_call_start(
     call: &PendingToolCall,
-    status: &str,
+    workspace: &Path,
+    external_locations: Option<Vec<acp::ToolCallLocation>>,
+) -> acp::ToolCall {
+    let foreign = external_locations.is_some();
+    let mut start = acp::ToolCall::new(call.execution_id.clone(), tool_call_title(call))
+        .kind(tool_call_kind(call))
+        .status(acp::ToolCallStatus::Pending);
+    if let Some(locations) = external_locations {
+        start = start.locations(locations);
+    } else {
+        start = start.locations(
+            tool_call_location(call, workspace)
+                .map(acp::ToolCallLocation::new)
+                .into_iter()
+                .collect(),
+        );
+    }
+    if !foreign {
+        start = start.content(
+            tool_call_requested_diffs(call, workspace)
+                .into_iter()
+                .map(acp::ToolCallContent::Diff)
+                .collect(),
+        );
+    }
+    start.raw_input((!call.input.is_null()).then(|| call.input.clone()))
+}
+
+fn tool_call_update(
+    call: &PendingToolCall,
+    workspace: &Path,
+    status: acp::ToolCallStatus,
     content: Option<&str>,
     rich_blocks: &[codewhale_tools::ToolResultContentBlock],
-) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    let mut update = json!({
-        "sessionUpdate": "tool_call_update",
-        "toolCallId": call.execution_id,
-        "status": status,
-    });
+    external_locations: Option<Vec<acp::ToolCallLocation>>,
+) -> acp::ToolCallUpdate {
+    let foreign = external_locations.is_some();
+    let mut fields = acp::ToolCallUpdateFields::new().status(status);
+    if let Some(locations) = external_locations {
+        fields = fields.locations(locations);
+    }
     if content.is_some() || !rich_blocks.is_empty() {
-        let mut blocks = Vec::with_capacity(rich_blocks.len() + usize::from(content.is_some()));
+        let mut blocks = Vec::with_capacity(rich_blocks.len() + 2);
+        if !foreign {
+            blocks.extend(
+                tool_call_requested_diffs(call, workspace)
+                    .into_iter()
+                    .map(acp::ToolCallContent::Diff),
+            );
+        }
         if let Some(content) = content {
-            blocks.push(json!({
-                "type": "content",
-                "content": { "type": "text", "text": truncate_for_acp(content) }
-            }));
+            blocks.push(acp::ToolCallContent::from(truncate_for_acp(content)));
         }
         blocks.extend(rich_blocks.iter().map(|block| match block {
-            codewhale_tools::ToolResultContentBlock::Image { mime_type, data } => json!({
-                "type": "content",
-                "content": { "type": "image", "data": data, "mimeType": mime_type }
-            }),
+            codewhale_tools::ToolResultContentBlock::Image { mime_type, data } => {
+                acp::ToolCallContent::from(acp::ContentBlock::Image(acp::ImageContent::new(
+                    data.clone(),
+                    mime_type.clone(),
+                )))
+            }
         }));
-        update["content"] = json!(blocks);
+        fields = fields.content(blocks);
     }
-    let notification = json!({
-        "jsonrpc": "2.0",
-        "method": "session/update",
-        "params": {
-            "sessionId": session_id,
-            "update": update
-        }
-    });
-    write_json_line(writer, notification).await
+    acp::ToolCallUpdate::new(call.execution_id.clone(), fields)
+}
+
+fn agent_text(text: String) -> acp::SessionUpdate {
+    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(acp::ContentBlock::from(text)))
 }
 
 impl AcpError {
@@ -1105,13 +1405,22 @@ impl AcpError {
             message: message.into(),
         }
     }
+}
 
-    fn method_not_found(method: &str) -> Self {
-        Self {
-            code: -32601,
-            message: format!("method not found: {method}"),
-        }
+impl From<AcpError> for SdkError {
+    fn from(error: AcpError) -> Self {
+        SdkError::new(error.code, error.message)
     }
+}
+
+fn to_wire<T: serde::Serialize>(value: &T) -> std::result::Result<Value, AcpError> {
+    serde_json::to_value(value).map_err(|error| AcpError::internal(error.to_string()))
+}
+
+fn codewhale_meta(fields: Value) -> acp::Meta {
+    let mut meta = acp::Meta::new();
+    meta.insert("codewhale".to_string(), fields);
+    meta
 }
 
 fn validate_mcp_servers(params: &Value) -> std::result::Result<(), AcpError> {
@@ -1119,67 +1428,66 @@ fn validate_mcp_servers(params: &Value) -> std::result::Result<(), AcpError> {
         None => Ok(()),
         Some(Value::Array(servers)) if servers.is_empty() => Ok(()),
         Some(Value::Array(_)) => Err(AcpError::invalid_params(
-            "Client-supplied MCP servers are unsupported by Codewhale's ACP adapter. Use an empty mcpServers list, or configure MCP through codewhale app-server --http and the Runtime API. ACP v1 stdio MCP support is incomplete.",
+            "Client-supplied MCP servers are unsupported by Codewhale's ACP adapter. Use an empty mcpServers list; sessions use the MCP servers and plugins configured in Codewhale itself.",
         )),
         Some(_) => Err(AcpError::invalid_params("mcpServers must be an array")),
     }
 }
 
-fn initialize_result(client_protocol_version: Option<u64>, config: &Config) -> Value {
-    json!({
-        "protocolVersion": client_protocol_version
-            .map(|version| version.min(ACP_PROTOCOL_VERSION))
-            .unwrap_or(ACP_PROTOCOL_VERSION),
-        "agentCapabilities": {
-            "loadSession": true,
-            "modelSelection": true,
-            "promptCapabilities": {
-                "image": false,
-                "audio": false,
-                "embeddedContext": true
-            },
-            "mcpCapabilities": {
-                "http": false,
-                "sse": false
-            },
-            // ACP `SessionCapabilities` fields are objects, never booleans:
-            // `{}` means "supported", absent/null means "not supported"
-            // (#5969 — a boolean here made JetBrains' strictly-typed client
-            // fail the handshake and kill the agent). `session/load` support
-            // is advertised by the top-level `loadSession` above; it is not a
-            // field of `sessionCapabilities`. We only claim `list` because
-            // `session/list` is the only one of the optional session methods
-            // this server dispatches.
-            "sessionCapabilities": {
-                "list": {}
-            }
-        },
-        "agentInfo": {
-            "name": "codewhale",
-            "title": "codewhale",
-            "version": env!("CARGO_PKG_VERSION")
-        },
-        "authMethods": acp_auth_methods(config)
-    })
+fn initialize_result(config: &Config, terminal_auth: bool) -> acp::InitializeResponse {
+    let features = config.features();
+    // ACP `SessionCapabilities` fields are objects, never booleans:
+    // `{}` means "supported", absent/null means "not supported"
+    // (#5969 — a boolean here made JetBrains' strictly-typed client
+    // fail the handshake and kill the agent). `session/load` support
+    // is advertised by the top-level `loadSession`; it is not a
+    // field of `sessionCapabilities`. We only claim `list` because
+    // `session/list` is the only one of the optional session methods
+    // this server dispatches.
+    let capabilities = acp::AgentCapabilities::new()
+        .load_session(true)
+        .prompt_capabilities(acp::PromptCapabilities::new().embedded_context(true))
+        .mcp_capabilities(acp::McpCapabilities::new())
+        .session_capabilities(
+            acp::SessionCapabilities::new().list(acp::SessionListCapabilities::new()),
+        )
+        .meta(codewhale_meta(json!({
+            "plugins": features.enabled(Feature::ExtensionHost)
+                && codewhale_plugins::activation::extension_host_policy_enabled(),
+            "configuredMcpServers": features.enabled(Feature::Mcp),
+            "clientMcpServers": false
+        })));
+    acp::InitializeResponse::new(ProtocolVersion::V1)
+        .agent_capabilities(capabilities)
+        .agent_info(
+            acp::Implementation::new("codewhale", env!("CARGO_PKG_VERSION")).title("codewhale"),
+        )
+        .auth_methods(acp_auth_methods(config, terminal_auth))
 }
 
-fn acp_auth_methods(config: &Config) -> Value {
-    let Some(identity) = config.active_provider_identity().ok().filter(|identity| {
-        identity.provider != ProviderKind::Custom && identity.provider != ProviderKind::Antigravity
-    }) else {
-        return json!([]);
+fn acp_auth_methods(config: &Config, terminal_auth: bool) -> Vec<acp::AuthMethod> {
+    let Some(identity) = terminal_auth
+        .then(|| config.active_provider_identity().ok())
+        .flatten()
+        .filter(|identity| {
+            identity.provider != ProviderKind::Custom
+                && identity.provider != ProviderKind::Antigravity
+        })
+    else {
+        return Vec::new();
     };
     let provider = identity.provider.as_str();
-    json!([
-        {
-            "id": "codewhale-terminal-auth",
-            "name": "Set Codewhale API key",
-            "description": format!("Run Codewhale's terminal credential setup for the {provider} provider."),
-            "type": "terminal",
-            "args": ["auth", "set", "--provider", provider],
-            "env": {}
-        }
-    ])
+    vec![acp::AuthMethod::Terminal(
+        acp::AuthMethodTerminal::new("codewhale-terminal-auth", "Set Codewhale API key")
+            .description(format!(
+                "Run Codewhale's terminal credential setup for the {provider} provider."
+            ))
+            .args(
+                ["auth", "set", "--provider", provider]
+                    .map(str::to_string)
+                    .to_vec(),
+            ),
+    )]
 }
 
 fn extract_prompt_text(prompt: Option<&Value>) -> Option<String> {
@@ -1193,6 +1501,31 @@ fn extract_prompt_text(prompt: Option<&Value>) -> Option<String> {
             (!parts.is_empty()).then(|| parts.join("\n\n"))
         }
         _ => None,
+    }
+}
+
+fn unsupported_prompt_block(prompt: Option<&Value>) -> Option<String> {
+    let Value::Array(blocks) = prompt? else {
+        return None;
+    };
+    blocks.iter().find_map(|block| {
+        let kind = block
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        content_block_text(block)
+            .is_none()
+            .then(|| kind.to_string())
+    })
+}
+
+fn absolute_cwd(params: &Value, method: &str) -> std::result::Result<Option<PathBuf>, AcpError> {
+    match params.get("cwd") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(path)) if Path::new(path).is_absolute() => Ok(Some(PathBuf::from(path))),
+        Some(_) => Err(AcpError::invalid_params(format!(
+            "{method} cwd must be an absolute path"
+        ))),
     }
 }
 
@@ -1224,135 +1557,18 @@ fn resource_link_text(block: &Value) -> Option<String> {
     Some(format!("@{uri}"))
 }
 
-async fn write_session_update<W>(writer: &mut W, session_id: &str, text: String) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    let notification = json!({
-        "jsonrpc": "2.0",
-        "method": "session/update",
-        "params": {
-            "sessionId": session_id,
-            "update": {
-                "sessionUpdate": "agent_message_chunk",
-                "content": {
-                    "type": "text",
-                    "text": text
-                }
-            }
-        }
-    });
-    write_json_line(writer, notification).await
-}
-
-async fn write_jsonrpc_result<W>(writer: &mut W, id: Value, result: Value) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    write_json_line(
-        writer,
-        json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": result
-        }),
-    )
-    .await
-}
-
-async fn write_jsonrpc_error<W>(
-    writer: &mut W,
-    id: Option<Value>,
-    code: i32,
-    message: impl Into<String>,
-) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    write_json_line(
-        writer,
-        json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": {
-                "code": code,
-                "message": message.into()
-            }
-        }),
-    )
-    .await
-}
-
-async fn write_json_line<W>(writer: &mut W, mut value: Value) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    let frame = match crate::stdio::serialize_control_frame(&value) {
-        Ok(frame) => frame,
-        Err(error) if crate::stdio::is_frame_refusal(&error) && value.get("method").is_none() => {
-            let id = value.get_mut("id").map(Value::take).unwrap_or(Value::Null);
-            let mut failure = json!({"jsonrpc":"2.0","id":id,"error":{"code":-32603,"message":"ACP response exceeds the 8 MiB transport limit; inspect canonical state without replay"}});
-            match crate::stdio::serialize_control_frame(&failure) {
-                Ok(frame) => frame,
-                Err(error) if crate::stdio::is_frame_refusal(&error) => {
-                    failure["id"] = Value::Null;
-                    crate::stdio::serialize_control_frame(&failure)?
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Err(error) => return Err(error.into()),
-    };
-    crate::stdio::write_control_line(writer, &frame).await
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JsonRpcResponseIdPolicy {
-    /// JSON-RPC's normal contract: echo the request id without changing type.
-    Preserve,
-    /// Zed's ACP client currently decodes response ids as strings even when it
-    /// sent a number. Keep this narrow compatibility mode client-identified.
-    StringifyNumeric,
-}
-
-impl JsonRpcResponseIdPolicy {
-    fn from_initialize_params(params: &Value) -> Self {
-        let client_name = params
-            .pointer("/clientInfo/name")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if client_name.eq_ignore_ascii_case("zed") {
-            Self::StringifyNumeric
-        } else {
-            Self::Preserve
-        }
-    }
-
-    fn response_id(self, id: Value) -> Value {
-        match (self, id) {
-            (Self::StringifyNumeric, Value::Number(number)) => Value::String(number.to_string()),
-            (_, id) => id,
-        }
-    }
-}
-
-fn is_jsonrpc_response(message: &Value) -> bool {
-    message.get("id").is_some()
-        && (message.get("result").is_some() || message.get("error").is_some())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use codewhale_engine::llm_client::mock::{MockLlmClient, canned};
     use codewhale_models::{ContentBlock, Role};
+    use codewhale_util::bounded_lines::MAX_FRAME_BYTES;
     use std::time::Duration;
 
-    pub(super) fn parse_lines(output: Vec<u8>) -> Vec<Value> {
-        String::from_utf8(output)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
+    fn replayed(updates: Vec<acp::SessionUpdate>) -> Vec<Value> {
+        updates
+            .into_iter()
+            .map(|update| json!({"params":{"update":serde_json::to_value(update).unwrap()}}))
             .collect()
     }
     pub(super) fn fixture_config() -> Config {
@@ -1384,6 +1600,65 @@ mod tests {
         config.set_feature("mcp", false).unwrap();
         config.set_feature("subagents", false).unwrap();
         config
+    }
+    pub(super) struct Editor {
+        lines: tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+        pub(super) write: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        pub(super) next_id: u64,
+        pub(super) seen: Vec<Value>,
+    }
+    impl Editor {
+        pub(super) async fn send(&mut self, message: Value) -> Result<()> {
+            let mut line = serde_json::to_vec(&message)?;
+            line.push(b'\n');
+            self.write.write_all(&line).await?;
+            self.write.flush().await?;
+            Ok(())
+        }
+        pub(super) async fn send_raw(&mut self, line: &str) -> Result<()> {
+            self.write.write_all(line.as_bytes()).await?;
+            self.write.write_all(b"\n").await?;
+            self.write.flush().await?;
+            Ok(())
+        }
+        pub(super) async fn recv(&mut self) -> Result<Value> {
+            let line = tokio::time::timeout(Duration::from_secs(30), self.lines.next_line())
+                .await
+                .map_err(|_| anyhow!("no frame within 30s"))??
+                .ok_or_else(|| anyhow!("the agent closed the transport"))?;
+            let frame: Value = serde_json::from_str(&line)?;
+            self.seen.push(frame.clone());
+            Ok(frame)
+        }
+        pub(super) async fn until_response(&mut self, id: &Value) -> Result<(Value, Vec<Value>)> {
+            let mut frames = Vec::new();
+            loop {
+                let frame = self.recv().await?;
+                if frame["id"] == *id && frame.get("method").is_none() {
+                    return Ok((frame, frames));
+                }
+                frames.push(frame);
+            }
+        }
+        pub(super) async fn request(
+            &mut self,
+            method: &str,
+            params: Value,
+        ) -> Result<(Value, Vec<Value>)> {
+            self.next_id += 1;
+            let id = json!(self.next_id);
+            self.send(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
+                .await?;
+            self.until_response(&id).await
+        }
+        pub(super) async fn until_permission(&mut self) -> Result<Value> {
+            loop {
+                let frame = self.recv().await?;
+                if frame["method"] == "session/request_permission" {
+                    return Ok(frame);
+                }
+            }
+        }
     }
     pub(super) struct Rig {
         pub(super) server: AcpServer,
@@ -1460,26 +1735,77 @@ mod tests {
                 .unwrap()
                 .to_string()
         }
-        async fn prompt(
-            &mut self,
-            session: &str,
-            text: &str,
-        ) -> Result<(&'static str, Vec<Value>)> {
-            // Keep the transport input open: an empty reader is a real EOF/cancel.
-            let (client, input) = tokio::io::duplex(4096);
-            let mut reader = crate::stdio::BoundedLines::new(BufReader::new(input));
-            let mut output = Vec::new();
-            let result = tokio::time::timeout(
-                Duration::from_secs(if cfg!(windows) { 120 } else { 20 }),
-                self.server.drive_prompt(
-                    json!({"sessionId":session,"prompt":text}),
-                    &mut reader,
-                    &mut output,
-                ),
+        fn placeholder(&self) -> AcpServer {
+            AcpServer::new(
+                self.server.config.clone(),
+                self.server.model.clone(),
+                self.server.default_cwd.clone(),
+                Arc::clone(&self.server.runtime),
+                self.server.sessions_dir.clone(),
+                None,
+                None,
             )
-            .await??;
-            drop(client);
-            Ok((result, parse_lines(output)))
+        }
+        pub(super) async fn drive<T>(
+            &mut self,
+            script: impl AsyncFnOnce(&mut Editor) -> Result<T>,
+        ) -> Result<(T, Vec<Value>)> {
+            let (editor_end, agent_end) = tokio::io::duplex(1 << 20);
+            let (agent_read, agent_write) = tokio::io::split(agent_end);
+            let (read, write) = tokio::io::split(editor_end);
+            let mut editor = Editor {
+                lines: tokio::io::AsyncBufReadExt::lines(BufReader::new(read)),
+                write,
+                next_id: 0,
+                seen: Vec::new(),
+            };
+            let placeholder = self.placeholder();
+            let server = std::mem::replace(&mut self.server, placeholder);
+            let serving = super::connection::serve_connection(
+                server,
+                Box::new(BufReader::new(agent_read)),
+                Box::new(agent_write),
+            );
+            let scripted = async {
+                let result = script(&mut editor).await;
+                let _ = editor.write.shutdown().await;
+                result
+            };
+            let (served, scripted) = tokio::time::timeout(
+                Duration::from_secs(if cfg!(windows) { 120 } else { 20 }),
+                async { tokio::join!(serving, scripted) },
+            )
+            .await?;
+            let shared = served?;
+            self.server = Arc::try_unwrap(shared)
+                .map_err(|_| anyhow!("the connection kept a server reference"))?
+                .into_server();
+            while let Some(line) = editor.lines.next_line().await? {
+                editor.seen.push(serde_json::from_str(&line)?);
+            }
+            Ok((scripted?, editor.seen))
+        }
+        async fn prompt(&mut self, session: &str, text: &str) -> Result<(String, Vec<Value>)> {
+            let (response, frames) = self
+                .drive(async |editor| {
+                    let (response, _) = editor
+                        .request("session/prompt", json!({"sessionId":session,"prompt":text}))
+                        .await?;
+                    Ok(response)
+                })
+                .await?;
+            if let Some(error) = response.get("error") {
+                anyhow::bail!("{error}");
+            }
+            let reason = response["result"]["stopReason"]
+                .as_str()
+                .ok_or_else(|| anyhow!("{response}"))?
+                .to_string();
+            let updates = frames
+                .into_iter()
+                .filter(|frame| frame["method"] == "session/update")
+                .collect();
+            Ok((reason, updates))
         }
         async fn history(&self, session: &str) -> Vec<codewhale_models::Message> {
             let thread = &self.server.sessions[session].thread_id;
@@ -1780,7 +2106,7 @@ mod tests {
 
     #[test]
     fn initialize_advertises_baseline_acp_agent() {
-        let result = initialize_result(Some(1), &Config::default());
+        let result = to_wire(&initialize_result(&Config::default(), true)).unwrap();
 
         assert_eq!(result["protocolVersion"], 1);
         assert_eq!(result["agentInfo"]["name"], "codewhale");
@@ -1815,10 +2141,42 @@ mod tests {
     }
 
     #[test]
-    fn initialize_advertises_model_selection_capability() {
-        let result = initialize_result(Some(1), &Config::default());
+    fn initialize_stays_inside_the_official_capability_shape() {
+        let result = to_wire(&initialize_result(&Config::default(), false)).unwrap();
 
-        assert_eq!(result["agentCapabilities"]["modelSelection"], true);
+        assert!(result["agentCapabilities"].get("modelSelection").is_none());
+        assert_eq!(result["authMethods"], json!([]));
+        assert_eq!(result["agentCapabilities"]["auth"], json!({}));
+    }
+
+    #[test]
+    fn initialize_advertises_configured_plugins_and_mcp_but_not_client_servers() {
+        let _policy = codewhale_plugins::activation::TestPolicyGuard::extension_host(true);
+        let mut config = Config::default();
+        config.set_feature("extension_host", true).unwrap();
+        config.set_feature("mcp", true).unwrap();
+        let result = to_wire(&initialize_result(&config, false)).unwrap();
+        let meta = &result["agentCapabilities"]["_meta"]["codewhale"];
+
+        assert_eq!(meta["plugins"], true);
+        assert_eq!(meta["configuredMcpServers"], true);
+        assert_eq!(meta["clientMcpServers"], false);
+        assert_eq!(
+            result["agentCapabilities"]["mcpCapabilities"]["http"],
+            false
+        );
+
+        config.set_feature("extension_host", false).unwrap();
+        config.set_feature("mcp", false).unwrap();
+        let off = to_wire(&initialize_result(&config, false)).unwrap();
+        assert_eq!(
+            off["agentCapabilities"]["_meta"]["codewhale"]["plugins"],
+            false
+        );
+        assert_eq!(
+            off["agentCapabilities"]["_meta"]["codewhale"]["configuredMcpServers"],
+            false
+        );
     }
 
     #[test]
@@ -1843,110 +2201,254 @@ mod tests {
         assert!(text.contains("@file:///tmp/lib.rs"));
     }
 
-    #[tokio::test]
-    async fn session_update_is_protocol_clean_single_line_json() {
-        let mut out = Vec::new();
-
-        write_session_update(&mut out, "sess_1", "hello\nworld".to_string())
-            .await
-            .expect("write update");
-
-        let line = String::from_utf8(out).expect("utf8");
-        assert_eq!(line.lines().count(), 1);
-        let value: Value = serde_json::from_str(line.trim()).expect("json");
-        assert_eq!(value["method"], "session/update");
-        assert_eq!(value["params"]["sessionId"], "sess_1");
-        assert_eq!(value["params"]["update"]["content"]["text"], "hello\nworld");
-    }
-
-    #[tokio::test]
-    async fn jsonrpc_result_preserves_numeric_ids_for_avante_acp() {
-        let mut out = Vec::new();
-
-        let params = json!({
-            "protocolVersion": 1,
-            "clientCapabilities": {}
-        });
-        let id = JsonRpcResponseIdPolicy::from_initialize_params(&params).response_id(json!(1));
-        write_jsonrpc_result(&mut out, id, json!({"ok": true}))
-            .await
-            .expect("write result");
-
-        let line = String::from_utf8(out).expect("utf8");
-        let value: Value = serde_json::from_str(line.trim()).expect("json");
-        // Numeric ID must stay numeric — avante.nvim's Lua client uses
-        // strict table keys (callbacks[1] ≠ callbacks["1"]).
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_connection_echoes_ids_and_answers_only_requests() -> Result<()> {
+        let mut rig = Rig::new(fixture_config(), vec![])?;
+        let (_, frames) = rig
+            .drive(async |editor| {
+                for info in [json!({}), json!({"clientInfo":{"name":"zed","version":"1"}})] {
+                    let mut params = json!({"protocolVersion":1,"clientCapabilities":{}});
+                    params.as_object_mut().unwrap().extend(info.as_object().unwrap().clone());
+                    let (reply, _) = editor.request("initialize", params).await?;
+                    assert!(reply["id"].is_number(), "{reply}");
+                }
+                editor
+                    .send(json!({"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":999}}))
+                    .await?;
+                editor
+                    .send(json!({"jsonrpc":"2.0","method":"session/not_a_notification","params":{}}))
+                    .await?;
+                editor.send_raw("not json").await?;
+                let parse = editor.recv().await?;
+                assert_eq!(parse["id"], Value::Null);
+                assert_eq!(parse["error"]["code"], -32700);
+                let (unknown, _) = editor.request("session/resume", json!({})).await?;
+                assert_eq!(unknown["error"]["code"], -32601);
+                Ok(())
+            })
+            .await?;
         assert!(
-            value["id"].is_number(),
-            "numeric id must stay numeric, got {:?}",
-            value["id"]
+            frames
+                .iter()
+                .all(|frame| frame["id"].is_number() || frame["id"].is_null()),
+            "{frames:?}"
         );
-        assert_eq!(value["result"], json!({"ok": true}));
+        assert_eq!(
+            frames.iter().filter(|frame| frame["id"].is_null()).count(),
+            1,
+            "a notification is never answered: {frames:?}"
+        );
+        rig.close().await;
+        Ok(())
     }
 
-    #[tokio::test]
-    async fn jsonrpc_result_stringifies_numeric_ids_for_zed_acp() {
-        let mut out = Vec::new();
-
-        let params = json!({
-            "protocolVersion": 1,
-            "clientCapabilities": {},
-            "clientInfo": {
-                "name": "zed",
-                "version": "1.2.6"
-            }
-        });
-        let id = JsonRpcResponseIdPolicy::from_initialize_params(&params).response_id(json!(1));
-        write_jsonrpc_result(&mut out, id, json!({"ok": true}))
-            .await
-            .expect("write result");
-
-        let line = String::from_utf8(out).expect("utf8");
-        let value: Value = serde_json::from_str(line.trim()).expect("json");
-        assert_eq!(value["id"], "1");
-        assert_eq!(value["result"], json!({"ok": true}));
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_oversize_line_is_refused_and_the_connection_continues() -> Result<()> {
+        let mut rig = Rig::new(fixture_config(), vec![])?;
+        let (_, _) = rig
+            .drive(async |editor| {
+                editor.send_raw(&"a".repeat(MAX_FRAME_BYTES + 16)).await?;
+                let refused = editor.recv().await?;
+                assert_eq!(refused["id"], Value::Null);
+                assert_eq!(refused["error"]["code"], -32700);
+                let (initialized, _) = editor
+                    .request("initialize", json!({"protocolVersion":1}))
+                    .await?;
+                assert_eq!(initialized["result"]["protocolVersion"], 1);
+                Ok(())
+            })
+            .await?;
+        rig.close().await;
+        Ok(())
     }
 
-    #[tokio::test]
-    async fn jsonrpc_error_keeps_absent_id_null() {
-        let mut out = Vec::new();
-
-        write_jsonrpc_error(&mut out, None, -32700, "invalid json")
-            .await
-            .expect("write error");
-
-        let line = String::from_utf8(out).expect("utf8");
-        let value: Value = serde_json::from_str(line.trim()).expect("json");
-        assert_eq!(value["id"], Value::Null);
-        assert_eq!(value["error"]["code"], -32700);
+    #[test]
+    fn an_oversize_response_becomes_an_error_and_anything_else_ends_the_connection() {
+        let big = "x".repeat(MAX_FRAME_BYTES);
+        let response = json!({"jsonrpc":"2.0","id":7,"result":{"big":big}}).to_string();
+        let replaced: Value =
+            serde_json::from_str(&connection::bound_outgoing(response).unwrap()).unwrap();
+        assert_eq!(replaced["id"], 7);
+        assert_eq!(replaced["error"]["code"], -32603);
+        let update =
+            json!({"jsonrpc":"2.0","method":"session/update","params":{"big":big}}).to_string();
+        let error = connection::bound_outgoing(update).unwrap_err();
+        assert!(crate::stdio::is_frame_refusal(&error));
     }
 
-    #[tokio::test]
-    async fn tool_update_emits_typed_acp_image_content() {
-        let mut output = Vec::new();
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_session_cap_evicts_the_oldest_binding() -> Result<()> {
+        let mut rig = Rig::new(fixture_config(), vec![])?;
+        for index in 0..=MAX_ACP_SESSIONS {
+            rig.server
+                .remember(format!("session-{index}"), format!("thread-{index}"));
+        }
+        assert_eq!(rig.server.sessions.len(), MAX_ACP_SESSIONS);
+        assert!(!rig.server.sessions.contains_key("session-0"));
+        assert!(
+            rig.server
+                .sessions
+                .contains_key(&format!("session-{MAX_ACP_SESSIONS}"))
+        );
+        rig.close().await;
+        Ok(())
+    }
+
+    #[test]
+    fn file_tool_start_preserves_requests_without_speculative_diffs() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let workspace = directory.path();
+        std::fs::create_dir(workspace.join("src")).expect("source directory");
+        std::fs::write(workspace.join("src/lib.rs"), "prefix a middle c suffix")
+            .expect("existing file");
+        let at = |rel: &str| {
+            codewhale_engine::tools::spec::normalize_path(&workspace.join(rel))
+                .to_string_lossy()
+                .into_owned()
+        };
+        let abs_new = codewhale_engine::tools::spec::normalize_path(&workspace.join("src/lib.rs"));
+        let abs_new_str = abs_new.to_string_lossy().into_owned();
+        let start = |name: &str, input: Value| {
+            to_wire(&tool_call_start(
+                &PendingToolCall {
+                    execution_id: "call-1".to_string(),
+                    name: name.to_string(),
+                    input,
+                },
+                workspace,
+                None,
+            ))
+            .expect("ACP tool call")
+        };
+        let edit = start(
+            "File",
+            json!({"action": "edit", "path": "src/lib.rs", "old_string": "a", "new_string": "b"}),
+        );
+        assert_eq!(edit["locations"], json!([{"path": at("src/lib.rs")}]));
+        assert_eq!(edit["title"], "File edit: src/lib.rs");
+        assert_eq!(edit["rawInput"]["old_string"], "a");
+        assert!(edit.get("content").is_none_or(|c| c == &json!([])));
+        let write = start("write_file", json!({"path": abs_new_str, "content": "hi"}));
+        assert_eq!(write["locations"], json!([{"path": abs_new_str}]));
+        assert!(write.get("content").is_none_or(|c| c == &json!([])));
+        assert_eq!(write["rawInput"]["content"], "hi");
+        let read = start("File", json!({"action": "read", "path": "README.md"}));
+        assert_eq!(read["locations"], json!([{"path": at("README.md")}]));
+        assert!(read.get("content").is_none_or(|c| c == &json!([])));
+        let shell = start("bash", json!({"command": "ls", "path": "x"}));
+        assert!(shell.get("locations").is_none_or(|l| l == &json!([])));
+        let aliased = start("write", json!({"file_path": "a.txt", "content": "x"}));
+        assert_eq!(aliased["locations"], json!([{"path": at("a.txt")}]));
+        let completed = to_wire(&tool_call_update(
+            &PendingToolCall {
+                execution_id: "exec-edit".to_string(),
+                name: "File".to_string(),
+                input: json!({"action": "edit", "path": "src/lib.rs", "search": "a", "replace": "b"}),
+            },
+            workspace,
+            acp::ToolCallStatus::Completed,
+            Some("edited"),
+            &[],
+            None,
+        ))
+        .expect("ACP update");
+        assert_eq!(completed["content"].as_array().unwrap().len(), 1);
+        assert_eq!(completed["content"][0]["content"]["text"], "edited");
+        let home = codewhale_paths::user_home().expect("home");
+        let home_edit = start(
+            "File",
+            json!({"action": "edit", "path": "~/notes.txt", "old_string": "a", "new_string": "b"}),
+        );
+        let expected_home_note =
+            codewhale_engine::tools::spec::normalize_path(&home.join("notes.txt"));
+        assert_eq!(
+            home_edit["locations"],
+            json!([{"path": expected_home_note.to_string_lossy()}])
+        );
+        let edits_array = start(
+            "edit",
+            json!({"path": "src/lib.rs", "edits": [
+                {"oldText": "a", "newText": "b"},
+                {"oldText": "c", "newText": "d"}
+            ]}),
+        );
+        assert!(edits_array.get("content").is_none_or(|c| c == &json!([])));
+        assert_eq!(
+            edits_array["rawInput"]["edits"].as_array().unwrap().len(),
+            2
+        );
+        let encoded = start(
+            "edit",
+            json!({"path": "src/lib.rs", "edits": "[{\"oldText\":\"a\",\"newText\":\"b\"}]"}),
+        );
+        assert!(encoded.get("content").is_none_or(|c| c == &json!([])));
+        let dotted = start(
+            "File",
+            json!({"action": "read", "path": "./sub/../README.md"}),
+        );
+        assert_eq!(dotted["locations"], json!([{"path": at("README.md")}]));
+    }
+
+    #[test]
+    fn external_tool_start_forwards_agent_locations_without_fabricated_diff() {
+        let workspace = Path::new("/work/repo");
+        let start = to_wire(&tool_call_start(
+            &PendingToolCall {
+                execution_id: "call-1".to_string(),
+                name: "File".to_string(),
+                input: json!({"action": "edit", "path": "notes.txt", "edits": [{"oldText": "a", "newText": "b"}]}),
+            },
+            workspace,
+            Some(vec![acp::ToolCallLocation::new(Path::new(
+                "/other/agent-workspace/notes.txt",
+            ))]),
+        ))
+        .expect("ACP tool call");
+        assert_eq!(
+            start["locations"],
+            json!([{"path": "/other/agent-workspace/notes.txt"}])
+        );
+        assert!(start["content"].as_array().is_none_or(|c| c.is_empty()));
+        let suppressed = to_wire(&tool_call_update(
+            &PendingToolCall {
+                execution_id: "call-1".to_string(),
+                name: "File".to_string(),
+                input: json!({"action": "edit", "path": "notes.txt", "edits": [{"oldText": "a", "newText": "b"}]}),
+            },
+            workspace,
+            acp::ToolCallStatus::Completed,
+            Some("edited"),
+            &[],
+            Some(Vec::new()),
+        ))
+        .expect("ACP update");
+        assert!(
+            suppressed["update"]["content"]
+                .as_array()
+                .is_none_or(|c| c.iter().all(|block| block["type"] != "diff"))
+        );
+    }
+
+    #[test]
+    fn tool_update_emits_typed_acp_image_content() {
         let call = PendingToolCall {
             execution_id: uuid::Uuid::new_v4().to_string(),
             name: "read".to_string(),
             input: json!({"path": "shot.png"}),
         };
-        write_tool_call_update_with_blocks(
-            &mut output,
-            "session_1",
+        let update = to_wire(&tool_call_update(
             &call,
-            "completed",
+            Path::new("/"),
+            acp::ToolCallStatus::Completed,
             Some("screenshot captured"),
             &[codewhale_tools::ToolResultContentBlock::Image {
                 mime_type: "image/png".to_string(),
                 data: "QUJD".to_string(),
             }],
-        )
-        .await
+            None,
+        ))
         .expect("ACP update");
-
-        let lines = parse_lines(output);
-        let content = lines[0]["params"]["update"]["content"]
-            .as_array()
-            .expect("ACP content blocks");
+        let content = update["content"].as_array().expect("ACP content blocks");
         assert_eq!(content[0]["content"]["type"], "text");
         assert_eq!(content[1]["content"]["type"], "image");
         assert_eq!(content[1]["content"]["mimeType"], "image/png");
@@ -2061,9 +2563,7 @@ mod tests {
         for (session, prompt, answer) in
             [(&a, "A prompt", "A answer"), (&b, "B prompt", "B answer")]
         {
-            let mut output = Vec::new();
-            rig.server.replay_history(&mut output, session).await?;
-            let updates = parse_lines(output);
+            let updates = replayed(rig.server.history_updates(session).await?);
             let text: Vec<_> = updates
                 .iter()
                 .map(|update| {
@@ -2088,6 +2588,7 @@ mod tests {
         let listed = rig
             .server
             .list_sessions(json!({"cwd":rig.workspace}))
+            .await
             .unwrap();
         assert_eq!(listed["sessions"].as_array().unwrap().len(), 2);
         let store = codewhale_engine::session_manager::SessionManager::new(
@@ -2134,9 +2635,7 @@ mod tests {
             ]),
         );
         store.save_session(&saved)?;
-        let mut output = Vec::new();
-        rig.server.replay_history(&mut output, &a).await?;
-        let updates = parse_lines(output);
+        let updates = replayed(rig.server.history_updates(&a).await?);
         let text: Vec<_> = updates
             .iter()
             .filter_map(|update| {
@@ -2202,7 +2701,14 @@ mod tests {
         );
         let statuses: Vec<_> = wire
             .iter()
-            .filter_map(|v| v.pointer("/params/update/status").and_then(Value::as_str))
+            .filter_map(|v| {
+                v.pointer("/params/update/status")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        (v.pointer("/params/update/sessionUpdate") == Some(&json!("tool_call")))
+                            .then_some("pending")
+                    })
+            })
             .collect();
         assert_eq!(
             statuses,
@@ -2415,7 +2921,14 @@ mod tests {
         assert_eq!(reason, "end_turn");
         let statuses: Vec<_> = wire
             .iter()
-            .filter_map(|v| v.pointer("/params/update/status").and_then(Value::as_str))
+            .filter_map(|v| {
+                v.pointer("/params/update/status")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        (v.pointer("/params/update/sessionUpdate") == Some(&json!("tool_call")))
+                            .then_some("pending")
+                    })
+            })
             .collect();
         assert_eq!(
             statuses,
@@ -2483,25 +2996,27 @@ mod tests {
         let thread = rig.server.sessions[&id].thread_id.clone();
         let manager = Arc::clone(&rig.server.runtime);
         let target = rig.workspace.join("ask.txt");
-        let (client, transport) = tokio::io::duplex(65536);
-        let (read, mut write) = tokio::io::split(transport);
-        let mut reader = crate::stdio::BoundedLines::new(BufReader::new(read));
-        let (cr, mut cw) = tokio::io::split(client);
-        let mut cr = crate::stdio::BoundedLines::new(BufReader::new(cr));
         let sid = id.clone();
         let target_in = target.clone();
-        let client = async move {
-            let mut seen = Vec::new();
-            loop {
-                let line = cr
-                    .next_line()
-                    .await?
-                    .ok_or_else(|| anyhow!("permission request missing"))?;
-                let v: Value = serde_json::from_str(&line)?;
-                seen.push(v.clone());
-                if v["method"] != "session/request_permission" {
-                    continue;
-                }
+        let (outcome, wire) = rig
+            .drive(async |editor| {
+                editor.next_id += 1;
+                let prompt_id = json!(editor.next_id);
+                editor
+                    .send(json!({"jsonrpc":"2.0","id":prompt_id,"method":"session/prompt","params":{"sessionId":sid,"prompt":"write under Ask"}}))
+                    .await?;
+                let v = editor.until_permission().await?;
+                assert!(
+                    v.pointer("/params/toolCall/content")
+                        .and_then(Value::as_array)
+                        .is_some_and(|content| {
+                            content.iter().any(|item| {
+                                item.pointer("/content/text")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|text| !text.is_empty())
+                            })
+                        })
+                );
                 let detail = manager.get_thread_detail(&thread).await?;
                 let pending = detail
                     .pending_approvals
@@ -2514,55 +3029,60 @@ mod tests {
                 );
                 assert!(!target_in.exists());
                 assert!(
-                    !seen
+                    !editor
+                        .seen
                         .iter()
                         .any(|v| v.pointer("/params/update/status") == Some(&json!("in_progress"))),
                     "no dispatch before the real decision"
                 );
+                let allow = json!({"outcome":{"outcome":"selected","optionId":"allow-once"}});
                 match reply {
-                    PermissionReply::AllowAfterWrong=>{
-                        write_json_line(&mut cw,json!({"jsonrpc":"2.0","id":"wrong-id","result":{"outcome":{"outcome":"selected","optionId":"allow-once"}}})).await?;
+                    PermissionReply::AllowAfterWrong => {
+                        editor.send(json!({"jsonrpc":"2.0","id":"wrong-id","result":allow})).await?;
                         tokio::time::sleep(Duration::from_millis(30)).await;
-                        assert!(!target_in.exists());assert_eq!(manager.get_thread_detail(&thread).await?.pending_approvals.len(),1);
-                        write_json_line(&mut cw,json!({"jsonrpc":"2.0","id":v["id"],"result":{"outcome":{"outcome":"selected","optionId":"allow-once"}}})).await?;
-                    },
-                    PermissionReply::ForeignCancelAndBusy=>{
-                        write_json_line(&mut cw,json!({"jsonrpc":"2.0","id":41,"method":"session/cancel","params":{"sessionId":"foreign-session"}})).await?;
-                        write_json_line(&mut cw,json!({"jsonrpc":"2.0","id":42,"method":"session/prompt","params":{"sessionId":sid,"prompt":"must not run"}})).await?;
-                        for expected in [41,42] {
-                            let response:Value=serde_json::from_str(&cr.next_line().await?.ok_or_else(||anyhow!("control response missing"))?)?;
-                            assert_eq!(response["id"],expected);
-                            if expected==41 {assert_eq!(response["result"],Value::Null);} else {assert_eq!(response["error"]["code"],-32603);}
-                            seen.push(response);
+                        assert!(!target_in.exists());
+                        assert_eq!(manager.get_thread_detail(&thread).await?.pending_approvals.len(), 1);
+                        editor.send(json!({"jsonrpc":"2.0","id":v["id"],"result":allow})).await?;
+                    }
+                    PermissionReply::ForeignCancelAndBusy => {
+                        editor.send(json!({"jsonrpc":"2.0","id":41,"method":"session/cancel","params":{"sessionId":"foreign-session"}})).await?;
+                        editor.send(json!({"jsonrpc":"2.0","id":42,"method":"session/prompt","params":{"sessionId":sid,"prompt":"must not run"}})).await?;
+                        for expected in [41, 42] {
+                            let (response, _) = editor.until_response(&json!(expected)).await?;
+                            if expected == 41 {
+                                assert_eq!(response["result"], Value::Null);
+                            } else {
+                                assert_eq!(response["error"]["code"], -32603);
+                            }
                         }
                         assert!(!target_in.exists());
-                        assert_eq!(manager.get_thread_detail(&thread).await?.pending_approvals.len(),1);
-                        write_json_line(&mut cw,json!({"jsonrpc":"2.0","id":v["id"],"result":{"outcome":{"outcome":"selected","optionId":"allow-once"}}})).await?;
-                    },
-                    PermissionReply::Reject=>write_json_line(&mut cw,json!({"jsonrpc":"2.0","id":v["id"],"result":{"outcome":{"outcome":"selected","optionId":"fabricated"}}})).await?,
-                    PermissionReply::Eof=>cw.shutdown().await?,
-                    PermissionReply::CancelLateAllow=>{
-                        write_json_line(&mut cw,json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":sid}})).await?;
-                        write_json_line(&mut cw,json!({"jsonrpc":"2.0","id":v["id"],"result":{"outcome":{"outcome":"selected","optionId":"allow-once"}}})).await?;
-                    },
+                        assert_eq!(manager.get_thread_detail(&thread).await?.pending_approvals.len(), 1);
+                        editor.send(json!({"jsonrpc":"2.0","id":v["id"],"result":allow})).await?;
+                    }
+                    PermissionReply::Reject => {
+                        editor.send(json!({"jsonrpc":"2.0","id":v["id"],"result":{"outcome":{"outcome":"selected","optionId":"fabricated"}}})).await?;
+                    }
+                    PermissionReply::Eof => {
+                        editor.write.shutdown().await?;
+                    }
+                    PermissionReply::CancelLateAllow => {
+                        editor.send(json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":sid}})).await?;
+                        editor.send(json!({"jsonrpc":"2.0","id":v["id"],"result":allow})).await?;
+                    }
                 }
-                return Ok::<_, anyhow::Error>((cr, cw, seen));
-            }
-        };
-        let driver = rig.server.drive_prompt(
-            json!({"sessionId":id,"prompt":"write under Ask"}),
-            &mut reader,
-            &mut write,
-        );
-        let (result, client) = tokio::time::timeout(Duration::from_secs(20), async {
-            tokio::join!(driver, client)
-        })
-        .await?;
-        let (mut cr, _cw, mut wire) = client?;
-        write.shutdown().await?;
-        while let Some(line) = cr.next_line().await? {
-            wire.push(serde_json::from_str(&line)?);
-        }
+                if !matches!(reply, PermissionReply::Eof) {
+                    editor.until_response(&prompt_id).await?;
+                }
+                Ok(prompt_id)
+            })
+            .await?;
+        let response = wire
+            .iter()
+            .find(|frame| frame["id"] == outcome && frame.get("method").is_none())
+            .ok_or_else(|| anyhow!("the prompt was never answered: {wire:?}"))?;
+        let result = response["result"]["stopReason"]
+            .as_str()
+            .ok_or_else(|| anyhow!("{response}"));
         match reply {
             PermissionReply::AllowAfterWrong | PermissionReply::ForeignCancelAndBusy => {
                 assert_eq!(result?, "end_turn");
@@ -2756,6 +3276,48 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_and_config_requests_are_served_while_a_turn_awaits_approval() -> Result<()> {
+        let mut rig = Rig::new(
+            fixture_config(),
+            vec![
+                canned::tool_call_turn("w", "write", r#"{"path":"busy.txt","content":"x"}"#),
+                canned::simple_text_turn("done"),
+            ],
+        )?;
+        let id = rig.new_session().await;
+        let (_, wire) = rig
+            .drive(async |editor| {
+                editor.next_id += 1;
+                let prompt_id = json!(editor.next_id);
+                editor
+                    .send(json!({"jsonrpc":"2.0","id":prompt_id,"method":"session/prompt","params":{"sessionId":id,"prompt":"write"}}))
+                    .await?;
+                let permission = editor.until_permission().await?;
+                let (listed, _) = editor.request("session/list", json!({})).await?;
+                assert!(listed["result"]["sessions"].is_array(), "{listed}");
+                let (model, _) = editor
+                    .request("session/set_config_option", json!({"sessionId":id,"configId":"model","value":"fixture-model"}))
+                    .await?;
+                assert!(model["result"]["configOptions"].is_array(), "{model}");
+                let (created, _) = editor.request("session/new", json!({})).await?;
+                assert_eq!(created["error"]["code"], -32603);
+                editor
+                    .send(json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":id}}))
+                    .await?;
+                editor
+                    .send(json!({"jsonrpc":"2.0","id":permission["id"],"result":{"outcome":{"outcome":"cancelled"}}}))
+                    .await?;
+                let (done, _) = editor.until_response(&prompt_id).await?;
+                assert_eq!(done["result"]["stopReason"], "cancelled");
+                Ok(())
+            })
+            .await?;
+        assert!(!rig.workspace.join("busy.txt").exists());
+        assert!(!wire.is_empty());
+        rig.close().await;
+        Ok(())
+    }
     #[tokio::test(flavor = "current_thread")]
     async fn acp_permission_allow_after_wrong_id_executes_once() -> Result<()> {
         permission_case(PermissionReply::AllowAfterWrong).await
@@ -3161,17 +3723,25 @@ mod tests {
     async fn invalid_prompt_and_rpc_shapes_refuse_before_core_admission() -> Result<()> {
         let mut rig = Rig::new(fixture_config(), vec![])?;
         let id = rig.new_session().await;
-        let input = format!(
-            "{}\n{}\n{}\n{}\n",
-            json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":id,"prompt":[]}}),
-            json!({"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":"unknown","prompt":"x"}}),
-            json!({"jsonrpc":"2.0","id":5,"method":"fabricated"}),
-            json!({"jsonrpc":"2.0","id":6,"method":"shutdown"})
-        );
-        let mut reader = crate::stdio::BoundedLines::new(BufReader::new(input.as_bytes()));
-        let mut output = Vec::new();
-        rig.server.serve(&mut reader, &mut output).await?;
-        let wire = parse_lines(output);
+        let (_, wire) = rig
+            .drive(async |editor| {
+                for (id, method, params) in [
+                    (3, "session/prompt", json!({"sessionId":id,"prompt":[]})),
+                    (
+                        4,
+                        "session/prompt",
+                        json!({"sessionId":"unknown","prompt":"x"}),
+                    ),
+                    (5, "fabricated", json!({})),
+                    (6, "shutdown", json!({})),
+                ] {
+                    editor
+                        .send(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
+                        .await?;
+                }
+                Ok(())
+            })
+            .await?;
         assert_eq!(wire[0]["error"]["code"], -32602);
         assert_eq!(wire[1]["error"]["code"], -32602);
         assert_eq!(wire[2]["error"]["code"], -32601);
@@ -3263,6 +3833,343 @@ mod tests {
             .unwrap();
         assert_eq!(selected["provider"], "acp-fixture");
         assert_eq!(rig.mock.call_count(), 0);
+        rig.close().await;
+        Ok(())
+    }
+    struct FailingInput(tokio::sync::mpsc::UnboundedReceiver<std::io::Result<Vec<u8>>>);
+    impl tokio::io::AsyncRead for FailingInput {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            match self.get_mut().0.poll_recv(cx) {
+                std::task::Poll::Ready(Some(Ok(bytes))) => {
+                    buf.put_slice(&bytes);
+                    std::task::Poll::Ready(Ok(()))
+                }
+                std::task::Poll::Ready(Some(Err(error))) => std::task::Poll::Ready(Err(error)),
+                std::task::Poll::Ready(None) => std::task::Poll::Ready(Ok(())),
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }
+        }
+    }
+    struct FailingOutput {
+        fail_on: Option<&'static str>,
+    }
+    impl AsyncWrite for FailingOutput {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self
+                .fail_on
+                .is_some_and(|marker| String::from_utf8_lossy(bytes).contains(marker))
+            {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "the editor stopped reading",
+                )));
+            }
+            std::task::Poll::Ready(Ok(bytes.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+    #[derive(Clone, Copy, PartialEq)]
+    enum Failure {
+        OutputAtPermission,
+        InputError,
+        OutputAfterWrite,
+    }
+    async fn transport_failure_case(mode: Failure) -> Result<()> {
+        let mut config = fixture_config();
+        config.yolo = (mode == Failure::OutputAfterWrite).then_some(true);
+        let mut rig = Rig::new(
+            config,
+            vec![
+                canned::tool_call_turn(
+                    "review-probe",
+                    "write",
+                    r#"{"path":"writer-failure.txt","content":"completed"}"#,
+                ),
+                canned::simple_text_turn("settled"),
+            ],
+        )?;
+        let id = rig.new_session().await;
+        let thread = rig.server.sessions[&id].thread_id.clone();
+        let manager = Arc::clone(&rig.server.runtime);
+        let (lines, input) = tokio::sync::mpsc::unbounded_channel::<std::io::Result<Vec<u8>>>();
+        let mut prompt = serde_json::to_vec(
+            &json!({"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":id,"prompt":"write under Ask"}}),
+        )?;
+        prompt.push(b'\n');
+        lines
+            .send(Ok(prompt))
+            .map_err(|_| anyhow!("review probe input closed early"))?;
+        let placeholder = rig.placeholder();
+        let server = std::mem::replace(&mut rig.server, placeholder);
+        let serving = tokio::time::timeout(
+            Duration::from_secs(60),
+            super::connection::serve_connection(
+                server,
+                Box::new(BufReader::new(FailingInput(input))),
+                Box::new(FailingOutput {
+                    fail_on: match mode {
+                        Failure::OutputAtPermission => Some("session/request_permission"),
+                        Failure::OutputAfterWrite => Some("agent_message_chunk"),
+                        Failure::InputError => None,
+                    },
+                }),
+            ),
+        );
+        let breaking = async {
+            if mode == Failure::InputError {
+                let waited = tokio::time::timeout(Duration::from_secs(30), async {
+                    loop {
+                        if !manager
+                            .get_thread_detail(&thread)
+                            .await?
+                            .pending_approvals
+                            .is_empty()
+                        {
+                            return Ok::<_, anyhow::Error>(());
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await;
+                let _ = lines.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "the editor's socket was reset",
+                )));
+                waited??;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        let (served, broke) = tokio::join!(serving, breaking);
+        broke?;
+        let served = served.map_err(|_| anyhow!("serve did not return in 60s"))?;
+        let ended_with_error = served.is_err();
+        drop(served);
+        let terminal = tokio::time::timeout(Duration::from_secs(40), async {
+            loop {
+                let detail = manager.get_thread_detail(&thread).await?;
+                if detail.turns.last().is_some_and(|turn| {
+                    !matches!(
+                        turn.status,
+                        codewhale_engine::runtime_threads::RuntimeTurnStatus::Queued
+                            | codewhale_engine::runtime_threads::RuntimeTurnStatus::InProgress
+                    )
+                }) {
+                    return Ok::<_, anyhow::Error>(format!(
+                        "{:?}",
+                        detail.turns.last().map(|turn| &turn.status)
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("the Core turn never settled"))??;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let saved_user_messages = codewhale_engine::session_manager::SessionManager::new(
+            rig.server.sessions_dir.clone(),
+        )?
+        .load_session(&id)
+        .map(|saved| {
+            saved
+                .messages
+                .iter()
+                .filter(|m| m.role == Role::User)
+                .count()
+        });
+        drop(lines);
+        rig.close().await;
+        assert!(
+            ended_with_error,
+            "a failed transport must end serve with an error"
+        );
+        assert!(
+            matches!(saved_user_messages, Ok(count) if count > 0),
+            "no checkpoint after a mid-turn transport failure ({}); Core turn ended {terminal}; saved user messages: {saved_user_messages:?}",
+            mode as u8
+        );
+        if mode == Failure::OutputAfterWrite {
+            assert_eq!(
+                std::fs::read_to_string(rig.workspace.join("writer-failure.txt"))?,
+                "completed"
+            );
+        }
+        Ok(())
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_output_write_mid_turn_keeps_the_checkpoint() -> Result<()> {
+        transport_failure_case(Failure::OutputAtPermission).await
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_input_read_mid_turn_keeps_the_checkpoint() -> Result<()> {
+        transport_failure_case(Failure::InputError).await
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_transport_after_completed_write_retains_actual_core_terminal_and_checkpoint()
+    -> Result<()> {
+        transport_failure_case(Failure::OutputAfterWrite).await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_oversize_update_fails_the_connection_without_dropping_the_turn() -> Result<()> {
+        use futures_util::SinkExt;
+        let rig = Rig::new(fixture_config(), vec![])?;
+        let shared = Arc::new(super::connection::Shared::new(rig.placeholder()));
+        let (frames, mut queued) = tokio::sync::mpsc::channel(4);
+        let mut sink = Box::pin(super::connection::outgoing_lines(
+            frames,
+            Arc::clone(&shared),
+        ));
+        let update = json!({"jsonrpc":"2.0","method":"session/update","params":{"big":"x".repeat(MAX_FRAME_BYTES)}})
+            .to_string();
+        sink.send(update).await?;
+        assert!(queued.try_recv().is_err());
+        assert!(shared.take_failure().is_some());
+        rig.close().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn acp_full_access_hint_is_localized_for_every_shipped_locale() -> Result<()> {
+        use codewhale_localization::{Locale, MessageId, tr};
+        let mut rig = Rig::new(fixture_config(), vec![])?;
+        let id = rig.new_session().await;
+        let english = tr(Locale::En, MessageId::AcpFullAccessHint);
+        for &locale in Locale::shipped_complete() {
+            let view = to_wire(
+                &rig.server
+                    .session_view_for_locale(&id, locale)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            let hint = view["configOptions"][2]["_meta"]["codewhale"]["enableFullAccess"]
+                .as_str()
+                .expect("permission option must include enableFullAccess hint");
+            assert_eq!(
+                hint,
+                tr(locale, MessageId::AcpFullAccessHint),
+                "{} enableFullAccess did not use localized MessageId::AcpFullAccessHint",
+                locale.tag()
+            );
+            assert!(hint.contains("codewhale serve --acp --full-access"));
+            assert!(hint.contains("--yolo"));
+            assert!(hint.contains("yolo = true"));
+            assert!(hint.contains("sandbox_mode"));
+            if locale != Locale::En {
+                assert_ne!(
+                    hint,
+                    english,
+                    "{} enableFullAccess fell back to English",
+                    locale.tag()
+                );
+            }
+        }
+        rig.close().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn acp_load_session_offloads_store_io_and_releases_server_mutex_across_awaits()
+    -> Result<()> {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let mut rig = Rig::new(fixture_config(), vec![])?;
+        let id = rig.new_session().await;
+        let store = codewhale_engine::session_manager::SessionManager::new(
+            rig.server.sessions_dir.clone(),
+        )?;
+        let mut saved = store.load_session(&id)?;
+        saved.messages = serde_json::from_value(Value::Array(
+            (0..64)
+                .map(|i| {
+                    json!({
+                        "role": if i % 2 == 0 { "user" } else { "assistant" },
+                        "content": [{ "type": "text", "text": format!("message-{i}: {}", "x".repeat(512)) }]
+                    })
+                })
+                .collect(),
+        ))?;
+        store.save_session(&saved)?;
+        rig.server.sessions.clear();
+        rig.server.insertion_order.clear();
+
+        let worker_thread = std::thread::current().id();
+        let blocking_thread = super::spawn_blocking_io(|| std::thread::current().id()).await?;
+        assert_ne!(
+            worker_thread, blocking_thread,
+            "spawn_blocking_io must run off the Tokio async worker thread"
+        );
+
+        let placeholder = rig.placeholder();
+        let server = tokio::sync::Mutex::new(std::mem::replace(&mut rig.server, placeholder));
+        let mut load_fut = Box::pin(super::AcpServer::load_session_shared(
+            &server,
+            json!({ "sessionId": id }),
+        ));
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut pending_polls = 0usize;
+        let mut concurrent_served = false;
+        let loaded = loop {
+            match load_fut.as_mut().poll(&mut cx) {
+                Poll::Ready(result) => break result.unwrap(),
+                Poll::Pending => {
+                    pending_polls += 1;
+                    assert!(
+                        server.try_lock().is_ok(),
+                        "server mutex must not be held across await points during session/load"
+                    );
+                    if !concurrent_served {
+                        let model = super::AcpServer::handle_request_shared(
+                            &server,
+                            "session/currentModel",
+                            json!({}),
+                        )
+                        .await
+                        .unwrap();
+                        assert!(model.get("model").is_some());
+                        concurrent_served = true;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        };
+        drop(load_fut);
+        assert!(
+            pending_polls > 0,
+            "session/load must yield off the async worker"
+        );
+        assert!(concurrent_served);
+        assert_eq!(loaded["sessionId"], id);
+
+        let (sessions_dir, config) = {
+            let guard = server.lock().await;
+            (guard.sessions_dir.clone(), guard.config.clone())
+        };
+        let updates = super::history_updates_for(sessions_dir, config, id).await?;
+        assert_eq!(updates.len(), 64);
+
+        rig.server = server.into_inner();
         rig.close().await;
         Ok(())
     }
